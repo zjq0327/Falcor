@@ -29,6 +29,7 @@
 #include "Falcor.h"
 #include "RenderGraph/RenderPass.h"
 #include "Utils/Sampling/SampleGenerator.h"
+#include "Rendering/Lights/EmissiveLightSampler.h"
 
 using namespace Falcor;
 
@@ -74,15 +75,19 @@ private:
     ref<Scene> mpScene;
     /// GPU sample generator.
     ref<SampleGenerator> mpSampleGenerator;
+    /// Emissive light sampler for NEE, or nullptr if the scene has no emissive lights.
+    std::unique_ptr<EmissiveLightSampler> mpEmissiveSampler;
 
     // Configuration
 
     /// Max number of indirect bounces (0 = none).
-    uint mMaxBounces = 3;
+    uint mMaxBounces = 64;
     /// Compute direct illumination (otherwise indirect only).
     bool mComputeDirect = true;
     /// Use importance sampling for materials.
     bool mUseImportanceSampling = true;
+    /// Fixed probability for russian roulette path termination.
+    float mRRProbability = 0.2f;
 
     // Runtime data
 

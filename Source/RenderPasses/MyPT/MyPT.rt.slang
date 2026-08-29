@@ -60,11 +60,13 @@ import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
 import Rendering.Lights.LightHelpers;
+import Rendering.Lights.EmissiveLightSampler;
 
 cbuffer CB
 {
     uint gFrameCount;    // Frame count since scene was loaded.
     uint gPRNGDimension; // First available PRNG dimension.
+    float gRRProbability; // Fixed probability for russian roulette path termination.
 }
 
 // Inputs
@@ -73,6 +75,9 @@ Texture2D<float4> gViewW; // Optional
 
 // Outputs
 RWTexture2D<float4> gOutputColor;
+
+// Emissive light sampler. Bound from the host when the scene has emissive lights.
+uniform EmissiveLightSampler emissiveSampler;
 
 // Static configuration based on defines set from the host.
 #define is_valid(name) (is_valid_##name != 0)
@@ -105,6 +110,8 @@ struct ScatterRayData
     uint pathLength;  ///< Path length in number of path segments (0 at origin, 1 at first secondary hit, etc.). Max 2^31.
     float3 origin;    ///< Next path segment origin.
     float3 direction; ///< Next path segment direction.
+    float pdf;        ///< Pdf of the BSDF-sampled direction (for MIS when the scatter ray hits an emissive surface).
+    float3 normal;    ///< Oriented face normal at the previous path vertex (for emissive PDF evaluation).
 
     SampleGenerator sg; ///< Per-ray state for the sample generator (up to 16B).
 
@@ -119,6 +126,8 @@ struct ScatterRayData
         this.thp = float3(1, 1, 1);
         this.origin = float3(0, 0, 0);
         this.direction = float3(0, 0, 0);
+        this.pdf = 0.f;
+        this.normal = float3(0, 0, 0);
         this.sg = sg;
     }
 };
@@ -126,47 +135,17 @@ struct ScatterRayData
 /**
  * Setup ShadingData based on loaded vertex/material attributes for a hit point.
  * @param[in] hit Hit information.
- * @param[in] rayOrigin Ray origin.
  * @param[in] rayDir Normalized ray direction.
  * @return ShadingData struct.
  */
-ShadingData loadShadingData(const HitInfo hit, const float3 rayOrigin, const float3 rayDir)
+ShadingData loadShadingData(const HitInfo hit, const float3 rayDir)
 {
     VertexData v = {};
     uint materialID = {};
 
-#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-    if (hit.getType() == HitType::Triangle)
-    {
-        const TriangleHit triangleHit = hit.getTriangleHit();
-        v = gScene.getVertexData(triangleHit);
-        materialID = gScene.getMaterialID(triangleHit.instanceID);
-    }
-#endif
-#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_DISPLACED_TRIANGLE_MESH)
-    if (hit.getType() == HitType::DisplacedTriangle)
-    {
-        const DisplacedTriangleHit displacedTriangleHit = hit.getDisplacedTriangleHit();
-        v = gScene.getVertexData(displacedTriangleHit, -rayDir);
-        materialID = gScene.getMaterialID(displacedTriangleHit.instanceID);
-    }
-#endif
-#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_CURVE)
-    if (hit.getType() == HitType::Curve)
-    {
-        const CurveHit curveHit = hit.getCurveHit();
-        v = gScene.getVertexDataFromCurve(curveHit);
-        materialID = gScene.getMaterialID(curveHit.instanceID);
-    }
-#endif
-#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_SDF_GRID)
-    if (hit.getType() == HitType::SDFGrid)
-    {
-        const SDFGridHit sdfGridHit = hit.getSDFGridHit();
-        v = gScene.getVertexDataFromSDFGrid(sdfGridHit, rayOrigin, rayDir);
-        materialID = gScene.getMaterialID(sdfGridHit.instanceID);
-    }
-#endif
+    const TriangleHit triangleHit = hit.getTriangleHit();
+    v = gScene.getVertexData(triangleHit);
+    materialID = gScene.getMaterialID(triangleHit.instanceID);
 
     ShadingData sd = gScene.materials.prepareShadingData(v, materialID, -rayDir);
 
@@ -238,6 +217,19 @@ void traceScatterRay(inout ScatterRayData rayData)
 }
 
 /**
+ * Evaluate the multiple importance sampling weight using the power heuristic.
+ * @param[in] p0 Pdf of the first sampling strategy.
+ * @param[in] p1 Pdf of the second sampling strategy.
+ * @return Weight for the contribution from the first strategy.
+ */
+float evalMIS(float p0, float p1)
+{
+    float q0 = p0 * p0;
+    float q1 = p1 * p1;
+    return q0 / (q0 + q1);
+}
+
+/**
  * Evaluates the direct illumination from analytic lights.
  * This function samples Falcor's light list uniformly with one shadow ray.
  * @param[in] sd Shading data.
@@ -281,30 +273,94 @@ float3 evalDirectAnalytic(const ShadingData sd, const IMaterialInstance mi, inou
 }
 
 /**
+ * Evaluates the direct illumination from emissive geometry using NEE + MIS.
+ * @param[in] sd Shading data.
+ * @param[in] mi Material instance.
+ * @param[in,out] sg SampleGenerator object.
+ * @return Outgoing radiance in view direction.
+ */
+float3 evalDirectEmissive(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
+{
+    if (!kUseEmissiveLights) return float3(0.f);
+
+    // Sample an emissive triangle.
+    TriangleLightSample tls;
+    if (!emissiveSampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), false, sg, tls))
+        return float3(0.f);
+
+    if (tls.pdf <= 0.f) return float3(0.f);
+
+    float3 Li = tls.Le / tls.pdf;
+
+    // Apply MIS weight against the BSDF sampling strategy.
+    const float scatterPdf = mi.evalPdf(sd, tls.dir, kUseImportanceSampling);
+    Li *= evalMIS(tls.pdf, scatterPdf);
+
+    // Test visibility.
+    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, tls.dir) >= 0.f ? sd.faceN : -sd.faceN);
+    if (!traceShadowRay(origin, tls.dir, tls.distance))
+        return float3(0.f);
+
+    return mi.eval(sd, tls.dir, sg) * Li;
+}
+
+/**
+ * Evaluates the total direct illumination (analytic lights + emissive geometry).
+ * @param[in] sd Shading data.
+ * @param[in] mi Material instance.
+ * @param[in,out] sg SampleGenerator object.
+ * @return Outgoing radiance in view direction.
+ */
+float3 evalDirect(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
+{
+    float3 Lr = evalDirectAnalytic(sd, mi, sg);
+    Lr += evalDirectEmissive(sd, mi, sg);
+    return Lr;
+}
+
+/**
  * Generate a new scatter ray or terminate.
  * @param[in] sd Shading data.
  * @param[in] mi Material instance.
- * @param[in] isCurveHit True if on curve hit.
  * @param[in] rayOrigin Ray origin for the new ray.
  * @param[in,out] rayData Ray payload.
  * @return True if the path continues.
  */
-bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, bool isCurveHit, float3 rayOrigin, inout ScatterRayData rayData)
+bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3 rayOrigin, inout ScatterRayData rayData)
 {
     // Sample material.
-    BSDFSample bsdfSample;
+    BSDFSample bsdfSample = {};
     if (mi.sample(sd, rayData.sg, bsdfSample, kUseImportanceSampling))
     {
         rayData.origin = rayOrigin;
-        if (!isCurveHit && bsdfSample.isLobe(LobeType::Transmission))
+        if (bsdfSample.isLobe(LobeType::Transmission))
         {
             rayData.origin = sd.computeRayOrigin(false);
         }
         rayData.direction = bsdfSample.wo;
+        rayData.pdf = bsdfSample.pdf;
+        rayData.normal = sd.getOrientedFaceNormal();
         rayData.thp *= bsdfSample.weight;
         return any(rayData.thp > 0.f);
     }
 
+    return false;
+}
+
+/**
+ * Apply russian roulette to terminate paths early.
+ * @param[in,out] rayData Ray payload.
+ * @param[in] u Uniform random number in [0,1).
+ * @return True if the path was terminated.
+ */
+bool terminatePathByRussianRoulette(inout ScatterRayData rayData, float u)
+{
+    if (u < gRRProbability)
+    {
+        rayData.terminated = true;
+        return true;
+    }
+    rayData.thp /= (1.f - gRRProbability);
     return false;
 }
 
@@ -317,10 +373,8 @@ bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, bool i
  */
 void handleHit(const HitInfo hit, inout ScatterRayData rayData)
 {
-    const bool isCurveHit = hit.getType() == HitType::Curve;
-
     // Load shading data.
-    ShadingData sd = loadShadingData(hit, rayData.origin, rayData.direction);
+    ShadingData sd = loadShadingData(hit, rayData.direction);
 
     // Create material instance.
     let lod = ExplicitLodTextureSampler(0.f);
@@ -329,7 +383,19 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     // Add emitted light.
     if (kUseEmissiveLights && (kComputeDirect || rayData.pathLength > 0))
     {
-        rayData.radiance += rayData.thp * mi.getProperties(sd).emission;
+        float3 emission = mi.getProperties(sd).emission;
+        if (rayData.pathLength > 0)
+        {
+            // The scatter ray hit an emissive surface. Apply MIS weight against the NEE strategy.
+            TriangleLightHit lightHit;
+            TriangleHit triangleHit = hit.getTriangleHit();
+            lightHit.triangleIndex = gScene.lightCollection.getTriangleIndex(triangleHit.instanceID, triangleHit.primitiveIndex);
+            lightHit.posW = sd.posW;
+            lightHit.normalW = sd.getOrientedFaceNormal();
+            const float lightPdf = emissiveSampler.evalPdf(rayData.origin, rayData.normal, false, lightHit);
+            emission *= evalMIS(rayData.pdf, lightPdf);
+        }
+        rayData.radiance += rayData.thp * emission;
     }
 
     // Check whether to terminate based on max depth.
@@ -340,27 +406,22 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     }
 
     // Compute ray origin for new rays spawned from the hit.
-    float3 rayOrigin;
-    if (isCurveHit)
-    {
-        // For curves, we set the new origin at the sphere center.
-        rayOrigin = sd.posW - sd.curveRadius * sd.frame.N;
-    }
-    else
-    {
-        rayOrigin = sd.computeRayOrigin();
-    }
+    const float3 rayOrigin = sd.computeRayOrigin();
 
-    // Add contribution of direct light from analytic lights.
-    if (kUseAnalyticLights)
+    // Add contribution of direct light (analytic lights + emissive NEE).
+    if (kUseAnalyticLights || kUseEmissiveLights)
     {
-        float3 Lr = evalDirectAnalytic(sd, mi, rayData.sg);
+        float3 Lr = evalDirect(sd, mi, rayData.sg);
         rayData.radiance += rayData.thp * Lr;
     }
 
+    // Apply russian roulette to terminate paths early.
+    if (terminatePathByRussianRoulette(rayData, sampleNext1D(rayData.sg)))
+        return;
+
     // Generate scatter ray for the next path segment.
     // The raygen shader will continue the path based on the returned payload.
-    if (!generateScatterRay(sd, mi, isCurveHit, rayOrigin, rayData))
+    if (!generateScatterRay(sd, mi, rayOrigin, rayData))
     {
         rayData.terminated = true;
         return;
@@ -383,7 +444,6 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
 {
     float3 outColor = float3(0.f);
 
-    const float3 primaryRayOrigin = gScene.camera.getPosition();
     const float3 primaryRayDir = getPrimaryRayDir(pixel, frameDim, gScene.camera);
 
     const HitInfo hit = HitInfo(gVBuffer[pixel]);
@@ -391,10 +451,8 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
     {
         // Pixel represents a valid primary hit. Compute its contribution.
 
-        const bool isCurveHit = hit.getType() == HitType::Curve;
-
         // Load shading data.
-        ShadingData sd = loadShadingData(hit, primaryRayOrigin, primaryRayDir);
+        ShadingData sd = loadShadingData(hit, primaryRayDir);
 
         // Create material instance at shading point.
         let lod = ExplicitLodTextureSampler(0.f);
@@ -408,30 +466,22 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             sampleNext1D(sg);
 
         // Compute ray origin for new rays spawned from the G-buffer.
-        float3 rayOrigin;
-        if (isCurveHit)
-        {
-            rayOrigin = sd.posW - sd.curveRadius * sd.frame.N;
-        }
-        else
-        {
-            rayOrigin = sd.computeRayOrigin();
-        }
+        const float3 rayOrigin = sd.computeRayOrigin();
 
         if (kComputeDirect)
         {
             // Always output directly emitted light, independent of whether emissive materials are treated as light sources or not.
             outColor += mi.getProperties(sd).emission;
 
-            // Add contribution of direct light from analytic lights.
-            outColor += kUseAnalyticLights ? evalDirectAnalytic(sd, mi, sg) : float3(0.f);
+            // Add contribution of direct light (analytic lights + emissive NEE).
+            outColor += evalDirect(sd, mi, sg);
         }
 
         // Prepare ray payload.
         ScatterRayData rayData = ScatterRayData(sg);
 
         // Generate scatter ray.
-        if (!generateScatterRay(sd, mi, isCurveHit, rayOrigin, rayData))
+        if (!generateScatterRay(sd, mi, rayOrigin, rayData))
             rayData.terminated = true;
 
         // Follow path into the scene and compute its total contribution.
@@ -511,84 +561,6 @@ void shadowTriangleMeshAnyHit(inout ShadowRayData rayData, BuiltInTriangleInters
     const uint materialID = gScene.getMaterialID(instanceID);
     if (gScene.materials.alphaTest(v, materialID, 0.f))
         IgnoreHit();
-}
-
-//
-// Shader entry points for DisplacedTriangleMesh hit groups.
-//
-
-[shader("intersection")]
-void displacedTriangleMeshIntersection()
-{
-    const Ray ray = Ray(WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent());
-    DisplacedTriangleMeshIntersector::Attribs attribs;
-    float t;
-    if (DisplacedTriangleMeshIntersector::intersect(ray, getGeometryInstanceID(), PrimitiveIndex(), attribs, t))
-    {
-        ReportHit(t, 0, attribs);
-    }
-}
-
-[shader("closesthit")]
-void scatterDisplacedTriangleMeshClosestHit(inout ScatterRayData rayData, DisplacedTriangleMeshIntersector::Attribs attribs)
-{
-    DisplacedTriangleHit displacedTriangleHit;
-    displacedTriangleHit.instanceID = getGeometryInstanceID();
-    displacedTriangleHit.primitiveIndex = PrimitiveIndex();
-    displacedTriangleHit.barycentrics = attribs.barycentrics;
-    displacedTriangleHit.displacement = attribs.displacement;
-    handleHit(HitInfo(displacedTriangleHit), rayData);
-}
-
-//
-// Shader entry points for Curve hit groups.
-//
-
-[shader("intersection")]
-void curveIntersection()
-{
-    const Ray ray = Ray(WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent());
-    CurveIntersector::Attribs attribs;
-    float t;
-    if (CurveIntersector::intersect(ray, getGeometryInstanceID(), PrimitiveIndex(), attribs, t))
-    {
-        ReportHit(t, 0, attribs);
-    }
-}
-
-[shader("closesthit")]
-void scatterCurveClosestHit(inout ScatterRayData rayData, CurveIntersector::Attribs attribs)
-{
-    CurveHit curveHit;
-    curveHit.instanceID = getGeometryInstanceID();
-    curveHit.primitiveIndex = PrimitiveIndex();
-    curveHit.barycentrics = attribs.barycentrics;
-    handleHit(HitInfo(curveHit), rayData);
-}
-
-//
-// Shader entry points for SDFGrid hit groups.
-//
-
-[shader("intersection")]
-void sdfGridIntersection()
-{
-    const Ray ray = Ray(WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent());
-    SDFGridHitData sdfGridHitData;
-    float t;
-    if (SDFGridIntersector::intersect(ray, getGeometryInstanceID(), PrimitiveIndex(), sdfGridHitData, t))
-    {
-        ReportHit(t, 0, sdfGridHitData);
-    }
-}
-
-[shader("closesthit")]
-void scatterSdfGridClosestHit(inout ScatterRayData rayData, SDFGridHitData sdfGridHitData)
-{
-    SDFGridHit sdfGridHit;
-    sdfGridHit.instanceID = getGeometryInstanceID();
-    sdfGridHit.hitData = sdfGridHitData;
-    handleHit(HitInfo(sdfGridHit), rayData);
 }
 
 //

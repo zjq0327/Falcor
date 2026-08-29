@@ -28,6 +28,7 @@
 #include "MyPT.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Rendering/Lights/EmissiveUniformSampler.h"
 
 // Register this class with the plugin system. This is what makes the pass
 // loadable from Python via `loadRenderPassLibrary("MyPT.dll")` followed by
@@ -43,7 +44,7 @@ const char kShaderFile[] = "RenderPasses/MyPT/MyPT.rt.slang";
 
 // Ray tracing settings that affect the traversal stack size.
 // These should be set as small as possible.
-const uint32_t kMaxPayloadSizeBytes = 72u;
+const uint32_t kMaxPayloadSizeBytes = 96u;
 const uint32_t kMaxRecursionDepth = 2u;
 
 const char kInputViewDir[] = "viewW";
@@ -64,6 +65,7 @@ const ChannelList kOutputChannels = {
 const char kMaxBounces[] = "maxBounces";
 const char kComputeDirect[] = "computeDirect";
 const char kUseImportanceSampling[] = "useImportanceSampling";
+const char kRRProbability[] = "rrProbability";
 } // namespace
 
 MyPT::MyPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -85,6 +87,8 @@ void MyPT::parseProperties(const Properties& props)
             mComputeDirect = value;
         else if (key == kUseImportanceSampling)
             mUseImportanceSampling = value;
+        else if (key == kRRProbability)
+            mRRProbability = value;
         else
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
@@ -96,6 +100,7 @@ Properties MyPT::getProperties() const
     props[kMaxBounces] = mMaxBounces;
     props[kComputeDirect] = mComputeDirect;
     props[kUseImportanceSampling] = mUseImportanceSampling;
+    props[kRRProbability] = mRRProbability;
     return props;
 }
 
@@ -162,6 +167,13 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mTracer.pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
     mTracer.pProgram->addDefine("USE_ENV_BACKGROUND", mpScene->useEnvBackground() ? "1" : "0");
 
+    // Update the emissive light sampler and inject its defines before program vars are created.
+    if (mpEmissiveSampler)
+    {
+        mpEmissiveSampler->update(pRenderContext, mpScene->getILightCollection(pRenderContext));
+        mTracer.pProgram->addDefines(mpEmissiveSampler->getDefines());
+    }
+
     // For optional I/O resources, set 'is_valid_<name>' defines to inform the program of which ones it can access.
     mTracer.pProgram->addDefines(getValidResourceDefines(kInputChannels, renderData));
     mTracer.pProgram->addDefines(getValidResourceDefines(kOutputChannels, renderData));
@@ -175,6 +187,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     auto var = mTracer.pVars->getRootVar();
     var["CB"]["gFrameCount"] = mFrameCount;
     var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
+    var["CB"]["gRRProbability"] = mRRProbability;
 
     // Bind I/O buffers. These needs to be done per-frame as the buffers may change anytime.
     auto bind = [&](const ChannelDesc& desc)
@@ -212,6 +225,9 @@ void MyPT::renderUI(Gui::Widgets& widget)
     dirty |= widget.checkbox("Use importance sampling", mUseImportanceSampling);
     widget.tooltip("Use importance sampling for materials", true);
 
+    dirty |= widget.var("RR Probability", mRRProbability, 0.f, 0.95f);
+    widget.tooltip("Probability of terminating a path by russian roulette at each indirect bounce.", true);
+
     // If rendering options that modify the output have changed, set flag to indicate that.
     // In execute() we will pass the flag to other passes for reset of temporal data etc.
     if (dirty)
@@ -231,13 +247,18 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     // Set new scene.
     mpScene = pScene;
 
+    // Create the emissive light sampler if the scene has emissive lights.
+    if (mpScene && mpScene->useEmissiveLights())
+    {
+        mpEmissiveSampler = std::make_unique<EmissiveUniformSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
+    }
+    else
+    {
+        mpEmissiveSampler = nullptr;
+    }
+
     if (mpScene)
     {
-        if (pScene->hasGeometryType(Scene::GeometryType::Custom))
-        {
-            logWarning("MyPT: This render pass does not support custom primitives.");
-        }
-
         // Create ray tracing program.
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
@@ -264,38 +285,6 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
             );
         }
 
-        if (mpScene->hasGeometryType(Scene::GeometryType::DisplacedTriangleMesh))
-        {
-            sbt->setHitGroup(
-                0,
-                mpScene->getGeometryIDs(Scene::GeometryType::DisplacedTriangleMesh),
-                desc.addHitGroup("scatterDisplacedTriangleMeshClosestHit", "", "displacedTriangleMeshIntersection")
-            );
-            sbt->setHitGroup(
-                1,
-                mpScene->getGeometryIDs(Scene::GeometryType::DisplacedTriangleMesh),
-                desc.addHitGroup("", "", "displacedTriangleMeshIntersection")
-            );
-        }
-
-        if (mpScene->hasGeometryType(Scene::GeometryType::Curve))
-        {
-            sbt->setHitGroup(
-                0, mpScene->getGeometryIDs(Scene::GeometryType::Curve), desc.addHitGroup("scatterCurveClosestHit", "", "curveIntersection")
-            );
-            sbt->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::Curve), desc.addHitGroup("", "", "curveIntersection"));
-        }
-
-        if (mpScene->hasGeometryType(Scene::GeometryType::SDFGrid))
-        {
-            sbt->setHitGroup(
-                0,
-                mpScene->getGeometryIDs(Scene::GeometryType::SDFGrid),
-                desc.addHitGroup("scatterSdfGridClosestHit", "", "sdfGridIntersection")
-            );
-            sbt->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::SDFGrid), desc.addHitGroup("", "", "sdfGridIntersection"));
-        }
-
         mTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
     }
 }
@@ -315,4 +304,5 @@ void MyPT::prepareVars()
     // Bind utility classes into shared data.
     auto var = mTracer.pVars->getRootVar();
     mpSampleGenerator->bindShaderData(var);
+    if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["emissiveSampler"]);
 }
