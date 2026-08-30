@@ -101,6 +101,13 @@ private:
     /// Number of candidate light samples (M) used by ReSTIR DI RIS.
     uint mRISCandidateCount = 32;
 
+    /// Max accumulated sample count (M) for ReSTIR temporal reuse.
+    uint mMaxHistoryLength = 20;
+    /// Max world-space position difference for ReSTIR temporal reuse.
+    float mTemporalDepthThreshold = 0.01f;
+    /// Min cosine between normals for ReSTIR temporal reuse.
+    float mTemporalNormalThreshold = 0.5f;
+
     /// Max number of indirect bounces (0 = none).
     uint mMaxBounces = 64;
     /// Compute direct illumination (otherwise indirect only).
@@ -117,6 +124,10 @@ private:
     /// Frame count since scene was loaded.
     uint mFrameCount = 0;
     bool mOptionsChanged = false;
+
+    /// ReSTIR reservoir ping-pong buffers (previous / current frame).
+    ref<Buffer> mpReservoirPrev;
+    ref<Buffer> mpReservoirCur;
 
     // Ray tracing program.
     struct

@@ -9,7 +9,7 @@ def render_graph_MyPT():
     ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
     g.addPass(ToneMapper, "ToneMapper")
 
-    MyPT = createPass("MyPT", {'mode': 'PT', 'risCandidateCount': 32, 'maxBounces': 64, 'computeDirect': True, 'useImportanceSampling': True, 'rrProbability': 0.2})
+    MyPT = createPass("MyPT", {'mode': 'PT', 'risCandidateCount': 32, 'maxHistoryLength': 20, 'temporalDepthThreshold': 0.01, 'temporalNormalThreshold': 0.5, 'maxBounces': 64, 'computeDirect': True, 'useImportanceSampling': True, 'rrProbability': 0.2})
     g.addPass(MyPT, "MyPT")
 
     VBufferRT = createPass("VBufferRT", {'samplePattern': 'Stratified', 'sampleCount': 16})
@@ -18,6 +18,7 @@ def render_graph_MyPT():
     g.addEdge("AccumulatePass.output", "ToneMapper.src")
     g.addEdge("VBufferRT.vbuffer", "MyPT.vbuffer")
     g.addEdge("VBufferRT.viewW", "MyPT.viewW")
+    g.addEdge("VBufferRT.mvec", "MyPT.mvec")
     g.addEdge("MyPT.color", "AccumulatePass.input")
     g.markOutput("ToneMapper.dst")
     return g

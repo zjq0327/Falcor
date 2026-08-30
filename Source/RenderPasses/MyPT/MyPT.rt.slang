@@ -61,6 +61,7 @@ import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
 import Rendering.Lights.LightHelpers;
 import Rendering.Lights.EmissiveLightSampler;
+import Utils.Color.ColorHelpers;
 import MyPTRestir;
 
 cbuffer CB
@@ -68,14 +69,22 @@ cbuffer CB
     uint gFrameCount;    // Frame count since scene was loaded.
     uint gPRNGDimension; // First available PRNG dimension.
     float gRRProbability; // Fixed probability for russian roulette path termination.
+    uint gMaxHistoryLength;         // Max accumulated sample count M for ReSTIR temporal reuse.
+    float gTemporalDepthThreshold;  // Max world-space position difference for temporal reuse.
+    float gTemporalNormalThreshold; // Min cosine between normals for temporal reuse.
 }
 
 // Inputs
 Texture2D<PackedHitInfo> gVBuffer;
 Texture2D<float4> gViewW; // Optional
+Texture2D<float2> gMotionVector; // Optional
 
 // Outputs
 RWTexture2D<float4> gOutputColor;
+
+// ReSTIR reservoir buffers (ping-pong across frames).
+RWStructuredBuffer<Reservoir> gReservoirPrev;
+RWStructuredBuffer<Reservoir> gReservoirCur;
 
 // The emissive light sampler (EmissiveLightSampler typedef, selected via _EMISSIVE_LIGHT_SAMPLER_TYPE)
 // is instantiated LOCALLY where needed instead of being declared as a global uniform parameter.
@@ -332,28 +341,32 @@ float3 evalDirect(const ShadingData sd, const IMaterialInstance mi, inout Sample
 }
 
 /**
- * Evaluates direct illumination using ReSTIR DI (RIS initial sampling).
+ * Evaluates direct illumination using a ReSTIR DI reservoir (RIS + temporal reuse).
  * @param[in] sd Shading data.
  * @param[in] mi Material instance.
  * @param[in,out] sg SampleGenerator object.
+ * @param[in] r Reservoir containing the selected light sample.
  * @return Outgoing radiance in view direction.
  */
-float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
+float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const Reservoir r)
 {
-    ReSTIRLightSample s = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
-    if (!s.valid)
+    if (!r.isValid())
         return float3(0.f);
 
     // Compute ray origin with offset applied in direction of the geometry normal to avoid self-intersection.
-    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, s.dir) >= 0.f ? sd.faceN : -sd.faceN);
+    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.dirDistance.xyz) >= 0.f ? sd.faceN : -sd.faceN);
 
     // Test visibility with a single shadow ray.
-    if (!traceShadowRay(origin, s.dir, s.distance))
+    if (!traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w))
         return float3(0.f);
 
-    // Final contribution: f(y_z) * (W_sum / M) / p_hat(y_z).
-    const float3 f = mi.eval(sd, s.dir, sg) * s.radiance;
-    return f * (s.weight / s.p_hat);
+    // Final contribution (ReSTIR Eq. 9, 1/M normalization): L = (W/M) * f(y_z) / p_hat(y_z),
+    // where p_hat = luminance(f) is the scalar target function used for RIS sample selection.
+    const float3 f = mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
+    const float p_hat = luminance(f);
+    if (p_hat <= 0.f)
+        return float3(0.f);
+    return f * (r.radianceWsum.w / float(r.getM())) / p_hat;
 }
 
 /**
@@ -521,8 +534,34 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             // Always output directly emitted light, independent of whether emissive materials are treated as light sources or not.
             outColor += mi.getProperties(sd).emission;
 
-            // Add contribution of direct light. ReSTIR uses RIS, PT uses NEE.
-            outColor += kUseReSTIR ? evalDirectReSTIR(sd, mi, sg) : evalDirect(sd, mi, sg);
+            // Add contribution of direct light. ReSTIR uses RIS + temporal reuse, PT uses NEE.
+            if (kUseReSTIR)
+            {
+                // RIS initial sampling.
+                Reservoir r = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
+
+                // Temporal reuse: reproject to the previous frame and merge with history.
+                if (is_valid(gMotionVector))
+                {
+                    float2 prevPixel = float2(pixel) + gMotionVector[pixel] * float2(frameDim);
+                    if (all(prevPixel >= 0.f) && all(prevPixel < float2(frameDim)))
+                    {
+                        uint prevIdx = uint(prevPixel.x) + uint(prevPixel.y) * frameDim.x;
+                        Reservoir prev = gReservoirPrev[prevIdx];
+                        r = temporalResample(sd, mi, sg, r, prev, gMaxHistoryLength, gTemporalDepthThreshold, gTemporalNormalThreshold);
+                    }
+                }
+
+                // Final shading.
+                outColor += evalDirectReSTIR(sd, mi, sg, r);
+
+                // Store the merged reservoir for the next frame.
+                gReservoirCur[pixel.x + pixel.y * frameDim.x] = r;
+            }
+            else
+            {
+                outColor += evalDirect(sd, mi, sg);
+            }
         }
 
         // Prepare ray payload.

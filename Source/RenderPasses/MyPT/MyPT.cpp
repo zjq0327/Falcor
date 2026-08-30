@@ -55,6 +55,7 @@ const ChannelList kInputChannels = {
     // clang-format off
     { "vbuffer",        "gVBuffer",     "Visibility buffer in packed format" },
     { kInputViewDir,    "gViewW",       "World-space view direction (xyz float format)", true /* optional */ },
+    { "mvec",           "gMotionVector","Motion vector (screen space)", true /* optional */, ResourceFormat::RG32Float },
     // clang-format on
 };
 
@@ -71,6 +72,9 @@ const char kComputeDirect[] = "computeDirect";
 const char kUseImportanceSampling[] = "useImportanceSampling";
 const char kUseMIS[] = "useMIS";
 const char kRRProbability[] = "rrProbability";
+const char kMaxHistoryLength[] = "maxHistoryLength";
+const char kTemporalDepthThreshold[] = "temporalDepthThreshold";
+const char kTemporalNormalThreshold[] = "temporalNormalThreshold";
 } // namespace
 
 MyPT::MyPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -100,6 +104,12 @@ void MyPT::parseProperties(const Properties& props)
             mUseMIS = value;
         else if (key == kRRProbability)
             mRRProbability = value;
+        else if (key == kMaxHistoryLength)
+            mMaxHistoryLength = value;
+        else if (key == kTemporalDepthThreshold)
+            mTemporalDepthThreshold = value;
+        else if (key == kTemporalNormalThreshold)
+            mTemporalNormalThreshold = value;
         else
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
@@ -115,6 +125,9 @@ Properties MyPT::getProperties() const
     props[kUseImportanceSampling] = mUseImportanceSampling;
     props[kUseMIS] = mUseMIS;
     props[kRRProbability] = mRRProbability;
+    props[kMaxHistoryLength] = mMaxHistoryLength;
+    props[kTemporalDepthThreshold] = mTemporalDepthThreshold;
+    props[kTemporalNormalThreshold] = mTemporalNormalThreshold;
     return props;
 }
 
@@ -205,6 +218,9 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     var["CB"]["gFrameCount"] = mFrameCount;
     var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
     var["CB"]["gRRProbability"] = mRRProbability;
+    var["CB"]["gMaxHistoryLength"] = mMaxHistoryLength;
+    var["CB"]["gTemporalDepthThreshold"] = mTemporalDepthThreshold;
+    var["CB"]["gTemporalNormalThreshold"] = mTemporalNormalThreshold;
 
     // Bind I/O buffers. These needs to be done per-frame as the buffers may change anytime.
     auto bind = [&](const ChannelDesc& desc)
@@ -223,6 +239,25 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const uint2 targetDim = renderData.getDefaultTextureDims();
     FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
 
+    // Manage ReSTIR reservoir ping-pong buffers.
+    const uint32_t pixelCount = targetDim.x * targetDim.y;
+    const uint32_t kReservoirSize = 64u; // Must match the Reservoir struct (4 x float4) in MyPTRestir.slang.
+    if (!mpReservoirPrev || mpReservoirPrev->getElementCount() < pixelCount)
+    {
+        mpReservoirPrev = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
+        mpReservoirCur = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
+    }
+
+    // Swap: this frame reads the previous frame's reservoir and writes the current frame's.
+    std::swap(mpReservoirPrev, mpReservoirCur);
+
+    // Bind the reservoir buffers.
+    var["gReservoirPrev"] = mpReservoirPrev;
+    var["gReservoirCur"] = mpReservoirCur;
+
+    // Clear the current frame reservoir (M == 0 marks it as invalid until written).
+    pRenderContext->clearUAV(mpReservoirCur->getUAV().get(), uint4(0));
+
     // Spawn the rays.
     mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(targetDim, 1));
 
@@ -238,6 +273,15 @@ void MyPT::renderUI(Gui::Widgets& widget)
 
     dirty |= widget.var("RIS candidate count", mRISCandidateCount, 1u, 256u);
     widget.tooltip("Number of candidate light samples (M) used by ReSTIR DI RIS.", true);
+
+    dirty |= widget.var("Max history length", mMaxHistoryLength, 1u, 64u);
+    widget.tooltip("Maximum accumulated sample count (M) for ReSTIR temporal reuse.", true);
+
+    dirty |= widget.var("Temporal depth threshold", mTemporalDepthThreshold, 0.f, 1.f);
+    widget.tooltip("Maximum world-space position difference for ReSTIR temporal reuse.", true);
+
+    dirty |= widget.var("Temporal normal threshold", mTemporalNormalThreshold, -1.f, 1.f);
+    widget.tooltip("Minimum cosine between normals for ReSTIR temporal reuse.", true);
 
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 1u << 16);
     widget.tooltip("Maximum path length for indirect illumination.\n0 = direct only\n1 = one indirect bounce etc.", true);
@@ -270,6 +314,10 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mTracer.pBindingTable = nullptr;
     mTracer.pVars = nullptr;
     mFrameCount = 0;
+
+    // Reset ReSTIR reservoirs so old-scene history is not reused.
+    mpReservoirPrev = nullptr;
+    mpReservoirCur = nullptr;
 
     // Set new scene.
     mpScene = pScene;

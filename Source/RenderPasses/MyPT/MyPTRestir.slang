@@ -29,15 +29,23 @@
 /**
  * ReSTIR DI implementation for MyPT.
  *
- * This file implements the first stage of ReSTIR DI: pure RIS initial
- * sampling (no temporal/spatial reuse). At the primary hit, M candidate
- * light samples are drawn from all light sources (emissive triangles +
- * analytic lights) and one is selected via resampled importance sampling.
+ * This file implements ReSTIR DI direct illumination:
+ *  - sampleLightRIS(): RIS initial sampling. At the primary hit, M candidate
+ *    light samples are drawn from all light sources (emissive triangles +
+ *    analytic lights) and one is selected via resampled importance sampling.
+ *  - temporalResample(): temporal reuse. The current frame's reservoir is
+ *    merged with the previous frame's reservoir (reprojected with motion
+ *    vectors and validated with depth/normal thresholds) to accumulate history.
  *
- * The result is consumed by evalDirectReSTIR() in MyPT.rt.slang, which traces
- * a single shadow ray and evaluates the final contribution. The indirect
+ * The result is consumed by evalDirectReSTIR() in MyPT.rt.slang, which traces a
+ * single shadow ray and evaluates the final contribution. The indirect
  * (scatter) recursion is handled entirely by MyPT.rt.slang and is identical to
  * the plain path tracer.
+ *
+ * Note: Slang does not allow swizzle l-value assignment on struct members of
+ * type float4 (e.g. `r.positionM.w = x;` or `r.radianceWsum.xyz = v;` are
+ * rejected with "left of '=' is not an l-value"). All partial updates of
+ * float4 members use full-vector reconstruction (`member = float4(...)`).
  */
 
 import Scene.Raytracing;
@@ -54,15 +62,26 @@ import Scene.Lights.LightData;
 static const bool kRestirUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kRestirUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 
-/** Result of ReSTIR DI RIS. */
-struct ReSTIRLightSample
+/** ReSTIR reservoir, stored per-pixel across frames.
+    Packed as float4 to keep the host/shader struct layout unambiguous (64B). */
+struct Reservoir
 {
-    float3 dir;       ///< Normalized direction to the selected light.
-    float3 radiance;  ///< Unoccluded incident radiance (not divided by pdf).
-    float  distance;  ///< Distance to the selected light.
-    float  weight;    ///< Reservoir weight W_sum / M.
-    float  p_hat;     ///< luminance(f) of the selected sample.
-    bool   valid;     ///< True if a valid sample was selected.
+    float4 dirDistance;   ///< xyz = selected light direction (normalized), w = distance to light.
+    float4 radianceWsum;  ///< xyz = unoccluded incident radiance, w = accumulated weight Wsum.
+    float4 positionM;     ///< xyz = shading point position (for next-frame depth validation), w = asfloat(M).
+    float4 normalPdf;     ///< xyz = shading normal (for next-frame normal validation), w = source pdf of the selected sample.
+};
+
+extension Reservoir
+{
+    /// True if this reservoir contains a valid selected sample.
+    bool isValid() { return asuint(positionM.w) > 0; }
+
+    /// Number of accumulated samples M.
+    uint getM() { return asuint(positionM.w); }
+
+    /// Set the number of accumulated samples M (preserves the xyz part).
+    [mutating] void setM(uint m) { positionM = float4(positionM.xyz, asfloat(m)); }
 };
 
 /** A single light candidate used by RIS. */
@@ -148,11 +167,15 @@ bool sampleAnalyticCandidate(const ShadingData sd, inout SampleGenerator sg, con
  * @param[in] mi Material instance.
  * @param[in,out] sg Sample generator.
  * @param[in] M Number of candidate samples.
- * @return Selected light sample with reservoir weight.
+ * @return Reservoir containing the selected sample (invalid if no valid candidate).
  */
-ReSTIRLightSample sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const uint M)
+Reservoir sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const uint M)
 {
-    ReSTIRLightSample result = {};
+    Reservoir result = {};
+
+    // Always store the current-frame geometry for next-frame temporal validation (xyz only; w is M=0 / pdf=0).
+    result.positionM = float4(sd.posW, 0.f);
+    result.normalPdf = float4(sd.getOrientedFaceNormal(), 0.f);
 
     const bool hasEmissive = kRestirUseEmissiveLights && (gScene.lightCollection.getActiveTriangleCount() > 0);
     const bool hasAnalytic = kRestirUseAnalyticLights && (gScene.getLightCount() > 0);
@@ -160,7 +183,7 @@ ReSTIRLightSample sampleLightRIS(const ShadingData sd, const IMaterialInstance m
     if (!hasEmissive && !hasAnalytic)
         return result;
 
-    // Type selection probabilities (first version: equal split when both are present).
+    // Type selection probabilities (equal split when both are present).
     float pEmissive;
     float pAnalytic;
     if (hasEmissive && hasAnalytic)
@@ -215,16 +238,79 @@ ReSTIRLightSample sampleLightRIS(const ShadingData sd, const IMaterialInstance m
         // Reservoir select with probability w / Wsum.
         if (Wsum > 0.f && sampleNext1D(sg) * Wsum < w)
         {
-            result.dir = c.dir;
-            result.radiance = c.radiance;
-            result.distance = c.distance;
-            result.p_hat = p_hat;
-            result.valid = true;
+            result.dirDistance = float4(c.dir, c.distance);
+            // Preserve the current w (0 at this point) when rewriting xyz.
+            result.radianceWsum = float4(c.radiance, result.radianceWsum.w);
+            // Store the source pdf of the selected sample (RIS estimator denominator).
+            result.normalPdf = float4(result.normalPdf.xyz, c.pdf);
         }
     }
 
-    if (result.valid && Wsum > 0.f)
-        result.weight = Wsum / float(M);
+    if (Wsum > 0.f)
+    {
+        // Finalize Wsum and M.
+        result.radianceWsum = float4(result.radianceWsum.xyz, Wsum);
+        result.setM(M);
+    }
+
+    return result;
+}
+
+/**
+ * Merge the current frame's reservoir with the previous frame's reservoir (temporal reuse).
+ * Follows ReSTIR (Bitterli et al. 2020), Algorithm 2:
+ *   w_p = M_p * p_hat(y_p) / p(y_p)   (history sample re-evaluated at the current shading point)
+ *   r.w_sum += w_p                     (add w_p, NOT the previous reservoir's w_sum)
+ *   select y_p with probability w_p / w_sum
+ *   r.M = min(M_cur + M_prev, maxHistory)
+ * @param[in] sd Shading data at the current pixel (primary hit).
+ * @param[in] mi Material instance (for re-evaluating the history sample's weight).
+ * @param[in,out] sg Sample generator.
+ * @param[in] cur Current frame reservoir (from RIS).
+ * @param[in] prev Previous frame reservoir (reprojected).
+ * @param[in] maxHistory Maximum accumulated sample count M.
+ * @param[in] depthThreshold Maximum allowed world-space position difference for reuse.
+ * @param[in] normalThreshold Minimum allowed cosine of the angle between normals for reuse.
+ * @return Merged reservoir. position/normal always reflect the current frame's geometry.
+ */
+Reservoir temporalResample(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const Reservoir cur, const Reservoir prev, const uint maxHistory, const float depthThreshold, const float normalThreshold)
+{
+    // Default to the current frame reservoir (position/normal already reflect current geometry).
+    Reservoir result = cur;
+
+    if (!prev.isValid())
+        return result;
+
+    // Validate the previous frame's surface against the current frame's.
+    if (distance(prev.positionM.xyz, sd.posW) >= depthThreshold)
+        return result;
+    if (dot(prev.normalPdf.xyz, sd.getOrientedFaceNormal()) <= normalThreshold)
+        return result;
+
+    // Re-evaluate the history sample's target function at the CURRENT shading point.
+    const float3 f_p = mi.eval(sd, prev.dirDistance.xyz, sg) * prev.radianceWsum.xyz;
+    const float p_hat_p = luminance(f_p);
+    const float pdf_p = prev.normalPdf.w;
+    if (p_hat_p <= 0.f || pdf_p <= 0.f)
+        return result; // History sample is invalid at this shading point.
+
+    // ReSTIR Algorithm 2: weight the history sample by M_p * p_hat(y_p) / p(y_p).
+    const float w_p = float(prev.getM()) * p_hat_p / pdf_p;
+    const float w_c = cur.radianceWsum.w;
+    const float w_sum = w_c + w_p;
+
+    // Select the history sample with probability w_p / w_sum.
+    if (w_sum > 0.f && sampleNext1D(sg) * w_sum < w_p)
+    {
+        result.dirDistance = prev.dirDistance;
+        result.radianceWsum = float4(prev.radianceWsum.xyz, result.radianceWsum.w);
+        result.normalPdf = float4(result.normalPdf.xyz, prev.normalPdf.w);
+        // Keep current-frame position/normal.
+    }
+
+    // Finalize w_sum and M.
+    result.radianceWsum = float4(result.radianceWsum.xyz, w_sum);
+    result.setM(min(cur.getM() + prev.getM(), maxHistory));
 
     return result;
 }
