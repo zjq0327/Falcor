@@ -44,7 +44,9 @@ const char kShaderFile[] = "RenderPasses/MyPT/MyPT.rt.slang";
 
 // Ray tracing settings that affect the traversal stack size.
 // These should be set as small as possible.
-const uint32_t kMaxPayloadSizeBytes = 96u;
+// The ScatterRayData payload packs: 5x float3 (radiance/thp/origin/direction/normal) + bool + uint + float + SampleGenerator (16B).
+// With HLSL 16B alignment padding this stays under 112B; 128B leaves headroom for future fields.
+const uint32_t kMaxPayloadSizeBytes = 128u;
 const uint32_t kMaxRecursionDepth = 2u;
 
 const char kInputViewDir[] = "viewW";
@@ -65,6 +67,7 @@ const ChannelList kOutputChannels = {
 const char kMaxBounces[] = "maxBounces";
 const char kComputeDirect[] = "computeDirect";
 const char kUseImportanceSampling[] = "useImportanceSampling";
+const char kUseMIS[] = "useMIS";
 const char kRRProbability[] = "rrProbability";
 } // namespace
 
@@ -87,6 +90,8 @@ void MyPT::parseProperties(const Properties& props)
             mComputeDirect = value;
         else if (key == kUseImportanceSampling)
             mUseImportanceSampling = value;
+        else if (key == kUseMIS)
+            mUseMIS = value;
         else if (key == kRRProbability)
             mRRProbability = value;
         else
@@ -100,6 +105,7 @@ Properties MyPT::getProperties() const
     props[kMaxBounces] = mMaxBounces;
     props[kComputeDirect] = mComputeDirect;
     props[kUseImportanceSampling] = mUseImportanceSampling;
+    props[kUseMIS] = mUseMIS;
     props[kRRProbability] = mRRProbability;
     return props;
 }
@@ -162,6 +168,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mTracer.pProgram->addDefine("MAX_BOUNCES", std::to_string(mMaxBounces));
     mTracer.pProgram->addDefine("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     mTracer.pProgram->addDefine("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
+    mTracer.pProgram->addDefine("USE_MIS", mUseMIS ? "1" : "0");
     mTracer.pProgram->addDefine("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
     mTracer.pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
     mTracer.pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
@@ -225,6 +232,10 @@ void MyPT::renderUI(Gui::Widgets& widget)
     dirty |= widget.checkbox("Use importance sampling", mUseImportanceSampling);
     widget.tooltip("Use importance sampling for materials", true);
 
+    dirty |= widget.checkbox("Use MIS", mUseMIS);
+    widget.tooltip("Use multiple importance sampling to combine NEE and BSDF sampling.\n"
+        "When disabled, NEE samples are added unweighted (may double count with BSDF hits on emissive surfaces).", true);
+
     dirty |= widget.var("RR Probability", mRRProbability, 0.f, 0.95f);
     widget.tooltip("Probability of terminating a path by russian roulette at each indirect bounce.", true);
 
@@ -285,7 +296,14 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
             );
         }
 
-        mTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+        // Merge the emissive light sampler's defines (including _EMISSIVE_LIGHT_SAMPLER_TYPE)
+        // into the program at creation time so the shader's EmissiveLightSampler typedef resolves
+        // to the correct concrete sampler type.
+        DefineList defines = mpScene->getSceneDefines();
+        if (mpEmissiveSampler)
+            defines.add(mpEmissiveSampler->getDefines());
+
+        mTracer.pProgram = Program::create(mpDevice, desc, defines);
     }
 }
 
@@ -304,5 +322,7 @@ void MyPT::prepareVars()
     // Bind utility classes into shared data.
     auto var = mTracer.pVars->getRootVar();
     mpSampleGenerator->bindShaderData(var);
-    if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["emissiveSampler"]);
+    // Note: The emissive sampler is stateless (all data comes from gScene.lightCollection), so it
+    // does not need to be bound here. The sampler struct is instantiated locally in the shader.
+    // gScene is bound automatically by Scene::raytrace() each frame.
 }

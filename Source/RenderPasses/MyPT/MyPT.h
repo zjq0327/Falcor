@@ -86,6 +86,8 @@ private:
     bool mComputeDirect = true;
     /// Use importance sampling for materials.
     bool mUseImportanceSampling = true;
+    /// Use multiple importance sampling (MIS) to combine NEE and BSDF sampling.
+    bool mUseMIS = true;
     /// Fixed probability for russian roulette path termination.
     float mRRProbability = 0.2f;
 

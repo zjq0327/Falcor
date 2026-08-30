@@ -76,14 +76,18 @@ Texture2D<float4> gViewW; // Optional
 // Outputs
 RWTexture2D<float4> gOutputColor;
 
-// Emissive light sampler. Bound from the host when the scene has emissive lights.
-uniform EmissiveLightSampler emissiveSampler;
+// The emissive light sampler (EmissiveLightSampler typedef, selected via _EMISSIVE_LIGHT_SAMPLER_TYPE)
+// is instantiated LOCALLY where needed instead of being declared as a global uniform parameter.
+// It is stateless (only dummy data; all methods read from gScene.lightCollection), so a local
+// instance behaves identically while avoiding a loose uniform struct in the root signature,
+// which Falcor's RtProgramVars cannot bind for ray tracing programs.
 
 // Static configuration based on defines set from the host.
 #define is_valid(name) (is_valid_##name != 0)
 static const uint kMaxBounces = MAX_BOUNCES;
 static const bool kComputeDirect = COMPUTE_DIRECT;
 static const bool kUseImportanceSampling = USE_IMPORTANCE_SAMPLING;
+static const bool kUseMIS = USE_MIS;
 static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
@@ -283,6 +287,9 @@ float3 evalDirectEmissive(const ShadingData sd, const IMaterialInstance mi, inou
 {
     if (!kUseEmissiveLights) return float3(0.f);
 
+    // Instantiate the stateless emissive light sampler locally.
+    EmissiveLightSampler emissiveSampler = {};
+
     // Sample an emissive triangle.
     TriangleLightSample tls;
     if (!emissiveSampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), false, sg, tls))
@@ -293,8 +300,11 @@ float3 evalDirectEmissive(const ShadingData sd, const IMaterialInstance mi, inou
     float3 Li = tls.Le / tls.pdf;
 
     // Apply MIS weight against the BSDF sampling strategy.
-    const float scatterPdf = mi.evalPdf(sd, tls.dir, kUseImportanceSampling);
-    Li *= evalMIS(tls.pdf, scatterPdf);
+    if (kUseMIS)
+    {
+        const float scatterPdf = mi.evalPdf(sd, tls.dir, kUseImportanceSampling);
+        Li *= evalMIS(tls.pdf, scatterPdf);
+    }
 
     // Test visibility.
     const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, tls.dir) >= 0.f ? sd.faceN : -sd.faceN);
@@ -384,16 +394,26 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     if (kUseEmissiveLights && (kComputeDirect || rayData.pathLength > 0))
     {
         float3 emission = mi.getProperties(sd).emission;
-        if (rayData.pathLength > 0)
+        // This hit came from a BSDF-sampled scatter ray, and the previous vertex performed NEE
+        // (the primary vertex does NEE when kComputeDirect, indirect vertices always do).
+        // Apply the MIS weight to avoid double counting with the NEE strategy.
+        // Note: the first scatter-ray hit has pathLength == 0, so the condition matches the
+        // outer emission condition (kComputeDirect || pathLength > 0).
+        if (kComputeDirect || rayData.pathLength > 0)
         {
-            // The scatter ray hit an emissive surface. Apply MIS weight against the NEE strategy.
+            // Instantiate the stateless emissive light sampler locally.
+            EmissiveLightSampler emissiveSampler = {};
             TriangleLightHit lightHit;
             TriangleHit triangleHit = hit.getTriangleHit();
             lightHit.triangleIndex = gScene.lightCollection.getTriangleIndex(triangleHit.instanceID, triangleHit.primitiveIndex);
             lightHit.posW = sd.posW;
             lightHit.normalW = sd.getOrientedFaceNormal();
-            const float lightPdf = emissiveSampler.evalPdf(rayData.origin, rayData.normal, false, lightHit);
-            emission *= evalMIS(rayData.pdf, lightPdf);
+            // With MIS disabled, keep the full emission (may double count with the NEE strategy).
+            if (kUseMIS)
+            {
+                const float lightPdf = emissiveSampler.evalPdf(rayData.origin, rayData.normal, false, lightHit);
+                emission *= evalMIS(rayData.pdf, lightPdf);
+            }
         }
         rayData.radiance += rayData.thp * emission;
     }
