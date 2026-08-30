@@ -64,6 +64,8 @@ const ChannelList kOutputChannels = {
     // clang-format on
 };
 
+const char kMode[] = "mode";
+const char kRISCandidateCount[] = "risCandidateCount";
 const char kMaxBounces[] = "maxBounces";
 const char kComputeDirect[] = "computeDirect";
 const char kUseImportanceSampling[] = "useImportanceSampling";
@@ -84,7 +86,11 @@ void MyPT::parseProperties(const Properties& props)
 {
     for (const auto& [key, value] : props)
     {
-        if (key == kMaxBounces)
+        if (key == kMode)
+            mMode = value;
+        else if (key == kRISCandidateCount)
+            mRISCandidateCount = value;
+        else if (key == kMaxBounces)
             mMaxBounces = value;
         else if (key == kComputeDirect)
             mComputeDirect = value;
@@ -102,6 +108,8 @@ void MyPT::parseProperties(const Properties& props)
 Properties MyPT::getProperties() const
 {
     Properties props;
+    props[kMode] = mMode;
+    props[kRISCandidateCount] = mRISCandidateCount;
     props[kMaxBounces] = mMaxBounces;
     props[kComputeDirect] = mComputeDirect;
     props[kUseImportanceSampling] = mUseImportanceSampling;
@@ -165,6 +173,8 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
     // Specialize program.
     // These defines should not modify the program vars. Do not trigger program vars re-creation.
+    mTracer.pProgram->addDefine("USE_RESTIR", mMode == Mode::ReSTIR ? "1" : "0");
+    mTracer.pProgram->addDefine("RIS_CANDIDATE_COUNT", std::to_string(mRISCandidateCount));
     mTracer.pProgram->addDefine("MAX_BOUNCES", std::to_string(mMaxBounces));
     mTracer.pProgram->addDefine("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     mTracer.pProgram->addDefine("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
@@ -222,6 +232,12 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 void MyPT::renderUI(Gui::Widgets& widget)
 {
     bool dirty = false;
+
+    dirty |= widget.dropdown("Mode", mMode);
+    widget.tooltip("Rendering mode.\nPT = brute-force path tracing.\nReSTIR = ReSTIR direct illumination (RIS).", true);
+
+    dirty |= widget.var("RIS candidate count", mRISCandidateCount, 1u, 256u);
+    widget.tooltip("Number of candidate light samples (M) used by ReSTIR DI RIS.", true);
 
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 1u << 16);
     widget.tooltip("Maximum path length for indirect illumination.\n0 = direct only\n1 = one indirect bounce etc.", true);

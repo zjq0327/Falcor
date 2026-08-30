@@ -50,6 +50,21 @@ class MyPT : public RenderPass
 public:
     FALCOR_PLUGIN_CLASS(MyPT, "MyPT", "Custom path tracer.");
 
+    /** Rendering mode. */
+    enum class Mode
+    {
+        PT,     ///< Brute-force path tracing (default).
+        ReSTIR, ///< ReSTIR (placeholder, not yet implemented).
+    };
+
+    FALCOR_ENUM_INFO(
+        Mode,
+        {
+            {Mode::PT, "PT"},
+            {Mode::ReSTIR, "ReSTIR"},
+        }
+    );
+
     static ref<MyPT> create(ref<Device> pDevice, const Properties& props)
     {
         return make_ref<MyPT>(pDevice, props);
@@ -80,6 +95,12 @@ private:
 
     // Configuration
 
+    /// Rendering mode (path tracing or ReSTIR).
+    Mode mMode = Mode::PT;
+
+    /// Number of candidate light samples (M) used by ReSTIR DI RIS.
+    uint mRISCandidateCount = 32;
+
     /// Max number of indirect bounces (0 = none).
     uint mMaxBounces = 64;
     /// Compute direct illumination (otherwise indirect only).
@@ -105,3 +126,5 @@ private:
         ref<RtProgramVars> pVars;
     } mTracer;
 };
+
+FALCOR_ENUM_REGISTER(MyPT::Mode);

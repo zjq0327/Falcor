@@ -61,6 +61,7 @@ import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
 import Rendering.Lights.LightHelpers;
 import Rendering.Lights.EmissiveLightSampler;
+import MyPTRestir;
 
 cbuffer CB
 {
@@ -88,6 +89,8 @@ static const uint kMaxBounces = MAX_BOUNCES;
 static const bool kComputeDirect = COMPUTE_DIRECT;
 static const bool kUseImportanceSampling = USE_IMPORTANCE_SAMPLING;
 static const bool kUseMIS = USE_MIS;
+static const bool kUseReSTIR = USE_RESTIR;
+static const uint kRISCandidateCount = RIS_CANDIDATE_COUNT;
 static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
@@ -329,6 +332,31 @@ float3 evalDirect(const ShadingData sd, const IMaterialInstance mi, inout Sample
 }
 
 /**
+ * Evaluates direct illumination using ReSTIR DI (RIS initial sampling).
+ * @param[in] sd Shading data.
+ * @param[in] mi Material instance.
+ * @param[in,out] sg SampleGenerator object.
+ * @return Outgoing radiance in view direction.
+ */
+float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
+{
+    ReSTIRLightSample s = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
+    if (!s.valid)
+        return float3(0.f);
+
+    // Compute ray origin with offset applied in direction of the geometry normal to avoid self-intersection.
+    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, s.dir) >= 0.f ? sd.faceN : -sd.faceN);
+
+    // Test visibility with a single shadow ray.
+    if (!traceShadowRay(origin, s.dir, s.distance))
+        return float3(0.f);
+
+    // Final contribution: f(y_z) * (W_sum / M) / p_hat(y_z).
+    const float3 f = mi.eval(sd, s.dir, sg) * s.radiance;
+    return f * (s.weight / s.p_hat);
+}
+
+/**
  * Generate a new scatter ray or terminate.
  * @param[in] sd Shading data.
  * @param[in] mi Material instance.
@@ -493,8 +521,8 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             // Always output directly emitted light, independent of whether emissive materials are treated as light sources or not.
             outColor += mi.getProperties(sd).emission;
 
-            // Add contribution of direct light (analytic lights + emissive NEE).
-            outColor += evalDirect(sd, mi, sg);
+            // Add contribution of direct light. ReSTIR uses RIS, PT uses NEE.
+            outColor += kUseReSTIR ? evalDirectReSTIR(sd, mi, sg) : evalDirect(sd, mi, sg);
         }
 
         // Prepare ray payload.
