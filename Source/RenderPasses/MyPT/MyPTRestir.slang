@@ -33,9 +33,11 @@
  *  - sampleLightRIS(): RIS initial sampling. At the primary hit, M candidate
  *    light samples are drawn from all light sources (emissive triangles +
  *    analytic lights) and one is selected via resampled importance sampling.
- *  - temporalResample(): temporal reuse. The current frame's reservoir is
- *    merged with the previous frame's reservoir (reprojected with motion
- *    vectors and validated with depth/normal thresholds) to accumulate history.
+ *  - mergeReservoir(): generic reservoir resampling merge primitive, used by both
+ *    temporal reuse (ReSTIR Algorithm 2) and spatial reuse (Algorithm 4). An
+ *    incoming reservoir (previous frame or spatial neighbor) has its selected
+ *    sample re-evaluated at the current shading point and merged with weight
+ *    M_in * p_hat(y_in) / p(y_in), with M clamped to a maximum.
  *
  * The result is consumed by evalDirectReSTIR() in MyPT.rt.slang, which traces a
  * single shadow ray and evaluates the final contribution. The indirect
@@ -257,60 +259,63 @@ Reservoir sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout
 }
 
 /**
- * Merge the current frame's reservoir with the previous frame's reservoir (temporal reuse).
- * Follows ReSTIR (Bitterli et al. 2020), Algorithm 2:
- *   w_p = M_p * p_hat(y_p) / p(y_p)   (history sample re-evaluated at the current shading point)
- *   r.w_sum += w_p                     (add w_p, NOT the previous reservoir's w_sum)
- *   select y_p with probability w_p / w_sum
- *   r.M = min(M_cur + M_prev, maxHistory)
+ * Merge an incoming reservoir into the current reservoir (generic resampling merge).
+ * This is the shared merge primitive for ReSTIR (Bitterli et al. 2020):
+ *   - temporal reuse (Algorithm 2): `incoming` is the previous frame's reservoir.
+ *   - spatial reuse  (Algorithm 4): `incoming` is a spatial neighbor's reservoir.
+ * The math is identical in both cases:
+ *   w_in = M_in * p_hat(y_in) / p(y_in)   (incoming sample re-evaluated at the CURRENT shading point)
+ *   r.w_sum += w_in                        (add w_in, NOT the incoming reservoir's w_sum)
+ *   select y_in with probability w_in / w_sum
+ *   r.M = min(M_cur + M_in, maxHistory)
  * @param[in] sd Shading data at the current pixel (primary hit).
- * @param[in] mi Material instance (for re-evaluating the history sample's weight).
+ * @param[in] mi Material instance (for re-evaluating the incoming sample's weight).
  * @param[in,out] sg Sample generator.
- * @param[in] cur Current frame reservoir (from RIS).
- * @param[in] prev Previous frame reservoir (reprojected).
+ * @param[in] cur Current reservoir accumulator (RIS result, or prior merged result).
+ * @param[in] incoming Incoming reservoir to merge (previous frame, or a neighbor).
  * @param[in] maxHistory Maximum accumulated sample count M.
  * @param[in] depthThreshold Maximum allowed world-space position difference for reuse.
  * @param[in] normalThreshold Minimum allowed cosine of the angle between normals for reuse.
  * @return Merged reservoir. position/normal always reflect the current frame's geometry.
  */
-Reservoir temporalResample(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const Reservoir cur, const Reservoir prev, const uint maxHistory, const float depthThreshold, const float normalThreshold)
+Reservoir mergeReservoir(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const Reservoir cur, const Reservoir incoming, const uint maxHistory, const float depthThreshold, const float normalThreshold)
 {
-    // Default to the current frame reservoir (position/normal already reflect current geometry).
+    // Default to the current reservoir (position/normal already reflect current geometry).
     Reservoir result = cur;
 
-    if (!prev.isValid())
+    if (!incoming.isValid())
         return result;
 
-    // Validate the previous frame's surface against the current frame's.
-    if (distance(prev.positionM.xyz, sd.posW) >= depthThreshold)
+    // Validate the incoming reservoir's surface against the current one.
+    if (distance(incoming.positionM.xyz, sd.posW) >= depthThreshold)
         return result;
-    if (dot(prev.normalPdf.xyz, sd.getOrientedFaceNormal()) <= normalThreshold)
+    if (dot(incoming.normalPdf.xyz, sd.getOrientedFaceNormal()) <= normalThreshold)
         return result;
 
-    // Re-evaluate the history sample's target function at the CURRENT shading point.
-    const float3 f_p = mi.eval(sd, prev.dirDistance.xyz, sg) * prev.radianceWsum.xyz;
+    // Re-evaluate the incoming sample's target function at the CURRENT shading point.
+    const float3 f_p = mi.eval(sd, incoming.dirDistance.xyz, sg) * incoming.radianceWsum.xyz;
     const float p_hat_p = luminance(f_p);
-    const float pdf_p = prev.normalPdf.w;
+    const float pdf_p = incoming.normalPdf.w;
     if (p_hat_p <= 0.f || pdf_p <= 0.f)
-        return result; // History sample is invalid at this shading point.
+        return result; // Incoming sample is invalid at this shading point.
 
-    // ReSTIR Algorithm 2: weight the history sample by M_p * p_hat(y_p) / p(y_p).
-    const float w_p = float(prev.getM()) * p_hat_p / pdf_p;
+    // ReSTIR merge: weight the incoming sample by M_in * p_hat(y_in) / p(y_in).
+    const float w_p = float(incoming.getM()) * p_hat_p / pdf_p;
     const float w_c = cur.radianceWsum.w;
     const float w_sum = w_c + w_p;
 
-    // Select the history sample with probability w_p / w_sum.
+    // Select the incoming sample with probability w_p / w_sum.
     if (w_sum > 0.f && sampleNext1D(sg) * w_sum < w_p)
     {
-        result.dirDistance = prev.dirDistance;
-        result.radianceWsum = float4(prev.radianceWsum.xyz, result.radianceWsum.w);
-        result.normalPdf = float4(result.normalPdf.xyz, prev.normalPdf.w);
+        result.dirDistance = incoming.dirDistance;
+        result.radianceWsum = float4(incoming.radianceWsum.xyz, result.radianceWsum.w);
+        result.normalPdf = float4(result.normalPdf.xyz, incoming.normalPdf.w);
         // Keep current-frame position/normal.
     }
 
     // Finalize w_sum and M.
     result.radianceWsum = float4(result.radianceWsum.xyz, w_sum);
-    result.setM(min(cur.getM() + prev.getM(), maxHistory));
+    result.setM(min(cur.getM() + incoming.getM(), maxHistory));
 
     return result;
 }

@@ -75,6 +75,10 @@ const char kRRProbability[] = "rrProbability";
 const char kMaxHistoryLength[] = "maxHistoryLength";
 const char kTemporalDepthThreshold[] = "temporalDepthThreshold";
 const char kTemporalNormalThreshold[] = "temporalNormalThreshold";
+const char kSpatialNeighborCount[] = "spatialNeighborCount";
+const char kSpatialRadius[] = "spatialRadius";
+const char kSpatialDepthThreshold[] = "spatialDepthThreshold";
+const char kSpatialNormalThreshold[] = "spatialNormalThreshold";
 } // namespace
 
 MyPT::MyPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
@@ -110,6 +114,14 @@ void MyPT::parseProperties(const Properties& props)
             mTemporalDepthThreshold = value;
         else if (key == kTemporalNormalThreshold)
             mTemporalNormalThreshold = value;
+        else if (key == kSpatialNeighborCount)
+            mSpatialNeighborCount = value;
+        else if (key == kSpatialRadius)
+            mSpatialRadius = value;
+        else if (key == kSpatialDepthThreshold)
+            mSpatialDepthThreshold = value;
+        else if (key == kSpatialNormalThreshold)
+            mSpatialNormalThreshold = value;
         else
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
@@ -128,6 +140,10 @@ Properties MyPT::getProperties() const
     props[kMaxHistoryLength] = mMaxHistoryLength;
     props[kTemporalDepthThreshold] = mTemporalDepthThreshold;
     props[kTemporalNormalThreshold] = mTemporalNormalThreshold;
+    props[kSpatialNeighborCount] = mSpatialNeighborCount;
+    props[kSpatialRadius] = mSpatialRadius;
+    props[kSpatialDepthThreshold] = mSpatialDepthThreshold;
+    props[kSpatialNormalThreshold] = mSpatialNormalThreshold;
     return props;
 }
 
@@ -213,53 +229,77 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         prepareVars();
     FALCOR_ASSERT(mTracer.pVars);
 
-    // Set constants.
-    auto var = mTracer.pVars->getRootVar();
-    var["CB"]["gFrameCount"] = mFrameCount;
-    var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
-    var["CB"]["gRRProbability"] = mRRProbability;
-    var["CB"]["gMaxHistoryLength"] = mMaxHistoryLength;
-    var["CB"]["gTemporalDepthThreshold"] = mTemporalDepthThreshold;
-    var["CB"]["gTemporalNormalThreshold"] = mTemporalNormalThreshold;
-
-    // Bind I/O buffers. These needs to be done per-frame as the buffers may change anytime.
-    auto bind = [&](const ChannelDesc& desc)
+    // Set constants and bind all resources (CB + I/O + reservoirs) for a pass's vars.
+    auto setupVars = [&](const ref<RtProgramVars>& pVars)
     {
-        if (!desc.texname.empty())
+        auto var = pVars->getRootVar();
+
+        // Constants.
+        var["CB"]["gFrameCount"] = mFrameCount;
+        var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
+        var["CB"]["gRRProbability"] = mRRProbability;
+        var["CB"]["gMaxHistoryLength"] = mMaxHistoryLength;
+        var["CB"]["gTemporalDepthThreshold"] = mTemporalDepthThreshold;
+        var["CB"]["gTemporalNormalThreshold"] = mTemporalNormalThreshold;
+        var["CB"]["gSpatialNeighborCount"] = mSpatialNeighborCount;
+        var["CB"]["gSpatialRadius"] = mSpatialRadius;
+        var["CB"]["gSpatialDepthThreshold"] = mSpatialDepthThreshold;
+        var["CB"]["gSpatialNormalThreshold"] = mSpatialNormalThreshold;
+
+        // I/O buffers (bound per-frame as they may change).
+        for (const auto& channel : kInputChannels)
         {
-            var[desc.texname] = renderData.getTexture(desc.name);
+            if (!channel.texname.empty())
+                var[channel.texname] = renderData.getTexture(channel.name);
         }
+        for (const auto& channel : kOutputChannels)
+        {
+            if (!channel.texname.empty())
+                var[channel.texname] = renderData.getTexture(channel.name);
+        }
+
+        // Reservoir buffers.
+        var["gReservoirPrev"] = mpReservoirPrev;
+        var["gReservoirTemporal"] = mpReservoirTemporal;
+        var["gReservoirSpatial"] = mpReservoirSpatial;
     };
-    for (auto channel : kInputChannels)
-        bind(channel);
-    for (auto channel : kOutputChannels)
-        bind(channel);
 
     // Get dimensions of ray dispatch.
     const uint2 targetDim = renderData.getDefaultTextureDims();
     FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
 
-    // Manage ReSTIR reservoir ping-pong buffers.
+    // Manage ReSTIR reservoir buffers (previous / temporal / spatial).
     const uint32_t pixelCount = targetDim.x * targetDim.y;
     const uint32_t kReservoirSize = 64u; // Must match the Reservoir struct (4 x float4) in MyPTRestir.slang.
     if (!mpReservoirPrev || mpReservoirPrev->getElementCount() < pixelCount)
     {
         mpReservoirPrev = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
-        mpReservoirCur = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
+        mpReservoirTemporal = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
+        mpReservoirSpatial = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
     }
 
-    // Swap: this frame reads the previous frame's reservoir and writes the current frame's.
-    std::swap(mpReservoirPrev, mpReservoirCur);
+    // Set constants and bind resources for both passes.
+    setupVars(mTracer.pVars);
+    setupVars(mTracer.pRestirVars);
 
-    // Bind the reservoir buffers.
-    var["gReservoirPrev"] = mpReservoirPrev;
-    var["gReservoirCur"] = mpReservoirCur;
+    // Clear the buffers written this frame (invalid pixels stay at M == 0).
+    pRenderContext->clearUAV(mpReservoirTemporal->getUAV().get(), uint4(0));
+    pRenderContext->clearUAV(mpReservoirSpatial->getUAV().get(), uint4(0));
 
-    // Clear the current frame reservoir (M == 0 marks it as invalid until written).
-    pRenderContext->clearUAV(mpReservoirCur->getUAV().get(), uint4(0));
+    // Pass 1: RIS initial sampling + temporal reuse (writes gReservoirTemporal).
+    if (mMode == Mode::ReSTIR)
+    {
+        mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pRestirVars, uint3(targetDim, 1));
+    }
 
-    // Spawn the rays.
+    // Pass 2: spatial reuse + shading + indirect (reads gReservoirTemporal, writes gReservoirSpatial).
     mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(targetDim, 1));
+
+    // Swap: this frame's spatial result becomes next frame's temporal input.
+    if (mMode == Mode::ReSTIR)
+    {
+        std::swap(mpReservoirPrev, mpReservoirSpatial);
+    }
 
     mFrameCount++;
 }
@@ -282,6 +322,18 @@ void MyPT::renderUI(Gui::Widgets& widget)
 
     dirty |= widget.var("Temporal normal threshold", mTemporalNormalThreshold, -1.f, 1.f);
     widget.tooltip("Minimum cosine between normals for ReSTIR temporal reuse.", true);
+
+    dirty |= widget.var("Spatial neighbor count", mSpatialNeighborCount, 0u, 16u);
+    widget.tooltip("Number of spatial reuse neighbors (K) sampled per pixel.", true);
+
+    dirty |= widget.var("Spatial radius", mSpatialRadius, 0.f, 128.f);
+    widget.tooltip("Maximum pixel radius for spatial neighbor selection.", true);
+
+    dirty |= widget.var("Spatial depth threshold", mSpatialDepthThreshold, 0.f, 1.f);
+    widget.tooltip("Maximum world-space position difference for ReSTIR spatial reuse.", true);
+
+    dirty |= widget.var("Spatial normal threshold", mSpatialNormalThreshold, -1.f, 1.f);
+    widget.tooltip("Minimum cosine between normals for ReSTIR spatial reuse.", true);
 
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 1u << 16);
     widget.tooltip("Maximum path length for indirect illumination.\n0 = direct only\n1 = one indirect bounce etc.", true);
@@ -313,11 +365,14 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mTracer.pProgram = nullptr;
     mTracer.pBindingTable = nullptr;
     mTracer.pVars = nullptr;
+    mTracer.pRestirBindingTable = nullptr;
+    mTracer.pRestirVars = nullptr;
     mFrameCount = 0;
 
     // Reset ReSTIR reservoirs so old-scene history is not reused.
     mpReservoirPrev = nullptr;
-    mpReservoirCur = nullptr;
+    mpReservoirTemporal = nullptr;
+    mpReservoirSpatial = nullptr;
 
     // Set new scene.
     mpScene = pScene;
@@ -342,22 +397,34 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
         desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
         desc.setMaxTraceRecursionDepth(kMaxRecursionDepth);
 
+        // Add the entry points. The ShaderIDs are shared between the two binding tables.
+        auto restirGenID = desc.addRayGen("restirGen");
+        auto rayGenID = desc.addRayGen("rayGen");
+        auto scatterMissID = desc.addMiss("scatterMiss");
+        auto shadowMissID = desc.addMiss("shadowMiss");
+
+        // Create the restirGen binding table. It reuses the same miss/hit groups as the main
+        // pass for a consistent ray-type layout; restirGen simply never calls TraceRay.
+        mTracer.pRestirBindingTable = RtBindingTable::create(2, 2, mpScene->getGeometryCount());
+        mTracer.pRestirBindingTable->setRayGen(restirGenID);
+        mTracer.pRestirBindingTable->setMiss(0, scatterMissID);
+        mTracer.pRestirBindingTable->setMiss(1, shadowMissID);
+
+        // Create the main rayGen binding table (full SBT).
         mTracer.pBindingTable = RtBindingTable::create(2, 2, mpScene->getGeometryCount());
-        auto& sbt = mTracer.pBindingTable;
-        sbt->setRayGen(desc.addRayGen("rayGen"));
-        sbt->setMiss(0, desc.addMiss("scatterMiss"));
-        sbt->setMiss(1, desc.addMiss("shadowMiss"));
+        mTracer.pBindingTable->setRayGen(rayGenID);
+        mTracer.pBindingTable->setMiss(0, scatterMissID);
+        mTracer.pBindingTable->setMiss(1, shadowMissID);
 
         if (mpScene->hasGeometryType(Scene::GeometryType::TriangleMesh))
         {
-            sbt->setHitGroup(
-                0,
-                mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh),
-                desc.addHitGroup("scatterTriangleMeshClosestHit", "scatterTriangleMeshAnyHit")
-            );
-            sbt->setHitGroup(
-                1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("", "shadowTriangleMeshAnyHit")
-            );
+            auto scatterHitGroupID = desc.addHitGroup("scatterTriangleMeshClosestHit", "scatterTriangleMeshAnyHit");
+            auto shadowHitGroupID = desc.addHitGroup("", "shadowTriangleMeshAnyHit");
+
+            mTracer.pRestirBindingTable->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), scatterHitGroupID);
+            mTracer.pRestirBindingTable->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), shadowHitGroupID);
+            mTracer.pBindingTable->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), scatterHitGroupID);
+            mTracer.pBindingTable->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), shadowHitGroupID);
         }
 
         // Merge the emissive light sampler's defines (including _EMISSIVE_LIGHT_SAMPLER_TYPE)
@@ -380,12 +447,13 @@ void MyPT::prepareVars()
     mTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
     mTracer.pProgram->setTypeConformances(mpScene->getTypeConformances());
 
-    // Create program variables for the current program.
+    // Create program variables for both passes (shared program, separate binding tables).
     mTracer.pVars = RtProgramVars::create(mpDevice, mTracer.pProgram, mTracer.pBindingTable);
+    mTracer.pRestirVars = RtProgramVars::create(mpDevice, mTracer.pProgram, mTracer.pRestirBindingTable);
 
     // Bind utility classes into shared data.
-    auto var = mTracer.pVars->getRootVar();
-    mpSampleGenerator->bindShaderData(var);
+    mpSampleGenerator->bindShaderData(mTracer.pVars->getRootVar());
+    mpSampleGenerator->bindShaderData(mTracer.pRestirVars->getRootVar());
     // Note: The emissive sampler is stateless (all data comes from gScene.lightCollection), so it
     // does not need to be bound here. The sampler struct is instantiated locally in the shader.
     // gScene is bound automatically by Scene::raytrace() each frame.

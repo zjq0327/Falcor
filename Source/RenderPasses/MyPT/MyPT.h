@@ -107,6 +107,14 @@ private:
     float mTemporalDepthThreshold = 0.01f;
     /// Min cosine between normals for ReSTIR temporal reuse.
     float mTemporalNormalThreshold = 0.5f;
+    /// Number of spatial reuse neighbors (K) for ReSTIR spatial reuse.
+    uint mSpatialNeighborCount = 4;
+    /// Max pixel radius for spatial neighbor selection.
+    float mSpatialRadius = 30.f;
+    /// Max world-space position difference for ReSTIR spatial reuse.
+    float mSpatialDepthThreshold = 0.02f;
+    /// Min cosine between normals for ReSTIR spatial reuse.
+    float mSpatialNormalThreshold = 0.5f;
 
     /// Max number of indirect bounces (0 = none).
     uint mMaxBounces = 64;
@@ -125,16 +133,19 @@ private:
     uint mFrameCount = 0;
     bool mOptionsChanged = false;
 
-    /// ReSTIR reservoir ping-pong buffers (previous / current frame).
-    ref<Buffer> mpReservoirPrev;
-    ref<Buffer> mpReservoirCur;
+    /// ReSTIR reservoir buffers (previous / temporal / spatial).
+    ref<Buffer> mpReservoirPrev;     ///< Previous frame's final (spatially-reused) reservoir.
+    ref<Buffer> mpReservoirTemporal; ///< This frame's temporally-reused reservoir.
+    ref<Buffer> mpReservoirSpatial;  ///< This frame's spatially-reused reservoir.
 
-    // Ray tracing program.
+    // Ray tracing program, shared by both the restirGen and rayGen passes.
     struct
     {
         ref<Program> pProgram;
-        ref<RtBindingTable> pBindingTable;
-        ref<RtProgramVars> pVars;
+        ref<RtBindingTable> pBindingTable;       ///< Full SBT (miss/hit groups) for the rayGen pass.
+        ref<RtProgramVars> pVars;                ///< Vars for the rayGen pass.
+        ref<RtBindingTable> pRestirBindingTable; ///< Raygen-only SBT for the restirGen pass.
+        ref<RtProgramVars> pRestirVars;          ///< Vars for the restirGen pass.
     } mTracer;
 };
 

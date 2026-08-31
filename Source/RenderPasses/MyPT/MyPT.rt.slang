@@ -72,6 +72,10 @@ cbuffer CB
     uint gMaxHistoryLength;         // Max accumulated sample count M for ReSTIR temporal reuse.
     float gTemporalDepthThreshold;  // Max world-space position difference for temporal reuse.
     float gTemporalNormalThreshold; // Min cosine between normals for temporal reuse.
+    uint gSpatialNeighborCount;     // Number of spatial reuse neighbor samples K.
+    float gSpatialRadius;           // Max pixel radius for spatial neighbor selection.
+    float gSpatialDepthThreshold;   // Max world-space position difference for spatial reuse.
+    float gSpatialNormalThreshold;  // Min cosine between normals for spatial reuse.
 }
 
 // Inputs
@@ -82,9 +86,10 @@ Texture2D<float2> gMotionVector; // Optional
 // Outputs
 RWTexture2D<float4> gOutputColor;
 
-// ReSTIR reservoir buffers (ping-pong across frames).
-RWStructuredBuffer<Reservoir> gReservoirPrev;
-RWStructuredBuffer<Reservoir> gReservoirCur;
+// ReSTIR reservoir buffers.
+RWStructuredBuffer<Reservoir> gReservoirPrev;     // Previous frame's final (spatially-reused) reservoir.
+RWStructuredBuffer<Reservoir> gReservoirTemporal; // This frame's temporally-reused reservoir (input to spatial reuse).
+RWStructuredBuffer<Reservoir> gReservoirSpatial;  // This frame's spatially-reused reservoir (input to next frame's temporal reuse).
 
 // The emissive light sampler (EmissiveLightSampler typedef, selected via _EMISSIVE_LIGHT_SAMPLER_TYPE)
 // is instantiated LOCALLY where needed instead of being declared as a global uniform parameter.
@@ -106,6 +111,7 @@ static const bool kUseEnvLight = USE_ENV_LIGHT;
 static const bool kUseEnvBackground = USE_ENV_BACKGROUND;
 static const float3 kDefaultBackgroundColor = float3(0, 0, 0);
 static const float kRayTMax = FLT_MAX;
+static const uint kSpatialPRNGOffset = 64; // Extra PRNG advance for the spatial reuse pass to decorrelate from the RIS pass.
 
 /**
  * Payload for shadow ray.
@@ -537,26 +543,40 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             // Add contribution of direct light. ReSTIR uses RIS + temporal reuse, PT uses NEE.
             if (kUseReSTIR)
             {
-                // RIS initial sampling.
-                Reservoir r = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
+                // Advance the generator further so this pass's random numbers (neighbor
+                // selection + shading + indirect) decorrelate from the restirGen pass.
+                for (uint i = 0; i < kSpatialPRNGOffset; i++)
+                    sampleNext1D(sg);
 
-                // Temporal reuse: reproject to the previous frame and merge with history.
-                if (is_valid(gMotionVector))
+                // Read this pixel's temporally-reused reservoir (written by the restirGen pass).
+                Reservoir r = gReservoirTemporal[pixel.x + pixel.y * frameDim.x];
+
+                // Spatial reuse: merge K random neighbors' reservoirs.
+                if (r.isValid())
                 {
-                    float2 prevPixel = float2(pixel) + gMotionVector[pixel] * float2(frameDim);
-                    if (all(prevPixel >= 0.f) && all(prevPixel < float2(frameDim)))
+                    const uint selfIdx = pixel.x + pixel.y * frameDim.x;
+                    for (uint k = 0; k < gSpatialNeighborCount; k++)
                     {
-                        uint prevIdx = uint(prevPixel.x) + uint(prevPixel.y) * frameDim.x;
-                        Reservoir prev = gReservoirPrev[prevIdx];
-                        r = temporalResample(sd, mi, sg, r, prev, gMaxHistoryLength, gTemporalDepthThreshold, gTemporalNormalThreshold);
+                        // Sample a random neighbor within a square radius.
+                        float2 rand = sampleNext2D(sg) * 2.f - 1.f; // [-1, 1]^2
+                        int2 offset = int2(int(floor(rand.x * gSpatialRadius)), int(floor(rand.y * gSpatialRadius)));
+                        int2 neighbor = int2(int(pixel.x), int(pixel.y)) + offset;
+                        if (neighbor.x < 0 || neighbor.y < 0 || neighbor.x >= int(frameDim.x) || neighbor.y >= int(frameDim.y))
+                            continue;
+                        uint neighborIdx = uint(neighbor.x) + uint(neighbor.y) * frameDim.x;
+                        if (neighborIdx == selfIdx)
+                            continue; // Skip self.
+
+                        Reservoir incoming = gReservoirTemporal[neighborIdx];
+                        r = mergeReservoir(sd, mi, sg, r, incoming, gMaxHistoryLength, gSpatialDepthThreshold, gSpatialNormalThreshold);
                     }
                 }
 
                 // Final shading.
                 outColor += evalDirectReSTIR(sd, mi, sg, r);
 
-                // Store the merged reservoir for the next frame.
-                gReservoirCur[pixel.x + pixel.y * frameDim.x] = r;
+                // Store the spatially-reused reservoir for the next frame's temporal reuse.
+                gReservoirSpatial[pixel.x + pixel.y * frameDim.x] = r;
             }
             else
             {
@@ -651,8 +671,48 @@ void shadowTriangleMeshAnyHit(inout ShadowRayData rayData, BuiltInTriangleInters
 }
 
 //
-// Shader entry point for ray generation shader.
+// Shader entry points for ray generation shaders.
 //
+
+// Pass 1: RIS initial sampling + temporal reuse. Writes gReservoirTemporal.
+// This pass does not trace any rays, so its binding table only needs a raygen entry.
+[shader("raygeneration")]
+void restirGen()
+{
+    uint2 pixel = DispatchRaysIndex().xy;
+    uint2 frameDim = DispatchRaysDimensions().xy;
+
+    const HitInfo hit = HitInfo(gVBuffer[pixel]);
+    if (!hit.isValid())
+        return; // Leave the reservoir invalid (M == 0).
+
+    const float3 primaryRayDir = getPrimaryRayDir(pixel, frameDim, gScene.camera);
+
+    ShadingData sd = loadShadingData(hit, primaryRayDir);
+    let lod = ExplicitLodTextureSampler(0.f);
+    let mi = gScene.materials.getMaterialInstance(sd, lod);
+
+    SampleGenerator sg = SampleGenerator(pixel, gFrameCount);
+    for (uint i = 0; i < gPRNGDimension; i++)
+        sampleNext1D(sg);
+
+    // RIS initial sampling.
+    Reservoir r = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
+
+    // Temporal reuse: reproject to the previous frame and merge with history.
+    if (is_valid(gMotionVector))
+    {
+        float2 prevPixel = float2(pixel) + gMotionVector[pixel] * float2(frameDim);
+        if (all(prevPixel >= 0.f) && all(prevPixel < float2(frameDim)))
+        {
+            uint prevIdx = uint(prevPixel.x) + uint(prevPixel.y) * frameDim.x;
+            Reservoir prev = gReservoirPrev[prevIdx];
+            r = mergeReservoir(sd, mi, sg, r, prev, gMaxHistoryLength, gTemporalDepthThreshold, gTemporalNormalThreshold);
+        }
+    }
+
+    gReservoirTemporal[pixel.x + pixel.y * frameDim.x] = r;
+}
 
 [shader("raygeneration")]
 void rayGen()
