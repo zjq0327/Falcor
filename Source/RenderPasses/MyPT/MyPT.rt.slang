@@ -354,7 +354,7 @@ float3 evalDirect(const ShadingData sd, const IMaterialInstance mi, inout Sample
  * @param[in] r Reservoir containing the selected light sample.
  * @return Outgoing radiance in view direction.
  */
-float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const Reservoir r)
+float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, inout Reservoir r)
 {
     if (!r.isValid())
         return float3(0.f);
@@ -363,16 +363,22 @@ float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout 
     const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.dirDistance.xyz) >= 0.f ? sd.faceN : -sd.faceN);
 
     // Test visibility with a single shadow ray.
-    if (!traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w))
+    const bool visible = traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w);
+
+    // Visibility reuse: store this frame's measured visibility back into the reservoir so it
+    // propagates to the next frame's temporal/spatial merge (occluded samples get zero weight there).
+    r.setVisibility(visible ? 1.f : 0.f);
+
+    if (!visible)
         return float3(0.f);
 
-    // Final contribution (ReSTIR Eq. 9, 1/M normalization): L = (W/M) * f(y_z) / p_hat(y_z),
-    // where p_hat = luminance(f) is the scalar target function used for RIS sample selection.
-    const float3 f = mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
-    const float p_hat = luminance(f);
-    if (p_hat <= 0.f)
-        return float3(0.f);
-    return f * (r.radianceWsum.w / float(r.getM())) / p_hat;
+    // Final contribution: weight * f, where weight is the reference's normalized
+    // weight (stored in radianceWsum.w) and f is the direct light contribution
+    // f = mi.eval * Le. This matches the reference's Li = weight * geomFactor * emission
+    // (the RIS weighting in the reference's p_hat already accounts for the cos theta
+    // and BRDF terms, so the user's weight * f is the correct direct light estimate
+    // under the reference's formulation).
+    return r.radianceWsum.w * mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
 }
 
 /**
@@ -698,6 +704,15 @@ void restirGen()
 
     // RIS initial sampling.
     Reservoir r = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
+
+    // Initial visibility check (align with the reference useInitialVisibility):
+    // discard occluded samples so they never enter the temporal/spatial reuse chain.
+    if (r.isValid())
+    {
+        const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.dirDistance.xyz) >= 0.f ? sd.faceN : -sd.faceN);
+        if (!traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w))
+            r = Reservoir::createEmpty();
+    }
 
     // Temporal reuse: reproject to the previous frame and merge with history.
     if (is_valid(gMotionVector))

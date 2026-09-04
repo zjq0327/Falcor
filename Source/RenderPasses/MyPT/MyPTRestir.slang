@@ -72,6 +72,7 @@ struct Reservoir
     float4 radianceWsum;  ///< xyz = unoccluded incident radiance, w = accumulated weight Wsum.
     float4 positionM;     ///< xyz = shading point position (for next-frame depth validation), w = asfloat(M).
     float4 normalPdf;     ///< xyz = shading normal (for next-frame normal validation), w = source pdf of the selected sample.
+    float4 visReserved;   ///< x = visibility of the selected sample (-1 = unmeasured, 0 = occluded, 1 = visible), yzw = reserved.
 };
 
 extension Reservoir
@@ -84,6 +85,19 @@ extension Reservoir
 
     /// Set the number of accumulated samples M (preserves the xyz part).
     [mutating] void setM(uint m) { positionM = float4(positionM.xyz, asfloat(m)); }
+
+    /// Visibility of the selected sample: -1 = unmeasured (RIS new sample), 0 = occluded, 1 = visible.
+    float getVisibility() { return visReserved.x; }
+
+    /// Set the visibility of the selected sample (preserves the yzw reserved part).
+    [mutating] void setVisibility(float v) { visReserved = float4(v, 0.f, 0.f, 0.f); }
+
+    /// Create an empty (invalid) reservoir.
+    static Reservoir createEmpty()
+    {
+        Reservoir r = {};
+        return r;
+    }
 };
 
 /** A single light candidate used by RIS. */
@@ -147,9 +161,13 @@ bool sampleAnalyticCandidate(const ShadingData sd, inout SampleGenerator sg, con
         c.pdf = pAnalytic * lightSelectionPdf * als.pdf;
         break;
     case LightType::Distant:
-        // Distant light: als.Li is radiance (not divided by pdf).
+        // Distant light: als.Li is radiance (not divided by pdf). The direction is
+        // (effectively) deterministic for the radiance integral — the light's angle
+        // only affects penumbra size, not brightness — so the source pdf uses only
+        // the discrete type + light selection probabilities, matching the reference
+        // path tracer (evalDirectAnalytic uses invPdf = lightCount, ignoring als.pdf).
         c.radiance = als.Li;
-        c.pdf = pAnalytic * lightSelectionPdf * als.pdf;
+        c.pdf = pAnalytic * lightSelectionPdf;
         break;
     case LightType::Point:
     case LightType::Directional:
@@ -178,6 +196,8 @@ Reservoir sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout
     // Always store the current-frame geometry for next-frame temporal validation (xyz only; w is M=0 / pdf=0).
     result.positionM = float4(sd.posW, 0.f);
     result.normalPdf = float4(sd.getOrientedFaceNormal(), 0.f);
+    // New RIS samples have no measured visibility yet; mark as unmeasured (-1).
+    result.visReserved = float4(-1.f, 0.f, 0.f, 0.f);
 
     const bool hasEmissive = kRestirUseEmissiveLights && (gScene.lightCollection.getActiveTriangleCount() > 0);
     const bool hasAnalytic = kRestirUseAnalyticLights && (gScene.getLightCount() > 0);
@@ -205,6 +225,7 @@ Reservoir sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout
     }
 
     float Wsum = 0.f;
+    float pHatSelected = 0.f;  // p_hat of the RIS-selected candidate (at the current shading point).
 
     for (uint i = 0; i < M; i++)
     {
@@ -241,18 +262,25 @@ Reservoir sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout
         if (Wsum > 0.f && sampleNext1D(sg) * Wsum < w)
         {
             result.dirDistance = float4(c.dir, c.distance);
-            // Preserve the current w (0 at this point) when rewriting xyz.
-            result.radianceWsum = float4(c.radiance, result.radianceWsum.w);
+            result.radianceWsum = float4(c.radiance, 0.f);
             // Store the source pdf of the selected sample (RIS estimator denominator).
             result.normalPdf = float4(result.normalPdf.xyz, c.pdf);
+            pHatSelected = p_hat;
         }
     }
 
     if (Wsum > 0.f)
     {
-        // Finalize Wsum and M.
-        result.radianceWsum = float4(result.radianceWsum.xyz, Wsum);
-        result.setM(M);
+        // Reference's condense (InitialResampling.cs.slang:219-222):
+        //   weight = (weightSum / M) / p_hat_selected
+        //   M = 1
+        // p_hat_selected is stored in normalPdf.w (repurposed; the source pdf
+        // is no longer needed after RIS). The merge then uses the reference's
+        // streamingResampleStep + unbiased normalization, and the final shading
+        // returns weight * f, matching the reference's Li = weight * geomFactor * emission.
+        result.radianceWsum = float4(result.radianceWsum.xyz, (Wsum / float(M)) / pHatSelected);
+        result.setM(1);
+        result.normalPdf.w = pHatSelected;
     }
 
     return result;
@@ -267,7 +295,7 @@ Reservoir sampleLightRIS(const ShadingData sd, const IMaterialInstance mi, inout
  *   w_in = M_in * p_hat(y_in) / p(y_in)   (incoming sample re-evaluated at the CURRENT shading point)
  *   r.w_sum += w_in                        (add w_in, NOT the incoming reservoir's w_sum)
  *   select y_in with probability w_in / w_sum
- *   r.M = min(M_cur + M_in, maxHistory)
+ *   r.M = M_cur + min(M_in, maxHistory)    (cap only the reused history length)
  * @param[in] sd Shading data at the current pixel (primary hit).
  * @param[in] mi Material instance (for re-evaluating the incoming sample's weight).
  * @param[in,out] sg Sample generator.
@@ -286,8 +314,21 @@ Reservoir mergeReservoir(const ShadingData sd, const IMaterialInstance mi, inout
     if (!incoming.isValid())
         return result;
 
+    // Visibility reuse: a sample measured occluded (V = 0) in the previous frame contributes
+    // nothing. Discard it entirely — not only from selection but also from M accumulation —
+    // otherwise its M would inflate the (W/M) denominator and bias the final estimate downward.
+    // Unmeasured samples (V = -1, e.g. fresh RIS samples) fall through and are treated as visible.
+    if (incoming.getVisibility() == 0.f)
+        return result;
+
     // Validate the incoming reservoir's surface against the current one.
-    if (distance(incoming.positionM.xyz, sd.posW) >= depthThreshold)
+    // Use relative depth (matching the reference EvalContext::isValidNeighbor):
+    // allow larger world-space offsets at larger depth, so distant geometry can
+    // still be reused. Absolute depth thresholds (e.g. 0.01-0.02 m) reject almost
+    // all spatial neighbors on large/planar surfaces.
+    const float currentDepth = distance(gScene.camera.getPosition(), sd.posW);
+    const float incomingDepth = distance(gScene.camera.getPosition(), incoming.positionM.xyz);
+    if (abs(currentDepth - incomingDepth) >= depthThreshold * currentDepth)
         return result;
     if (dot(incoming.normalPdf.xyz, sd.getOrientedFaceNormal()) <= normalThreshold)
         return result;
@@ -295,27 +336,62 @@ Reservoir mergeReservoir(const ShadingData sd, const IMaterialInstance mi, inout
     // Re-evaluate the incoming sample's target function at the CURRENT shading point.
     const float3 f_p = mi.eval(sd, incoming.dirDistance.xyz, sg) * incoming.radianceWsum.xyz;
     const float p_hat_p = luminance(f_p);
-    const float pdf_p = incoming.normalPdf.w;
-    if (p_hat_p <= 0.f || pdf_p <= 0.f)
+    if (p_hat_p <= 0.f)
         return result; // Incoming sample is invalid at this shading point.
 
-    // ReSTIR merge: weight the incoming sample by M_in * p_hat(y_in) / p(y_in).
-    const float w_p = float(incoming.getM()) * p_hat_p / pdf_p;
-    const float w_c = cur.radianceWsum.w;
-    const float w_sum = w_c + w_p;
+    // Cap the number of reusable samples carried by the incoming reservoir.
+    // Mirrors the reference (TemporalResampling.cs.slang: prevReservoir.M = min(prev.M, cur.M * maxHistory)).
+    const uint incomingM = min(incoming.getM(), maxHistory);
 
-    // Select the incoming sample with probability w_p / w_sum.
-    if (w_sum > 0.f && sampleNext1D(sg) * w_sum < w_p)
+    // Reference's streamingResampleStep equivalent (Resampling.slang:90-106).
+    //   sampleWeight = p_hat_at_merge * weight * M
+    // For cur: p_hat_at_merge = p_hat of cur's selected at cur context = cur.normalPdf.w
+    //   (stored in sampleLightRIS or a previous merge). With cur.radianceWsum.w =
+    //   (Wsum_cur/M_cur)/p_hat_cur_selected, sampleWeight_cur simplifies to Wsum_cur.
+    // For incoming: p_hat_at_merge = p_hat_p (p_hat of incoming's sample at cur context).
+    //   sampleWeight_in = p_hat_p * incoming.radianceWsum.w * incomingM.
+    const float sampleWeight_cur = cur.normalPdf.w * cur.radianceWsum.w * float(cur.getM());
+    const float sampleWeight_in = p_hat_p * incoming.radianceWsum.w * float(incomingM);
+    const float weightSum = sampleWeight_cur + sampleWeight_in;
+    const uint M_new = cur.getM() + incomingM;
+
+    // Select incoming with probability sampleWeight_in / weightSum.
+    bool selectedCur = true;
+    if (weightSum > 0.f && sampleNext1D(sg) * weightSum < sampleWeight_in)
     {
+        // Incoming selected.
         result.dirDistance = incoming.dirDistance;
         result.radianceWsum = float4(incoming.radianceWsum.xyz, result.radianceWsum.w);
-        result.normalPdf = float4(result.normalPdf.xyz, incoming.normalPdf.w);
-        // Keep current-frame position/normal.
+        result.visReserved = incoming.visReserved;
+        // result.normalPdf.xyz stays as cur's (current frame's normal).
+        selectedCur = false;
     }
 
-    // Finalize w_sum and M.
-    result.radianceWsum = float4(result.radianceWsum.xyz, w_sum);
-    result.setM(min(cur.getM() + incoming.getM(), maxHistory));
+    // Reference's unbiased normalization (TemporalResampling.cs.slang non-MIS branch).
+    //   denom = M_cur * p_hat_at_cur + M_prev * p_hat_at_prev
+    //   new weight = weightSum / denom
+    // p_hat_at_cur_of_selected: if cur selected, p_hat of cur's sample at cur context
+    //   (= cur.normalPdf.w); if incoming selected, p_hat of incoming's sample at cur
+    //   context (= p_hat_p).
+    // p_hat_at_prev_of_selected: if cur selected, ≈ p_hat at cur context (static camera
+    //   approximation); if incoming selected, p_hat at incoming's own context
+    //   (= incoming.normalPdf.w).
+    const float p_hat_at_cur = selectedCur ? cur.normalPdf.w : p_hat_p;
+    const float p_hat_at_prev = selectedCur ? cur.normalPdf.w : incoming.normalPdf.w;
+    const float denom = float(cur.getM()) * p_hat_at_cur + float(incomingM) * p_hat_at_prev;
+    const float newWeight = (denom > 0.f) ? weightSum / denom : 0.f;
+
+    // Store: radianceWsum.w = newWeight (the reference's normalized weight).
+    // normalPdf.w = p_hat_at_cur_of_selected (for the next merge).
+    //
+    // IMPORTANT: position/normal must ALWAYS reflect the CURRENT frame's geometry. They are
+    // used for next-frame temporal/spatial depth+normal validation. If `cur` was an empty
+    // reservoir (e.g. the RIS sample was rejected by the initial visibility test in restirGen,
+    // which zeroes the whole struct), its position/normal are (0,0,0) and would otherwise
+    // pollute the merged result, causing the history to be rejected every following frame.
+    result.radianceWsum = float4(result.radianceWsum.xyz, newWeight);
+    result.normalPdf = float4(sd.getOrientedFaceNormal(), p_hat_at_cur);
+    result.positionM = float4(sd.posW, asfloat(M_new));
 
     return result;
 }

@@ -103,16 +103,16 @@ private:
 
     /// Max accumulated sample count (M) for ReSTIR temporal reuse.
     uint mMaxHistoryLength = 20;
-    /// Max world-space position difference for ReSTIR temporal reuse.
-    float mTemporalDepthThreshold = 0.01f;
+    /// Relative depth threshold for ReSTIR temporal reuse (fraction of depth).
+    float mTemporalDepthThreshold = 0.1f;
     /// Min cosine between normals for ReSTIR temporal reuse.
     float mTemporalNormalThreshold = 0.5f;
     /// Number of spatial reuse neighbors (K) for ReSTIR spatial reuse.
     uint mSpatialNeighborCount = 4;
     /// Max pixel radius for spatial neighbor selection.
     float mSpatialRadius = 30.f;
-    /// Max world-space position difference for ReSTIR spatial reuse.
-    float mSpatialDepthThreshold = 0.02f;
+    /// Relative depth threshold for ReSTIR spatial reuse (fraction of depth).
+    float mSpatialDepthThreshold = 0.1f;
     /// Min cosine between normals for ReSTIR spatial reuse.
     float mSpatialNormalThreshold = 0.5f;
 

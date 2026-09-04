@@ -28,7 +28,7 @@
 #include "MyPT.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
-#include "Rendering/Lights/EmissiveUniformSampler.h"
+#include "Rendering/Lights/EmissivePowerSampler.h"
 
 // Register this class with the plugin system. This is what makes the pass
 // loadable from Python via `loadRenderPassLibrary("MyPT.dll")` followed by
@@ -270,12 +270,16 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
     // Manage ReSTIR reservoir buffers (previous / temporal / spatial).
     const uint32_t pixelCount = targetDim.x * targetDim.y;
-    const uint32_t kReservoirSize = 64u; // Must match the Reservoir struct (4 x float4) in MyPTRestir.slang.
+    const uint32_t kReservoirSize = 80u; // Must match the Reservoir struct (5 x float4) in MyPTRestir.slang.
     if (!mpReservoirPrev || mpReservoirPrev->getElementCount() < pixelCount)
     {
         mpReservoirPrev = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
         mpReservoirTemporal = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
         mpReservoirSpatial = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
+
+        // Clear the previous-frame reservoir once: a freshly created buffer is uninitialized,
+        // and garbage M > 0 would pollute the first temporal merge.
+        pRenderContext->clearUAV(mpReservoirPrev->getUAV().get(), uint4(0));
     }
 
     // Set constants and bind resources for both passes.
@@ -380,7 +384,7 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     // Create the emissive light sampler if the scene has emissive lights.
     if (mpScene && mpScene->useEmissiveLights())
     {
-        mpEmissiveSampler = std::make_unique<EmissiveUniformSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
+        mpEmissiveSampler = std::make_unique<EmissivePowerSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
     }
     else
     {
