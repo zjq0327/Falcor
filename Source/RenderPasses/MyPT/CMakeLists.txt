@@ -5,6 +5,7 @@ target_sources(MyPT PRIVATE
     MyPT.h
     MyPT.rt.slang
     MyPTRestir.slang
+    MyPTRestirGI.slang
 )
 
 target_copy_shaders(MyPT RenderPasses/MyPT)

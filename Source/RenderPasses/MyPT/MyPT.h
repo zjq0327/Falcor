@@ -101,6 +101,9 @@ private:
     /// Number of candidate light samples (M) used by ReSTIR DI RIS.
     uint mRISCandidateCount = 32;
 
+    /// Number of candidate paths (M) used by ReSTIR GI RIS.
+    uint mGIRISCandidateCount = 4;
+
     /// Check visibility of the RIS-selected sample before it enters the temporal/spatial reuse chain.
     /// When disabled, saves one shadow ray per pixel; visibility is then only measured at final shading.
     bool mUseInitialVisibility = true;
@@ -141,6 +144,11 @@ private:
     ref<Buffer> mpReservoirPrev;     ///< Previous frame's final (spatially-reused) reservoir.
     ref<Buffer> mpReservoirTemporal; ///< This frame's temporally-reused reservoir.
     ref<Buffer> mpReservoirSpatial;  ///< This frame's spatially-reused reservoir.
+
+    /// ReSTIR GI reservoir buffers (previous / temporal / spatial).
+    ref<Buffer> mpGIReservoirPrev;     ///< Previous frame's final (spatially-reused) GI reservoir.
+    ref<Buffer> mpGIReservoirTemporal; ///< This frame's temporally-reused GI reservoir.
+    ref<Buffer> mpGIReservoirSpatial;  ///< This frame's spatially-reused GI reservoir.
 
     // Ray tracing program, shared by both the restirGen and rayGen passes.
     struct

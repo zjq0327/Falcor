@@ -63,6 +63,7 @@ import Rendering.Lights.LightHelpers;
 import Rendering.Lights.EmissiveLightSampler;
 import Utils.Color.ColorHelpers;
 import MyPTRestir;
+import MyPTRestirGI;
 
 cbuffer CB
 {
@@ -76,6 +77,7 @@ cbuffer CB
     float gSpatialRadius;           // Max pixel radius for spatial neighbor selection.
     float gSpatialDepthThreshold;   // Max world-space position difference for spatial reuse.
     float gSpatialNormalThreshold;  // Min cosine between normals for spatial reuse.
+    uint gGIRISCandidateCount;      // Number of candidate paths (M) used by ReSTIR GI RIS.
 }
 
 // Inputs
@@ -91,6 +93,11 @@ RWStructuredBuffer<Reservoir> gReservoirPrev;     // Previous frame's final (spa
 RWStructuredBuffer<Reservoir> gReservoirTemporal; // This frame's temporally-reused reservoir (input to spatial reuse).
 RWStructuredBuffer<Reservoir> gReservoirSpatial;  // This frame's spatially-reused reservoir (input to next frame's temporal reuse).
 
+// ReSTIR GI reservoir buffers (1-bounce path samples).
+RWStructuredBuffer<GIPathReservoir> gGIReservoirPrev;     // Previous frame's final (spatially-reused) GI reservoir.
+RWStructuredBuffer<GIPathReservoir> gGIReservoirTemporal; // This frame's temporally-reused GI reservoir (input to spatial reuse).
+RWStructuredBuffer<GIPathReservoir> gGIReservoirSpatial;  // This frame's spatially-reused GI reservoir (input to next frame's temporal reuse).
+
 // The emissive light sampler (EmissiveLightSampler typedef, selected via _EMISSIVE_LIGHT_SAMPLER_TYPE)
 // is instantiated LOCALLY where needed instead of being declared as a global uniform parameter.
 // It is stateless (only dummy data; all methods read from gScene.lightCollection), so a local
@@ -105,6 +112,7 @@ static const bool kUseImportanceSampling = USE_IMPORTANCE_SAMPLING;
 static const bool kUseMIS = USE_MIS;
 static const bool kUseReSTIR = USE_RESTIR;
 static const uint kRISCandidateCount = RIS_CANDIDATE_COUNT;
+static const uint kGIRISCandidateCount = GIRIS_CANDIDATE_COUNT;
 static const bool kUseInitialVisibility = USE_INITIAL_VISIBILITY;
 static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
@@ -153,6 +161,20 @@ struct ScatterRayData
         this.normal = float3(0, 0, 0);
         this.sg = sg;
     }
+};
+
+/**
+ * Payload for a ReSTIR GI path-sampling ray (1-bounce: x1 -> x2).
+ * The closest-hit shader fills x2PosW/x2Normal/Lout; the raygen consumes them.
+ */
+struct GIPathSampleData
+{
+    bool hit;           ///< True if the path hit a surface (x2 is valid).
+    float dist;         ///< Distance |x1 - x2| (t of the traced ray).
+    float3 x2PosW;      ///< x2 world position.
+    float3 x2Normal;    ///< x2 oriented normal (for the reconnection Jacobian).
+    float3 Lout;        ///< L_out(x2) = emission + direct (NEE), computed in the hit shader.
+    SampleGenerator sg; ///< Sample generator used for NEE at x2 (copied from the caller).
 };
 
 /**
@@ -237,6 +259,33 @@ void traceScatterRay(inout ScatterRayData rayData)
 
     uint rayFlags = 0; // TODO: Set cull mode from the app
     TraceRay(gScene.rtAccel, rayFlags, 0xff /* instanceInclusionMask */, 0 /* hitIdx */, rayTypeCount, 0 /* missIdx */, ray, rayData);
+}
+
+/**
+ * Traces a ReSTIR GI path-sampling ray (1-bounce) from x1 along `dir` to x2.
+ * The closest-hit shader (giPathTriangleMeshClosestHit) evaluates L_out(x2).
+ * @param[in] origin Ray origin (offset from x1).
+ * @param[in] dir Normalized sampled direction.
+ * @param[in,out] data Payload; filled by the hit/miss shader.
+ */
+void traceGIPathSample(const float3 origin, const float3 dir, inout GIPathSampleData data)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = 0.f;
+    ray.TMax = kRayTMax;
+
+    TraceRay(
+        gScene.rtAccel,
+        0 /* rayFlags */,
+        0xff /* instanceInclusionMask */,
+        2 /* hitIdx (rayType giPath) */,
+        rayTypeCount,
+        2 /* missIdx (giPathMiss) */,
+        ray,
+        data
+    );
 }
 
 /**
@@ -380,6 +429,94 @@ float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout 
     // and BRDF terms, so the user's weight * f is the correct direct light estimate
     // under the reference's formulation).
     return r.radianceWsum.w * mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
+}
+
+/**
+ * Generate M candidate 1-bounce paths and select one via RIS (ReSTIR GI).
+ * Each candidate samples a direction d from the BSDF, traces it to a surface x2,
+ * and evaluates the path throughput p_hat = luminance(mi.eval(x1,d) * L_out(x2)).
+ * The selected sample stores the x2 vertex (pos/normal), L_out and the source pdf.
+ * @param[in] sd Shading data at the primary hit x1.
+ * @param[in] mi Material instance.
+ * @param[in,out] sg Sample generator.
+ * @param[in] M Number of candidate paths.
+ * @return GI reservoir containing the selected path sample (invalid if none).
+ */
+GIPathReservoir samplePathRIS(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const uint M)
+{
+    GIPathReservoir result = {};
+
+    // Store the current-frame geometry for next-frame temporal validation.
+    result.posX1M = float4(sd.posW, 0.f);
+    result.normalX1Pdf = float4(sd.getOrientedFaceNormal(), 0.f);
+    result.normalX2Vis = float4(0.f, 0.f, 0.f, 1.f); // Phase 1: samples are always "visible" (trace hit).
+
+    const float3 origin = sd.computeRayOrigin();
+
+    float Wsum = 0.f;
+    float pHatSelected = 0.f;
+
+    for (uint i = 0; i < M; i++)
+    {
+        // Sample a direction from the BSDF (solid-angle measure).
+        BSDFSample bsdfSample = {};
+        if (!mi.sample(sd, sg, bsdfSample, kUseImportanceSampling))
+            continue;
+        const float3 d = bsdfSample.wo;
+        const float pdf = bsdfSample.pdf;
+        if (pdf <= 0.f)
+            continue;
+
+        // Trace the path to x2 and evaluate L_out(x2) in the hit shader.
+        GIPathSampleData data;
+        data.hit = false;
+        data.dist = 0.f;
+        data.x2PosW = float3(0.f);
+        data.x2Normal = float3(0.f);
+        data.Lout = float3(0.f);
+        data.sg = sg;
+
+        traceGIPathSample(origin, d, data);
+        if (!data.hit)
+            continue;
+
+        const float3 Lout = data.Lout;
+        if (luminance(Lout) <= 0.f)
+            continue;
+
+        // Target function: path throughput p_hat = f(x1,d) * cos(theta) * L_out(x2).
+        // mi.eval already includes the cos(theta) foreshortening term.
+        const float3 f = mi.eval(sd, d, sg) * Lout;
+        const float p_hat = luminance(f);
+        if (p_hat <= 0.f)
+            continue;
+
+        const float w = p_hat / pdf;
+        Wsum += w;
+
+        // Reservoir select with probability w / Wsum.
+        if (Wsum > 0.f && sampleNext1D(sg) * Wsum < w)
+        {
+            result.posX2Dist = float4(data.x2PosW, data.dist);
+            result.radianceWsum = float4(Lout, 0.f);
+            result.normalX2Vis = float4(data.x2Normal, 1.f);
+            // Area-measure source pdf (used by the reconnection Jacobian in merge).
+            const float3 v = data.x2PosW - sd.posW;
+            const float cosPhi2 = abs(dot(data.x2Normal, normalize(sd.posW - data.x2PosW)));
+            result.sourcePdfRes = float4(pdf * cosPhi2 / max(dot(v, v), 1e-6f), 0.f, 0.f, 0.f);
+            pHatSelected = p_hat;
+        }
+    }
+
+    if (Wsum > 0.f)
+    {
+        // Condense, matching sampleLightRIS() in MyPTRestir.slang.
+        result.radianceWsum = float4(result.radianceWsum.xyz, (Wsum / float(M)) / pHatSelected);
+        result.setM(1);
+        result.normalX1Pdf.w = pHatSelected;
+    }
+
+    return result;
 }
 
 /**
@@ -591,21 +728,61 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             }
         }
 
-        // Prepare ray payload.
-        ScatterRayData rayData = ScatterRayData(sg);
-
-        // Generate scatter ray.
-        if (!generateScatterRay(sd, mi, rayOrigin, rayData))
-            rayData.terminated = true;
-
-        // Follow path into the scene and compute its total contribution.
-        for (uint depth = 0; depth <= kMaxBounces && !rayData.terminated; depth++)
+        // Indirect illumination: ReSTIR GI (spatial reuse + eval) or plain PT recursion.
+        if (kUseReSTIR)
         {
-            traceScatterRay(rayData);
-        }
+            // Advance the generator so GI spatial reuse decorrelates from DI.
+            for (uint i = 0; i < kSpatialPRNGOffset; i++)
+                sampleNext1D(sg);
 
-        // Store contribution from scatter ray.
-        outColor += rayData.radiance;
+            // Read this pixel's temporally-reused GI reservoir (written by restirGen).
+            GIPathReservoir rgi = gGIReservoirTemporal[pixel.x + pixel.y * frameDim.x];
+
+            // Spatial reuse: merge K random neighbors' GI reservoirs.
+            if (rgi.isValid())
+            {
+                const uint selfIdx = pixel.x + pixel.y * frameDim.x;
+                for (uint k = 0; k < gSpatialNeighborCount; k++)
+                {
+                    // Sample a random neighbor within a square radius.
+                    float2 rand = sampleNext2D(sg) * 2.f - 1.f; // [-1, 1]^2
+                    int2 offset = int2(int(floor(rand.x * gSpatialRadius)), int(floor(rand.y * gSpatialRadius)));
+                    int2 neighbor = int2(int(pixel.x), int(pixel.y)) + offset;
+                    if (neighbor.x < 0 || neighbor.y < 0 || neighbor.x >= int(frameDim.x) || neighbor.y >= int(frameDim.y))
+                        continue;
+                    uint neighborIdx = uint(neighbor.x) + uint(neighbor.y) * frameDim.x;
+                    if (neighborIdx == selfIdx)
+                        continue; // Skip self.
+
+                    GIPathReservoir incoming = gGIReservoirTemporal[neighborIdx];
+                    rgi = mergeGIPathReservoir(sd, mi, sg, rgi, incoming, gMaxHistoryLength, gSpatialDepthThreshold, gSpatialNormalThreshold);
+                }
+            }
+
+            // Final shading: L_indirect = weight * f(x1,d) * L_out(x2).
+            outColor += evalGIPathReSTIR(sd, mi, sg, rgi);
+
+            // Store the spatially-reused GI reservoir for the next frame's temporal reuse.
+            gGIReservoirSpatial[pixel.x + pixel.y * frameDim.x] = rgi;
+        }
+        else
+        {
+            // Prepare ray payload.
+            ScatterRayData rayData = ScatterRayData(sg);
+
+            // Generate scatter ray.
+            if (!generateScatterRay(sd, mi, rayOrigin, rayData))
+                rayData.terminated = true;
+
+            // Follow path into the scene and compute its total contribution.
+            for (uint depth = 0; depth <= kMaxBounces && !rayData.terminated; depth++)
+            {
+                traceScatterRay(rayData);
+            }
+
+            // Store contribution from scatter ray.
+            outColor += rayData.radiance;
+        }
     }
     else
     {
@@ -678,11 +855,69 @@ void shadowTriangleMeshAnyHit(inout ShadowRayData rayData, BuiltInTriangleInters
 }
 
 //
+// Shader entry points for the ReSTIR GI path-sampling ray (ray type 2).
+//
+
+[shader("miss")]
+void giPathMiss(inout GIPathSampleData rayData)
+{
+    // A 1-bounce indirect path sample requires x2 to be a surface. A miss means
+    // the path escaped to the environment, which is not part of the 1-bounce
+    // indirect estimate (env light is handled elsewhere). Mark invalid.
+    rayData.hit = false;
+    rayData.dist = 0.f;
+    rayData.x2PosW = float3(0.f);
+    rayData.x2Normal = float3(0.f);
+    rayData.Lout = float3(0.f);
+}
+
+[shader("anyhit")]
+void giPathTriangleMeshAnyHit(inout GIPathSampleData rayData, BuiltInTriangleIntersectionAttributes attribs)
+{
+    // Alpha test for non-opaque geometry.
+    GeometryInstanceID instanceID = getGeometryInstanceID();
+    VertexData v = getVertexData(instanceID, PrimitiveIndex(), attribs);
+    const uint materialID = gScene.getMaterialID(instanceID);
+    if (gScene.materials.alphaTest(v, materialID, 0.f))
+        IgnoreHit();
+}
+
+[shader("closesthit")]
+void giPathTriangleMeshClosestHit(inout GIPathSampleData rayData, BuiltInTriangleIntersectionAttributes attribs)
+{
+    TriangleHit triangleHit;
+    triangleHit.instanceID = getGeometryInstanceID();
+    triangleHit.primitiveIndex = PrimitiveIndex();
+    triangleHit.barycentrics = attribs.barycentrics;
+
+    const HitInfo hit = HitInfo(triangleHit);
+    const float hitT = RayTCurrent();
+    const float3 rayDir = WorldRayDirection();
+
+    ShadingData sd = loadShadingData(hit, rayDir);
+    let lod = ExplicitLodTextureSampler(0.f);
+    let mi = gScene.materials.getMaterialInstance(sd, lod);
+
+    // L_out(x2) = emission + direct illumination (NEE + shadow ray).
+    float3 Lout = float3(0.f);
+    if (kUseEmissiveLights)
+        Lout += mi.getProperties(sd).emission;
+    if (kUseAnalyticLights || kUseEmissiveLights)
+        Lout += evalDirect(sd, mi, rayData.sg);
+
+    rayData.hit = true;
+    rayData.dist = hitT;
+    rayData.x2PosW = sd.posW;
+    rayData.x2Normal = sd.getOrientedFaceNormal();
+    rayData.Lout = Lout;
+}
+
+//
 // Shader entry points for ray generation shaders.
 //
 
-// Pass 1: RIS initial sampling + temporal reuse. Writes gReservoirTemporal.
-// This pass does not trace any rays, so its binding table only needs a raygen entry.
+// Pass 1: RIS initial sampling + temporal reuse. Writes gReservoirTemporal / gGIReservoirTemporal.
+// The DI part does not trace; the GI part traces one scatter ray per candidate (ray type 2).
 [shader("raygeneration")]
 void restirGen()
 {
@@ -728,6 +963,22 @@ void restirGen()
     }
 
     gReservoirTemporal[pixel.x + pixel.y * frameDim.x] = r;
+
+    // ReSTIR GI: RIS initial sampling + temporal reuse for 1-bounce indirect light.
+    GIPathReservoir rgi = samplePathRIS(sd, mi, sg, kGIRISCandidateCount);
+
+    if (is_valid(gMotionVector))
+    {
+        float2 prevPixel = float2(pixel) + gMotionVector[pixel] * float2(frameDim);
+        if (all(prevPixel >= 0.f) && all(prevPixel < float2(frameDim)))
+        {
+            uint prevIdx = uint(prevPixel.x) + uint(prevPixel.y) * frameDim.x;
+            GIPathReservoir prev = gGIReservoirPrev[prevIdx];
+            rgi = mergeGIPathReservoir(sd, mi, sg, rgi, prev, gMaxHistoryLength, gTemporalDepthThreshold, gTemporalNormalThreshold);
+        }
+    }
+
+    gGIReservoirTemporal[pixel.x + pixel.y * frameDim.x] = rgi;
 }
 
 [shader("raygeneration")]
