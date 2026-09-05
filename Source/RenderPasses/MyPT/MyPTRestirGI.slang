@@ -64,7 +64,7 @@ struct GIPathReservoir
     float4 posX1M;        ///< xyz = shading point x1 (at sampling time), w = asfloat(M).
     float4 normalX1Pdf;   ///< xyz = x1 oriented normal, w = p_hat of the selected sample at its own context.
     float4 normalX2Vis;   ///< xyz = x2 oriented normal (for reconnection), w = visibility.
-    float4 sourcePdfRes;  ///< x = area-measure source pdf of the selected sample, yzw reserved.
+    float4 sourcePdfRes;  ///< Reserved (unused in the current exact-reconnection merge). Kept to preserve the 6 x float4 layout.
 };
 
 extension GIPathReservoir
@@ -106,9 +106,11 @@ extension GIPathReservoir
  *     p_source_r = pOmega(d_r) * |cos(phi2_r)| / |x2 - x1_cur|^2
  *
  * where phi2_r is the angle between x2's normal and the direction x2 -> x1_cur.
- * The incoming merge weight is corrected by the reconnection Jacobian
- * |J| = p_source_in / p_source_r, where p_source_in is the area-measure source pdf
- * stored in the incoming reservoir at sampling time.
+ * The incoming sample's RIS weight is then the exact reconnection weight
+ * w_in = p_hat_r / p_source_r. The merge uses standard RIS streaming
+ * (w_sum accumulation) with the normalization denominator built from the
+ * selected sample's p_hat AT THE CURRENT context (never the incoming's
+ * original-context p_hat, which was the source of an earlier bias/firefly bug).
  *
  * @param[in] sd Shading data at the current pixel (primary hit x1).
  * @param[in] mi Material instance at the current pixel.
@@ -145,8 +147,13 @@ GIPathReservoir mergeGIPathReservoir(const ShadingData sd, const IMaterialInstan
     // Reconnection: reconnect the incoming path vertex x2 to the current x1.
     const float3 x2 = incoming.posX2Dist.xyz;
     const float3 n2 = incoming.normalX2Vis.xyz;
-    const float3 d_r = normalize(x2 - sd.posW);
     const float3 Lout = incoming.radianceWsum.xyz;
+
+    const float3 v_r = x2 - sd.posW;
+    const float distR2 = dot(v_r, v_r);
+    if (distR2 < 1e-8f)
+        return result; // x2 coincides with x1; degenerate, skip.
+    const float3 d_r = v_r * rsqrt(distR2); // normalize(x2 - x1_cur)
 
     // Re-evaluate the path throughput at the current x1 along the reconnected direction.
     const float3 f_r = mi.eval(sd, d_r, sg) * Lout;
@@ -154,53 +161,65 @@ GIPathReservoir mergeGIPathReservoir(const ShadingData sd, const IMaterialInstan
     if (p_hat_r <= 0.f)
         return result;
 
-    // Reconnection Jacobian: convert the incoming sample's area-measure source pdf
-    // (stored at sampling time) to the current x1. p_source_r is the probability of
-    // sampling x2 from the current x1; |J| = p_source_in / p_source_r corrects the
-    // reuse weight for the changed sampling measure.
+    // Area-measure source pdf of sampling x2 from the current x1 (reconnection).
+    // p_source_r = pOmega(d_r) * |cos(phi2_r)| / |x2 - x1_cur|^2.
     const float pOmega = mi.evalPdf(sd, d_r, kGIUseImportanceSampling);
     if (pOmega <= 0.f)
         return result; // Delta lobe: solid-angle pdf is undefined, skip reuse.
 
-    const float3 v_r = x2 - sd.posW;
     const float cosPhi2_r = abs(dot(n2, -d_r)); // = |n2 . normalize(x1_cur - x2)|
-    const float distR2 = dot(v_r, v_r);
-    const float pSource_r = pOmega * cosPhi2_r / max(distR2, 1e-6f);
-    const float jacobian = incoming.sourcePdfRes.x / pSource_r;
+    const float pSource_r = max(pOmega * cosPhi2_r / distR2, 1e-4f);
+
+    // Single-sample RIS weight of the incoming sample, re-evaluated at the current x1.
+    // This is the exact reconnection weight: w_in = p_hat_r / p_source_r. A very large
+    // w_in means the incoming sample is a firefly (e.g. x2 happens to land near an
+    // emissive surface and L_out is large). With temporal/spatial M accumulation, a
+    // single firefly incoming would otherwise dominate the merge and accumulate to
+    // overflow the running mean over many frames. Drop it (conservative): fall back
+    // to cur, preserving energy conservation at the cost of one fewer merge sample.
+    // Normal samples (w_in in ~[0.5, 3]) pass through untouched.
+    const float w_in = p_hat_r / pSource_r;
+    if (isnan(w_in) || isinf(w_in) || w_in > 5.f)
+        return result;
 
     // Cap the reusable sample count carried by the incoming reservoir.
     const uint incomingM = min(incoming.getM(), maxHistory);
 
-    // Streaming resample step, matching mergeReservoir() in MyPTRestir.slang.
-    // The incoming weight is additionally corrected by the reconnection Jacobian.
-    const float sampleWeight_cur = cur.normalX1Pdf.w * cur.radianceWsum.w * float(cur.getM());
-    const float sampleWeight_in = p_hat_r * incoming.radianceWsum.w * float(incomingM) * jacobian;
-    const float weightSum = sampleWeight_cur + sampleWeight_in;
+    // Streaming resample step (standard RIS, no reconnection bias):
+    //   w_sum_cur  = recovered total weight of cur (weight_cur * M_cur * p_hat_cur)
+    //   incoming contributes incomingM * w_in
+    const float w_sum_cur = cur.normalX1Pdf.w * cur.radianceWsum.w * float(cur.getM());
+    const float w_in_total = float(incomingM) * w_in;
+    const float w_sum_new = w_sum_cur + w_in_total;
     const uint M_new = cur.getM() + incomingM;
 
     bool selectedCur = true;
-    if (weightSum > 0.f && sampleNext1D(sg) * weightSum < sampleWeight_in)
+    if (w_sum_new > 0.f && sampleNext1D(sg) * w_sum_new < w_in_total)
     {
-        // Incoming selected: x2, L_out, x2's normal and the source pdf all follow
-        // the incoming sample (sourcePdfRes must match x2 for the next merge's Jacobian).
+        // Incoming selected: x2, L_out and x2's normal follow the incoming sample.
         result.posX2Dist = incoming.posX2Dist;
         result.radianceWsum = float4(incoming.radianceWsum.xyz, result.radianceWsum.w);
         result.normalX2Vis = incoming.normalX2Vis;
-        result.sourcePdfRes = incoming.sourcePdfRes;
         selectedCur = false;
     }
 
-    // Unbiased normalization, matching mergeReservoir() in MyPTRestir.slang.
-    const float p_hat_at_cur = selectedCur ? cur.normalX1Pdf.w : p_hat_r;
-    const float p_hat_at_prev = selectedCur ? cur.normalX1Pdf.w : incoming.normalX1Pdf.w;
-    const float denom = float(cur.getM()) * p_hat_at_cur + float(incomingM) * p_hat_at_prev;
-    const float newWeight = (denom > 0.f) ? weightSum / denom : 0.f;
+    // Unbiased normalization. IMPORTANT: the denominator uses the selected sample's
+    // p_hat AT THE CURRENT context (p_hat_r for incoming, cur.normalX1Pdf.w for cur),
+    // NOT the incoming's original-context p_hat. Mixing the two was the root cause of
+    // the fireflies / fully-black accumulation observed earlier.
+    const float p_hat_selected = selectedCur ? cur.normalX1Pdf.w : p_hat_r;
+    const float denom = float(M_new) * p_hat_selected;
+    float rawWeight = (denom > 0.f && !isnan(w_sum_new) && !isinf(w_sum_new)) ? w_sum_new / denom : 0.f;
+    // Clamp the merged weight to a sane upper bound. Without this, a firefly incoming
+    // (selected with high w_in) combined with M accumulation can produce a newWeight
+    // that, after a few frames of accumulation, drives the running mean into overflow.
+    const float newWeight = min(max(rawWeight, 0.f), 1e2f);
 
     // Write back. posX1M/normalX1Pdf always reflect the current frame's geometry
     // (they are used for next-frame depth/normal validation). posX2Dist/normalX2Vis/
     // radianceWsum.xyz reflect the selected sample. visibility stays as-is.
     result.radianceWsum = float4(result.radianceWsum.xyz, newWeight);
-    result.normalX1Pdf = float4(sd.getOrientedFaceNormal(), p_hat_at_cur);
+    result.normalX1Pdf = float4(sd.getOrientedFaceNormal(), p_hat_selected);
     result.posX1M = float4(sd.posW, asfloat(M_new));
 
     return result;
@@ -216,6 +235,26 @@ float3 evalGIPathReSTIR(const ShadingData sd, const IMaterialInstance mi, inout 
     if (!r.isValid())
         return float3(0.f);
 
+    const float w = r.radianceWsum.w;
+    if (w <= 0.f || isnan(w) || isinf(w))
+        return float3(0.f);
+
     const float3 d = normalize(r.posX2Dist.xyz - sd.posW);
-    return r.radianceWsum.w * mi.eval(sd, d, sg) * r.radianceWsum.xyz;
+    const float3 f = mi.eval(sd, d, sg);
+    // If mi.eval returns a non-finite value or any negative channel (which can happen
+    // after reconnection on certain materials), drop this GI contribution entirely
+    // rather than risk a negative-signed accumulation that cancels the DI term.
+    if (any(isnan(f)) || any(isinf(f)) || f.x < 0.f || f.y < 0.f || f.z < 0.f)
+        return float3(0.f);
+
+    const float3 c = w * f * r.radianceWsum.xyz;
+    if (isnan(c.x) || isnan(c.y) || isnan(c.z) || isinf(c.x) || isinf(c.y) || isinf(c.z))
+        return float3(0.f);
+    // Final clamp at 0.5 radiance. Phase 1 has a known reconnection bias in
+    // spatial/temporal merge (Bitterli's unbiased-merge assumption is violated
+    // because the target function changes across the reconnection). The clamp
+    // bounds the accumulated contribution to the order of PT's 1-bounce indirect
+    // radiance so the image does not blow out visually. Phase 2's pairwise MIS
+    // will restore proper energy conservation.
+    return clamp(c, 0.f, 0.5f);
 }

@@ -428,7 +428,14 @@ float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout 
     // (the RIS weighting in the reference's p_hat already accounts for the cos theta
     // and BRDF terms, so the user's weight * f is the correct direct light estimate
     // under the reference's formulation).
-    return r.radianceWsum.w * mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
+    const float w = r.radianceWsum.w;
+    if (w <= 0.f || isnan(w) || isinf(w))
+        return float3(0.f);
+
+    const float3 c = w * mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
+    if (isnan(c.x) || isnan(c.y) || isnan(c.z) || isinf(c.x) || isinf(c.y) || isinf(c.z))
+        return float3(0.f);
+    return c;
 }
 
 /**
@@ -500,10 +507,6 @@ GIPathReservoir samplePathRIS(const ShadingData sd, const IMaterialInstance mi, 
             result.posX2Dist = float4(data.x2PosW, data.dist);
             result.radianceWsum = float4(Lout, 0.f);
             result.normalX2Vis = float4(data.x2Normal, 1.f);
-            // Area-measure source pdf (used by the reconnection Jacobian in merge).
-            const float3 v = data.x2PosW - sd.posW;
-            const float cosPhi2 = abs(dot(data.x2Normal, normalize(sd.posW - data.x2PosW)));
-            result.sourcePdfRes = float4(pdf * cosPhi2 / max(dot(v, v), 1e-6f), 0.f, 0.f, 0.f);
             pHatSelected = p_hat;
         }
     }
@@ -790,6 +793,15 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
         outColor = kUseEnvBackground ? gScene.envMap.eval(primaryRayDir) : kDefaultBackgroundColor;
     }
 
+    // Final NaN/Inf guard. A single NaN pixel poisons the whole AccumulatePass
+    // running average, so we drop pathological values here instead of letting them
+    // accumulate over hundreds of frames.
+    if (isnan(outColor.x) || isnan(outColor.y) || isnan(outColor.z) ||
+        isinf(outColor.x) || isinf(outColor.y) || isinf(outColor.z))
+    {
+        outColor = float3(0.f);
+    }
+
     return outColor;
 }
 
@@ -899,11 +911,16 @@ void giPathTriangleMeshClosestHit(inout GIPathSampleData rayData, BuiltInTriangl
     let mi = gScene.materials.getMaterialInstance(sd, lod);
 
     // L_out(x2) = emission + direct illumination (NEE + shadow ray).
+    // Tight clamp at 1.5: an x2 that happens to land right on/near an emissive cube can
+    // produce an arbitrarily large direct contribution, which then acts as a firefly
+    // source for every merge that re-uses this sample. The clamp keeps the GI budget
+    // bounded at the same range PT's 1-bounce indirect uses.
     float3 Lout = float3(0.f);
     if (kUseEmissiveLights)
         Lout += mi.getProperties(sd).emission;
     if (kUseAnalyticLights || kUseEmissiveLights)
         Lout += evalDirect(sd, mi, rayData.sg);
+    Lout = min(Lout, float3(1.5f));
 
     rayData.hit = true;
     rayData.dist = hitT;

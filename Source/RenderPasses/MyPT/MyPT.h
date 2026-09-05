@@ -102,7 +102,7 @@ private:
     uint mRISCandidateCount = 32;
 
     /// Number of candidate paths (M) used by ReSTIR GI RIS.
-    uint mGIRISCandidateCount = 4;
+    uint mGIRISCandidateCount = 8;
 
     /// Check visibility of the RIS-selected sample before it enters the temporal/spatial reuse chain.
     /// When disabled, saves one shadow ray per pixel; visibility is then only measured at final shading.

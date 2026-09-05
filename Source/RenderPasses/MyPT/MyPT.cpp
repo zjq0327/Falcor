@@ -343,9 +343,9 @@ void MyPT::renderUI(Gui::Widgets& widget)
     dirty |= widget.var("RIS candidate count", mRISCandidateCount, 1u, 256u);
     widget.tooltip("Number of candidate light samples (M) used by ReSTIR DI RIS.", true);
 
-    dirty |= widget.var("GI RIS candidate count", mGIRISCandidateCount, 1u, 64u);
+    dirty |= widget.var("GI RIS candidate count", mGIRISCandidateCount, 0u, 64u);
     widget.tooltip("Number of candidate paths (M) used by ReSTIR GI RIS.\n"
-        "Each candidate traces one scatter ray and one shadow ray, so keep this small.", true);
+        "Set to 0 to disable GI entirely (DI-only ReSTIR, useful for isolating GI issues).", true);
 
     dirty |= widget.checkbox("Use initial visibility", mUseInitialVisibility);
     widget.tooltip("Check visibility of the RIS-selected sample before temporal/spatial reuse.\n"
