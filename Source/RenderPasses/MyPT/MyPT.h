@@ -101,6 +101,10 @@ private:
     /// Number of candidate light samples (M) used by ReSTIR DI RIS.
     uint mRISCandidateCount = 32;
 
+    /// Check visibility of the RIS-selected sample before it enters the temporal/spatial reuse chain.
+    /// When disabled, saves one shadow ray per pixel; visibility is then only measured at final shading.
+    bool mUseInitialVisibility = true;
+
     /// Max accumulated sample count (M) for ReSTIR temporal reuse.
     uint mMaxHistoryLength = 20;
     /// Relative depth threshold for ReSTIR temporal reuse (fraction of depth).

@@ -67,6 +67,7 @@ const ChannelList kOutputChannels = {
 
 const char kMode[] = "mode";
 const char kRISCandidateCount[] = "risCandidateCount";
+const char kUseInitialVisibility[] = "useInitialVisibility";
 const char kMaxBounces[] = "maxBounces";
 const char kComputeDirect[] = "computeDirect";
 const char kUseImportanceSampling[] = "useImportanceSampling";
@@ -98,6 +99,8 @@ void MyPT::parseProperties(const Properties& props)
             mMode = value;
         else if (key == kRISCandidateCount)
             mRISCandidateCount = value;
+        else if (key == kUseInitialVisibility)
+            mUseInitialVisibility = value;
         else if (key == kMaxBounces)
             mMaxBounces = value;
         else if (key == kComputeDirect)
@@ -132,6 +135,7 @@ Properties MyPT::getProperties() const
     Properties props;
     props[kMode] = mMode;
     props[kRISCandidateCount] = mRISCandidateCount;
+    props[kUseInitialVisibility] = mUseInitialVisibility;
     props[kMaxBounces] = mMaxBounces;
     props[kComputeDirect] = mComputeDirect;
     props[kUseImportanceSampling] = mUseImportanceSampling;
@@ -204,6 +208,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // These defines should not modify the program vars. Do not trigger program vars re-creation.
     mTracer.pProgram->addDefine("USE_RESTIR", mMode == Mode::ReSTIR ? "1" : "0");
     mTracer.pProgram->addDefine("RIS_CANDIDATE_COUNT", std::to_string(mRISCandidateCount));
+    mTracer.pProgram->addDefine("USE_INITIAL_VISIBILITY", mUseInitialVisibility ? "1" : "0");
     mTracer.pProgram->addDefine("MAX_BOUNCES", std::to_string(mMaxBounces));
     mTracer.pProgram->addDefine("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     mTracer.pProgram->addDefine("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
@@ -317,6 +322,10 @@ void MyPT::renderUI(Gui::Widgets& widget)
 
     dirty |= widget.var("RIS candidate count", mRISCandidateCount, 1u, 256u);
     widget.tooltip("Number of candidate light samples (M) used by ReSTIR DI RIS.", true);
+
+    dirty |= widget.checkbox("Use initial visibility", mUseInitialVisibility);
+    widget.tooltip("Check visibility of the RIS-selected sample before temporal/spatial reuse.\n"
+        "Disabling saves one shadow ray per pixel, but occluded samples may briefly enter the reuse chain.", true);
 
     dirty |= widget.var("Max history length", mMaxHistoryLength, 1u, 64u);
     widget.tooltip("Maximum accumulated sample count (M) for ReSTIR temporal reuse.", true);

@@ -105,6 +105,7 @@ static const bool kUseImportanceSampling = USE_IMPORTANCE_SAMPLING;
 static const bool kUseMIS = USE_MIS;
 static const bool kUseReSTIR = USE_RESTIR;
 static const uint kRISCandidateCount = RIS_CANDIDATE_COUNT;
+static const bool kUseInitialVisibility = USE_INITIAL_VISIBILITY;
 static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
@@ -707,7 +708,7 @@ void restirGen()
 
     // Initial visibility check (align with the reference useInitialVisibility):
     // discard occluded samples so they never enter the temporal/spatial reuse chain.
-    if (r.isValid())
+    if (kUseInitialVisibility && r.isValid())
     {
         const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.dirDistance.xyz) >= 0.f ? sd.faceN : -sd.faceN);
         if (!traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w))

@@ -9,7 +9,7 @@ def render_graph_MyPT():
     ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
     g.addPass(ToneMapper, "ToneMapper")
 
-    MyPT = createPass("MyPT", {'mode': 'PT', 'risCandidateCount': 128, 'maxHistoryLength': 20, 'temporalDepthThreshold': 0.1, 'temporalNormalThreshold': 0.5, 'spatialNeighborCount': 4, 'spatialRadius': 20, 'spatialDepthThreshold': 0.1, 'spatialNormalThreshold': 0.5, 'maxBounces': 3, 'computeDirect': True, 'useImportanceSampling': True, 'rrProbability': 0.2})
+    MyPT = createPass("MyPT", {'mode': 'PT', 'risCandidateCount': 32, 'maxHistoryLength': 20, 'temporalDepthThreshold': 0.1, 'temporalNormalThreshold': 0.5, 'spatialNeighborCount': 4, 'spatialRadius': 20, 'spatialDepthThreshold': 0.1, 'spatialNormalThreshold': 0.5, 'maxBounces': 3, 'computeDirect': True, 'useImportanceSampling': True, 'rrProbability': 0.2})
     g.addPass(MyPT, "MyPT")
 
     VBufferRT = createPass("VBufferRT", {'samplePattern': 'Stratified', 'sampleCount': 16})
