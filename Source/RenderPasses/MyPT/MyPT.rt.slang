@@ -911,16 +911,16 @@ void giPathTriangleMeshClosestHit(inout GIPathSampleData rayData, BuiltInTriangl
     let mi = gScene.materials.getMaterialInstance(sd, lod);
 
     // L_out(x2) = emission + direct illumination (NEE + shadow ray).
-    // Tight clamp at 1.5: an x2 that happens to land right on/near an emissive cube can
-    // produce an arbitrarily large direct contribution, which then acts as a firefly
-    // source for every merge that re-uses this sample. The clamp keeps the GI budget
-    // bounded at the same range PT's 1-bounce indirect uses.
+    // No L_out clamp here: PT's scatter recursion uses the unclamped L_out, so any
+    // clamp on the GI path causes a systematic bias (ReSTIR GI looking darker than PT
+    // on bright emissives). A very loose clamp guards against pathological Inf values
+    // from concurrent light accumulation but otherwise lets L_out pass through freely.
     float3 Lout = float3(0.f);
     if (kUseEmissiveLights)
         Lout += mi.getProperties(sd).emission;
     if (kUseAnalyticLights || kUseEmissiveLights)
         Lout += evalDirect(sd, mi, rayData.sg);
-    Lout = min(Lout, float3(1.5f));
+    Lout = min(Lout, float3(1e3f));
 
     rayData.hit = true;
     rayData.dist = hitT;
