@@ -1,5 +1,6 @@
 #include "MyPT.h"
 #include "Rendering/Lights/EmissivePowerSampler.h"
+#include "RenderGraph/RenderPassStandardFlags.h"
 
 void MyPT::resetGRIS()
 {
@@ -10,9 +11,26 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
 {
     FALCOR_CHECK(!mpScene->hasProceduralGeometry(), "GRIS currently supports triangle geometry only.");
     const uint2 dimensions = data.getDefaultTextureDims();
-    if (dimensions.x == 0 || dimensions.y == 0) return;
+    if (dimensions.x == 0 || dimensions.y == 0) { mGRIS.historyValid = false; return; }
     const bool useSpatial = mSpatialReuse && mSpatialNeighborCount > 0 && mSpatialReuseRounds > 0;
+    const auto& camera = mpScene->getCamera();
+    const bool useTemporal = mTemporalReuse && mMaxHistoryLength > 0 && camera->getApertureRadius() == 0.f;
     if (auto texture = data.getTexture("spatialDebug")) context->clearTexture(texture.get(), float4(0.f));
+    if (auto texture = data.getTexture("temporalDebug")) context->clearTexture(texture.get(), float4(0.f));
+
+    // The suffix is only reusable while geometry, materials and lighting are unchanged.
+    // CameraPropertiesChanged also includes per-frame jitter, so inspect its finer flags.
+    const auto updates = mpScene->getUpdates() | mPendingSceneUpdates;
+    mPendingSceneUpdates = IScene::UpdateFlags::None;
+    const auto cameraOnly = IScene::UpdateFlags::CameraMoved | IScene::UpdateFlags::CameraPropertiesChanged |
+        IScene::UpdateFlags::SceneGraphChanged;
+    const auto benignCameraChanges = Camera::Changes::Movement | Camera::Changes::Jitter | Camera::Changes::History;
+    const auto refresh = data.getDictionary().getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
+    if (!useTemporal || (updates & ~cameraOnly) != IScene::UpdateFlags::None ||
+        (camera->getChanges() & ~benignCameraChanges) != Camera::Changes::None ||
+        refresh != RenderPassRefreshFlags::None ||
+        (mGRIS.historyValid && camera->getData().prevViewProjMatNoJitter != mGRIS.previousViewProj))
+        mGRIS.historyValid = false;
 
     // Sampler specialization can change with scene lighting, independently of UI options.
     if (mpScene->useEmissiveLights())
@@ -40,6 +58,9 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     defines.add("GRIS_HAS_DEBUG", data.getTexture("reservoirDebug") ? "1" : "0");
     defines.add("GRIS_HAS_INITIAL", data.getTexture("initialColor") ? "1" : "0");
     defines.add("GRIS_HAS_SPATIAL_DEBUG", data.getTexture("spatialDebug") ? "1" : "0");
+    defines.add("GRIS_HAS_TEMPORAL_DEBUG", data.getTexture("temporalDebug") ? "1" : "0");
+    defines.add("GRIS_HAS_TEMPORAL_COLOR", data.getTexture("temporalColor") ? "1" : "0");
+    defines.add("GRIS_HAS_MOTION", data.getTexture("mvec") ? "1" : "0");
     if (mpEmissiveSampler) defines.add(mpEmissiveSampler->getDefines());
 
     if (!mGRIS.generatePaths || defines != mGRIS.defines)
@@ -57,11 +78,13 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         };
         mGRIS.generatePaths = create("GeneratePaths.cs.slang");
         mGRIS.tracePaths = create("TracePaths.cs.slang");
+        mGRIS.temporalReuse = create("TemporalReuse.cs.slang");
         mGRIS.spatialReuse = create("SpatialReuse.cs.slang");
         mGRIS.resolve = create("Resolve.cs.slang");
         mGRIS.defines = defines;
         mGRIS.primary = nullptr; // Reflection may have changed (PackedHitInfo is scene-dependent).
         mGRIS.frameIndex = 0;
+        mGRIS.historyValid = false;
     }
     if (!mGRIS.primary || any(mGRIS.dimensions != dimensions))
     {
@@ -72,9 +95,22 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         mGRIS.primary = mpDevice->createStructuredBuffer(var["gPrimary"], uint32_t(count));
         mGRIS.fresh = mpDevice->createStructuredBuffer(var["gFresh"], uint32_t(count));
         mGRIS.reference = mpDevice->createStructuredBuffer(var["gReference"], uint32_t(count));
+        mGRIS.temporal = nullptr;
+        mGRIS.historyPrimary = nullptr;
+        mGRIS.historyReservoir = nullptr;
+        mGRIS.historyValid = false;
         for (auto& buffer : mGRIS.spatial) buffer = nullptr;
         mGRIS.dimensions = dimensions;
         mGRIS.frameIndex = 0;
+    }
+    if (useTemporal && !mGRIS.historyReservoir)
+    {
+        auto var = mGRIS.generatePaths->getRootVar();
+        const uint32_t count = dimensions.x * dimensions.y;
+        mGRIS.historyPrimary = mpDevice->createStructuredBuffer(var["gPrimary"], count);
+        mGRIS.historyReservoir = mpDevice->createStructuredBuffer(var["gFresh"], count);
+        mGRIS.temporal = mpDevice->createStructuredBuffer(var["gFresh"], count);
+        mGRIS.historyValid = false;
     }
     auto bind = [&](const ref<ComputePass>& pass)
     {
@@ -91,6 +127,13 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         var["CB"]["gSpatialDepthThreshold"] = mSpatialDepthThreshold;
         var["CB"]["gSpatialNormalThreshold"] = mSpatialNormalThreshold;
         var["CB"]["gSpatialNeighborOffset"] = mSpatialNeighborOffset;
+        var["CB"]["gHistoryValid"] = uint32_t(mGRIS.historyValid);
+        var["CB"]["gTemporalReprojection"] = uint32_t(mTemporalReprojection);
+        var["CB"]["gMaxHistoryLength"] = mMaxHistoryLength;
+        var["CB"]["gTemporalDepthThreshold"] = mTemporalDepthThreshold;
+        var["CB"]["gTemporalNormalThreshold"] = mTemporalNormalThreshold;
+        var["CB"]["gPreviousViewProj"] = mGRIS.previousViewProj;
+        var["CB"]["gPreviousCameraPosition"] = mGRIS.previousCameraPosition;
         var["gPrimary"] = mGRIS.primary;
         var["gFresh"] = mGRIS.fresh;
         var["gReference"] = mGRIS.reference;
@@ -114,6 +157,21 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         mGRIS.tracePaths->execute(context, uint3(dimensions, 1));
     }
     ref<Buffer> current = mGRIS.fresh;
+    if (useTemporal)
+    {
+        FALCOR_PROFILE(context, "GRIS.TemporalReuse");
+        bind(mGRIS.temporalReuse);
+        auto var = mGRIS.temporalReuse->getRootVar();
+        var["gHistoryPrimary"] = mGRIS.historyPrimary;
+        var["gHistoryReservoir"] = mGRIS.historyReservoir;
+        var["gTemporalOutput"] = mGRIS.temporal;
+        if (auto texture = data.getTexture("mvec")) var["gMotionVector"] = texture;
+        if (auto texture = data.getTexture("temporalDebug")) var["gTemporalDebug"] = texture;
+        mpScene->bindShaderDataForRaytracing(context, var["gScene"]);
+        mGRIS.temporalReuse->execute(context, uint3(dimensions, 1));
+        current = mGRIS.temporal;
+    }
+    const ref<Buffer> temporal = current;
     if (useSpatial)
     {
         for (uint round = 0; round < mSpatialReuseRounds; ++round)
@@ -138,12 +196,25 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         bind(mGRIS.resolve);
         auto var = mGRIS.resolve->getRootVar();
         var["gCurrent"] = current;
+        if (data.getTexture("temporalColor")) var["gTemporal"] = temporal;
         var["gColor"] = data.getTexture("color");
         if (auto texture = data.getTexture("ptReference")) var["gPTReference"] = texture;
         if (auto texture = data.getTexture("reservoirF")) var["gReservoirF"] = texture;
         if (auto texture = data.getTexture("reservoirDebug")) var["gReservoirDebug"] = texture;
         if (auto texture = data.getTexture("initialColor")) var["gInitialColor"] = texture;
+        if (auto texture = data.getTexture("temporalColor")) var["gTemporalColor"] = texture;
         mGRIS.resolve->execute(context, uint3(dimensions, 1));
+    }
+    if (useTemporal)
+    {
+        // Reference endFrame preserves the FINAL spatial reservoir, together with the
+        // actual primary directions. All history readers have finished before these copies.
+        FALCOR_PROFILE(context, "GRIS.StoreHistory");
+        context->copyResource(mGRIS.historyReservoir.get(), current.get());
+        context->copyResource(mGRIS.historyPrimary.get(), mGRIS.primary.get());
+        mGRIS.previousViewProj = camera->getViewProjMatrixNoJitter();
+        mGRIS.previousCameraPosition = camera->getPosition();
+        mGRIS.historyValid = true;
     }
     ++mGRIS.frameIndex;
 }

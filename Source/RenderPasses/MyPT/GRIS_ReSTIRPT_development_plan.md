@@ -9,7 +9,7 @@
 
 GRIS 是理论框架；本计划的具体算法基线是用户提供的 2022 年 ReSTIR PT 实现，采用 `PathSamplingMode::ReSTIR` 分支。先对齐该分支，再考虑其他方法。资料定位如下：
 
-- 当前项目：`C:/Users/13243/Desktop/Restir/Falcor`，HEAD 为 `901e4e96a40e3a27a6a9d9f34a9e0718381984e9`。
+- 当前项目：`C:/Users/13243/Desktop/Restir/Falcor`，计划初建时的基线 HEAD 为 `901e4e96a40e3a27a6a9d9f34a9e0718381984e9`；各轮实施版本见对应验收记录和 source_state.json。
 - 参考项目：`C:/Users/13243/Desktop/Restir/ReSTIR_PT`，HEAD 为 `8d12332228eb64bc234e27c6f7e0913a926285ab`。该工作区另有核心 API、构建及 Mogwai 文件的本地修改；引用以本次读取的源码为准。
 - 理论依据：本地 `C:/Users/13243/Desktop/Restir/sig22_GRIS.pdf`，重点为 §4.3–4.4、§5.6、§6.2–6.5、§7、§8.1–8.3。
 - 本文源码链接定位到实际文件和起始行；后续修改可能使行号变化，应优先按函数名查找。
@@ -340,18 +340,44 @@ M 表示复用置信权重，不等同于实际追踪射线数，也不等同于
 
 ### M3. 纯 Reconnection 与空间 Pairwise
 
-- [ ] 实现连接两端 BSDF/PDF、几何与 PSS Jacobian、可见性和终止分支。
-- [ ] 完成 P6，先固定一个邻居，再启用邻居分布和多轮 ping-pong。
-- [ ] 验证双向求值、支持域及 canonical 权重；P5 在该模式下无需执行。
+第二轮实施约束（2026-09-09，对照 `Shift.slang::computeShiftedIntegrandReconnection`、`SpatialReuse.cs.slang` 的 Pairwise 分支、`PathReservoir.slang::mergeWithResamplingMIS/finalizeGRIS`）：
+
+- 在现有 ReSTIR 的 P1 → P2 → P7 中插入 P6 SpatialReuse；纯重连直接读取主表面，不创建 P5 Retrace。UI 仍只有 PT / ReSTIR，启用原有空间邻居、半径及几何阈值参数，增加空间开关和轮次。
+- 保留完整候选生成器与初始 RIS。将固定重连点前后事件单独保存，补充前端 PDF、重连点 PDF、几何项；紧接重连点的 BSDF 命中光源/环境需缓存不含终止 MIS 的后缀，在 shift 中重新计算 MIS。多轮选中样本必须写回目的空间的 F 和 Jacobian 元数据。
+- Falcor 8 的 `StandardBSDF.sample()` 返回选中 lobe 的权重与混合 PDF，而 shift 求完整 BSDF。StandardMaterial 连续事件的候选 throughput 因此改为完整 `eval/pdf`（delta 保留原权重），统一候选与 shift 的测度；同树 PTReference 随之更新，均值应保持，单帧不要求与第一轮历史图逐位相同。另在 MyPT 共享 PDF helper 中修正该版本 StandardMaterial reference sampling 对透射返回负 PDF 的符号。其他材质保留原采样权重；本轮仅允许 StandardMaterial 作为重连的两端，分层材质的近似 PDF 不用于该映射。
+- 主表面自发光、主表面 NEE，以及重连点前后 delta 路径暂不做跨像素映射，采用对称的失败支持域。保留它们在原 reservoir 中，通过参考 defensive canonical 权重保留本像素贡献；不能依据中心抽中何种路径跳过整轮。无需改变直接光分工，也不使用缓存旧方向 Lout。
+- 初始树到达固定 rc 后，用与 shift 相同的可见性规则检查存储顶点重建的源连接。若浮点重建或端点偏移使其被相邻几何遮挡，明确标记为本地路径，由 canonical 保留其贡献；不扩大射线终点容差放过遮挡，也不允许只能单向成立的映射进入复用。
+- 冻结中心样本；几何合法邻居先计数，再进行双向 shift。失败、零贡献和零 M 不混同于几何无效。合并权重为 `pHat(Fshift) * J * Wsrc * MIS`，不重复乘 M；最后除选中目标值以及 `validNeighborCount + 1`，不再除累计 M。
+- 每轮只读输入、单线程写本像素输出，使用独立 scratch ping-pong；空间关闭、邻居数为零、轮次为零时完整旁路。先用固定偏移验证，再测随机邻居、重复/无效邻居和多轮。
+- 增加可选诊断输出用于检查初始结果、有效/成功邻居、同上下文贡献重建误差和跨像素往返 Jacobian/贡献误差。自身像素用解析恒等映射 J=1，跨轮累计最大误差。保存独立种子能量结果，继续将跨 Falcor 版本的完整参考 HDR 对拍列为未完成。
+
+- 本轮启用参考 `Shift.slang:556` 的对称 Jacobian 拒绝规则，采用参考阈值 10，即 `max(J, 1/J) <= 11`，另留 `1e-5` 相对浮点边界容差。Falcor 8 的极端粗糙透射 PDF 在同一上下文重评时可能产生相对误差；拒绝这类映射并由 canonical 保留原贡献，不裁剪辐射值。此支持域限制必须在材质回归和第二轮结果中明确记录。
+
+- [x] 实现连接两端 BSDF/PDF、几何与 PSS Jacobian、可见性和终止分支。
+- [x] 完成 P6，先固定一个邻居，再启用邻居分布和多轮 ping-pong。
+- [x] 验证双向求值、支持域及 canonical 权重；P5 在该模式下无需执行。
+
+第二轮验收已通过，详见 [GRIS_round2_results.md](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round2_results.md)。五组必需能量测试、全部数值/边界检查及原 MyPT.py 入口通过；均匀透射的小预算能量回归仍为统计精度不足，不声称完整材质画质已对齐。
 
 **依赖：** M2。  
 **完成条件：** 静态漫反射及遮挡场景通过能量测试；glossy 测试可以噪声较大，但不能用旧方向 Lout 近似代替正确求值。
 
 ### M4. 时间 Talbot 与历史管理
 
-- [ ] 完成 P4 和历史主表面重建；先使用纯 Reconnection。
-- [ ] 处理首帧、无效历史、参数重置、相机移动和遮挡显露。
-- [ ] 按参考 historyLength × currentM 规则处理时间置信权重。
+第三轮实施约束（对照参考 TemporalReuse 的 Talbot 分支与 ReSTIRPTPass.cpp 帧末历史保存）：
+
+- 扩展原流程为 `GeneratePaths → TracePaths → TemporalReuse → SpatialReuse × rounds → Resolve`；仍只保留 PT / ReSTIR 模式。纯重连不增加 TemporalPathRetrace，P3 留到 M5。
+- 历史 reservoir 和历史 PrimaryPathContext（hit 与实际 direction）独立保留至本帧所有 pass 结束；下一帧历史取本帧最终空间结果。fresh 始终保留作初始 RIS 对照。
+- 历史 M 仅在读取时限制为 `min(history.M, historyLength * fresh.M)`，不修改历史 W。Talbot 对当前和历史做双向 shift 后合并，最终不除 2、不除 M。合法历史的零贡献/失败 shift 仍累计 M；无合法历史时完整旁路。
+- 使用已有 mvec 输入的归一化 current→previous 偏移；缺输入时按上一帧无抖动 VP 投影静态世界坐标。随机取整前检查有限值与屏幕范围。历史命中、材质、法线和同一历史相机空间的深度用于拒绝不相符的表面。只有 hit 与实际射线方向完全相同才使用恒等映射。
+- 场景切换、尺寸/参数变化、相机实质参数变化、几何/材质/光照变化清空历史；相机移动允许重投影，每帧 Jitter/History 更新不清空历史。本轮不复用已改变的几何/材质/光照后缀，也不扩展 DOF 历史复用。
+- 增加可选 temporalColor / temporalDebug 输出，验证 temporal-only、spatial-only、二者结合、历史上限、重置、相机运动与显露区域；统计单位为独立完整 seed 序列，不把相关历史帧当独立样本。
+
+- [x] 完成 P4 和历史主表面重建；先使用纯 Reconnection。
+- [x] 处理首帧、无效历史、参数重置、相机移动和遮挡显露。
+- [x] 按参考 historyLength × currentM 规则处理时间置信权重。
+
+第三轮验收已通过，详见 [GRIS_round3_results.md](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round3_results.md)。25 项边界检查、四组必需能量对照及原 MyPT.py 入口通过；首轮统计精度不足的两组使用新的独立种子完成固定预算确认，两份报告分别保留。M4 仍限定为纯重连，不代表 Hybrid、任意动态场景或跨版本完整画面对齐。
 
 **依赖：** M3。  
 **完成条件：** 分别记录 spatial-only、temporal-only、temporal+spatial 的结果；独立运行统计不显示持续能量偏移。
@@ -449,9 +475,17 @@ M 表示复用置信权重，不等同于实际追踪射线数，也不等同于
 - [x] 接通 GeneratePaths、TracePaths、Resolve 三个实际 GPU pass。
 - [x] 引入反射创建的 reservoir 和明确的当前帧缓冲生命周期；没有创建未使用的历史池。
 - [x] 完成静态有限路径长度、无时空复用的本地初始 RIS 基线验证。
-- [x] 将实际测试与限制写入相邻的 GRIS_round1_results.md。下一轮 M3 仍需验证 shift，不代表效果已经对齐完整 GRIS。
+- [x] 将第一轮实际测试与限制写入相邻的 GRIS_round1_results.md。第一轮不包含 shift，也不代表效果已经对齐完整 GRIS。
 
-后续按 M3 → M4 → M5 → M6 推进。任何阶段出现未解释的能量差，先定位该阶段的路径覆盖、测度、支持域和权重，不使用曝光系数或辐射 clamp 消除差异。
+## 11. 第二轮实施结果
+
+M3 已在原 ReSTIR 中完成：`GeneratePaths → TracePaths → SpatialReuse × rounds → Resolve`，没有新增 PT 模式。17 项边界检查、11 组场景配置的数值检查、五组必需能量对照、分层材质 canonical 兼容性和用户原启动脚本均通过。测试参数、参考对应、Jacobian 支持域限制和统计精度不足项见 [第二轮结果](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round2_results.md)。
+
+## 12. 第三轮实施结果
+
+M4 已在原 ReSTIR 中完成：`GeneratePaths → TracePaths → TemporalReuse → SpatialReuse × rounds → Resolve → StoreHistory`。保留现有 PT / ReSTIR 两项 UI，原 MyPT.py 显式启用时间复用。25 项边界检查通过；首轮和独立确认合计执行 81,920 个能量测试帧，四组必需场景的时间/最终输出均通过相对初始 RIS 和同树 PTReference 的逐 RGB 配对 95% CI ±1% 检查。对照关系、分组数据、首轮精度不足记录和适用范围见 [第三轮结果](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round3_results.md)。
+
+后续按 M5 → M6 推进。任何阶段出现未解释的能量差，先定位该阶段的路径覆盖、测度、支持域和权重，不使用曝光系数或辐射 clamp 消除差异。
 
 ## 源码定位
 

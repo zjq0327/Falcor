@@ -9,9 +9,9 @@ def render_graph_MyPT():
     ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
     g.addPass(ToneMapper, "ToneMapper")
 
-    # GRIS second round: initial RIS -> pure reconnection / spatial Pairwise -> resolve.
-    # Keep the existing PT / ReSTIR modes. Temporal reuse follows in the next milestone.
-    MyPT = createPass("MyPT", {'mode': 'ReSTIR', 'giRISCandidateCount': 1, 'maxBounces': 8, 'computeDirect': True, 'useImportanceSampling': True, 'useMIS': True, 'rrProbability': 0.0, 'seed': 0, 'spatialReuse': True, 'spatialNeighborCount': 3, 'spatialRadius': 20.0, 'spatialReuseRounds': 1})
+    # GRIS third round: initial RIS -> temporal Talbot -> spatial Pairwise -> resolve.
+    # Keep the existing PT / ReSTIR modes and the original display graph.
+    MyPT = createPass("MyPT", {'mode': 'ReSTIR', 'giRISCandidateCount': 1, 'maxBounces': 8, 'computeDirect': True, 'useImportanceSampling': True, 'useMIS': True, 'rrProbability': 0.0, 'seed': 0, 'temporalReuse': True, 'temporalReprojection': True, 'maxHistoryLength': 20, 'spatialReuse': True, 'spatialNeighborCount': 3, 'spatialRadius': 20.0, 'spatialReuseRounds': 1})
     g.addPass(MyPT, "MyPT")
 
     VBufferRT = createPass("VBufferRT", {'samplePattern': 'Stratified', 'sampleCount': 16})

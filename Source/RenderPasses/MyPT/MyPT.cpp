@@ -118,6 +118,10 @@ void MyPT::parseProperties(const Properties& props)
             mRRProbability = value;
         else if (key == kMaxHistoryLength)
             mMaxHistoryLength = value;
+        else if (key == "temporalReuse")
+            mTemporalReuse = value;
+        else if (key == "temporalReprojection")
+            mTemporalReprojection = value;
         else if (key == kTemporalDepthThreshold)
             mTemporalDepthThreshold = value;
         else if (key == kTemporalNormalThreshold)
@@ -142,6 +146,9 @@ void MyPT::parseProperties(const Properties& props)
     FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
     FALCOR_CHECK(mMaxBounces < 65536, "maxBounces must be less than 65536.");
     FALCOR_CHECK(mRRProbability >= 0.f && mRRProbability <= 0.95f, "rrProbability must be in [0, 0.95].");
+    FALCOR_CHECK(mMaxHistoryLength <= 128, "maxHistoryLength must be in [0, 128].");
+    FALCOR_CHECK(mTemporalDepthThreshold >= 0.f && mTemporalDepthThreshold <= 1.f, "temporalDepthThreshold must be in [0, 1].");
+    FALCOR_CHECK(mTemporalNormalThreshold >= -1.f && mTemporalNormalThreshold <= 1.f, "temporalNormalThreshold must be in [-1, 1].");
     FALCOR_CHECK(mSpatialNeighborCount <= 16 && mSpatialReuseRounds <= 8, "Spatial neighbors must be in [0, 16], rounds in [0, 8].");
     FALCOR_CHECK(mSpatialRadius >= 0.f && mSpatialRadius <= 128.f, "spatialRadius must be in [0, 128].");
     FALCOR_CHECK(mSpatialDepthThreshold >= 0.f && mSpatialDepthThreshold <= 1.f, "spatialDepthThreshold must be in [0, 1].");
@@ -164,6 +171,8 @@ Properties MyPT::getProperties() const
     props[kUseMIS] = mUseMIS;
     props[kRRProbability] = mRRProbability;
     props[kMaxHistoryLength] = mMaxHistoryLength;
+    props["temporalReuse"] = mTemporalReuse;
+    props["temporalReprojection"] = mTemporalReprojection;
     props[kTemporalDepthThreshold] = mTemporalDepthThreshold;
     props[kTemporalNormalThreshold] = mTemporalNormalThreshold;
     props[kSpatialNeighborCount] = mSpatialNeighborCount;
@@ -193,6 +202,10 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
         .flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addOutput("spatialDebug", "Last-round eligible/successful neighbors; max identity/round-trip error over all rounds")
         .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("temporalColor", "RIS after temporal reuse and before spatial reuse")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("temporalDebug", "Temporal status, clamped history M, accepted incoming sample, round-trip error")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
 
     return reflector;
 }
@@ -207,16 +220,18 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         dict[Falcor::kRenderPassRefreshFlags] = flags | Falcor::RenderPassRefreshFlags::RenderOptionsChanged;
         mOptionsChanged = false;
         mGRIS.frameIndex = 0;
+        mGRIS.historyValid = false;
     }
 
     // Resolve writes every diagnostic pixel in ReSTIR. PT/no-scene diagnostics are explicitly zero.
     if (!mpScene || mMode == Mode::PT)
-        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug", "initialColor", "spatialDebug"})
+        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug", "initialColor", "spatialDebug", "temporalColor", "temporalDebug"})
             if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
 
     // If we have no scene, just clear the outputs and return.
     if (!mpScene)
     {
+        mGRIS.historyValid = false;
         for (auto it : kOutputChannels)
         {
             Texture* pDst = renderData.getTexture(it.name).get();
@@ -252,6 +267,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
 
     // Specialize program.
+    mGRIS.historyValid = false; // PT must never leave reusable ReSTIR history behind.
     // These defines should not modify the program vars. Do not trigger program vars re-creation.
     mTracer.pProgram->addDefine("MAX_BOUNCES", std::to_string(mMaxBounces));
     mTracer.pProgram->addDefine("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
@@ -300,6 +316,15 @@ void MyPT::renderUI(Gui::Widgets& widget)
         widget.tooltip("Complete candidate path trees. 0 retains direct-only rendering using one tree.");
         dirty |= widget.var("Seed", mSeed);
         if (widget.button("Reset sampling")) dirty = true;
+        dirty |= widget.checkbox("Temporal reuse", mTemporalReuse);
+        if (mTemporalReuse)
+        {
+            dirty |= widget.checkbox("Temporal reprojection", mTemporalReprojection);
+            dirty |= widget.var("History length", mMaxHistoryLength, 0u, 128u);
+            dirty |= widget.var("Temporal depth threshold", mTemporalDepthThreshold, 0.f, 1.f);
+            dirty |= widget.var("Temporal normal threshold", mTemporalNormalThreshold, -1.f, 1.f);
+            widget.tooltip("Talbot MIS with pure reconnection. History length 0 bypasses temporal reuse. Depth of field bypasses temporal reuse in this version.");
+        }
         dirty |= widget.checkbox("Spatial reuse", mSpatialReuse);
         if (mSpatialReuse)
         {
@@ -310,7 +335,6 @@ void MyPT::renderUI(Gui::Widgets& widget)
             dirty |= widget.var("Spatial normal threshold", mSpatialNormalThreshold, -1.f, 1.f);
             widget.tooltip("Pure reconnection with defensive Pairwise MIS. Jacobian ratio is limited to 11 in either direction. Zero neighbors or rounds bypass reuse.");
         }
-        widget.text("Temporal reuse is not enabled yet.");
     }
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 65535u);
     widget.tooltip("0 = direct lighting; 1 = one indirect bounce. Shared by PT and ReSTIR.");
@@ -325,6 +349,7 @@ void MyPT::renderUI(Gui::Widgets& widget)
 void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     resetGRIS();
+    mPendingSceneUpdates = Scene::UpdateFlags::None;
     // Clear data for previous scene.
     mTracer.pProgram = nullptr;
     mTracer.pBindingTable = nullptr;
@@ -378,6 +403,12 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 
         mTracer.pProgram = Program::create(mpDevice, desc, defines);
     }
+}
+
+void MyPT::onSceneUpdates(RenderContext*, Scene::UpdateFlags updates)
+{
+    // RenderGraph retains changes made while another graph was active.
+    mPendingSceneUpdates |= updates;
 }
 
 void MyPT::prepareVars()

@@ -5,6 +5,7 @@ RWTexture2D<float4> gPTReference;
 RWTexture2D<float4> gReservoirF;
 RWTexture2D<float4> gReservoirDebug;
 RWTexture2D<float4> gInitialColor;
+RWTexture2D<float4> gTemporalColor;
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -15,6 +16,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     PathReservoir reservoir = gCurrent[index];
     float3 color = reservoir.sample.F * reservoir.W;
     gColor[pixel] = float4(color, 1.f);
+#if GRIS_HAS_TEMPORAL_COLOR
+    PathReservoir temporal = gTemporal[index];
+    gTemporalColor[pixel] = float4(temporal.sample.F * temporal.W, 1.f);
+#endif
 #if GRIS_HAS_INITIAL
     PathReservoir fresh = gFresh[index];
     gInitialColor[pixel] = float4(fresh.sample.F * fresh.W, 1.f);

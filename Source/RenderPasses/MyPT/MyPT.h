@@ -55,7 +55,7 @@ public:
     enum class Mode
     {
         PT,     ///< Brute-force path tracing (default).
-        ReSTIR, ///< Complete-path RIS and spatial GRIS with pure reconnection.
+        ReSTIR, ///< Complete-path RIS and temporal/spatial GRIS with pure reconnection.
     };
 
     FALCOR_ENUM_INFO(
@@ -78,6 +78,7 @@ public:
     virtual void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
     virtual void renderUI(Gui::Widgets& widget) override;
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
+    virtual void onSceneUpdates(RenderContext* pRenderContext, Scene::UpdateFlags updates) override;
     virtual bool onMouseEvent(const MouseEvent& mouseEvent) override { return false; }
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
 
@@ -110,7 +111,9 @@ private:
     /// Legacy option. M0-M2 always tests NEE visibility before reservoir insertion.
     bool mUseInitialVisibility = true;
 
-    /// Temporal settings retained for saved scripts; temporal reuse is a later milestone.
+    /// Existing scripts opt in; MyPT.py enables temporal and spatial reuse explicitly.
+    bool mTemporalReuse = false;
+    bool mTemporalReprojection = true;
     uint mMaxHistoryLength = 20;
     /// Relative depth threshold for ReSTIR temporal reuse (fraction of depth).
     float mTemporalDepthThreshold = 0.1f;
@@ -145,6 +148,7 @@ private:
     /// Frame count since scene was loaded.
     uint mFrameCount = 0;
     bool mOptionsChanged = false;
+    Scene::UpdateFlags mPendingSceneUpdates = Scene::UpdateFlags::None;
 
     // Existing ReSTIR uses the shared configuration above.
     uint32_t mSeed = 0;
@@ -152,16 +156,23 @@ private:
     {
         ref<ComputePass> generatePaths;
         ref<ComputePass> tracePaths;
+        ref<ComputePass> temporalReuse;
         ref<ComputePass> spatialReuse;
         ref<ComputePass> resolve;
         ref<Buffer> primary;
         ref<Buffer> fresh;
         ref<Buffer> reference;
+        ref<Buffer> temporal;
+        ref<Buffer> historyPrimary;
+        ref<Buffer> historyReservoir;
         ref<Buffer> spatial[2];
         std::unique_ptr<EnvMapSampler> envSampler;
         DefineList defines;
         uint2 dimensions = uint2(0);
         uint32_t frameIndex = 0;
+        bool historyValid = false;
+        float4x4 previousViewProj = float4x4::identity();
+        float3 previousCameraPosition = float3(0.f);
     } mGRIS;
 
     // Existing PT ray tracing program. ReSTIR uses explicit compute passes.

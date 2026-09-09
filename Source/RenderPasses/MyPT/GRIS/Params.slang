@@ -15,10 +15,18 @@ cbuffer CB
     float gSpatialDepthThreshold;
     float gSpatialNormalThreshold;
     int2 gSpatialNeighborOffset;
+    uint gHistoryValid;
+    uint gTemporalReprojection;
+    uint gMaxHistoryLength;
+    float gTemporalDepthThreshold;
+    float gTemporalNormalThreshold;
+    float4x4 gPreviousViewProj;
+    float3 gPreviousCameraPosition;
 };
 RWStructuredBuffer<PrimaryPathContext> gPrimary;
 RWStructuredBuffer<PathReservoir> gFresh;
 RWStructuredBuffer<float4> gReference;
 StructuredBuffer<PathReservoir> gCurrent;
+StructuredBuffer<PathReservoir> gTemporal;
 
 uint pixelIndex(uint2 pixel) { return pixel.y * gDimensions.x + pixel.x; }
