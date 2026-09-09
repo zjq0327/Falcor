@@ -30,6 +30,7 @@
 #include "RenderGraph/RenderPass.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Rendering/Lights/EmissiveLightSampler.h"
+#include "Rendering/Lights/EnvMapSampler.h"
 
 using namespace Falcor;
 
@@ -54,7 +55,7 @@ public:
     enum class Mode
     {
         PT,     ///< Brute-force path tracing (default).
-        ReSTIR, ///< ReSTIR (placeholder, not yet implemented).
+        ReSTIR, ///< Complete-path initial RIS, migrated incrementally toward GRIS.
     };
 
     FALCOR_ENUM_INFO(
@@ -83,6 +84,8 @@ public:
 private:
     void parseProperties(const Properties& props);
     void prepareVars();
+    void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData);
+    void resetGRIS();
 
     // Internal state
 
@@ -98,17 +101,16 @@ private:
     /// Rendering mode (path tracing or ReSTIR).
     Mode mMode = Mode::PT;
 
-    /// Number of candidate light samples (M) used by ReSTIR DI RIS.
+    /// Retained for old script compatibility; separate DI reuse is not dispatched in M0-M2.
     uint mRISCandidateCount = 32;
 
-    /// Number of candidate paths (M) used by ReSTIR GI RIS.
+    /// Independent complete path-tree candidates; 0 preserves direct-only rendering.
     uint mGIRISCandidateCount = 8;
 
-    /// Check visibility of the RIS-selected sample before it enters the temporal/spatial reuse chain.
-    /// When disabled, saves one shadow ray per pixel; visibility is then only measured at final shading.
+    /// Legacy option. M0-M2 always tests NEE visibility before reservoir insertion.
     bool mUseInitialVisibility = true;
 
-    /// Max accumulated sample count (M) for ReSTIR temporal reuse.
+    /// Reuse settings retained for saved scripts and subsequent milestones; currently inactive.
     uint mMaxHistoryLength = 20;
     /// Relative depth threshold for ReSTIR temporal reuse (fraction of depth).
     float mTemporalDepthThreshold = 0.1f;
@@ -140,24 +142,28 @@ private:
     uint mFrameCount = 0;
     bool mOptionsChanged = false;
 
-    /// ReSTIR reservoir buffers (previous / temporal / spatial).
-    ref<Buffer> mpReservoirPrev;     ///< Previous frame's final (spatially-reused) reservoir.
-    ref<Buffer> mpReservoirTemporal; ///< This frame's temporally-reused reservoir.
-    ref<Buffer> mpReservoirSpatial;  ///< This frame's spatially-reused reservoir.
+    // Existing ReSTIR uses the shared configuration above; only the seed is new.
+    uint32_t mSeed = 0;
+    struct
+    {
+        ref<ComputePass> generatePaths;
+        ref<ComputePass> tracePaths;
+        ref<ComputePass> resolve;
+        ref<Buffer> primary;
+        ref<Buffer> fresh;
+        ref<Buffer> reference;
+        std::unique_ptr<EnvMapSampler> envSampler;
+        DefineList defines;
+        uint2 dimensions = uint2(0);
+        uint32_t frameIndex = 0;
+    } mGRIS;
 
-    /// ReSTIR GI reservoir buffers (previous / temporal / spatial).
-    ref<Buffer> mpGIReservoirPrev;     ///< Previous frame's final (spatially-reused) GI reservoir.
-    ref<Buffer> mpGIReservoirTemporal; ///< This frame's temporally-reused GI reservoir.
-    ref<Buffer> mpGIReservoirSpatial;  ///< This frame's spatially-reused GI reservoir.
-
-    // Ray tracing program, shared by both the restirGen and rayGen passes.
+    // Existing PT ray tracing program. ReSTIR uses explicit compute passes.
     struct
     {
         ref<Program> pProgram;
         ref<RtBindingTable> pBindingTable;       ///< Full SBT (miss/hit groups) for the rayGen pass.
         ref<RtProgramVars> pVars;                ///< Vars for the rayGen pass.
-        ref<RtBindingTable> pRestirBindingTable; ///< Raygen-only SBT for the restirGen pass.
-        ref<RtProgramVars> pRestirVars;          ///< Vars for the restirGen pass.
     } mTracer;
 };
 

@@ -62,22 +62,13 @@ import Utils.Sampling.SampleGenerator;
 import Rendering.Lights.LightHelpers;
 import Rendering.Lights.EmissiveLightSampler;
 import Utils.Color.ColorHelpers;
-import MyPTRestir;
-import MyPTRestirGI;
+import MyPTCommon;
 
 cbuffer CB
 {
     uint gFrameCount;    // Frame count since scene was loaded.
     uint gPRNGDimension; // First available PRNG dimension.
     float gRRProbability; // Fixed probability for russian roulette path termination.
-    uint gMaxHistoryLength;         // Max accumulated sample count M for ReSTIR temporal reuse.
-    float gTemporalDepthThreshold;  // Max world-space position difference for temporal reuse.
-    float gTemporalNormalThreshold; // Min cosine between normals for temporal reuse.
-    uint gSpatialNeighborCount;     // Number of spatial reuse neighbor samples K.
-    float gSpatialRadius;           // Max pixel radius for spatial neighbor selection.
-    float gSpatialDepthThreshold;   // Max world-space position difference for spatial reuse.
-    float gSpatialNormalThreshold;  // Min cosine between normals for spatial reuse.
-    uint gGIRISCandidateCount;      // Number of candidate paths (M) used by ReSTIR GI RIS.
 }
 
 // Inputs
@@ -88,21 +79,7 @@ Texture2D<float2> gMotionVector; // Optional
 // Outputs
 RWTexture2D<float4> gOutputColor;
 
-// ReSTIR reservoir buffers.
-RWStructuredBuffer<Reservoir> gReservoirPrev;     // Previous frame's final (spatially-reused) reservoir.
-RWStructuredBuffer<Reservoir> gReservoirTemporal; // This frame's temporally-reused reservoir (input to spatial reuse).
-RWStructuredBuffer<Reservoir> gReservoirSpatial;  // This frame's spatially-reused reservoir (input to next frame's temporal reuse).
-
-// ReSTIR GI reservoir buffers (1-bounce path samples).
-RWStructuredBuffer<GIPathReservoir> gGIReservoirPrev;     // Previous frame's final (spatially-reused) GI reservoir.
-RWStructuredBuffer<GIPathReservoir> gGIReservoirTemporal; // This frame's temporally-reused GI reservoir (input to spatial reuse).
-RWStructuredBuffer<GIPathReservoir> gGIReservoirSpatial;  // This frame's spatially-reused GI reservoir (input to next frame's temporal reuse).
-
-// The emissive light sampler (EmissiveLightSampler typedef, selected via _EMISSIVE_LIGHT_SAMPLER_TYPE)
-// is instantiated LOCALLY where needed instead of being declared as a global uniform parameter.
-// It is stateless (only dummy data; all methods read from gScene.lightCollection), so a local
-// instance behaves identically while avoiding a loose uniform struct in the root signature,
-// which Falcor's RtProgramVars cannot bind for ray tracing programs.
+// MyPTCommon declares the emissive sampler parameter block; execute() binds its alias table.
 
 // Static configuration based on defines set from the host.
 #define is_valid(name) (is_valid_##name != 0)
@@ -110,17 +87,12 @@ static const uint kMaxBounces = MAX_BOUNCES;
 static const bool kComputeDirect = COMPUTE_DIRECT;
 static const bool kUseImportanceSampling = USE_IMPORTANCE_SAMPLING;
 static const bool kUseMIS = USE_MIS;
-static const bool kUseReSTIR = USE_RESTIR;
-static const uint kRISCandidateCount = RIS_CANDIDATE_COUNT;
-static const uint kGIRISCandidateCount = GIRIS_CANDIDATE_COUNT;
-static const bool kUseInitialVisibility = USE_INITIAL_VISIBILITY;
 static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
 static const bool kUseEmissiveLights = USE_EMISSIVE_LIGHTS;
 static const bool kUseEnvLight = USE_ENV_LIGHT;
 static const bool kUseEnvBackground = USE_ENV_BACKGROUND;
 static const float3 kDefaultBackgroundColor = float3(0, 0, 0);
 static const float kRayTMax = FLT_MAX;
-static const uint kSpatialPRNGOffset = 64; // Extra PRNG advance for the spatial reuse pass to decorrelate from the RIS pass.
 
 /**
  * Payload for shadow ray.
@@ -162,40 +134,6 @@ struct ScatterRayData
         this.sg = sg;
     }
 };
-
-/**
- * Payload for a ReSTIR GI path-sampling ray (1-bounce: x1 -> x2).
- * The closest-hit shader fills x2PosW/x2Normal/Lout; the raygen consumes them.
- */
-struct GIPathSampleData
-{
-    bool hit;           ///< True if the path hit a surface (x2 is valid).
-    float dist;         ///< Distance |x1 - x2| (t of the traced ray).
-    float3 x2PosW;      ///< x2 world position.
-    float3 x2Normal;    ///< x2 oriented normal (for the reconnection Jacobian).
-    float3 Lout;        ///< L_out(x2) = emission + direct (NEE), computed in the hit shader.
-    SampleGenerator sg; ///< Sample generator used for NEE at x2 (copied from the caller).
-};
-
-/**
- * Setup ShadingData based on loaded vertex/material attributes for a hit point.
- * @param[in] hit Hit information.
- * @param[in] rayDir Normalized ray direction.
- * @return ShadingData struct.
- */
-ShadingData loadShadingData(const HitInfo hit, const float3 rayDir)
-{
-    VertexData v = {};
-    uint materialID = {};
-
-    const TriangleHit triangleHit = hit.getTriangleHit();
-    v = gScene.getVertexData(triangleHit);
-    materialID = gScene.getMaterialID(triangleHit.instanceID);
-
-    ShadingData sd = gScene.materials.prepareShadingData(v, materialID, -rayDir);
-
-    return sd;
-}
 
 /**
  * Returns the primary ray's direction.
@@ -262,46 +200,6 @@ void traceScatterRay(inout ScatterRayData rayData)
 }
 
 /**
- * Traces a ReSTIR GI path-sampling ray (1-bounce) from x1 along `dir` to x2.
- * The closest-hit shader (giPathTriangleMeshClosestHit) evaluates L_out(x2).
- * @param[in] origin Ray origin (offset from x1).
- * @param[in] dir Normalized sampled direction.
- * @param[in,out] data Payload; filled by the hit/miss shader.
- */
-void traceGIPathSample(const float3 origin, const float3 dir, inout GIPathSampleData data)
-{
-    RayDesc ray;
-    ray.Origin = origin;
-    ray.Direction = dir;
-    ray.TMin = 0.f;
-    ray.TMax = kRayTMax;
-
-    TraceRay(
-        gScene.rtAccel,
-        0 /* rayFlags */,
-        0xff /* instanceInclusionMask */,
-        2 /* hitIdx (rayType giPath) */,
-        rayTypeCount,
-        2 /* missIdx (giPathMiss) */,
-        ray,
-        data
-    );
-}
-
-/**
- * Evaluate the multiple importance sampling weight using the power heuristic.
- * @param[in] p0 Pdf of the first sampling strategy.
- * @param[in] p1 Pdf of the second sampling strategy.
- * @return Weight for the contribution from the first strategy.
- */
-float evalMIS(float p0, float p1)
-{
-    float q0 = p0 * p0;
-    float q1 = p1 * p1;
-    return q0 / (q0 + q1);
-}
-
-/**
  * Evaluates the direct illumination from analytic lights.
  * This function samples Falcor's light list uniformly with one shadow ray.
  * @param[in] sd Shading data.
@@ -311,18 +209,9 @@ float evalMIS(float p0, float p1)
  */
 float3 evalDirectAnalytic(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg)
 {
-    const uint lightCount = gScene.getLightCount();
-    if (lightCount == 0)
-        return float3(0.f);
-
-    // Pick one of the analytic light sources randomly with equal probability.
-    const uint lightIndex = min(uint(sampleNext1D(sg) * lightCount), lightCount - 1);
-    float invPdf = lightCount; // Light selection pdf = 1.0 / lightCount.
-
-    // Sample local light source.
     AnalyticLightSample ls;
-    if (!sampleLight(sd.posW, gScene.getLight(lightIndex), sg, ls))
-        return float3(0.f);
+    float invPdf;
+    if (!sampleMyPTAnalyticLight(sd, sg, ls, invPdf)) return 0.f;
 
     // Reject sample if not in the hemisphere of a BSDF lobe.
     const uint lobeTypes = mi.getLobeTypes(sd);
@@ -355,12 +244,9 @@ float3 evalDirectEmissive(const ShadingData sd, const IMaterialInstance mi, inou
 {
     if (!kUseEmissiveLights) return float3(0.f);
 
-    // Instantiate the stateless emissive light sampler locally.
-    EmissiveLightSampler emissiveSampler = {};
-
     // Sample an emissive triangle.
     TriangleLightSample tls;
-    if (!emissiveSampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), false, sg, tls))
+    if (!sampleMyPTEmissiveLight(sd, sg, tls))
         return float3(0.f);
 
     if (tls.pdf <= 0.f) return float3(0.f);
@@ -397,144 +283,17 @@ float3 evalDirect(const ShadingData sd, const IMaterialInstance mi, inout Sample
 }
 
 /**
- * Evaluates direct illumination using a ReSTIR DI reservoir (RIS + temporal reuse).
+ * Generates the next scatter ray using the shared material sampling function.
  * @param[in] sd Shading data.
  * @param[in] mi Material instance.
  * @param[in,out] sg SampleGenerator object.
- * @param[in] r Reservoir containing the selected light sample.
- * @return Outgoing radiance in view direction.
- */
-float3 evalDirectReSTIR(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, inout Reservoir r)
-{
-    if (!r.isValid())
-        return float3(0.f);
-
-    // Compute ray origin with offset applied in direction of the geometry normal to avoid self-intersection.
-    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.dirDistance.xyz) >= 0.f ? sd.faceN : -sd.faceN);
-
-    // Test visibility with a single shadow ray.
-    const bool visible = traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w);
-
-    // Visibility reuse: store this frame's measured visibility back into the reservoir so it
-    // propagates to the next frame's temporal/spatial merge (occluded samples get zero weight there).
-    r.setVisibility(visible ? 1.f : 0.f);
-
-    if (!visible)
-        return float3(0.f);
-
-    // Final contribution: weight * f, where weight is the reference's normalized
-    // weight (stored in radianceWsum.w) and f is the direct light contribution
-    // f = mi.eval * Le. This matches the reference's Li = weight * geomFactor * emission
-    // (the RIS weighting in the reference's p_hat already accounts for the cos theta
-    // and BRDF terms, so the user's weight * f is the correct direct light estimate
-    // under the reference's formulation).
-    const float w = r.radianceWsum.w;
-    if (w <= 0.f || isnan(w) || isinf(w))
-        return float3(0.f);
-
-    const float3 c = w * mi.eval(sd, r.dirDistance.xyz, sg) * r.radianceWsum.xyz;
-    if (isnan(c.x) || isnan(c.y) || isnan(c.z) || isinf(c.x) || isinf(c.y) || isinf(c.z))
-        return float3(0.f);
-    return c;
-}
-
-/**
- * Generate M candidate 1-bounce paths and select one via RIS (ReSTIR GI).
- * Each candidate samples a direction d from the BSDF, traces it to a surface x2,
- * and evaluates the path throughput p_hat = luminance(mi.eval(x1,d) * L_out(x2)).
- * The selected sample stores the x2 vertex (pos/normal), L_out and the source pdf.
- * @param[in] sd Shading data at the primary hit x1.
- * @param[in] mi Material instance.
- * @param[in,out] sg Sample generator.
- * @param[in] M Number of candidate paths.
- * @return GI reservoir containing the selected path sample (invalid if none).
- */
-GIPathReservoir samplePathRIS(const ShadingData sd, const IMaterialInstance mi, inout SampleGenerator sg, const uint M)
-{
-    GIPathReservoir result = {};
-
-    // Store the current-frame geometry for next-frame temporal validation.
-    result.posX1M = float4(sd.posW, 0.f);
-    result.normalX1Pdf = float4(sd.getOrientedFaceNormal(), 0.f);
-    result.normalX2Vis = float4(0.f, 0.f, 0.f, 1.f); // Phase 1: samples are always "visible" (trace hit).
-
-    const float3 origin = sd.computeRayOrigin();
-
-    float Wsum = 0.f;
-    float pHatSelected = 0.f;
-
-    for (uint i = 0; i < M; i++)
-    {
-        // Sample a direction from the BSDF (solid-angle measure).
-        BSDFSample bsdfSample = {};
-        if (!mi.sample(sd, sg, bsdfSample, kUseImportanceSampling))
-            continue;
-        const float3 d = bsdfSample.wo;
-        const float pdf = bsdfSample.pdf;
-        if (pdf <= 0.f)
-            continue;
-
-        // Trace the path to x2 and evaluate L_out(x2) in the hit shader.
-        GIPathSampleData data;
-        data.hit = false;
-        data.dist = 0.f;
-        data.x2PosW = float3(0.f);
-        data.x2Normal = float3(0.f);
-        data.Lout = float3(0.f);
-        data.sg = sg;
-
-        traceGIPathSample(origin, d, data);
-        if (!data.hit)
-            continue;
-
-        const float3 Lout = data.Lout;
-        if (luminance(Lout) <= 0.f)
-            continue;
-
-        // Target function: path throughput p_hat = f(x1,d) * cos(theta) * L_out(x2).
-        // mi.eval already includes the cos(theta) foreshortening term.
-        const float3 f = mi.eval(sd, d, sg) * Lout;
-        const float p_hat = luminance(f);
-        if (p_hat <= 0.f)
-            continue;
-
-        const float w = p_hat / pdf;
-        Wsum += w;
-
-        // Reservoir select with probability w / Wsum.
-        if (Wsum > 0.f && sampleNext1D(sg) * Wsum < w)
-        {
-            result.posX2Dist = float4(data.x2PosW, data.dist);
-            result.radianceWsum = float4(Lout, 0.f);
-            result.normalX2Vis = float4(data.x2Normal, 1.f);
-            pHatSelected = p_hat;
-        }
-    }
-
-    if (Wsum > 0.f)
-    {
-        // Condense, matching sampleLightRIS() in MyPTRestir.slang.
-        result.radianceWsum = float4(result.radianceWsum.xyz, (Wsum / float(M)) / pHatSelected);
-        result.setM(1);
-        result.normalX1Pdf.w = pHatSelected;
-    }
-
-    return result;
-}
-
-/**
- * Generate a new scatter ray or terminate.
- * @param[in] sd Shading data.
- * @param[in] mi Material instance.
- * @param[in] rayOrigin Ray origin for the new ray.
- * @param[in,out] rayData Ray payload.
- * @return True if the path continues.
+ * @return True if the scatter ray was generated.
  */
 bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3 rayOrigin, inout ScatterRayData rayData)
 {
     // Sample material.
     BSDFSample bsdfSample = {};
-    if (mi.sample(sd, rayData.sg, bsdfSample, kUseImportanceSampling))
+    if (sampleMyPTBSDF(sd, mi, rayData.sg, bsdfSample, kUseImportanceSampling))
     {
         rayData.origin = rayOrigin;
         if (bsdfSample.isLobe(LobeType::Transmission))
@@ -595,8 +354,6 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
         // outer emission condition (kComputeDirect || pathLength > 0).
         if (kComputeDirect || rayData.pathLength > 0)
         {
-            // Instantiate the stateless emissive light sampler locally.
-            EmissiveLightSampler emissiveSampler = {};
             TriangleLightHit lightHit;
             TriangleHit triangleHit = hit.getTriangleHit();
             lightHit.triangleIndex = gScene.lightCollection.getTriangleIndex(triangleHit.instanceID, triangleHit.primitiveIndex);
@@ -605,7 +362,7 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
             // With MIS disabled, keep the full emission (may double count with the NEE strategy).
             if (kUseMIS)
             {
-                const float lightPdf = emissiveSampler.evalPdf(rayData.origin, rayData.normal, false, lightHit);
+                const float lightPdf = gMyPTEmissiveSampler.evalPdf(rayData.origin, rayData.normal, false, lightHit);
                 emission *= evalMIS(rayData.pdf, lightPdf);
             }
         }
@@ -687,88 +444,9 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
             // Always output directly emitted light, independent of whether emissive materials are treated as light sources or not.
             outColor += mi.getProperties(sd).emission;
 
-            // Add contribution of direct light. ReSTIR uses RIS + temporal reuse, PT uses NEE.
-            if (kUseReSTIR)
-            {
-                // Advance the generator further so this pass's random numbers (neighbor
-                // selection + shading + indirect) decorrelate from the restirGen pass.
-                for (uint i = 0; i < kSpatialPRNGOffset; i++)
-                    sampleNext1D(sg);
-
-                // Read this pixel's temporally-reused reservoir (written by the restirGen pass).
-                Reservoir r = gReservoirTemporal[pixel.x + pixel.y * frameDim.x];
-
-                // Spatial reuse: merge K random neighbors' reservoirs.
-                if (r.isValid())
-                {
-                    const uint selfIdx = pixel.x + pixel.y * frameDim.x;
-                    for (uint k = 0; k < gSpatialNeighborCount; k++)
-                    {
-                        // Sample a random neighbor within a square radius.
-                        float2 rand = sampleNext2D(sg) * 2.f - 1.f; // [-1, 1]^2
-                        int2 offset = int2(int(floor(rand.x * gSpatialRadius)), int(floor(rand.y * gSpatialRadius)));
-                        int2 neighbor = int2(int(pixel.x), int(pixel.y)) + offset;
-                        if (neighbor.x < 0 || neighbor.y < 0 || neighbor.x >= int(frameDim.x) || neighbor.y >= int(frameDim.y))
-                            continue;
-                        uint neighborIdx = uint(neighbor.x) + uint(neighbor.y) * frameDim.x;
-                        if (neighborIdx == selfIdx)
-                            continue; // Skip self.
-
-                        Reservoir incoming = gReservoirTemporal[neighborIdx];
-                        r = mergeReservoir(sd, mi, sg, r, incoming, gMaxHistoryLength, gSpatialDepthThreshold, gSpatialNormalThreshold);
-                    }
-                }
-
-                // Final shading.
-                outColor += evalDirectReSTIR(sd, mi, sg, r);
-
-                // Store the spatially-reused reservoir for the next frame's temporal reuse.
-                gReservoirSpatial[pixel.x + pixel.y * frameDim.x] = r;
-            }
-            else
-            {
-                outColor += evalDirect(sd, mi, sg);
-            }
+            outColor += evalDirect(sd, mi, sg);
         }
 
-        // Indirect illumination: ReSTIR GI (spatial reuse + eval) or plain PT recursion.
-        if (kUseReSTIR)
-        {
-            // Advance the generator so GI spatial reuse decorrelates from DI.
-            for (uint i = 0; i < kSpatialPRNGOffset; i++)
-                sampleNext1D(sg);
-
-            // Read this pixel's temporally-reused GI reservoir (written by restirGen).
-            GIPathReservoir rgi = gGIReservoirTemporal[pixel.x + pixel.y * frameDim.x];
-
-            // Spatial reuse: merge K random neighbors' GI reservoirs.
-            if (rgi.isValid())
-            {
-                const uint selfIdx = pixel.x + pixel.y * frameDim.x;
-                for (uint k = 0; k < gSpatialNeighborCount; k++)
-                {
-                    // Sample a random neighbor within a square radius.
-                    float2 rand = sampleNext2D(sg) * 2.f - 1.f; // [-1, 1]^2
-                    int2 offset = int2(int(floor(rand.x * gSpatialRadius)), int(floor(rand.y * gSpatialRadius)));
-                    int2 neighbor = int2(int(pixel.x), int(pixel.y)) + offset;
-                    if (neighbor.x < 0 || neighbor.y < 0 || neighbor.x >= int(frameDim.x) || neighbor.y >= int(frameDim.y))
-                        continue;
-                    uint neighborIdx = uint(neighbor.x) + uint(neighbor.y) * frameDim.x;
-                    if (neighborIdx == selfIdx)
-                        continue; // Skip self.
-
-                    GIPathReservoir incoming = gGIReservoirTemporal[neighborIdx];
-                    rgi = mergeGIPathReservoir(sd, mi, sg, rgi, incoming, gMaxHistoryLength, gSpatialDepthThreshold, gSpatialNormalThreshold);
-                }
-            }
-
-            // Final shading: L_indirect = weight * f(x1,d) * L_out(x2).
-            outColor += evalGIPathReSTIR(sd, mi, sg, rgi);
-
-            // Store the spatially-reused GI reservoir for the next frame's temporal reuse.
-            gGIReservoirSpatial[pixel.x + pixel.y * frameDim.x] = rgi;
-        }
-        else
         {
             // Prepare ray payload.
             ScatterRayData rayData = ScatterRayData(sg);
@@ -867,136 +545,8 @@ void shadowTriangleMeshAnyHit(inout ShadowRayData rayData, BuiltInTriangleInters
 }
 
 //
-// Shader entry points for the ReSTIR GI path-sampling ray (ray type 2).
+// Main PT ray generation entry point.
 //
-
-[shader("miss")]
-void giPathMiss(inout GIPathSampleData rayData)
-{
-    // A 1-bounce indirect path sample requires x2 to be a surface. A miss means
-    // the path escaped to the environment, which is not part of the 1-bounce
-    // indirect estimate (env light is handled elsewhere). Mark invalid.
-    rayData.hit = false;
-    rayData.dist = 0.f;
-    rayData.x2PosW = float3(0.f);
-    rayData.x2Normal = float3(0.f);
-    rayData.Lout = float3(0.f);
-}
-
-[shader("anyhit")]
-void giPathTriangleMeshAnyHit(inout GIPathSampleData rayData, BuiltInTriangleIntersectionAttributes attribs)
-{
-    // Alpha test for non-opaque geometry.
-    GeometryInstanceID instanceID = getGeometryInstanceID();
-    VertexData v = getVertexData(instanceID, PrimitiveIndex(), attribs);
-    const uint materialID = gScene.getMaterialID(instanceID);
-    if (gScene.materials.alphaTest(v, materialID, 0.f))
-        IgnoreHit();
-}
-
-[shader("closesthit")]
-void giPathTriangleMeshClosestHit(inout GIPathSampleData rayData, BuiltInTriangleIntersectionAttributes attribs)
-{
-    TriangleHit triangleHit;
-    triangleHit.instanceID = getGeometryInstanceID();
-    triangleHit.primitiveIndex = PrimitiveIndex();
-    triangleHit.barycentrics = attribs.barycentrics;
-
-    const HitInfo hit = HitInfo(triangleHit);
-    const float hitT = RayTCurrent();
-    const float3 rayDir = WorldRayDirection();
-
-    ShadingData sd = loadShadingData(hit, rayDir);
-    let lod = ExplicitLodTextureSampler(0.f);
-    let mi = gScene.materials.getMaterialInstance(sd, lod);
-
-    // L_out(x2) = emission + direct illumination (NEE + shadow ray).
-    // No L_out clamp here: PT's scatter recursion uses the unclamped L_out, so any
-    // clamp on the GI path causes a systematic bias (ReSTIR GI looking darker than PT
-    // on bright emissives). A very loose clamp guards against pathological Inf values
-    // from concurrent light accumulation but otherwise lets L_out pass through freely.
-    float3 Lout = float3(0.f);
-    if (kUseEmissiveLights)
-        Lout += mi.getProperties(sd).emission;
-    if (kUseAnalyticLights || kUseEmissiveLights)
-        Lout += evalDirect(sd, mi, rayData.sg);
-    Lout = min(Lout, float3(1e3f));
-
-    rayData.hit = true;
-    rayData.dist = hitT;
-    rayData.x2PosW = sd.posW;
-    rayData.x2Normal = sd.getOrientedFaceNormal();
-    rayData.Lout = Lout;
-}
-
-//
-// Shader entry points for ray generation shaders.
-//
-
-// Pass 1: RIS initial sampling + temporal reuse. Writes gReservoirTemporal / gGIReservoirTemporal.
-// The DI part does not trace; the GI part traces one scatter ray per candidate (ray type 2).
-[shader("raygeneration")]
-void restirGen()
-{
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
-
-    const HitInfo hit = HitInfo(gVBuffer[pixel]);
-    if (!hit.isValid())
-        return; // Leave the reservoir invalid (M == 0).
-
-    const float3 primaryRayDir = getPrimaryRayDir(pixel, frameDim, gScene.camera);
-
-    ShadingData sd = loadShadingData(hit, primaryRayDir);
-    let lod = ExplicitLodTextureSampler(0.f);
-    let mi = gScene.materials.getMaterialInstance(sd, lod);
-
-    SampleGenerator sg = SampleGenerator(pixel, gFrameCount);
-    for (uint i = 0; i < gPRNGDimension; i++)
-        sampleNext1D(sg);
-
-    // RIS initial sampling.
-    Reservoir r = sampleLightRIS(sd, mi, sg, kRISCandidateCount);
-
-    // Initial visibility check (align with the reference useInitialVisibility):
-    // discard occluded samples so they never enter the temporal/spatial reuse chain.
-    if (kUseInitialVisibility && r.isValid())
-    {
-        const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, r.dirDistance.xyz) >= 0.f ? sd.faceN : -sd.faceN);
-        if (!traceShadowRay(origin, r.dirDistance.xyz, r.dirDistance.w))
-            r = Reservoir::createEmpty();
-    }
-
-    // Temporal reuse: reproject to the previous frame and merge with history.
-    if (is_valid(gMotionVector))
-    {
-        float2 prevPixel = float2(pixel) + gMotionVector[pixel] * float2(frameDim);
-        if (all(prevPixel >= 0.f) && all(prevPixel < float2(frameDim)))
-        {
-            uint prevIdx = uint(prevPixel.x) + uint(prevPixel.y) * frameDim.x;
-            Reservoir prev = gReservoirPrev[prevIdx];
-            r = mergeReservoir(sd, mi, sg, r, prev, gMaxHistoryLength, gTemporalDepthThreshold, gTemporalNormalThreshold);
-        }
-    }
-
-    gReservoirTemporal[pixel.x + pixel.y * frameDim.x] = r;
-
-    // ReSTIR GI: RIS initial sampling + temporal reuse for 1-bounce indirect light.
-    GIPathReservoir rgi = samplePathRIS(sd, mi, sg, kGIRISCandidateCount);
-
-    if (is_valid(gMotionVector))
-    {
-        float2 prevPixel = float2(pixel) + gMotionVector[pixel] * float2(frameDim);
-        if (all(prevPixel >= 0.f) && all(prevPixel < float2(frameDim)))
-        {
-            uint prevIdx = uint(prevPixel.x) + uint(prevPixel.y) * frameDim.x;
-            GIPathReservoir prev = gGIReservoirPrev[prevIdx];
-            rgi = mergeGIPathReservoir(sd, mi, sg, rgi, prev, gMaxHistoryLength, gTemporalDepthThreshold, gTemporalNormalThreshold);
-        }
-    }
-
-    gGIReservoirTemporal[pixel.x + pixel.y * frameDim.x] = rgi;
-}
 
 [shader("raygeneration")]
 void rayGen()

@@ -9,7 +9,9 @@ def render_graph_MyPT():
     ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
     g.addPass(ToneMapper, "ToneMapper")
 
-    MyPT = createPass("MyPT", {'mode': 'PT', 'risCandidateCount': 32, 'giRISCandidateCount': 8, 'maxHistoryLength': 20, 'temporalDepthThreshold': 0.1, 'temporalNormalThreshold': 0.5, 'spatialNeighborCount': 4, 'spatialRadius': 20, 'spatialDepthThreshold': 0.1, 'spatialNormalThreshold': 0.5, 'maxBounces': 3, 'computeDirect': True, 'useImportanceSampling': True, 'rrProbability': 0.2})
+    # GRIS first round: complete path candidates and initial RIS, without temporal/spatial reuse.
+    # Existing PT / ReSTIR UI and controls; the first-round baseline explicitly disables RR.
+    MyPT = createPass("MyPT", {'mode': 'ReSTIR', 'giRISCandidateCount': 1, 'maxBounces': 8, 'computeDirect': True, 'useImportanceSampling': True, 'useMIS': True, 'rrProbability': 0.0, 'seed': 0})
     g.addPass(MyPT, "MyPT")
 
     VBufferRT = createPass("VBufferRT", {'samplePattern': 'Stratified', 'sampleCount': 16})

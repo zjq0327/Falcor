@@ -98,6 +98,8 @@ void MyPT::parseProperties(const Properties& props)
     {
         if (key == kMode)
             mMode = value;
+        else if (key == "seed")
+            mSeed = value;
         else if (key == kRISCandidateCount)
             mRISCandidateCount = value;
         else if (key == kGIRISCandidateCount)
@@ -131,12 +133,16 @@ void MyPT::parseProperties(const Properties& props)
         else
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
+    FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
+    FALCOR_CHECK(mMaxBounces < 65536, "maxBounces must be less than 65536.");
+    FALCOR_CHECK(mRRProbability >= 0.f && mRRProbability <= 0.95f, "rrProbability must be in [0, 0.95].");
 }
 
 Properties MyPT::getProperties() const
 {
     Properties props;
     props[kMode] = mMode;
+    props["seed"] = mSeed;
     props[kRISCandidateCount] = mRISCandidateCount;
     props[kGIRISCandidateCount] = mGIRISCandidateCount;
     props[kUseInitialVisibility] = mUseInitialVisibility;
@@ -162,6 +168,12 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
     // Define our input/output channels.
     addRenderPassInputs(reflector, kInputChannels);
     addRenderPassOutputs(reflector, kOutputChannels);
+    reflector.addOutput("ptReference", "Mean of the GRIS path trees before RIS").format(ResourceFormat::RGBA32Float)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("reservoirF", "Selected PSS contribution F; alpha is terminal type").format(ResourceFormat::RGBA32Float)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("reservoirDebug", "GRIS reservoir: W, M, surface-scatter count, rejected non-finite contributions")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
 
     return reflector;
 }
@@ -175,7 +187,13 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         auto flags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
         dict[Falcor::kRenderPassRefreshFlags] = flags | Falcor::RenderPassRefreshFlags::RenderOptionsChanged;
         mOptionsChanged = false;
+        mGRIS.frameIndex = 0;
     }
+
+    // Resolve writes every diagnostic pixel in ReSTIR. PT/no-scene diagnostics are explicitly zero.
+    if (!mpScene || mMode == Mode::PT)
+        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug"})
+            if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
 
     // If we have no scene, just clear the outputs and return.
     if (!mpScene)
@@ -208,12 +226,14 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         logWarning("Depth-of-field requires the '{}' input. Expect incorrect shading.", kInputViewDir);
     }
 
+    if (mMode == Mode::ReSTIR)
+    {
+        executeGRIS(pRenderContext, renderData);
+        return;
+    }
+
     // Specialize program.
     // These defines should not modify the program vars. Do not trigger program vars re-creation.
-    mTracer.pProgram->addDefine("USE_RESTIR", mMode == Mode::ReSTIR ? "1" : "0");
-    mTracer.pProgram->addDefine("RIS_CANDIDATE_COUNT", std::to_string(mRISCandidateCount));
-    mTracer.pProgram->addDefine("GIRIS_CANDIDATE_COUNT", std::to_string(mGIRISCandidateCount));
-    mTracer.pProgram->addDefine("USE_INITIAL_VISIBILITY", mUseInitialVisibility ? "1" : "0");
     mTracer.pProgram->addDefine("MAX_BOUNCES", std::to_string(mMaxBounces));
     mTracer.pProgram->addDefine("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     mTracer.pProgram->addDefine("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
@@ -239,180 +259,48 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         prepareVars();
     FALCOR_ASSERT(mTracer.pVars);
 
-    // Set constants and bind all resources (CB + I/O + reservoirs) for a pass's vars.
-    auto setupVars = [&](const ref<RtProgramVars>& pVars)
-    {
-        auto var = pVars->getRootVar();
-
-        // Constants.
-        var["CB"]["gFrameCount"] = mFrameCount;
-        var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
-        var["CB"]["gRRProbability"] = mRRProbability;
-        var["CB"]["gMaxHistoryLength"] = mMaxHistoryLength;
-        var["CB"]["gTemporalDepthThreshold"] = mTemporalDepthThreshold;
-        var["CB"]["gTemporalNormalThreshold"] = mTemporalNormalThreshold;
-        var["CB"]["gSpatialNeighborCount"] = mSpatialNeighborCount;
-        var["CB"]["gSpatialRadius"] = mSpatialRadius;
-        var["CB"]["gSpatialDepthThreshold"] = mSpatialDepthThreshold;
-        var["CB"]["gSpatialNormalThreshold"] = mSpatialNormalThreshold;
-        var["CB"]["gGIRISCandidateCount"] = mGIRISCandidateCount;
-
-        // I/O buffers (bound per-frame as they may change).
-        for (const auto& channel : kInputChannels)
-        {
-            if (!channel.texname.empty())
-                var[channel.texname] = renderData.getTexture(channel.name);
-        }
-        for (const auto& channel : kOutputChannels)
-        {
-            if (!channel.texname.empty())
-                var[channel.texname] = renderData.getTexture(channel.name);
-        }
-
-        // Reservoir buffers.
-        var["gReservoirPrev"] = mpReservoirPrev;
-        var["gReservoirTemporal"] = mpReservoirTemporal;
-        var["gReservoirSpatial"] = mpReservoirSpatial;
-
-        // GI reservoir buffers.
-        var["gGIReservoirPrev"] = mpGIReservoirPrev;
-        var["gGIReservoirTemporal"] = mpGIReservoirTemporal;
-        var["gGIReservoirSpatial"] = mpGIReservoirSpatial;
-    };
-
-    // Get dimensions of ray dispatch.
-    const uint2 targetDim = renderData.getDefaultTextureDims();
-    FALCOR_ASSERT(targetDim.x > 0 && targetDim.y > 0);
-
-    // Manage ReSTIR reservoir buffers (previous / temporal / spatial).
-    const uint32_t pixelCount = targetDim.x * targetDim.y;
-    const uint32_t kReservoirSize = 80u;   // Must match the Reservoir struct (5 x float4) in MyPTRestir.slang.
-    const uint32_t kGIReservoirSize = 96u; // Must match the GIPathReservoir struct (6 x float4) in MyPTRestirGI.slang.
-    if (!mpReservoirPrev || mpReservoirPrev->getElementCount() < pixelCount)
-    {
-        mpReservoirPrev = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
-        mpReservoirTemporal = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
-        mpReservoirSpatial = mpDevice->createStructuredBuffer(kReservoirSize, pixelCount);
-
-        mpGIReservoirPrev = mpDevice->createStructuredBuffer(kGIReservoirSize, pixelCount);
-        mpGIReservoirTemporal = mpDevice->createStructuredBuffer(kGIReservoirSize, pixelCount);
-        mpGIReservoirSpatial = mpDevice->createStructuredBuffer(kGIReservoirSize, pixelCount);
-
-        // Clear the previous-frame reservoirs once: freshly created buffers are uninitialized,
-        // and garbage M > 0 would pollute the first temporal merge.
-        pRenderContext->clearUAV(mpReservoirPrev->getUAV().get(), uint4(0));
-        pRenderContext->clearUAV(mpGIReservoirPrev->getUAV().get(), uint4(0));
-    }
-
-    // Set constants and bind resources for both passes.
-    setupVars(mTracer.pVars);
-    setupVars(mTracer.pRestirVars);
-
-    // Clear the buffers written this frame (invalid pixels stay at M == 0).
-    pRenderContext->clearUAV(mpReservoirTemporal->getUAV().get(), uint4(0));
-    pRenderContext->clearUAV(mpReservoirSpatial->getUAV().get(), uint4(0));
-    pRenderContext->clearUAV(mpGIReservoirTemporal->getUAV().get(), uint4(0));
-    pRenderContext->clearUAV(mpGIReservoirSpatial->getUAV().get(), uint4(0));
-
-    // Pass 1: RIS initial sampling + temporal reuse (writes gReservoirTemporal).
-    if (mMode == Mode::ReSTIR)
-    {
-        mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pRestirVars, uint3(targetDim, 1));
-    }
-
-    // Pass 2: spatial reuse + shading + indirect (reads gReservoirTemporal, writes gReservoirSpatial).
-    mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(targetDim, 1));
-
-    // Swap: this frame's spatial result becomes next frame's temporal input.
-    if (mMode == Mode::ReSTIR)
-    {
-        std::swap(mpReservoirPrev, mpReservoirSpatial);
-        std::swap(mpGIReservoirPrev, mpGIReservoirSpatial);
-    }
+    auto var = mTracer.pVars->getRootVar();
+    if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
+    var["CB"]["gFrameCount"] = mFrameCount;
+    var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
+    var["CB"]["gRRProbability"] = mRRProbability;
+    for (const auto& channel : kInputChannels)
+        if (!channel.texname.empty()) var[channel.texname] = renderData.getTexture(channel.name);
+    var["gOutputColor"] = renderData.getTexture("color");
+    mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(renderData.getDefaultTextureDims(), 1));
 
     mFrameCount++;
 }
 
 void MyPT::renderUI(Gui::Widgets& widget)
 {
-    bool dirty = false;
-
-    dirty |= widget.dropdown("Mode", mMode);
-    widget.tooltip("Rendering mode.\nPT = brute-force path tracing.\nReSTIR = ReSTIR direct illumination (RIS).", true);
-
-    dirty |= widget.var("RIS candidate count", mRISCandidateCount, 1u, 256u);
-    widget.tooltip("Number of candidate light samples (M) used by ReSTIR DI RIS.", true);
-
-    dirty |= widget.var("GI RIS candidate count", mGIRISCandidateCount, 0u, 64u);
-    widget.tooltip("Number of candidate paths (M) used by ReSTIR GI RIS.\n"
-        "Set to 0 to disable GI entirely (DI-only ReSTIR, useful for isolating GI issues).", true);
-
-    dirty |= widget.checkbox("Use initial visibility", mUseInitialVisibility);
-    widget.tooltip("Check visibility of the RIS-selected sample before temporal/spatial reuse.\n"
-        "Disabling saves one shadow ray per pixel, but occluded samples may briefly enter the reuse chain.", true);
-
-    dirty |= widget.var("Max history length", mMaxHistoryLength, 1u, 64u);
-    widget.tooltip("Maximum accumulated sample count (M) for ReSTIR temporal reuse.", true);
-
-    dirty |= widget.var("Temporal depth threshold", mTemporalDepthThreshold, 0.f, 1.f);
-    widget.tooltip("Maximum world-space position difference for ReSTIR temporal reuse.", true);
-
-    dirty |= widget.var("Temporal normal threshold", mTemporalNormalThreshold, -1.f, 1.f);
-    widget.tooltip("Minimum cosine between normals for ReSTIR temporal reuse.", true);
-
-    dirty |= widget.var("Spatial neighbor count", mSpatialNeighborCount, 0u, 16u);
-    widget.tooltip("Number of spatial reuse neighbors (K) sampled per pixel.", true);
-
-    dirty |= widget.var("Spatial radius", mSpatialRadius, 0.f, 128.f);
-    widget.tooltip("Maximum pixel radius for spatial neighbor selection.", true);
-
-    dirty |= widget.var("Spatial depth threshold", mSpatialDepthThreshold, 0.f, 1.f);
-    widget.tooltip("Maximum world-space position difference for ReSTIR spatial reuse.", true);
-
-    dirty |= widget.var("Spatial normal threshold", mSpatialNormalThreshold, -1.f, 1.f);
-    widget.tooltip("Minimum cosine between normals for ReSTIR spatial reuse.", true);
-
-    dirty |= widget.var("Max bounces", mMaxBounces, 0u, 1u << 16);
-    widget.tooltip("Maximum path length for indirect illumination.\n0 = direct only\n1 = one indirect bounce etc.", true);
-
-    dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
-    widget.tooltip("Compute direct illumination.\nIf disabled only indirect is computed (when max bounces > 0).", true);
-
-    dirty |= widget.checkbox("Use importance sampling", mUseImportanceSampling);
-    widget.tooltip("Use importance sampling for materials", true);
-
-    dirty |= widget.checkbox("Use MIS", mUseMIS);
-    widget.tooltip("Use multiple importance sampling to combine NEE and BSDF sampling.\n"
-        "When disabled, NEE samples are added unweighted (may double count with BSDF hits on emissive surfaces).", true);
-
-    dirty |= widget.var("RR Probability", mRRProbability, 0.f, 0.95f);
-    widget.tooltip("Probability of terminating a path by russian roulette at each indirect bounce.", true);
-
-    // If rendering options that modify the output have changed, set flag to indicate that.
-    // In execute() we will pass the flag to other passes for reset of temporal data etc.
-    if (dirty)
+    bool dirty = widget.dropdown("Mode", mMode);
+    if (mMode == Mode::ReSTIR)
     {
-        mOptionsChanged = true;
+        dirty |= widget.var("GI RIS candidate count", mGIRISCandidateCount, 0u, 64u);
+        widget.tooltip("Complete candidate path trees. 0 retains direct-only rendering using one tree.");
+        dirty |= widget.var("Seed", mSeed);
+        if (widget.button("Reset sampling")) dirty = true;
+        widget.text("Temporal and spatial reuse are pending the initial-RIS baseline validation.");
     }
+    dirty |= widget.var("Max bounces", mMaxBounces, 0u, 65535u);
+    widget.tooltip("0 = direct lighting; 1 = one indirect bounce. Shared by PT and ReSTIR.");
+    dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
+    dirty |= widget.checkbox("Use importance sampling", mUseImportanceSampling);
+    dirty |= widget.checkbox("Use MIS", mUseMIS);
+    dirty |= widget.var("RR Probability", mRRProbability, 0.f, 0.95f);
+    widget.tooltip("Termination probability. Use 0 for the first-round comparison.");
+    mOptionsChanged |= dirty;
 }
 
 void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    resetGRIS();
     // Clear data for previous scene.
     mTracer.pProgram = nullptr;
     mTracer.pBindingTable = nullptr;
     mTracer.pVars = nullptr;
-    mTracer.pRestirBindingTable = nullptr;
-    mTracer.pRestirVars = nullptr;
     mFrameCount = 0;
-
-    // Reset ReSTIR reservoirs so old-scene history is not reused.
-    mpReservoirPrev = nullptr;
-    mpReservoirTemporal = nullptr;
-    mpReservoirSpatial = nullptr;
-    mpGIReservoirPrev = nullptr;
-    mpGIReservoirTemporal = nullptr;
-    mpGIReservoirSpatial = nullptr;
 
     // Set new scene.
     mpScene = pScene;
@@ -437,40 +325,19 @@ void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
         desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
         desc.setMaxTraceRecursionDepth(kMaxRecursionDepth);
 
-        // Add the entry points. The ShaderIDs are shared between the two binding tables.
-        auto restirGenID = desc.addRayGen("restirGen");
         auto rayGenID = desc.addRayGen("rayGen");
         auto scatterMissID = desc.addMiss("scatterMiss");
         auto shadowMissID = desc.addMiss("shadowMiss");
-        auto giPathMissID = desc.addMiss("giPathMiss");
-
-        // Create the restirGen binding table. It reuses the same miss/hit groups as the main
-        // pass for a consistent ray-type layout; restirGen simply never calls TraceRay.
-        mTracer.pRestirBindingTable = RtBindingTable::create(3, 3, mpScene->getGeometryCount());
-        mTracer.pRestirBindingTable->setRayGen(restirGenID);
-        mTracer.pRestirBindingTable->setMiss(0, scatterMissID);
-        mTracer.pRestirBindingTable->setMiss(1, shadowMissID);
-        mTracer.pRestirBindingTable->setMiss(2, giPathMissID);
-
-        // Create the main rayGen binding table (full SBT).
-        mTracer.pBindingTable = RtBindingTable::create(3, 3, mpScene->getGeometryCount());
+        mTracer.pBindingTable = RtBindingTable::create(2, 2, mpScene->getGeometryCount());
         mTracer.pBindingTable->setRayGen(rayGenID);
         mTracer.pBindingTable->setMiss(0, scatterMissID);
         mTracer.pBindingTable->setMiss(1, shadowMissID);
-        mTracer.pBindingTable->setMiss(2, giPathMissID);
-
         if (mpScene->hasGeometryType(Scene::GeometryType::TriangleMesh))
         {
-            auto scatterHitGroupID = desc.addHitGroup("scatterTriangleMeshClosestHit", "scatterTriangleMeshAnyHit");
-            auto shadowHitGroupID = desc.addHitGroup("", "shadowTriangleMeshAnyHit");
-            auto giPathHitGroupID = desc.addHitGroup("giPathTriangleMeshClosestHit", "giPathTriangleMeshAnyHit");
-
-            mTracer.pRestirBindingTable->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), scatterHitGroupID);
-            mTracer.pRestirBindingTable->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), shadowHitGroupID);
-            mTracer.pRestirBindingTable->setHitGroup(2, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), giPathHitGroupID);
-            mTracer.pBindingTable->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), scatterHitGroupID);
-            mTracer.pBindingTable->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), shadowHitGroupID);
-            mTracer.pBindingTable->setHitGroup(2, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), giPathHitGroupID);
+            auto scatterHitID = desc.addHitGroup("scatterTriangleMeshClosestHit", "scatterTriangleMeshAnyHit");
+            auto shadowHitID = desc.addHitGroup("", "shadowTriangleMeshAnyHit");
+            mTracer.pBindingTable->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), scatterHitID);
+            mTracer.pBindingTable->setHitGroup(1, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), shadowHitID);
         }
 
         // Merge the emissive light sampler's defines (including _EMISSIVE_LIGHT_SAMPLER_TYPE)
@@ -493,14 +360,11 @@ void MyPT::prepareVars()
     mTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
     mTracer.pProgram->setTypeConformances(mpScene->getTypeConformances());
 
-    // Create program variables for both passes (shared program, separate binding tables).
+    // Create program variables for the existing PT pass.
     mTracer.pVars = RtProgramVars::create(mpDevice, mTracer.pProgram, mTracer.pBindingTable);
-    mTracer.pRestirVars = RtProgramVars::create(mpDevice, mTracer.pProgram, mTracer.pRestirBindingTable);
 
     // Bind utility classes into shared data.
     mpSampleGenerator->bindShaderData(mTracer.pVars->getRootVar());
-    mpSampleGenerator->bindShaderData(mTracer.pRestirVars->getRootVar());
-    // Note: The emissive sampler is stateless (all data comes from gScene.lightCollection), so it
-    // does not need to be bound here. The sampler struct is instantiated locally in the shader.
+    // Bind the emissive power sampler's alias table each frame in execute().
     // gScene is bound automatically by Scene::raytrace() each frame.
 }
