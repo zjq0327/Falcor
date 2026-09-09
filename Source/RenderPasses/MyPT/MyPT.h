@@ -55,7 +55,7 @@ public:
     enum class Mode
     {
         PT,     ///< Brute-force path tracing (default).
-        ReSTIR, ///< Complete-path initial RIS, migrated incrementally toward GRIS.
+        ReSTIR, ///< Complete-path RIS and spatial GRIS with pure reconnection.
     };
 
     FALCOR_ENUM_INFO(
@@ -110,12 +110,16 @@ private:
     /// Legacy option. M0-M2 always tests NEE visibility before reservoir insertion.
     bool mUseInitialVisibility = true;
 
-    /// Reuse settings retained for saved scripts and subsequent milestones; currently inactive.
+    /// Temporal settings retained for saved scripts; temporal reuse is a later milestone.
     uint mMaxHistoryLength = 20;
     /// Relative depth threshold for ReSTIR temporal reuse (fraction of depth).
     float mTemporalDepthThreshold = 0.1f;
     /// Min cosine between normals for ReSTIR temporal reuse.
     float mTemporalNormalThreshold = 0.5f;
+    bool mSpatialReuse = true;
+    uint mSpatialReuseRounds = 1;
+    /// Script-only fixed neighbor hook. Zero uses random disk sampling.
+    int2 mSpatialNeighborOffset = int2(0);
     /// Number of spatial reuse neighbors (K) for ReSTIR spatial reuse.
     uint mSpatialNeighborCount = 4;
     /// Max pixel radius for spatial neighbor selection.
@@ -142,16 +146,18 @@ private:
     uint mFrameCount = 0;
     bool mOptionsChanged = false;
 
-    // Existing ReSTIR uses the shared configuration above; only the seed is new.
+    // Existing ReSTIR uses the shared configuration above.
     uint32_t mSeed = 0;
     struct
     {
         ref<ComputePass> generatePaths;
         ref<ComputePass> tracePaths;
+        ref<ComputePass> spatialReuse;
         ref<ComputePass> resolve;
         ref<Buffer> primary;
         ref<Buffer> fresh;
         ref<Buffer> reference;
+        ref<Buffer> spatial[2];
         std::unique_ptr<EnvMapSampler> envSampler;
         DefineList defines;
         uint2 dimensions = uint2(0);

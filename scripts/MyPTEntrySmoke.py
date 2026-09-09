@@ -7,13 +7,14 @@ from falcor import *
 from pathlib import Path
 import importlib.util
 import json
+import os
 import sys
 
 root = Path.cwd()
 sys.path.insert(0, str(root / "build/gris-python"))
 import numpy as np
 
-out = root / "build/gris-validation"
+out = Path(os.environ.get("MYPT_ENTRY_OUT", str(root / "build/gris-entry-validation")))
 out.mkdir(parents=True, exist_ok=True)
 exec((root / "scripts/MyPT.py").read_text(), globals())
 m.resizeFrameBuffer(640, 360)
@@ -29,6 +30,10 @@ assert np.isfinite(image).all() and image[..., :3].max() > 0
 np.save(out / "user_entry_tonemapped.npy", image)
 texture_format = str(texture.format)
 print("MYPT_USER_ENTRY_PASS", image.shape, texture_format, flush=True)
+m.frameCapture.outputDir = str(out)
+m.frameCapture.baseFilename = "MyPT-entry"
+m.frameCapture.capture()
+m.renderFrame()
 
 spec = importlib.util.spec_from_file_location("gris_graph", root / "scripts/MyPTGRIS.py")
 module = importlib.util.module_from_spec(spec)

@@ -4,6 +4,7 @@ RWTexture2D<float4> gColor;
 RWTexture2D<float4> gPTReference;
 RWTexture2D<float4> gReservoirF;
 RWTexture2D<float4> gReservoirDebug;
+RWTexture2D<float4> gInitialColor;
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -11,9 +12,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     uint2 pixel = dispatchThreadID.xy;
     if (any(pixel >= gDimensions)) return;
     uint index = pixelIndex(pixel);
-    PathReservoir reservoir = gFresh[index];
+    PathReservoir reservoir = gCurrent[index];
     float3 color = reservoir.sample.F * reservoir.W;
     gColor[pixel] = float4(color, 1.f);
+#if GRIS_HAS_INITIAL
+    PathReservoir fresh = gFresh[index];
+    gInitialColor[pixel] = float4(fresh.sample.F * fresh.W, 1.f);
+#endif
 #if GRIS_HAS_REFERENCE
     gPTReference[pixel] = gReference[index];
 #endif

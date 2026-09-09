@@ -35,6 +35,14 @@ bool sampleMyPTBSDF(ShadingData sd, IMaterialInstance mi, inout SampleGenerator 
     return mi.sample(sd, sg, bs, importance);
 }
 
+float evalMyPTBSDFPdf(ShadingData sd, IMaterialInstance mi, float3 direction, bool importance)
+{
+    float pdf = mi.evalPdf(sd, direction, importance);
+    // Falcor 8 StandardMaterialInstance.evalPdfReference uses signed wo.z on
+    // transmission, although sampleReference returns 0.5 * abs(wo.z) / pi.
+    return !importance && gScene.materials.getMaterialType(sd.materialID) == MaterialType::Standard ? abs(pdf) : pdf;
+}
+
 // Keep the PT power heuristic; GRIS calls this with powerHeuristic=false for balance MIS.
 float evalMIS(float p0, float p1, bool powerHeuristic = true)
 {

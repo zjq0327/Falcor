@@ -124,6 +124,12 @@ void MyPT::parseProperties(const Properties& props)
             mTemporalNormalThreshold = value;
         else if (key == kSpatialNeighborCount)
             mSpatialNeighborCount = value;
+        else if (key == "spatialReuse")
+            mSpatialReuse = value;
+        else if (key == "spatialReuseRounds")
+            mSpatialReuseRounds = value;
+        else if (key == "spatialNeighborOffset")
+            mSpatialNeighborOffset = value;
         else if (key == kSpatialRadius)
             mSpatialRadius = value;
         else if (key == kSpatialDepthThreshold)
@@ -136,6 +142,12 @@ void MyPT::parseProperties(const Properties& props)
     FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
     FALCOR_CHECK(mMaxBounces < 65536, "maxBounces must be less than 65536.");
     FALCOR_CHECK(mRRProbability >= 0.f && mRRProbability <= 0.95f, "rrProbability must be in [0, 0.95].");
+    FALCOR_CHECK(mSpatialNeighborCount <= 16 && mSpatialReuseRounds <= 8, "Spatial neighbors must be in [0, 16], rounds in [0, 8].");
+    FALCOR_CHECK(mSpatialRadius >= 0.f && mSpatialRadius <= 128.f, "spatialRadius must be in [0, 128].");
+    FALCOR_CHECK(mSpatialDepthThreshold >= 0.f && mSpatialDepthThreshold <= 1.f, "spatialDepthThreshold must be in [0, 1].");
+    FALCOR_CHECK(mSpatialNormalThreshold >= -1.f && mSpatialNormalThreshold <= 1.f, "spatialNormalThreshold must be in [-1, 1].");
+    FALCOR_CHECK(all(mSpatialNeighborOffset >= int2(-65536)) && all(mSpatialNeighborOffset <= int2(65536)),
+        "spatialNeighborOffset components must be in [-65536, 65536].");
 }
 
 Properties MyPT::getProperties() const
@@ -155,6 +167,9 @@ Properties MyPT::getProperties() const
     props[kTemporalDepthThreshold] = mTemporalDepthThreshold;
     props[kTemporalNormalThreshold] = mTemporalNormalThreshold;
     props[kSpatialNeighborCount] = mSpatialNeighborCount;
+    props["spatialReuse"] = mSpatialReuse;
+    props["spatialReuseRounds"] = mSpatialReuseRounds;
+    props["spatialNeighborOffset"] = mSpatialNeighborOffset;
     props[kSpatialRadius] = mSpatialRadius;
     props[kSpatialDepthThreshold] = mSpatialDepthThreshold;
     props[kSpatialNormalThreshold] = mSpatialNormalThreshold;
@@ -174,6 +189,10 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
         .flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addOutput("reservoirDebug", "GRIS reservoir: W, M, surface-scatter count, rejected non-finite contributions")
         .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("initialColor", "Initial RIS before spatial reuse").format(ResourceFormat::RGBA32Float)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("spatialDebug", "Last-round eligible/successful neighbors; max identity/round-trip error over all rounds")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
 
     return reflector;
 }
@@ -192,7 +211,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
     // Resolve writes every diagnostic pixel in ReSTIR. PT/no-scene diagnostics are explicitly zero.
     if (!mpScene || mMode == Mode::PT)
-        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug"})
+        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug", "initialColor", "spatialDebug"})
             if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
 
     // If we have no scene, just clear the outputs and return.
@@ -281,7 +300,17 @@ void MyPT::renderUI(Gui::Widgets& widget)
         widget.tooltip("Complete candidate path trees. 0 retains direct-only rendering using one tree.");
         dirty |= widget.var("Seed", mSeed);
         if (widget.button("Reset sampling")) dirty = true;
-        widget.text("Temporal and spatial reuse are pending the initial-RIS baseline validation.");
+        dirty |= widget.checkbox("Spatial reuse", mSpatialReuse);
+        if (mSpatialReuse)
+        {
+            dirty |= widget.var("Spatial neighbors", mSpatialNeighborCount, 0u, 16u);
+            dirty |= widget.var("Spatial radius", mSpatialRadius, 0.f, 128.f);
+            dirty |= widget.var("Spatial rounds", mSpatialReuseRounds, 0u, 8u);
+            dirty |= widget.var("Spatial depth threshold", mSpatialDepthThreshold, 0.f, 1.f);
+            dirty |= widget.var("Spatial normal threshold", mSpatialNormalThreshold, -1.f, 1.f);
+            widget.tooltip("Pure reconnection with defensive Pairwise MIS. Jacobian ratio is limited to 11 in either direction. Zero neighbors or rounds bypass reuse.");
+        }
+        widget.text("Temporal reuse is not enabled yet.");
     }
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 65535u);
     widget.tooltip("0 = direct lighting; 1 = one indirect bounce. Shared by PT and ReSTIR.");

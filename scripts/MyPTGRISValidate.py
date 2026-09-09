@@ -32,7 +32,7 @@ report = {"frames_per_seed": frames, "seeds": seeds, "resolution": [96, 64],
           "roi": {"rows": [12, 56], "columns": [8, 88]}, "cases": [], "checks": {}}
 
 def configure(n=1, bounces=8, seed=0, mode="ReSTIR", mis=True, rr=0.0, direct=True, importance=True):
-    props = {"mode": mode, "giRISCandidateCount": n, "maxBounces": bounces, "seed": seed,
+    props = {"mode": mode, "spatialReuse": False, "giRISCandidateCount": n, "maxBounces": bounces, "seed": seed,
              "useMIS": mis, "rrProbability": rr, "computeDirect": direct, "useImportanceSampling": importance}
     g.updatePass("MyPT", props)
     return props

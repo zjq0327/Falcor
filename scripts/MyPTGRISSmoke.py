@@ -38,7 +38,7 @@ m.renderFrame()  # FrameCapture schedules capture on the following frame.
 # Cornell has no analytic/environment lights. Disabling its emissive lights must
 # remove all indirect illumination, while the camera-visible emitter remains a direct term.
 m.scene.renderSettings = SceneRenderSettings(useEmissiveLights=False)
-g.updatePass("MyPT", {"mode": "ReSTIR", "giRISCandidateCount": 1, "maxBounces": 2,
+g.updatePass("MyPT", {"mode": "ReSTIR", "spatialReuse": False, "giRISCandidateCount": 1, "maxBounces": 2,
     "rrProbability": 0.0, "computeDirect": False})
 m.renderFrame()
 assert np.all(g.getOutput("MyPT.color").to_numpy()[..., :3] == 0)

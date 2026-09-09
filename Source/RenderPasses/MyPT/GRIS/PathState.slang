@@ -19,7 +19,8 @@ struct PathSample
     uint surfaceScatters;      // NEE includes its final connection; primary emission is zero.
     PathTerminal terminal;
     PathLight light;
-    uint flags;                // bit 0: preceding delta; bit 1: preceding transmission.
+    uint rcBeforeFlags;        // bit 0: delta; bit 1: transmission; bit 2: unsupported material; bit 3: invalid reconstructed source.
+    uint rcAfterFlags;         // Same bits for rc BSDF; zero for an NEE terminal at rc.
     PackedHitInfo rcHit;       // Fixed secondary vertex; invalid for shorter paths.
     uint rcIndex;              // 1 for a secondary surface, 0xffffffff when unavailable.
     uint rcSeed;               // RNG state after sampling the outgoing BSDF at rc.
@@ -27,4 +28,5 @@ struct PathSample
     float3 rcPrefix;           // Throughput arriving at rc (before local scattering).
     float3 rcIrradiance;       // Suffix excluding rc BSDF; terminal-at-rc excludes light PDF/MIS.
     float lightPdf;
+    float3 cachedJacobian;     // Primary BSDF PDF, rc BSDF PDF, |n_rc.w| / distance^2.
 };

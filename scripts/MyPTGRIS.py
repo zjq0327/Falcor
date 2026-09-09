@@ -11,6 +11,7 @@ def render_graph_MyPTGRIS(candidate_count=1, max_bounces=8, seed=0, mode="ReSTIR
     g.addPass(createPass("VBufferRT", {"samplePattern": "Center", "sampleCount": 1}), "VBuffer")
     g.addPass(createPass("MyPT", {
         "mode": mode,
+        "spatialReuse": False,
         "giRISCandidateCount": candidate_count,
         "maxBounces": max_bounces,
         "seed": seed,
