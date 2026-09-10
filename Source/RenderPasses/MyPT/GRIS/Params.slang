@@ -22,11 +22,14 @@ cbuffer CB
     float gTemporalNormalThreshold;
     float4x4 gPreviousViewProj;
     float3 gPreviousCameraPosition;
+    float gRoughnessThreshold;
+    float gNearFieldDistance;
 };
 RWStructuredBuffer<PrimaryPathContext> gPrimary;
 RWStructuredBuffer<PathReservoir> gFresh;
 RWStructuredBuffer<float4> gReference;
 StructuredBuffer<PathReservoir> gCurrent;
 StructuredBuffer<PathReservoir> gTemporal;
+RWStructuredBuffer<HybridPair> gHybridPairs;
 
 uint pixelIndex(uint2 pixel) { return pixel.y * gDimensions.x + pixel.x; }

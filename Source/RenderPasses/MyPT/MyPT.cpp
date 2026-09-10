@@ -66,6 +66,9 @@ const ChannelList kOutputChannels = {
 };
 
 const char kMode[] = "mode";
+const char kShiftStrategy[] = "shiftStrategy";
+const char kSpecularRoughnessThreshold[] = "specularRoughnessThreshold";
+const char kNearFieldDistance[] = "nearFieldDistance";
 const char kRISCandidateCount[] = "risCandidateCount";
 const char kGIRISCandidateCount[] = "giRISCandidateCount";
 const char kUseInitialVisibility[] = "useInitialVisibility";
@@ -98,6 +101,12 @@ void MyPT::parseProperties(const Properties& props)
     {
         if (key == kMode)
             mMode = value;
+        else if (key == kShiftStrategy)
+            mShiftStrategy = value;
+        else if (key == kSpecularRoughnessThreshold)
+            mSpecularRoughnessThreshold = value;
+        else if (key == kNearFieldDistance)
+            mNearFieldDistance = value;
         else if (key == "seed")
             mSeed = value;
         else if (key == kRISCandidateCount)
@@ -144,6 +153,9 @@ void MyPT::parseProperties(const Properties& props)
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
     FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
+    FALCOR_CHECK(mSpecularRoughnessThreshold >= 0.f && mSpecularRoughnessThreshold <= 1.f,
+        "specularRoughnessThreshold must be in [0, 1].");
+    FALCOR_CHECK(mNearFieldDistance >= 0.f && mNearFieldDistance <= 100.f, "nearFieldDistance must be in [0, 100].");
     FALCOR_CHECK(mMaxBounces < 65536, "maxBounces must be less than 65536.");
     FALCOR_CHECK(mRRProbability >= 0.f && mRRProbability <= 0.95f, "rrProbability must be in [0, 0.95].");
     FALCOR_CHECK(mMaxHistoryLength <= 128, "maxHistoryLength must be in [0, 128].");
@@ -161,6 +173,9 @@ Properties MyPT::getProperties() const
 {
     Properties props;
     props[kMode] = mMode;
+    props[kShiftStrategy] = mShiftStrategy;
+    props[kSpecularRoughnessThreshold] = mSpecularRoughnessThreshold;
+    props[kNearFieldDistance] = mNearFieldDistance;
     props["seed"] = mSeed;
     props[kRISCandidateCount] = mRISCandidateCount;
     props[kGIRISCandidateCount] = mGIRISCandidateCount;
@@ -206,6 +221,10 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
         .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addOutput("temporalDebug", "Temporal status, clamped history M, accepted incoming sample, round-trip error")
         .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("shiftDebug", "Replay and shift consistency diagnostics")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("pathDebug", "Initial rc index (0 if none), surface scatters, prefix flags, rc event flags")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
 
     return reflector;
 }
@@ -225,7 +244,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
     // Resolve writes every diagnostic pixel in ReSTIR. PT/no-scene diagnostics are explicitly zero.
     if (!mpScene || mMode == Mode::PT)
-        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug", "initialColor", "spatialDebug", "temporalColor", "temporalDebug"})
+        for (const char* name : {"ptReference", "reservoirF", "reservoirDebug", "initialColor", "spatialDebug", "temporalColor", "temporalDebug", "shiftDebug", "pathDebug"})
             if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
 
     // If we have no scene, just clear the outputs and return.
@@ -312,6 +331,13 @@ void MyPT::renderUI(Gui::Widgets& widget)
     bool dirty = widget.dropdown("Mode", mMode);
     if (mMode == Mode::ReSTIR)
     {
+        dirty |= widget.dropdown("Shift strategy", mShiftStrategy);
+        if (mShiftStrategy == ShiftStrategy::Hybrid)
+        {
+            dirty |= widget.var("Specular roughness threshold", mSpecularRoughnessThreshold, 0.f, 1.f);
+            dirty |= widget.var("Near-field distance", mNearFieldDistance, 0.f, 100.f);
+            widget.tooltip("Replay the prefix until a compatible rough surface is far enough away to reconnect.");
+        }
         dirty |= widget.var("GI RIS candidate count", mGIRISCandidateCount, 0u, 64u);
         widget.tooltip("Complete candidate path trees. 0 retains direct-only rendering using one tree.");
         dirty |= widget.var("Seed", mSeed);
@@ -323,7 +349,7 @@ void MyPT::renderUI(Gui::Widgets& widget)
             dirty |= widget.var("History length", mMaxHistoryLength, 0u, 128u);
             dirty |= widget.var("Temporal depth threshold", mTemporalDepthThreshold, 0.f, 1.f);
             dirty |= widget.var("Temporal normal threshold", mTemporalNormalThreshold, -1.f, 1.f);
-            widget.tooltip("Talbot MIS with pure reconnection. History length 0 bypasses temporal reuse. Depth of field bypasses temporal reuse in this version.");
+            widget.tooltip("Talbot MIS with the selected shift strategy. History length 0 or depth of field bypasses temporal reuse.");
         }
         dirty |= widget.checkbox("Spatial reuse", mSpatialReuse);
         if (mSpatialReuse)
@@ -333,7 +359,7 @@ void MyPT::renderUI(Gui::Widgets& widget)
             dirty |= widget.var("Spatial rounds", mSpatialReuseRounds, 0u, 8u);
             dirty |= widget.var("Spatial depth threshold", mSpatialDepthThreshold, 0.f, 1.f);
             dirty |= widget.var("Spatial normal threshold", mSpatialNormalThreshold, -1.f, 1.f);
-            widget.tooltip("Pure reconnection with defensive Pairwise MIS. Jacobian ratio is limited to 11 in either direction. Zero neighbors or rounds bypass reuse.");
+            widget.tooltip("Defensive Pairwise MIS with the selected shift strategy. Reconnection Jacobian ratios are limited to 11 in either direction. Zero neighbors or rounds bypass reuse.");
         }
     }
     dirty |= widget.var("Max bounces", mMaxBounces, 0u, 65535u);

@@ -2,6 +2,8 @@ import Params;
 import PathTracer;
 import Utils.Math.HashUtils;
 
+RWTexture2D<float4> gPathDebug;
+
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
@@ -16,11 +18,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     {
         // The first N candidates are invariant when the candidate budget grows.
         uint seed = jenkinsHash(primary.seed + candidate * 0x9e3779b9u);
-        PathBuilder builder = tracePathTree(primary, seed, gMaxSurfaceBounces, gRRProbability);
+        PathBuilder builder = tracePathTree(primary, seed, gMaxSurfaceBounces, gRRProbability, gRoughnessThreshold, gNearFieldDistance);
         fresh.mergeTree(builder.reservoir, selection);
         reference += builder.radiance / float(gCandidateCount);
     }
     fresh.finalizeRIS();
     gFresh[index] = fresh;
     gReference[index] = float4(reference, 1.f);
+#if GRIS_HAS_PATH_DEBUG
+    gPathDebug[pixel] = float4(fresh.sample.rcIndex == 0xffffffff ? 0.f : float(fresh.sample.rcIndex),
+        float(fresh.sample.surfaceScatters), float(fresh.sample.prefixFlags), float(fresh.sample.rcAfterFlags));
+#endif
 }

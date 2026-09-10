@@ -6,6 +6,7 @@ import Rendering.Lights.EmissiveLightSampler;
 import Rendering.Lights.EnvMapSampler;
 import RenderPasses.MyPT.MyPTCommon;
 __exported import PathBuilder;
+__exported import BSDF;
 
 ParameterBlock<EnvMapSampler> gEnvSampler;
 
@@ -38,9 +39,30 @@ float hitMIS(float bsdfPdf, float lightPdf, bool previousDelta)
     return GRIS_USE_MIS ? balanceWeight(bsdfPdf, lightPdf) : 0.f;
 }
 
-PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatters, float rrProbability)
+bool hybridRough(ShadingData sd, float threshold)
+{
+    if (gScene.materials.getMaterialType(sd.materialID) != MaterialType::Standard) return false;
+    let material = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+    // Reference separatePathBSDF=false: classify the material, not a sampled lobe
+    // whose single-component PDF would differ from our full mixture PDF.
+    return material.getProperties(sd).roughness > threshold;
+}
+
+struct PathTraceResult
+{
+    PathBuilder builder;
+    HybridPrefix prefix;
+};
+
+PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxScatters, float rrProbability,
+    uint traceMode, PathSample target, float roughnessThreshold, float nearFieldDistance)
 {
     PathBuilder builder = PathBuilder(seed);
+    builder.replayEnabled = traceMode != 0;
+    builder.replayTarget = target;
+    HybridPrefix prefix = {};
+    prefix.hit = HitInfo().pack();
+    prefix.failure = 11; // Ended before the requested prefix endpoint.
     SampleGenerator sg = SampleGenerator(seed);
     HitInfo hit = HitInfo(primary.hit);
     float3 direction = primary.direction;
@@ -51,6 +73,12 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
     float3 previousOrigin = 0.f;
     float previousPdf = 0.f;
     bool previousDelta = true;
+    PackedHitInfo previousHit = HitInfo().pack();
+    float3 previousDirection = 0.f;
+    float3 previousScatterPrefix = 1.f;
+    uint previousScatterSeed = seed;
+    uint previousFlags = 0;
+    bool previousRough = false;
     SceneRayQuery<true> query;
 
     // Like the reference TracePass: complete each path in one dispatch, including
@@ -74,17 +102,39 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             }
 #endif
             // The rc BSDF PDF changes during reconnection. Reevaluate its terminal MIS in Shift.
-            builder.add(throughput * emission * mis, suffix * emission * (depth == 2 ? 1.f : mis), depth,
+            builder.add(throughput * emission * mis, suffix * emission * (depth == builder.descriptor.rcIndex + 1 ? 1.f : mis), depth,
                 PathTerminal::Environment, PathLight::Environment, sg.rng.state, lightPdf, direction, false);
             break;
         }
 
         ShadingData sd = loadShadingData(hit, direction);
         bool atRc = depth == 1;
+#if GRIS_SHIFT_STRATEGY == 2
+        bool currentRough = hybridRough(sd, roughnessThreshold);
+        bool canConnect = depth > 0 && previousRough && currentRough && (builder.descriptor.prefixFlags & 4u) == 0 &&
+            length(sd.posW - previousOrigin) >= nearFieldDistance;
+        if (traceMode == 2 && canConnect && depth < target.rcIndex)
+        {
+            prefix.failure = 12; // The destination would choose an earlier rc.
+            break;
+        }
+        atRc = builder.descriptor.rcIndex == 0xffffffff && canConnect;
+        if (traceMode == 2) atRc = false;
+#endif
         if (atRc)
         {
             builder.descriptor.rcHit = hit.pack();
-            builder.descriptor.rcIndex = 1;
+            builder.descriptor.rcPositionW = sd.posW;
+            builder.descriptor.rcTexCoord = sd.uv;
+            builder.descriptor.rcFrame = sd.frame;
+            builder.descriptor.rcTangentW = sd.tangentW;
+            builder.descriptor.rcFaceN = sd.faceN;
+            builder.descriptor.rcIndex = depth;
+            builder.descriptor.rcPrevHit = previousHit;
+            builder.descriptor.rcPrevDirection = previousDirection;
+            builder.descriptor.rcPrevSeed = previousScatterSeed;
+            builder.descriptor.rcBeforeFlags = previousFlags;
+            builder.descriptor.cachedJacobian.x = previousPdf;
             float3 edge = sd.posW - previousOrigin;
             // Use the stored hit positions for geometry on both sides of a later shift.
             // The sampled direction can differ slightly at grazing angles after hit reconstruction.
@@ -96,20 +146,20 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             {
                 // Pure reconnection in the reference reevaluates the SOURCE PDF using
                 // the geometric connection too. Cache that value, not the sampled-ray PDF.
-                ShadingData firstSd = loadShadingData(HitInfo(primary.hit), primary.direction);
+                ShadingData firstSd = loadShadingData(HitInfo(previousHit), previousDirection);
                 let firstMaterial = gScene.materials.getMaterialInstance(firstSd, ExplicitLodTextureSampler(0.f));
-                float p1 = evalMyPTBSDFPdf(firstSd, firstMaterial, connection, bool(USE_IMPORTANCE_SAMPLING));
+                float p1 = evalGRISBSDFPdf(firstSd, firstMaterial, connection, bool(USE_IMPORTANCE_SAMPLING));
                 if (p1 > 0.f)
                 {
                     // Parameterize the candidate by its stored vertices, just as Shift does.
                     // This only removes the floating-point discrepancy between the sampled
                     // ray direction and the direction reconstructed from its hit position.
                     SampleGenerator evaluation = sg;
-                    throughput = firstMaterial.eval(firstSd, connection, evaluation) / p1;
+                    throughput = previousScatterPrefix * evalGRISBSDF(firstSd, firstMaterial, connection, evaluation) / p1;
                     builder.descriptor.cachedJacobian.x = p1;
                     previousPdf = p1;
                     direction = connection;
-                    sd = loadShadingData(hit, direction);
+                    sd = loadRcShadingData(builder.descriptor, direction);
                 }
                 else builder.descriptor.rcBeforeFlags |= 8u;
                 // A reconstructed source segment must itself be in the mapping's support.
@@ -138,7 +188,7 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
 #endif
         float emissionMIS = depth == 0 ? 1.f : hitMIS(previousPdf, emissionPdf, previousDelta);
         // Unlike the reference's external-DI branch, the baseline owns primary/direct emission too.
-        builder.add(throughput * emission * emissionMIS, suffix * emission * (depth <= 2 ? 1.f : emissionMIS), depth,
+        builder.add(throughput * emission * emissionMIS, suffix * emission * (depth <= builder.descriptor.rcIndex + 1 ? 1.f : emissionMIS), depth,
             PathTerminal::Emission, PathLight::Emissive, emissionSeed, emissionPdf, direction, atRc);
 
         if (depth == maxScatters) break;
@@ -152,7 +202,7 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             if (sampleMyPTAnalyticLight(sd, sg, ls, invPdf))
             {
                 float3 Li = ls.Li * invPdf;
-                float3 local = mi.eval(sd, ls.dir, sg) * Li;
+                float3 local = evalGRISBSDF(sd, mi, ls.dir, sg) * Li;
                 if (any(local > 0.f) && pathVisible(sd, ls.dir, ls.distance))
                     builder.add(throughput * local, atRc ? ls.Li : suffix * local, depth + 1,
                         PathTerminal::NEE, PathLight::Analytic, lightSeed, 1.f / invPdf, ls.dir, atRc);
@@ -165,8 +215,8 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             TriangleLightSample ls;
             if (sampleMyPTEmissiveLight(sd, sg, ls) && ls.pdf > 0.f)
             {
-                float mis = GRIS_USE_MIS ? balanceWeight(ls.pdf, evalMyPTBSDFPdf(sd, mi, ls.dir, bool(USE_IMPORTANCE_SAMPLING))) : 1.f;
-                float3 local = mi.eval(sd, ls.dir, sg) * ls.Le * (mis / ls.pdf);
+                float mis = GRIS_USE_MIS ? balanceWeight(ls.pdf, evalGRISBSDFPdf(sd, mi, ls.dir, bool(USE_IMPORTANCE_SAMPLING))) : 1.f;
+                float3 local = evalGRISBSDF(sd, mi, ls.dir, sg) * ls.Le * (mis / ls.pdf);
                 if (any(local > 0.f) && pathVisible(sd, ls.dir, ls.distance))
                     builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
                         PathTerminal::NEE, PathLight::Emissive, lightSeed, ls.pdf, ls.dir, atRc);
@@ -179,8 +229,8 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             EnvMapSample ls;
             if (gEnvSampler.sample(sampleNext2D(sg), ls) && ls.pdf > 0.f)
             {
-                float mis = GRIS_USE_MIS ? balanceWeight(ls.pdf, evalMyPTBSDFPdf(sd, mi, ls.dir, bool(USE_IMPORTANCE_SAMPLING))) : 1.f;
-                float3 local = mi.eval(sd, ls.dir, sg) * ls.Le * (mis / ls.pdf);
+                float mis = GRIS_USE_MIS ? balanceWeight(ls.pdf, evalGRISBSDFPdf(sd, mi, ls.dir, bool(USE_IMPORTANCE_SAMPLING))) : 1.f;
+                float3 local = evalGRISBSDF(sd, mi, ls.dir, sg) * ls.Le * (mis / ls.pdf);
                 if (any(local > 0.f) && pathVisible(sd, ls.dir, 1e30f))
                     builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
                         PathTerminal::NEE, PathLight::Environment, lightSeed, ls.pdf, ls.dir, atRc);
@@ -194,8 +244,21 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
         {
             if (sampleNext1D(sg) < rrProbability) break;
             throughput /= 1.f - rrProbability;
-            if (depth > 1) suffix /= 1.f - rrProbability;
+            if (builder.descriptor.rcIndex != 0xffffffff && depth > builder.descriptor.rcIndex) suffix /= 1.f - rrProbability;
         }
+        if (traceMode == 2 && depth + 1 == target.rcIndex)
+        {
+            if (!hybridRough(sd, roughnessThreshold)) { prefix.failure = 13; break; }
+            if ((builder.descriptor.prefixFlags & 4u) != 0) { prefix.failure = 9; break; }
+            prefix.hit = hit.pack();
+            prefix.direction = direction;
+            prefix.throughput = throughput;
+            prefix.rngState = sg.rng.state;
+            prefix.failure = 0;
+            break; // RR for the connection is included; the connection BSDF is not.
+        }
+        previousScatterPrefix = throughput;
+        previousScatterSeed = sg.rng.state;
         if (!sampleMyPTBSDF(sd, mi, sg, bs, bool(USE_IMPORTANCE_SAMPLING))) break;
         if (!bs.isLobe(LobeType::Delta) && gScene.materials.getMaterialType(sd.materialID) == MaterialType::Standard)
         {
@@ -203,9 +266,9 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             // Reconnection evaluates the full continuous BSDF, so use the same estimator
             // here (marginalize the lobe choice). Keep the transport random stream intact.
             SampleGenerator evaluation = sg;
-            bs.pdf = evalMyPTBSDFPdf(sd, mi, bs.wo, bool(USE_IMPORTANCE_SAMPLING));
+            bs.pdf = evalGRISBSDFPdf(sd, mi, bs.wo, bool(USE_IMPORTANCE_SAMPLING));
             if (bs.pdf <= 0.f) break;
-            bs.weight = mi.eval(sd, bs.wo, evaluation) / bs.pdf;
+            bs.weight = evalGRISBSDF(sd, mi, bs.wo, evaluation) / bs.pdf;
         }
         throughput *= bs.weight;
         if (any(!isfinite(throughput))) { builder.reservoir.invalidCount++; break; }
@@ -218,9 +281,9 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
             if ((builder.descriptor.rcBeforeFlags & 13u) == 0 && !bs.isLobe(LobeType::Delta))
             {
                 float3 sourceConnection = normalize(sd.posW - previousOrigin);
-                ShadingData sourceRc = loadShadingData(hit, sourceConnection);
+                ShadingData sourceRc = loadRcShadingData(builder.descriptor, sourceConnection);
                 let sourceRcMaterial = gScene.materials.getMaterialInstance(sourceRc, ExplicitLodTextureSampler(0.f));
-                builder.descriptor.cachedJacobian.y = evalMyPTBSDFPdf(sourceRc, sourceRcMaterial, bs.wo, bool(USE_IMPORTANCE_SAMPLING));
+                builder.descriptor.cachedJacobian.y = evalGRISBSDFPdf(sourceRc, sourceRcMaterial, bs.wo, bool(USE_IMPORTANCE_SAMPLING));
             }
             builder.descriptor.rcAfterFlags = (bs.isLobe(LobeType::Delta) ? 1u : 0u) |
                 (bs.isLobe(LobeType::Transmission) ? 2u : 0u);
@@ -234,7 +297,14 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
                 (bs.isLobe(LobeType::Transmission) ? 2u : 0u) |
                 (gScene.materials.getMaterialType(sd.materialID) != MaterialType::Standard ? 4u : 0u);
         }
-        else if (depth > 1) suffix *= bs.weight;
+        else if (builder.descriptor.rcIndex != 0xffffffff && depth > builder.descriptor.rcIndex) suffix *= bs.weight;
+        previousFlags = (bs.isLobe(LobeType::Delta) ? 1u : 0u) |
+            (bs.isLobe(LobeType::Transmission) ? 2u : 0u) |
+            (gScene.materials.getMaterialType(sd.materialID) != MaterialType::Standard ? 4u : 0u);
+        if (builder.descriptor.rcIndex == 0xffffffff) builder.descriptor.prefixFlags |= previousFlags;
+        previousHit = hit.pack();
+        previousDirection = direction;
+        previousRough = hybridRough(sd, roughnessThreshold);
         previousPosition = sd.posW;
         previousNormal = sd.getOrientedFaceNormal();
         previousPdf = bs.pdf;
@@ -246,5 +316,46 @@ PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatter
         hit = query.traceRay(Ray(origin, direction, 0.f, 1e30f), hitT);
     }
     builder.finalize();
-    return builder;
+    PathTraceResult result;
+    result.builder = builder;
+    result.prefix = prefix;
+    return result;
+}
+
+PathBuilder tracePathTree(PrimaryPathContext primary, uint seed, uint maxScatters, float rrProbability,
+    float roughnessThreshold = 0.2f, float nearFieldDistance = 0.1f)
+{
+    PathSample target = {};
+    return tracePathImpl(primary, seed, maxScatters, rrProbability, 0, target, roughnessThreshold, nearFieldDistance).builder;
+}
+
+PathSample traceReplayContribution(PrimaryPathContext primary, PathSample source, uint maxScatters, float rrProbability,
+    float roughnessThreshold = 0.2f, float nearFieldDistance = 0.1f)
+{
+    PathTraceResult result = tracePathImpl(primary, source.initialSeed, min(maxScatters, source.surfaceScatters),
+        rrProbability, 1, source, roughnessThreshold, nearFieldDistance);
+    PathSample sample = result.builder.replaySample;
+    if (!result.builder.replayFound) sample = {};
+    return sample;
+}
+
+HybridPrefix traceHybridPrefix(PrimaryPathContext primary, PathSample source, uint maxScatters, float rrProbability,
+    float roughnessThreshold, float nearFieldDistance)
+{
+    if (source.rcIndex != 0xffffffff)
+        return tracePathImpl(primary, source.initialSeed, maxScatters, rrProbability, 2, source,
+            roughnessThreshold, nearFieldDistance).prefix;
+    PathTraceResult result = tracePathImpl(primary, source.initialSeed, min(maxScatters, source.surfaceScatters),
+        rrProbability, 1, source, roughnessThreshold, nearFieldDistance);
+    HybridPrefix prefix = {};
+    prefix.hit = HitInfo().pack();
+    if (!result.builder.replayFound) prefix.failure = 16;
+    else if (result.builder.replaySample.rcIndex != 0xffffffff) prefix.failure = 15;
+    else
+    {
+        prefix.throughput = result.builder.replaySample.F;
+        prefix.terminal = result.builder.replaySample.terminal;
+        prefix.light = result.builder.replaySample.light;
+    }
+    return prefix;
 }

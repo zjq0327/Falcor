@@ -55,7 +55,7 @@ public:
     enum class Mode
     {
         PT,     ///< Brute-force path tracing (default).
-        ReSTIR, ///< Complete-path RIS and temporal/spatial GRIS with pure reconnection.
+        ReSTIR, ///< Complete-path RIS and temporal/spatial GRIS.
     };
 
     FALCOR_ENUM_INFO(
@@ -63,6 +63,22 @@ public:
         {
             {Mode::PT, "PT"},
             {Mode::ReSTIR, "ReSTIR"},
+        }
+    );
+
+    enum class ShiftStrategy
+    {
+        Reconnection,
+        RandomReplay,
+        Hybrid,
+    };
+
+    FALCOR_ENUM_INFO(
+        ShiftStrategy,
+        {
+            {ShiftStrategy::Reconnection, "Reconnection"},
+            {ShiftStrategy::RandomReplay, "RandomReplay"},
+            {ShiftStrategy::Hybrid, "Hybrid"},
         }
     );
 
@@ -101,6 +117,11 @@ private:
 
     /// Rendering mode (path tracing or ReSTIR).
     Mode mMode = Mode::PT;
+
+    /// Existing scripts retain pure reconnection unless they opt into another shift.
+    ShiftStrategy mShiftStrategy = ShiftStrategy::Reconnection;
+    float mSpecularRoughnessThreshold = 0.2f;
+    float mNearFieldDistance = 0.1f;
 
     /// Retained for old script compatibility; separate DI reuse is not dispatched in M0-M2.
     uint mRISCandidateCount = 32;
@@ -156,6 +177,9 @@ private:
     {
         ref<ComputePass> generatePaths;
         ref<ComputePass> tracePaths;
+        ref<ComputePass> temporalPathRetrace;
+        ref<ComputePass> spatialPathRetrace;
+        ref<ComputePass> validateShift;
         ref<ComputePass> temporalReuse;
         ref<ComputePass> spatialReuse;
         ref<ComputePass> resolve;
@@ -165,6 +189,7 @@ private:
         ref<Buffer> temporal;
         ref<Buffer> historyPrimary;
         ref<Buffer> historyReservoir;
+        ref<Buffer> hybridPairs;
         ref<Buffer> spatial[2];
         std::unique_ptr<EnvMapSampler> envSampler;
         DefineList defines;
@@ -185,3 +210,4 @@ private:
 };
 
 FALCOR_ENUM_REGISTER(MyPT::Mode);
+FALCOR_ENUM_REGISTER(MyPT::ShiftStrategy);

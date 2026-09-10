@@ -15,8 +15,10 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     const bool useSpatial = mSpatialReuse && mSpatialNeighborCount > 0 && mSpatialReuseRounds > 0;
     const auto& camera = mpScene->getCamera();
     const bool useTemporal = mTemporalReuse && mMaxHistoryLength > 0 && camera->getApertureRadius() == 0.f;
+    const bool useHybrid = mShiftStrategy == ShiftStrategy::Hybrid;
     if (auto texture = data.getTexture("spatialDebug")) context->clearTexture(texture.get(), float4(0.f));
     if (auto texture = data.getTexture("temporalDebug")) context->clearTexture(texture.get(), float4(0.f));
+    if (auto texture = data.getTexture("shiftDebug")) context->clearTexture(texture.get(), float4(0.f));
 
     // The suffix is only reusable while geometry, materials and lighting are unchanged.
     // CameraPropertiesChanged also includes per-frame jitter, so inspect its finer flags.
@@ -50,6 +52,7 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     defines.add("USE_ENV_BACKGROUND", mpScene->useEnvBackground() ? "1" : "0");
     defines.add("GRIS_USE_NEE", "1");
     defines.add("GRIS_USE_MIS", mUseMIS ? "1" : "0");
+    defines.add("GRIS_SHIFT_STRATEGY", std::to_string(uint32_t(mShiftStrategy)));
     defines.add("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     defines.add("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
     defines.add("GRIS_HAS_VIEW", data.getTexture("viewW") ? "1" : "0");
@@ -61,11 +64,16 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     defines.add("GRIS_HAS_TEMPORAL_DEBUG", data.getTexture("temporalDebug") ? "1" : "0");
     defines.add("GRIS_HAS_TEMPORAL_COLOR", data.getTexture("temporalColor") ? "1" : "0");
     defines.add("GRIS_HAS_MOTION", data.getTexture("mvec") ? "1" : "0");
+    defines.add("GRIS_HAS_SHIFT_DEBUG", data.getTexture("shiftDebug") ? "1" : "0");
+    defines.add("GRIS_HAS_PATH_DEBUG", data.getTexture("pathDebug") ? "1" : "0");
     if (mpEmissiveSampler) defines.add(mpEmissiveSampler->getDefines());
 
     if (!mGRIS.generatePaths || defines != mGRIS.defines)
     {
         ProgramDesc base;
+        // Replay evaluates the same transport in separately compiled passes.
+        // Preserve floating-point operation ordering across their call contexts.
+        base.setCompilerFlags(SlangCompilerFlags::FloatingPointModePrecise);
         mpScene->getShaderModules(base.shaderModules);
         TypeConformanceList conformances;
         mpScene->getTypeConformances(conformances);
@@ -78,6 +86,9 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         };
         mGRIS.generatePaths = create("GeneratePaths.cs.slang");
         mGRIS.tracePaths = create("TracePaths.cs.slang");
+        mGRIS.temporalPathRetrace = create("TemporalPathRetrace.cs.slang");
+        mGRIS.spatialPathRetrace = create("SpatialPathRetrace.cs.slang");
+        mGRIS.validateShift = create("ValidateShift.cs.slang");
         mGRIS.temporalReuse = create("TemporalReuse.cs.slang");
         mGRIS.spatialReuse = create("SpatialReuse.cs.slang");
         mGRIS.resolve = create("Resolve.cs.slang");
@@ -98,6 +109,7 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         mGRIS.temporal = nullptr;
         mGRIS.historyPrimary = nullptr;
         mGRIS.historyReservoir = nullptr;
+        mGRIS.hybridPairs = nullptr;
         mGRIS.historyValid = false;
         for (auto& buffer : mGRIS.spatial) buffer = nullptr;
         mGRIS.dimensions = dimensions;
@@ -111,6 +123,18 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         mGRIS.historyReservoir = mpDevice->createStructuredBuffer(var["gFresh"], count);
         mGRIS.temporal = mpDevice->createStructuredBuffer(var["gFresh"], count);
         mGRIS.historyValid = false;
+    }
+    if (useHybrid && (useTemporal || useSpatial))
+    {
+        const uint64_t count = uint64_t(dimensions.x) * dimensions.y * std::max(1u, mSpatialNeighborCount);
+        FALCOR_CHECK(count <= UINT32_MAX, "GRIS hybrid pair buffer element count overflow.");
+        if (!mGRIS.hybridPairs || mGRIS.hybridPairs->getElementCount() != uint32_t(count))
+        {
+            // Pair layouts are scene-dependent too. Reflect the retrace output rather
+            // than duplicating HybridPair's shader layout on the host.
+            const auto& pass = useSpatial ? mGRIS.spatialPathRetrace : mGRIS.temporalPathRetrace;
+            mGRIS.hybridPairs = mpDevice->createStructuredBuffer(pass->getRootVar()["gHybridPairs"], uint32_t(count));
+        }
     }
     auto bind = [&](const ref<ComputePass>& pass)
     {
@@ -134,9 +158,31 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         var["CB"]["gTemporalNormalThreshold"] = mTemporalNormalThreshold;
         var["CB"]["gPreviousViewProj"] = mGRIS.previousViewProj;
         var["CB"]["gPreviousCameraPosition"] = mGRIS.previousCameraPosition;
+        var["CB"]["gRoughnessThreshold"] = mSpecularRoughnessThreshold;
+        var["CB"]["gNearFieldDistance"] = mNearFieldDistance;
         var["gPrimary"] = mGRIS.primary;
         var["gFresh"] = mGRIS.fresh;
         var["gReference"] = mGRIS.reference;
+    };
+    auto bindTransport = [&](const ref<ComputePass>& pass)
+    {
+        auto var = pass->getRootVar();
+        mpScene->bindShaderDataForRaytracing(context, var["gScene"]);
+        if (mpScene->useEnvLight()) mGRIS.envSampler->bindShaderData(var["gEnvSampler"]);
+        if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
+    };
+    auto bindHistory = [&](const ref<ComputePass>& pass)
+    {
+        auto var = pass->getRootVar();
+        var["gHistoryPrimary"] = mGRIS.historyPrimary;
+        var["gHistoryReservoir"] = mGRIS.historyReservoir;
+        if (auto texture = data.getTexture("mvec")) var["gMotionVector"] = texture;
+    };
+    auto bindReuseDiagnostics = [&](const ref<ComputePass>& pass)
+    {
+        auto var = pass->getRootVar();
+        if (useHybrid) var["gHybridPairs"] = mGRIS.hybridPairs;
+        if (auto texture = data.getTexture("shiftDebug")) var["gShiftDebug"] = texture;
     };
     {
         FALCOR_PROFILE(context, "GRIS.GeneratePaths");
@@ -151,23 +197,38 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         FALCOR_PROFILE(context, "GRIS.TracePaths");
         bind(mGRIS.tracePaths);
         auto var = mGRIS.tracePaths->getRootVar();
-        mpScene->bindShaderDataForRaytracing(context, var["gScene"]);
-        if (mpScene->useEnvLight()) mGRIS.envSampler->bindShaderData(var["gEnvSampler"]);
-        if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
+        bindTransport(mGRIS.tracePaths);
+        if (auto texture = data.getTexture("pathDebug")) var["gPathDebug"] = texture;
         mGRIS.tracePaths->execute(context, uint3(dimensions, 1));
+    }
+    if (auto texture = data.getTexture("shiftDebug"))
+    {
+        FALCOR_PROFILE(context, "GRIS.ValidateShift");
+        bind(mGRIS.validateShift);
+        bindTransport(mGRIS.validateShift);
+        mGRIS.validateShift->getRootVar()["gShiftDebug"] = texture;
+        mGRIS.validateShift->execute(context, uint3(dimensions, 1));
     }
     ref<Buffer> current = mGRIS.fresh;
     if (useTemporal)
     {
+        if (useHybrid)
+        {
+            FALCOR_PROFILE(context, "GRIS.TemporalPathRetrace");
+            bind(mGRIS.temporalPathRetrace);
+            bindHistory(mGRIS.temporalPathRetrace);
+            bindTransport(mGRIS.temporalPathRetrace);
+            bindReuseDiagnostics(mGRIS.temporalPathRetrace);
+            mGRIS.temporalPathRetrace->execute(context, uint3(dimensions, 1));
+        }
         FALCOR_PROFILE(context, "GRIS.TemporalReuse");
         bind(mGRIS.temporalReuse);
+        bindHistory(mGRIS.temporalReuse);
+        bindTransport(mGRIS.temporalReuse);
+        bindReuseDiagnostics(mGRIS.temporalReuse);
         auto var = mGRIS.temporalReuse->getRootVar();
-        var["gHistoryPrimary"] = mGRIS.historyPrimary;
-        var["gHistoryReservoir"] = mGRIS.historyReservoir;
         var["gTemporalOutput"] = mGRIS.temporal;
-        if (auto texture = data.getTexture("mvec")) var["gMotionVector"] = texture;
         if (auto texture = data.getTexture("temporalDebug")) var["gTemporalDebug"] = texture;
-        mpScene->bindShaderDataForRaytracing(context, var["gScene"]);
         mGRIS.temporalReuse->execute(context, uint3(dimensions, 1));
         current = mGRIS.temporal;
     }
@@ -176,16 +237,28 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     {
         for (uint round = 0; round < mSpatialReuseRounds; ++round)
         {
+            if (useHybrid)
+            {
+                FALCOR_PROFILE(context, "GRIS.SpatialPathRetrace");
+                bind(mGRIS.spatialPathRetrace);
+                bindTransport(mGRIS.spatialPathRetrace);
+                bindReuseDiagnostics(mGRIS.spatialPathRetrace);
+                auto var = mGRIS.spatialPathRetrace->getRootVar();
+                var["CB"]["gSpatialRound"] = round;
+                var["gSpatialInput"] = current;
+                mGRIS.spatialPathRetrace->execute(context, uint3(dimensions, 1));
+            }
             FALCOR_PROFILE(context, "GRIS.SpatialReuse");
             auto& output = mGRIS.spatial[round & 1u];
             if (!output)
                 output = mpDevice->createStructuredBuffer(mGRIS.generatePaths->getRootVar()["gFresh"], dimensions.x * dimensions.y);
             bind(mGRIS.spatialReuse);
+            bindTransport(mGRIS.spatialReuse);
+            bindReuseDiagnostics(mGRIS.spatialReuse);
             auto var = mGRIS.spatialReuse->getRootVar();
             var["CB"]["gSpatialRound"] = round;
             var["gSpatialInput"] = current;
             var["gSpatialOutput"] = output;
-            mpScene->bindShaderDataForRaytracing(context, var["gScene"]);
             if (auto texture = data.getTexture("spatialDebug")) var["gSpatialDebug"] = texture;
             mGRIS.spatialReuse->execute(context, uint3(dimensions, 1));
             current = output;

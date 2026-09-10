@@ -1,7 +1,7 @@
 # MyPT 向 GRIS / ReSTIR PT 迁移的开发计划
 
 编写日期：2026-09-08  
-状态：第一轮实现及本地初始 RIS 验收已完成。2026-09-08 按用户反馈修订为在原有 PT / ReSTIR 上增量修改，不增加 UI 渲染模式。M0 的跨版本同场景 HDR 对拍仍未完成；详见[第一轮验收记录](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round1_results.md)。这不表示完整 GRIS 已实现。
+状态（2026-09-10）：M1–M5 已在各轮声明的支持范围内完成。M5 经完整恢复验收通过：同冻结构建的四组核心统计、新的全部 27 项边界、图像、Layered 和原入口检查均通过，原中断记录保留。继续在原有 PT / ReSTIR 上增量修改，不增加 UI 渲染模式。M0 的跨版本同场景 HDR 对拍及 M6 完整画质/性能对齐仍未完成；本轮详见[第四轮记录](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round4_results.md)。
 
 ## 1. 目标、范围与参考基线
 
@@ -384,19 +384,35 @@ M 表示复用置信权重，不等同于实际追踪射线数，也不等同于
 
 ### M5. Random Replay 与 Hybrid
 
-- [ ] 先完成纯 RandomReplay，验证同上下文路径恢复和 PSS 单位 Jacobian。
-- [ ] 按 [参考可连接性与可逆性逻辑][R12] 实现 roughness、distance、采样 lobe、重连索引和终止类型约束。
-- [ ] 接入 P3/P5 的双向前缀缓存，与 P4/P6 共用对应关系。
-- [ ] 记录不可逆、路径长度不匹配、delta 不可重连等失败原因。
+第四轮实施约束（2026-09-09，对照参考 PathTracer 的 replay / Hybrid 选点与 Shift）：
+
+- 沿用原 PT / ReSTIR 模式，在 ReSTIR 内增加 Shift strategy：Reconnection / RandomReplay / Hybrid。切换策略或阈值重置采样和历史；原脚本本轮最终启用 Hybrid，旧脚本未声明策略时仍使用 Reconnection。
+- RandomReplay 复用现有候选追踪循环，从 initialSeed 恢复指定的逻辑贡献槽：路径长度、NEE/BSDF-arrival 类别及 NEE 光源分支。不能重新执行 RIS 选择另一个贡献，也不能按“第几个非零贡献”或旧 terminalSeed 匹配。重放与生成执行同一 NEE/BSDF/RR 随机数消费，PSS Jacobian 为 1。
+- 本轮对应参考 separatePathBSDF=false 分支，保留当前完整 BSDF / mixture PDF 估计器。按材质 roughness、连接距离选择第一个有限表面重连点，单独保存并检查 delta 和反射/透射事件。参考默认的分量拆分配置需要成套的分量 eval/pdf 与 MIS，不混用到现有估计器。
+- Hybrid 保存广义 rcIndex、前一顶点命中/观察方向、前缀吞吐及后缀。双向重放到 rcIndex-1，检查更早重连点、终止和粗糙度分类变化；连接段另检查距离、事件类型、可见性、Jacobian 支持域。被移位的样本保留固定重连后缀，不能在重连失败时改用完整 Replay。
+- 有限 rc 的前缀限定为 Standard 材质，并校验源/目的连接前 RNG 状态一致，避免可变采样维度错配。包含非 Standard 前缀的候选归入 noRC 完整 Replay；这类材质的有限 rc Hybrid 不在本轮支持范围内。
+- 未选到有限表面重连点的贡献使用完整 Replay，并要求目的贡献仍属于无重连点分区。BSDF 恰在首次可连接表面发光终止、尚无更早有限 rc 时，该贡献也改记 noRC；已有较早有限 rc 的发光或环境后缀仍保留该 rc。本轮未实现参考额外的发光/逃逸终端 rc 表示，包括无限远 rc。
+- P3/P5 实际 dispatch 写入双向前缀缓存，P4/P6 读取同一邻居对应。每轮冻结输入、重新生成缓存，所有无效槽均明确初始化；保留原 Talbot / Pairwise 权重生命周期。
+- 增加可选重放/Hybrid 诊断，验收真实 identity 重放、往返 F/J、分区拒绝、深重连点、镜面/透射前缀、近场、RR、时间/空间组合和原入口。身份检查必须绕过“直接拷贝相同像素”的快捷路径。
+- 数值一致性修正限制在 GRIS 的共享材质求值入口：对 Standard 材质最终 shading frame 的世界到局部方向变换使用明确顺序的 precise 标量乘加，继续调用 Falcor 原有材质准备、半球检查和 StandardBSDF eval/pdf；生成、Replay 与重连共用。该调整针对已复现的近掠射角跨 Pass 浮点误差，不复制源 F、不放宽 1e-3 门槛、不另写 BSDF 物理模型；原 PT 模式保持现有入口。
+- 固定有限 rc 缓存视角无关的原始表面数据（位置、UV、未调整 TBN、原 tangentW、未翻转 faceN），生成与双向移位共用；每个目的视角仍重新计算 V/frontFacing 并执行材质 setup。该缓存是 Falcor 8 数值适配，参考自身仍由 rcHit 重建。不得缓存旧视角的最终材质法线；几何/材质变化继续失效历史。新增存储代价在 M6 记录。
+
+- [x] 先完成纯 RandomReplay，验证同上下文路径恢复和 PSS 单位 Jacobian。
+- [x] 按 [参考可连接性与可逆性逻辑][R12] 实现 roughness、distance、整材质分类下的 delta / 反射透射事件、重连索引和终止类型约束。
+- [x] 接入 P3/P5 的双向前缀缓存，与 P4/P6 共用对应关系。
+- [x] 记录不可逆、路径长度不匹配、delta 不可重连等失败原因。
+
+第四轮验收通过，详见 [GRIS_round4_results.md](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round4_results.md)。最终审计状态为 `passed_with_retained_interruption`：131,072 帧核心统计、新进程完整 27 项边界、同构建图像/Layered/原入口及人工图像检查通过；原中断的 20 项不计入通过数量。支持范围仍为本节声明的整材质 Hybrid 与 noRC Replay，不表示参考默认分量拆分、额外终端 rc 或完整画质/性能已对齐。深 rc 与镜面/透射计数属于路径生成覆盖，不能代替各类前缀的跨像素接纳证明。
 
 **依赖：** M4 和确定性的完整路径采样。  
-**完成条件：** 参考定义域内的成功映射通过往返检查；glossy、镜面/透射链路和近距离几何通过图像验收。
+**完成条件：** 本轮声明的支持域和已记录配置内，成功映射通过往返检查；glossy、镜面/透射链路和近距离几何通过图像验收。
 
 ### M6. 完整效果对齐与性能收敛
 
-- [ ] 对齐参考的 realtime / offline 两种配置，比较原始 HDR。
+- [ ] 先统一或记录 separatePathBSDF、终端 rc 表示与 DI 分工的差异，再对齐参考的 realtime / offline 两种配置并比较原始 HDR。
 - [ ] 单独验证 DI 输入，完成整体画面比较；按需要接入 NRD。
 - [ ] 记录每 pass GPU 时间、射线数、缓存大小及失败率，针对实测瓶颈优化。
+- [ ] 修复已定位的 Falcor 成功编译请求生命周期问题，并重新验证长进程中反复重建 shader 的资源占用；M5 数值验收先采用已记录的分进程执行。
 - [ ] 保存最终参数与对照结果，逐项标注相同、预期不同和待解决。
 
 **依赖：** M5。  
@@ -518,6 +534,6 @@ M4 已在原 ReSTIR 中完成：`GeneratePaths → TracePaths → TemporalReuse 
 [R16]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/PathTracer.slang:1022
 [R17]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/GeneratePaths.cs.slang:100
 [R18]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/TemporalPathRetrace.cs.slang:119
-[R19]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/SpatialPathRetrace.cs.slang:128
+[R19]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/SpatialPathRetrace.cs.slang:155
 [R20]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/ReSTIRPTPass.h:75
 [R21]: C:/Users/13243/Desktop/Restir/ReSTIR_PT/Source/RenderPasses/ReSTIRPTPass/ComputePathReuseMISWeights.cs.slang:95

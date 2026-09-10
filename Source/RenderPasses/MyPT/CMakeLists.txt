@@ -10,8 +10,13 @@ target_sources(MyPT PRIVATE
     GRIS/PathState.slang
     GRIS/PathReservoir.slang
     GRIS/PathBuilder.slang
+    GRIS/BSDF.slang
     GRIS/PathTracer.slang
     GRIS/Shift.slang
+    GRIS/ReuseHelpers.slang
+    GRIS/SpatialPathRetrace.cs.slang
+    GRIS/TemporalPathRetrace.cs.slang
+    GRIS/ValidateShift.cs.slang
     GRIS/SpatialReuse.cs.slang
     GRIS/TemporalReuse.cs.slang
     GRIS/GeneratePaths.cs.slang

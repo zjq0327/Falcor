@@ -1,13 +1,10 @@
 // Talbot resampling MIS, following ReSTIRPTPass/TemporalReuse.cs.slang.
-import Params;
+import ReuseHelpers;
 import Shift;
 import RenderPasses.MyPT.MyPTCommon;
 import Utils.Math.HashUtils;
 
-StructuredBuffer<PrimaryPathContext> gHistoryPrimary;
-StructuredBuffer<PathReservoir> gHistoryReservoir;
 RWStructuredBuffer<PathReservoir> gTemporalOutput;
-Texture2D<float2> gMotionVector;
 RWTexture2D<float4> gTemporalDebug;
 
 void writeTemporalDebug(uint2 pixel, float status, float historyM = 0.f,
@@ -16,48 +13,6 @@ void writeTemporalDebug(uint2 pixel, float status, float historyM = 0.f,
 #if GRIS_HAS_TEMPORAL_DEBUG
     gTemporalDebug[pixel] = float4(status, historyM, incomingAccepted, roundTripError);
 #endif
-}
-
-bool validTemporalGeometry(ShadingData current, ShadingData previous)
-{
-    // Compare both surfaces in the previous camera's coordinate system. Comparing
-    // current and previous camera distances would reject ordinary camera motion.
-    float currentDepth = length(current.posW - gPreviousCameraPosition);
-    float previousDepth = length(previous.posW - gPreviousCameraPosition);
-    return current.materialID == previous.materialID &&
-        dot(current.frame.N, previous.frame.N) >= gTemporalNormalThreshold &&
-        abs(currentDepth - previousDepth) <= gTemporalDepthThreshold * min(currentDepth, previousDepth);
-}
-
-bool findHistoryPixel(uint2 pixel, ShadingData current, uint seed, out uint2 previousPixel)
-{
-    previousPixel = pixel;
-    if (gTemporalReprojection == 0) return true;
-
-    SampleGenerator reprojection = SampleGenerator(jenkinsHash(seed ^ 0xa24baed5u));
-    float2 offset = sampleNext2D(reprojection);
-    float2 location;
-#if GRIS_HAS_MOTION
-    // Falcor mvec points from current to previous in normalized screen coordinates.
-    // Its camera jitter has already been removed by VBufferRT.
-    location = float2(pixel) + gMotionVector[pixel] * float2(gDimensions) + offset;
-#else
-    float4 previousClip = mul(gPreviousViewProj, float4(current.posW, 1.f));
-    if (any(!isfinite(previousClip)) || previousClip.w <= 0.f) return false;
-    float2 previousUV = previousClip.xy / previousClip.w;
-#ifdef FALCOR_FLIP_Y
-    previousUV *= float2(0.5f, 0.5f);
-#else
-    previousUV *= float2(0.5f, -0.5f);
-#endif
-    previousUV += 0.5f;
-    location = previousUV * float2(gDimensions) - 0.5f + offset;
-#endif
-    // Check the floating-point position before conversion: negative coordinates
-    // truncated to int would otherwise incorrectly reuse the screen border.
-    if (any(!isfinite(location)) || any(location < 0.f) || any(location >= float2(gDimensions))) return false;
-    previousPixel = uint2(floor(location));
-    return true;
 }
 
 [numthreads(8, 8, 1)]
@@ -70,29 +25,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     PrimaryPathContext currentPrimary = gPrimary[index];
     gTemporalOutput[index] = current;
     writeTemporalDebug(pixel, 0.f);
-    if (gHistoryValid == 0) return;
-    if (!HitInfo(currentPrimary.hit).isValid()) { writeTemporalDebug(pixel, 1.f); return; }
-
-    ShadingData currentSd = loadShadingData(HitInfo(currentPrimary.hit), currentPrimary.direction);
-    uint2 previousPixel;
-    if (!findHistoryPixel(pixel, currentSd, currentPrimary.seed, previousPixel))
-    {
-        writeTemporalDebug(pixel, 2.f);
-        return;
-    }
-    uint previousIndex = pixelIndex(previousPixel);
+    HybridPair pair = {};
+#if GRIS_SHIFT_STRATEGY == 2
+    pair = gHybridPairs[index];
+#else
+    pair.status = temporalNeighbor(pixel, pair.neighborIndex);
+#endif
+    if (pair.status != 5) { writeTemporalDebug(pixel, float(pair.status)); return; }
+    uint previousIndex = pair.neighborIndex;
     PrimaryPathContext previousPrimary = gHistoryPrimary[previousIndex];
-    if (!HitInfo(previousPrimary.hit).isValid()) { writeTemporalDebug(pixel, 3.f); return; }
 
     PathReservoir history = gHistoryReservoir[previousIndex];
     // Reference caps confidence only; the normalized estimator weight stays intact.
     history.M = min(float(gMaxHistoryLength) * current.M, history.M);
-    ShadingData previousSd = loadShadingData(HitInfo(previousPrimary.hit), previousPrimary.direction);
-    if (!validTemporalGeometry(currentSd, previousSd))
-    {
-        writeTemporalDebug(pixel, 4.f);
-        return;
-    }
 
     // Equal screen coordinates do not imply equal domains when the camera moves.
     // Exact contexts do support the identity even for direct/delta/local-only paths.
@@ -109,8 +54,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
     else
     {
-        currentToHistory = reconnectPath(current.sample, currentSd, previousSd);
-        historyToCurrent = reconnectPath(history.sample, previousSd, currentSd);
+        currentToHistory = shiftForPair(current.sample, currentPrimary, previousPrimary, pair.toNeighbor);
+        historyToCurrent = shiftForPair(history.sample, previousPrimary, currentPrimary, pair.toCenter);
+        recordShiftCheck(pixel, current.sample, currentPrimary, previousPrimary, currentToHistory);
+        recordShiftCheck(pixel, history.sample, previousPrimary, currentPrimary, historyToCurrent);
     }
 
     float currentMIS = balanceProductMass(float3(pathTarget(current.sample.F), current.M, 1.f),
@@ -134,13 +81,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     {
         if (currentToHistory.jacobian > 0.f && any(currentToHistory.sample.F > 0.f))
         {
-            ShiftResult back = reconnectPath(currentToHistory.sample, previousSd, currentSd);
+            ShiftResult back = shiftInline(currentToHistory.sample, previousPrimary, currentPrimary);
+            recordShiftFailure(pixel, back.failure);
             roundTripError = max(relativeContributionError(back.sample.F, current.sample.F),
                 abs(back.jacobian * currentToHistory.jacobian - 1.f));
         }
         if (incomingAccepted > 0.f)
         {
-            ShiftResult back = reconnectPath(historyToCurrent.sample, currentSd, previousSd);
+            ShiftResult back = shiftInline(historyToCurrent.sample, currentPrimary, previousPrimary);
+            recordShiftFailure(pixel, back.failure);
             roundTripError = max(roundTripError, max(relativeContributionError(back.sample.F, history.sample.F),
                 abs(back.jacobian * historyToCurrent.jacobian - 1.f)));
         }
