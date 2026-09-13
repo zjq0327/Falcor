@@ -37,6 +37,7 @@
 #endif
 
 #include <slang.h>
+#include <slang-com-ptr.h>
 
 #include <map>
 #include <string>
@@ -1655,12 +1656,12 @@ public:
     };
 
     /**
-     * Create a new object for a Slang reflector object
+     * Create reflection and retain the exact Slang components that own its layouts.
      */
     static ref<const ProgramReflection> create(
         ProgramVersion const* pProgramVersion,
-        slang::ShaderReflection* pSlangReflector,
-        const std::vector<slang::EntryPointLayout*>& pSlangEntryPointReflectors,
+        slang::IComponentType* pSlangGlobalScope,
+        const std::vector<Slang::ComPtr<slang::IComponentType>>& pSlangEntryPoints,
         std::string& log
     );
 
@@ -1725,13 +1726,19 @@ public:
 private:
     ProgramReflection(
         ProgramVersion const* pProgramVersion,
-        slang::ShaderReflection* pSlangReflector,
-        const std::vector<slang::EntryPointLayout*>& pSlangEntryPointReflectors,
+        slang::IComponentType* pSlangGlobalScope,
+        const std::vector<Slang::ComPtr<slang::IComponentType>>& pSlangEntryPoints,
         std::string& log
     );
     ProgramReflection(ProgramVersion const* pProgramVersion);
     ProgramReflection(const ProgramReflection&) = default;
     void setDefaultParameterBlock(const ref<ParameterBlockReflection>& pBlock);
+
+    // Layouts belong to their exact component, and the components borrow session-owned code.
+    // Declare these owners first so reflection data and components are destroyed before the session.
+    Slang::ComPtr<slang::ISession> mpSlangSession;
+    Slang::ComPtr<slang::IComponentType> mpSlangGlobalScope;
+    std::vector<Slang::ComPtr<slang::IComponentType>> mpSlangEntryPoints;
 
     ProgramVersion const* mpProgramVersion;
 

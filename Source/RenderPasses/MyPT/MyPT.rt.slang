@@ -63,10 +63,13 @@ import Rendering.Lights.LightHelpers;
 import Rendering.Lights.EmissiveLightSampler;
 import Utils.Color.ColorHelpers;
 import MyPTCommon;
+import Utils.Math.HashUtils;
+import GRIS.Measurement;
 
 cbuffer CB
 {
     uint gFrameCount;    // Frame count since scene was loaded.
+    uint gSeed;          // Independent run seed; zero preserves the original PT sequence.
     uint gPRNGDimension; // First available PRNG dimension.
     float gRRProbability; // Fixed probability for russian roulette path termination.
 }
@@ -169,6 +172,9 @@ bool traceShadowRay(float3 origin, float3 dir, float distance)
 
     ShadowRayData rayData;
     rayData.visible = false; // Set to true by miss shader if ray is not terminated before
+    // DispatchRaysIndex stays the ray-generation owner even in nested hit shaders.
+    measurementInit(DispatchRaysIndex().xy, kMeasurePT);
+    measurementShadowRay();
     TraceRay(
         gScene.rtAccel,
         RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
@@ -196,6 +202,8 @@ void traceScatterRay(inout ScatterRayData rayData)
     ray.TMax = kRayTMax;
 
     uint rayFlags = 0; // TODO: Set cull mode from the app
+    measurementInit(DispatchRaysIndex().xy, kMeasurePT);
+    measurementScatterRay();
     TraceRay(gScene.rtAccel, rayFlags, 0xff /* instanceInclusionMask */, 0 /* hitIdx */, rayTypeCount, 0 /* missIdx */, ray, rayData);
 }
 
@@ -261,8 +269,11 @@ float3 evalDirectEmissive(const ShadingData sd, const IMaterialInstance mi, inou
     }
 
     // Test visibility.
-    const float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, tls.dir) >= 0.f ? sd.faceN : -sd.faceN);
-    if (!traceShadowRay(origin, tls.dir, tls.distance))
+    float3 origin, visibilityDirection;
+    float visibilityDistance;
+    if (!getMyPTEmissiveVisibilityRay(sd, tls, origin, visibilityDirection, visibilityDistance))
+        return float3(0.f);
+    if (!traceShadowRay(origin, visibilityDirection, visibilityDistance))
         return float3(0.f);
 
     return mi.eval(sd, tls.dir, sg) * Li;
@@ -430,7 +441,8 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
         let mi = gScene.materials.getMaterialInstance(sd, lod);
 
         // Create sample generator.
-        SampleGenerator sg = SampleGenerator(pixel, gFrameCount);
+        uint sampleFrame = gSeed == 0 ? gFrameCount : jenkinsHash(gFrameCount ^ jenkinsHash(gSeed));
+        SampleGenerator sg = SampleGenerator(pixel, sampleFrame);
 
         // Advance the generator to the first available dimension.
         for (uint i = 0; i < gPRNGDimension; i++)

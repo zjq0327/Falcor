@@ -3,6 +3,7 @@ __exported import Scene.Shading;
 __exported import Utils.Sampling.SampleGenerator;
 __exported import Rendering.Lights.LightHelpers;
 __exported import Rendering.Lights.EmissiveLightSampler;
+import Utils.Geometry.GeometryHelpers;
 
 // Power sampling owns an alias-table buffer in this Falcor version; bind it from C++.
 ParameterBlock<EmissiveLightSampler> gMyPTEmissiveSampler;
@@ -28,6 +29,22 @@ bool sampleMyPTAnalyticLight(ShadingData sd, inout SampleGenerator sg, out Analy
 bool sampleMyPTEmissiveLight(ShadingData sd, inout SampleGenerator sg, out TriangleLightSample ls)
 {
     return gMyPTEmissiveSampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), false, sg, ls);
+}
+
+bool getMyPTEmissiveVisibilityRay(ShadingData sd, TriangleLightSample ls,
+    out float3 origin, out float3 direction, out float distance)
+{
+    // Reference ReSTIRPTPass::generateEmissiveSample offsets BOTH endpoints.
+    // Keeping the original direction/distance after moving the origin can hit
+    // the sampled emitter itself. Keep these offsets out of transport BSDF/PDFs.
+    float3 target = computeRayOrigin(ls.posW, ls.normalW);
+    origin = computeRayOrigin(sd.posW, dot(sd.faceN, target - sd.posW) >= 0.f ? sd.faceN : -sd.faceN);
+    float3 edge = target - origin;
+    distance = length(edge);
+    direction = 0.f;
+    if (!(distance > 0.f) || !isfinite(distance)) return false;
+    direction = edge / distance;
+    return true;
 }
 
 bool sampleMyPTBSDF(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg, out BSDFSample bs, bool importance)

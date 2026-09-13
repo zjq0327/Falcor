@@ -7,6 +7,7 @@ import Rendering.Lights.EnvMapSampler;
 import RenderPasses.MyPT.MyPTCommon;
 __exported import PathBuilder;
 __exported import BSDF;
+__exported import Measurement;
 
 ParameterBlock<EnvMapSampler> gEnvSampler;
 
@@ -19,7 +20,18 @@ bool pathVisible(ShadingData sd, float3 direction, float distance)
 {
     float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, direction) >= 0.f ? sd.faceN : -sd.faceN);
     SceneRayQuery<true> query;
+    measurementShadowRay();
     return query.traceVisibilityRay(Ray(origin, direction, 0.f, max(0.f, distance * (1.f - 1e-5f))));
+}
+
+bool emissivePathVisible(ShadingData sd, TriangleLightSample ls)
+{
+    float3 origin, direction;
+    float distance;
+    if (!getMyPTEmissiveVisibilityRay(sd, ls, origin, direction, distance)) return false;
+    SceneRayQuery<true> query;
+    measurementShadowRay();
+    return query.traceVisibilityRay(Ray(origin, direction, 0.f, distance));
 }
 
 bool reconnectionVisible(float3 origin, ShadingData rc, float3 connection)
@@ -29,6 +41,7 @@ bool reconnectionVisible(float3 origin, ShadingData rc, float3 connection)
     float distance = length(edge);
     if (!(distance > 0.f) || !isfinite(distance)) return false;
     SceneRayQuery<true> query;
+    measurementShadowRay(true);
     return query.traceVisibilityRay(Ray(origin, edge / distance, 0.f, distance * (1.f - 1e-5f)));
 }
 
@@ -55,7 +68,7 @@ struct PathTraceResult
 };
 
 PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxScatters, float rrProbability,
-    uint traceMode, PathSample target, float roughnessThreshold, float nearFieldDistance)
+    uint traceMode, PathSample target, float roughnessThreshold, float nearFieldDistance, bool evaluateSourceSupport = true)
 {
     PathBuilder builder = PathBuilder(seed);
     builder.replayEnabled = traceMode != 0;
@@ -164,7 +177,12 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
                 else builder.descriptor.rcBeforeFlags |= 8u;
                 // A reconstructed source segment must itself be in the mapping's support.
                 // Retain numerically non-invertible paths in the canonical reservoir.
-                if (!reconnectionVisible(previousOrigin, sd, connection)) builder.descriptor.rcBeforeFlags |= 8u;
+                // Compact Hybrid prefixes do not return these support flags or cached
+                // PDFs. Skip both the unused query and its measurement explicitly.
+                if (evaluateSourceSupport)
+                {
+                    if (!reconnectionVisible(previousOrigin, sd, connection)) builder.descriptor.rcBeforeFlags |= 8u;
+                }
             }
             builder.descriptor.rcPrefix = throughput;
             suffix = 1.f;
@@ -203,9 +221,15 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
             {
                 float3 Li = ls.Li * invPdf;
                 float3 local = evalGRISBSDF(sd, mi, ls.dir, sg) * Li;
-                if (any(local > 0.f) && pathVisible(sd, ls.dir, ls.distance))
-                    builder.add(throughput * local, atRc ? ls.Li : suffix * local, depth + 1,
-                        PathTerminal::NEE, PathLight::Analytic, lightSeed, 1.f / invPdf, ls.dir, atRc);
+                // Keep sampling and BSDF evaluation above: they can consume RNG
+                // even when this contribution is not part of the requested replay.
+                if (traceMode != 2 && builder.acceptsContribution(depth + 1, PathTerminal::NEE, PathLight::Analytic) && any(local > 0.f))
+                {
+                    // Explicit control flow is required with DisableShortCircuit.
+                    if (pathVisible(sd, ls.dir, ls.distance))
+                        builder.add(throughput * local, atRc ? ls.Li : suffix * local, depth + 1,
+                            PathTerminal::NEE, PathLight::Analytic, lightSeed, 1.f / invPdf, ls.dir, atRc);
+                }
             }
         }
 #endif
@@ -217,9 +241,12 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
             {
                 float mis = GRIS_USE_MIS ? balanceWeight(ls.pdf, evalGRISBSDFPdf(sd, mi, ls.dir, bool(USE_IMPORTANCE_SAMPLING))) : 1.f;
                 float3 local = evalGRISBSDF(sd, mi, ls.dir, sg) * ls.Le * (mis / ls.pdf);
-                if (any(local > 0.f) && pathVisible(sd, ls.dir, ls.distance))
-                    builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
-                        PathTerminal::NEE, PathLight::Emissive, lightSeed, ls.pdf, ls.dir, atRc);
+                if (traceMode != 2 && builder.acceptsContribution(depth + 1, PathTerminal::NEE, PathLight::Emissive) && any(local > 0.f))
+                {
+                    if (emissivePathVisible(sd, ls))
+                        builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
+                            PathTerminal::NEE, PathLight::Emissive, lightSeed, ls.pdf, ls.dir, atRc);
+                }
             }
         }
 #endif
@@ -231,9 +258,12 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
             {
                 float mis = GRIS_USE_MIS ? balanceWeight(ls.pdf, evalGRISBSDFPdf(sd, mi, ls.dir, bool(USE_IMPORTANCE_SAMPLING))) : 1.f;
                 float3 local = evalGRISBSDF(sd, mi, ls.dir, sg) * ls.Le * (mis / ls.pdf);
-                if (any(local > 0.f) && pathVisible(sd, ls.dir, 1e30f))
-                    builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
-                        PathTerminal::NEE, PathLight::Environment, lightSeed, ls.pdf, ls.dir, atRc);
+                if (traceMode != 2 && builder.acceptsContribution(depth + 1, PathTerminal::NEE, PathLight::Environment) && any(local > 0.f))
+                {
+                    if (pathVisible(sd, ls.dir, 1e30f))
+                        builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
+                            PathTerminal::NEE, PathLight::Environment, lightSeed, ls.pdf, ls.dir, atRc);
+                }
             }
         }
 #endif
@@ -312,7 +342,11 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
         direction = bs.wo;
         float3 origin = computeRayOrigin(sd.posW, dot(sd.faceN, direction) >= 0.f ? sd.faceN : -sd.faceN);
         previousOrigin = origin;
+        // The target NEE slot is complete. Preserve the RR/BSDF state updates
+        // above, but do not trace an arrival that cannot replace this slot.
+        if (traceMode == 1 && target.terminal == PathTerminal::NEE && depth + 1 == target.surfaceScatters) break;
         float hitT;
+        measurementScatterRay();
         hit = query.traceRay(Ray(origin, direction, 0.f, 1e30f), hitT);
     }
     builder.finalize();
@@ -344,9 +378,9 @@ HybridPrefix traceHybridPrefix(PrimaryPathContext primary, PathSample source, ui
 {
     if (source.rcIndex != 0xffffffff)
         return tracePathImpl(primary, source.initialSeed, maxScatters, rrProbability, 2, source,
-            roughnessThreshold, nearFieldDistance).prefix;
+            roughnessThreshold, nearFieldDistance, false).prefix;
     PathTraceResult result = tracePathImpl(primary, source.initialSeed, min(maxScatters, source.surfaceScatters),
-        rrProbability, 1, source, roughnessThreshold, nearFieldDistance);
+        rrProbability, 1, source, roughnessThreshold, nearFieldDistance, false);
     HybridPrefix prefix = {};
     prefix.hit = HitInfo().pack();
     if (!result.builder.replayFound) prefix.failure = 16;

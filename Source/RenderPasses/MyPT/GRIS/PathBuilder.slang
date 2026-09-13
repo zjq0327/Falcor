@@ -29,11 +29,25 @@ struct PathBuilder
         replayFound = false;
     }
 
+    bool acceptsContribution(uint length, PathTerminal terminal, PathLight light)
+    {
+        if (!COMPUTE_DIRECT && length <= 1) return false;
+        if (!replayEnabled) return true;
+        // NEE light families are separate slots. A BSDF arrival can change
+        // between emission and environment under replay.
+        bool arrival = terminal == PathTerminal::Emission || terminal == PathTerminal::Environment;
+        bool targetArrival = replayTarget.terminal == PathTerminal::Emission ||
+            replayTarget.terminal == PathTerminal::Environment;
+        bool sameBranch = (terminal == PathTerminal::NEE && replayTarget.terminal == PathTerminal::NEE &&
+            light == replayTarget.light) || (arrival && targetArrival);
+        return length == replayTarget.surfaceScatters && sameBranch;
+    }
+
     [mutating]
     void add(float3 F, float3 suffix, uint length, PathTerminal terminal, PathLight light,
         uint seed, float pdf, float3 direction, bool atRc)
     {
-        if (!COMPUTE_DIRECT && length <= 1) return;
+        if (!acceptsContribution(length, terminal, light)) return;
         PathSample candidate = descriptor;
         candidate.F = F;
         candidate.surfaceScatters = length;
@@ -55,18 +69,8 @@ struct PathBuilder
 #endif
         if (replayEnabled)
         {
-            // A tree evaluates all three NEE branches independently. Keep their
-            // identities distinct; BSDF arrival may change between hit and miss.
-            bool arrival = terminal == PathTerminal::Emission || terminal == PathTerminal::Environment;
-            bool targetArrival = replayTarget.terminal == PathTerminal::Emission ||
-                replayTarget.terminal == PathTerminal::Environment;
-            bool sameBranch = (terminal == PathTerminal::NEE && replayTarget.terminal == PathTerminal::NEE &&
-                light == replayTarget.light) || (arrival && targetArrival);
-            if (length == replayTarget.surfaceScatters && sameBranch)
-            {
-                replaySample = candidate;
-                replayFound = true;
-            }
+            replaySample = candidate;
+            replayFound = true;
             // Transport still executes the ordinary sampling code. Only reservoir
             // selection is bypassed, preserving the original transport random stream.
             return;

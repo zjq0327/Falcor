@@ -5,6 +5,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     uint2 pixel = dispatchThreadID.xy;
     if (any(pixel >= gDimensions)) return;
+    measurementInit(pixel, kMeasureSpatial);
     uint index = pixelIndex(pixel);
     PrimaryPathContext primary = gPrimary[index];
     for (uint i = 0; i < gSpatialNeighborCount; ++i)

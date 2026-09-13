@@ -36,6 +36,12 @@
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, MyPT>();
+    ScriptBindings::registerBinding([](pybind11::module& m)
+    {
+        pybind11::class_<MyPT, RenderPass, ref<MyPT>> pass(m, "MyPT");
+        pass.def_property_readonly("resourceStats", [](const MyPT& p) { return p.getResourceStats().toPython(); });
+        pass.def("resetSampling", &MyPT::resetSampling, pybind11::arg("seed"));
+    });
 }
 
 namespace
@@ -109,6 +115,8 @@ void MyPT::parseProperties(const Properties& props)
             mNearFieldDistance = value;
         else if (key == "seed")
             mSeed = value;
+        else if (key == "referenceLambertian")
+            mReferenceLambertian = value;
         else if (key == kRISCandidateCount)
             mRISCandidateCount = value;
         else if (key == kGIRISCandidateCount)
@@ -177,6 +185,7 @@ Properties MyPT::getProperties() const
     props[kSpecularRoughnessThreshold] = mSpecularRoughnessThreshold;
     props[kNearFieldDistance] = mNearFieldDistance;
     props["seed"] = mSeed;
+    props["referenceLambertian"] = mReferenceLambertian;
     props[kRISCandidateCount] = mRISCandidateCount;
     props[kGIRISCandidateCount] = mGIRISCandidateCount;
     props[kUseInitialVisibility] = mUseInitialVisibility;
@@ -225,12 +234,28 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
         .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addOutput("pathDebug", "Initial rc index (0 if none), surface scatters, prefix flags, rc event flags")
         .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("rayStats0", "Actual rays: generation closest/shadow, temporal prefix closest/shadow")
+        .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("rayStats1", "Actual rays: temporal connection, spatial prefix closest/shadow, spatial connection")
+        .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("rayStats2", "Actual rays: validation closest/shadow, ordinary PT closest/shadow")
+        .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
+    for (const char* name : {"temporalShiftStats", "spatialShiftStats"})
+        reflector.addOutput(name, "Eligible pairs, nonzero source direction attempts, failed directions, positive directions")
+            .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
 
     return reflector;
 }
 
 void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    // Optional measurements are accumulated across passes and spatial rounds in this frame.
+    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats"})
+        if (auto output = renderData.getTexture(name))
+        {
+            pRenderContext->uavBarrier(output.get());
+            pRenderContext->clearUAV(output->getUAV().get(), uint4(0));
+        }
     // Update refresh flag if options that affect the output have changed.
     auto& dict = renderData.getDictionary();
     if (mOptionsChanged)
@@ -296,6 +321,10 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mTracer.pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
     mTracer.pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
     mTracer.pProgram->addDefine("USE_ENV_BACKGROUND", mpScene->useEnvBackground() ? "1" : "0");
+    bool layoutChanged = mTracer.pProgram->addDefine("MYPT_HAS_RAY_STATS2", renderData.getTexture("rayStats2") ? "1" : "0");
+    if (mReferenceLambertian) layoutChanged |= mTracer.pProgram->addDefine("DiffuseBrdf", "0");
+    else layoutChanged |= mTracer.pProgram->removeDefine("DiffuseBrdf");
+    if (layoutChanged) mTracer.pVars = nullptr;
 
     // Update the emissive light sampler and inject its defines before program vars are created.
     if (mpEmissiveSampler)
@@ -316,11 +345,13 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     auto var = mTracer.pVars->getRootVar();
     if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
     var["CB"]["gFrameCount"] = mFrameCount;
+    var["CB"]["gSeed"] = mSeed;
     var["CB"]["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
     var["CB"]["gRRProbability"] = mRRProbability;
     for (const auto& channel : kInputChannels)
         if (!channel.texname.empty()) var[channel.texname] = renderData.getTexture(channel.name);
     var["gOutputColor"] = renderData.getTexture("color");
+    if (auto output = renderData.getTexture("rayStats2")) var["gRayStats2"] = output;
     mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(renderData.getDefaultTextureDims(), 1));
 
     mFrameCount++;
@@ -435,6 +466,15 @@ void MyPT::onSceneUpdates(RenderContext*, Scene::UpdateFlags updates)
 {
     // RenderGraph retains changes made while another graph was active.
     mPendingSceneUpdates |= updates;
+}
+
+void MyPT::resetSampling(uint32_t seed)
+{
+    mSeed = seed;
+    mFrameCount = 0;
+    mGRIS.frameIndex = 0;
+    mGRIS.historyValid = false;
+    mOptionsChanged = true;
 }
 
 void MyPT::prepareVars()

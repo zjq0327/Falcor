@@ -32,9 +32,99 @@
 #include "Utils/Timing/CpuTimer.h"
 
 #include <slang.h>
+#include <functional>
 
 namespace Falcor
 {
+
+namespace
+{
+// Keep values (including both compiler-option strings), their order and boundaries.
+// Comparing this serialization avoids hash collisions and dangling descriptor pointers.
+struct CompileRecipe
+{
+    std::string value;
+    void add(const std::string& text) { value += std::to_string(text.size()) + ":" + text; }
+    void add(const char* text)
+    {
+        add(uint64_t(text != nullptr));
+        if (text) add(std::string(text));
+    }
+    void add(uint64_t number) { add(std::to_string(number)); }
+    void options(const slang::CompilerOptionEntry* entries, uint32_t count)
+    {
+        add(uint64_t(count));
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const auto& option = entries[i];
+            add(uint64_t(option.name));
+            add(uint64_t(option.value.kind));
+            add(uint64_t(option.value.intValue0));
+            add(uint64_t(option.value.intValue1));
+            add(option.value.stringValue0);
+            add(option.value.stringValue1);
+        }
+    }
+    void conformances(const TypeConformanceList& list)
+    {
+        add(uint64_t(list.size()));
+        for (const auto& [types, id] : list)
+        {
+            add(types.typeName);
+            add(types.interfaceName);
+            add(uint64_t(id));
+        }
+    }
+};
+
+bool dependenciesChanged(const std::unordered_map<std::string, time_t>& fileTimes)
+{
+    for (const auto& [path, time] : fileTimes)
+    {
+        std::error_code error;
+        if (!std::filesystem::exists(path, error) || error) return true;
+        try
+        {
+            if (getFileModifiedTime(path) != time) return true;
+        }
+        catch (const std::exception&)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+using DependencyMetadata = std::pair<std::filesystem::file_time_type, uintmax_t>;
+
+DependencyMetadata getDependencyMetadata(const std::filesystem::path& path)
+{
+    return {std::filesystem::last_write_time(path), std::filesystem::file_size(path)};
+}
+
+bool dependenciesChanged(const std::unordered_map<std::string, DependencyMetadata>& files)
+{
+    for (const auto& [path, metadata] : files)
+    {
+        try
+        {
+            if (getDependencyMetadata(path) != metadata) return true;
+        }
+        catch (const std::exception&)
+        {
+            return true; // Deleted or no longer readable.
+        }
+    }
+    return false;
+}
+
+struct CompileFailureGuard
+{
+    std::function<void()> onFailure;
+    bool succeeded = false;
+    ~CompileFailureGuard() { if (!succeeded) onFailure(); }
+};
+} // namespace
 
 inline SlangStage getSlangStage(ShaderType type)
 {
@@ -78,24 +168,13 @@ inline std::string getSlangProfileString(ShaderModel shaderModel)
 inline bool doSlangReflection(
     const ProgramVersion& programVersion,
     slang::IComponentType* pSlangGlobalScope,
-    std::vector<Slang::ComPtr<slang::IComponentType>> pSlangLinkedEntryPoints,
+    const std::vector<Slang::ComPtr<slang::IComponentType>>& pSlangLinkedEntryPoints,
     ref<const ProgramReflection>& pReflector,
     std::string& log
 )
 {
-    auto pSlangGlobalScopeLayout = pSlangGlobalScope->getLayout();
-
-    // TODO: actually need to reflect the entry point groups!
-
-    std::vector<slang::EntryPointLayout*> pSlangEntryPointReflectors;
-
-    for (auto pSlangLinkedEntryPoint : pSlangLinkedEntryPoints)
-    {
-        auto pSlangEntryPointLayout = pSlangLinkedEntryPoint->getLayout()->getEntryPointByIndex(0);
-        pSlangEntryPointReflectors.push_back(pSlangEntryPointLayout);
-    }
-
-    pReflector = ProgramReflection::create(&programVersion, pSlangGlobalScopeLayout, pSlangEntryPointReflectors, log);
+    // Transfer ownership along with the layouts, including the temporary specialized composite.
+    pReflector = ProgramReflection::create(&programVersion, pSlangGlobalScope, pSlangLinkedEntryPoints, log);
 
     return true;
 }
@@ -121,7 +200,12 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     CpuTimer timer;
     timer.update();
 
-    auto pSlangRequest = createSlangCompileRequest(program);
+    std::string sessionKey;
+    // A failed request may leave partial imports or failed lookups in its session.
+    // Evict on every failure/exception, while live components retain their own owners.
+    CompileFailureGuard failureGuard{[&]() { mCompileSessions.erase(sessionKey); }};
+    // Adopt the request's initial COM reference. ProgramVersion retains its session/components.
+    Slang::ComPtr<SlangCompileRequest> pSlangRequest(Slang::INIT_ATTACH, createSlangCompileRequest(program, sessionKey));
     if (pSlangRequest == nullptr)
         return nullptr;
 
@@ -129,7 +213,6 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     log += spGetDiagnosticOutput(pSlangRequest);
     if (SLANG_FAILED(slangResult))
     {
-        spDestroyCompileRequest(pSlangRequest);
         return nullptr;
     }
 
@@ -164,12 +247,26 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     }
 
     // Extract list of files referenced, for dependency-tracking purposes.
+    auto& cachedSession = mCompileSessions.at(sessionKey);
+    auto recordDependency = [&](const char* path)
+    {
+        if (!path || !std::filesystem::exists(path)) return;
+        const time_t modified = getFileModifiedTime(path);
+        // Never replace the recorded time of an already cached module with a newer
+        // disk timestamp. A later cache hit/reload must still detect such a change.
+        cachedSession.fileTimes.try_emplace(path, modified);
+        cachedSession.fileMetadata.try_emplace(path, getDependencyMetadata(path));
+        program.mFileTimeMap[path] = cachedSession.fileTimes.at(path);
+    };
     int depFileCount = spGetDependencyFileCount(pSlangRequest);
     for (int ii = 0; ii < depFileCount; ++ii)
+        recordDependency(spGetDependencyFilePath(pSlangRequest, ii));
+    // Include cached imports even if a later request does not report them again.
+    for (SlangInt i = 0; i < pSlangSession->getLoadedModuleCount(); ++i)
     {
-        std::string depFilePath = spGetDependencyFilePath(pSlangRequest, ii);
-        if (std::filesystem::exists(depFilePath))
-            program.mFileTimeMap[depFilePath] = getFileModifiedTime(depFilePath);
+        auto module = pSlangSession->getLoadedModule(i);
+        for (SlangInt32 j = 0; j < module->getDependencyFileCount(); ++j)
+            recordDependency(module->getDependencyFilePath(j));
     }
 
     // Note: the `ProgramReflection` needs to be able to refer back to the
@@ -214,6 +311,7 @@ ref<const ProgramVersion> ProgramManager::createProgramVersion(const Program& pr
     mCompilationStats.programVersionMaxTime = std::max(mCompilationStats.programVersionMaxTime, time);
     logDebug("Created program version in {:.3f} s: {}", timer.delta(), descStr);
 
+    failureGuard.succeeded = true;
     return pVersion;
 }
 
@@ -552,12 +650,15 @@ std::string ProgramManager::getHlslLanguagePrelude() const
 {
     Slang::ComPtr<ISlangBlob> prelude;
     mpDevice->getSlangGlobalSession()->getLanguagePrelude(SLANG_SOURCE_LANGUAGE_HLSL, prelude.writeRef());
+    if (!prelude || prelude->getBufferSize() == 0) return {};
     return std::string(reinterpret_cast<const char*>(prelude->getBufferPointer()), prelude->getBufferSize());
 }
 
 void ProgramManager::setHlslLanguagePrelude(const std::string& prelude)
 {
+    if (getHlslLanguagePrelude() == prelude) return;
     mpDevice->getSlangGlobalSession()->setLanguagePrelude(SLANG_SOURCE_LANGUAGE_HLSL, prelude.c_str());
+    reloadAllPrograms(true);
 }
 
 void ProgramManager::registerProgramForReload(Program* program)
@@ -572,35 +673,51 @@ void ProgramManager::unregisterProgramForReload(Program* program)
 
 bool ProgramManager::reloadAllPrograms(bool forceReload)
 {
-    bool hasReloaded = false;
-
+    bool changed = forceReload;
+    for (const auto& [key, cached] : mCompileSessions)
+        changed |= dependenciesChanged(cached.fileMetadata);
     for (auto program : mLoadedPrograms)
-    {
-        if (program->checkIfFilesChanged() || forceReload)
-        {
-            program->reset();
-            hasReloaded = true;
-        }
-    }
+        changed |= program->mpActiveVersion && dependenciesChanged(program->mFileTimeMap);
+    if (!changed) return false;
 
-    return hasReloaded;
+    // Imported modules are immutable within a session. Resetting ProgramVersion
+    // alone would silently compile new requests against the old imported source.
+    // Clear even when no Program is live; cached imports can outlive their graph.
+    mCompileSessions.clear();
+    for (auto program : mLoadedPrograms) program->reset();
+    return !mLoadedPrograms.empty();
 }
 
 void ProgramManager::addGlobalDefines(const DefineList& defineList)
 {
-    mGlobalDefineList.add(defineList);
+    DefineList updated = mGlobalDefineList;
+    updated.add(defineList);
+    if (updated == mGlobalDefineList) return;
+    mGlobalDefineList = std::move(updated);
     reloadAllPrograms(true);
 }
 
 void ProgramManager::removeGlobalDefines(const DefineList& defineList)
 {
-    mGlobalDefineList.remove(defineList);
+    DefineList updated = mGlobalDefineList;
+    updated.remove(defineList);
+    if (updated == mGlobalDefineList) return;
+    mGlobalDefineList = std::move(updated);
+    reloadAllPrograms(true);
+}
+
+void ProgramManager::setGlobalCompilerArguments(const std::vector<std::string>& args)
+{
+    if (mGlobalCompilerArguments == args) return;
+    mGlobalCompilerArguments = args;
     reloadAllPrograms(true);
 }
 
 void ProgramManager::setGenerateDebugInfoEnabled(bool enabled)
 {
+    if (mGenerateDebugInfo == enabled) return;
     mGenerateDebugInfo = enabled;
+    reloadAllPrograms(true);
 }
 
 bool ProgramManager::isGenerateDebugInfoEnabled()
@@ -610,6 +727,8 @@ bool ProgramManager::isGenerateDebugInfoEnabled()
 
 void ProgramManager::setForcedCompilerFlags(ForcedCompilerFlags forcedCompilerFlags)
 {
+    if (mForcedCompilerFlags.enabled == forcedCompilerFlags.enabled && mForcedCompilerFlags.disabled == forcedCompilerFlags.disabled)
+        return;
     mForcedCompilerFlags = forcedCompilerFlags;
     reloadAllPrograms(true);
 }
@@ -619,7 +738,7 @@ ProgramManager::ForcedCompilerFlags ProgramManager::getForcedCompilerFlags()
     return mForcedCompilerFlags;
 }
 
-SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& program) const
+SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& program, std::string& sessionKey) const
 {
     slang::IGlobalSession* pSlangGlobalSession = mpDevice->getSlangGlobalSession();
     FALCOR_ASSERT(pSlangGlobalSession);
@@ -635,10 +754,9 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
     std::vector<std::string> searchPaths;
     std::vector<const char*> slangSearchPaths;
     for (auto& path : getShaderDirectoriesList())
-    {
         searchPaths.push_back(path.string());
-        slangSearchPaths.push_back(searchPaths.back().data());
-    }
+    // Build pointers after vector growth; short strings can move with the vector.
+    for (const auto& path : searchPaths) slangSearchPaths.push_back(path.c_str());
     sessionDesc.searchPaths = slangSearchPaths.data();
     sessionDesc.searchPathCount = (SlangInt)slangSearchPaths.size();
 
@@ -760,50 +878,149 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
     sessionDesc.compilerOptionEntries = compilerOptionEntries.data();
     sessionDesc.compilerOptionEntryCount = (uint32_t)compilerOptionEntries.size();
 
-    Slang::ComPtr<slang::ISession> pSlangSession;
-    pSlangGlobalSession->createSession(sessionDesc, pSlangSession.writeRef());
-    FALCOR_ASSERT(pSlangSession);
+    const bool dumpIR = is_set(program.mDesc.compilerFlags, SlangCompilerFlags::DumpIntermediates);
+    const bool debugInfo = mGenerateDebugInfo || is_set(program.mDesc.compilerFlags, SlangCompilerFlags::GenerateDebugInfo);
+    const SlangCompileFlags slangFlags = SLANG_COMPILE_FLAG_NO_CODEGEN;
+    std::vector<std::string> arguments = mGlobalCompilerArguments;
+    arguments.insert(arguments.end(), program.mDesc.compilerArguments.begin(), program.mDesc.compilerArguments.end());
+#if FALCOR_NVAPI_AVAILABLE
+    arguments.push_back("-Xdxc");
+    arguments.push_back("-I" + (getRuntimeDirectory() / "shaders/nvapi").string());
+#endif
+
+    CompileRecipe recipe;
+    recipe.add("FalcorCompileSessionRecipe1");
+    recipe.add(uint64_t(sessionDesc.structureSize));
+    recipe.add(uint64_t(sessionDesc.flags));
+    recipe.add(uint64_t(sessionDesc.defaultMatrixLayoutMode));
+    recipe.add(uint64_t(sessionDesc.enableEffectAnnotations));
+    recipe.add(uint64_t(sessionDesc.allowGLSLSyntax));
+    // This manager only constructs filesystem-backed descriptors. An injected
+    // filesystem needs its own versioned identity before it can safely be cached.
+    FALCOR_CHECK(sessionDesc.fileSystem == nullptr, "Compile-session cache requires the default filesystem.");
+    recipe.add(uint64_t(sessionDesc.targetCount));
+    for (SlangInt i = 0; i < sessionDesc.targetCount; ++i)
+    {
+        const auto& target = sessionDesc.targets[i];
+        recipe.add(uint64_t(target.structureSize));
+        recipe.add(uint64_t(target.format));
+        recipe.add(uint64_t(target.profile));
+        recipe.add(uint64_t(target.flags));
+        recipe.add(uint64_t(target.floatingPointMode));
+        recipe.add(uint64_t(target.lineDirectiveMode));
+        recipe.add(uint64_t(target.forceGLSLScalarBufferLayout));
+        recipe.options(target.compilerOptionEntries, target.compilerOptionEntryCount);
+    }
+    recipe.add(uint64_t(searchPaths.size()));
+    for (const auto& path : searchPaths) recipe.add(path);
+    recipe.add(uint64_t(slangDefines.size()));
+    for (const auto& define : slangDefines) { recipe.add(define.name); recipe.add(define.value); }
+    recipe.options(sessionDesc.compilerOptionEntries, sessionDesc.compilerOptionEntryCount);
+    recipe.add(getHlslLanguagePrelude());
+    recipe.add(uint64_t(dumpIR));
+    recipe.add(uint64_t(debugInfo));
+    recipe.add(uint64_t(slangFlags));
+    recipe.add(uint64_t(arguments.size()));
+    for (const auto& argument : arguments) recipe.add(argument);
+
+    // Keep named/generated modules, entry-point exports and type-conformance IDs
+    // in separate sessions when their complete program recipes differ. Repeated
+    // graph creation reuses its recipes without merging unrelated program scopes.
+    const auto& desc = program.mDesc;
+    recipe.add(uint64_t(desc.shaderModel));
+    recipe.add(uint64_t(desc.compilerFlags));
+    recipe.add(uint64_t(desc.maxTraceRecursionDepth));
+    recipe.add(uint64_t(desc.maxPayloadSize));
+    recipe.add(uint64_t(desc.maxAttributeSize));
+    recipe.add(uint64_t(desc.rtPipelineFlags));
+    recipe.add(uint64_t(desc.useSPIRVBackend));
+    recipe.conformances(desc.typeConformances);
+    recipe.conformances(program.mTypeConformanceList);
+    recipe.add(uint64_t(desc.compilerArguments.size()));
+    for (const auto& argument : desc.compilerArguments) recipe.add(argument);
+    recipe.add(uint64_t(desc.shaderModules.size()));
+    std::vector<std::vector<std::filesystem::path>> resolvedSources;
+    for (const auto& module : desc.shaderModules)
+    {
+        recipe.add(module.name);
+        recipe.add(uint64_t(module.sources.size()));
+        auto& paths = resolvedSources.emplace_back();
+        for (const auto& source : module.sources)
+        {
+            recipe.add(uint64_t(source.type));
+            recipe.add(source.path.string());
+            recipe.add(source.string);
+            std::filesystem::path resolved;
+            if (source.type == ProgramDesc::ShaderSource::Type::File)
+                FALCOR_CHECK(findFileInShaderDirectories(source.path, resolved), "Can't find shader file {}", source.path);
+            paths.push_back(resolved);
+            recipe.add(resolved.string());
+        }
+    }
+    recipe.add(uint64_t(desc.entryPointGroups.size()));
+    for (const auto& group : desc.entryPointGroups)
+    {
+        recipe.add(uint64_t(group.shaderModuleIndex));
+        recipe.conformances(group.typeConformances);
+        recipe.add(uint64_t(group.entryPoints.size()));
+        for (const auto& entry : group.entryPoints)
+        {
+            recipe.add(uint64_t(entry.type));
+            recipe.add(entry.name);
+            recipe.add(entry.exportName);
+            recipe.add(uint64_t(entry.globalIndex));
+        }
+    }
+    sessionKey = std::move(recipe.value);
+    auto cached = mCompileSessions.find(sessionKey);
+    if (cached != mCompileSessions.end() && dependenciesChanged(cached->second.fileMetadata))
+    {
+        mCompileSessions.erase(cached);
+        cached = mCompileSessions.end();
+    }
+    if (cached == mCompileSessions.end())
+    {
+        CompileSession entry;
+        SlangResult result = pSlangGlobalSession->createSession(sessionDesc, entry.session.writeRef());
+        FALCOR_CHECK(SLANG_SUCCEEDED(result) && entry.session, "Failed to create Slang session ({}).", result);
+        cached = mCompileSessions.emplace(sessionKey, std::move(entry)).first;
+    }
+    Slang::ComPtr<slang::ISession> pSlangSession = cached->second.session;
+    for (const auto& paths : resolvedSources)
+        for (const auto& path : paths)
+            if (!path.empty())
+            {
+                cached->second.fileTimes.try_emplace(path.string(), getFileModifiedTime(path));
+                cached->second.fileMetadata.try_emplace(path.string(), getDependencyMetadata(path));
+            }
 
     program.mFileTimeMap.clear(); // TODO @skallweit
 
-    SlangCompileRequest* pSlangRequest = nullptr;
-    pSlangSession->createCompileRequest(&pSlangRequest);
-    FALCOR_ASSERT(pSlangRequest);
+    Slang::ComPtr<SlangCompileRequest> pSlangRequest;
+    SlangResult requestResult = pSlangSession->createCompileRequest(pSlangRequest.writeRef());
+    FALCOR_CHECK(SLANG_SUCCEEDED(requestResult) && pSlangRequest, "Failed to create Slang compile request ({}).", requestResult);
 
     // Enable/disable intermediates dump
-    bool dumpIR = is_set(program.mDesc.compilerFlags, SlangCompilerFlags::DumpIntermediates);
     spSetDumpIntermediates(pSlangRequest, dumpIR);
 
     // Set debug level
-    if (mGenerateDebugInfo || is_set(program.mDesc.compilerFlags, SlangCompilerFlags::GenerateDebugInfo))
+    if (debugInfo)
         spSetDebugInfoLevel(pSlangRequest, SLANG_DEBUG_INFO_LEVEL_STANDARD);
 
     // Configure any flags for the Slang compilation step
-    SlangCompileFlags slangFlags = 0;
-
     // When we invoke the Slang compiler front-end, skip code generation step
     // so that the compiler does not complain about missing arguments for
     // specialization parameters.
     //
-    slangFlags |= SLANG_COMPILE_FLAG_NO_CODEGEN;
-
     spSetCompileFlags(pSlangRequest, slangFlags);
 
     // Set additional command line arguments.
     {
         std::vector<const char*> args;
-        for (const auto& arg : mGlobalCompilerArguments)
-            args.push_back(arg.c_str());
-        for (const auto& arg : program.mDesc.compilerArguments)
-            args.push_back(arg.c_str());
-#if FALCOR_NVAPI_AVAILABLE
-        // If NVAPI is available, we need to inform slang/dxc where to find it.
-        std::string nvapiInclude = "-I" + (getRuntimeDirectory() / "shaders/nvapi").string();
-        args.push_back("-Xdxc");
-        args.push_back(nvapiInclude.c_str());
-#endif
+        for (const auto& arg : arguments) args.push_back(arg.c_str());
         if (!args.empty())
-            spProcessCommandLineArguments(pSlangRequest, args.data(), (int)args.size());
+            FALCOR_CHECK(SLANG_SUCCEEDED(spProcessCommandLineArguments(pSlangRequest, args.data(), (int)args.size())),
+                "Invalid Slang compiler arguments: {}", spGetDiagnosticOutput(pSlangRequest));
     }
 
     for (size_t moduleIndex = 0; moduleIndex < program.mDesc.shaderModules.size(); ++moduleIndex)
@@ -814,8 +1031,9 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
         int translationUnitIndex = spAddTranslationUnit(pSlangRequest, SLANG_SOURCE_LANGUAGE_SLANG, name);
         FALCOR_ASSERT(translationUnitIndex == moduleIndex);
 
-        for (const auto& source : module.sources)
+        for (size_t sourceIndex = 0; sourceIndex < module.sources.size(); ++sourceIndex)
         {
+            const auto& source = module.sources[sourceIndex];
             // Add source code to the translation unit
             if (source.type == ProgramDesc::ShaderSource::Type::File)
             {
@@ -828,12 +1046,7 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
                         "file contains valid shaders"
                     );
                 }
-                std::filesystem::path fullPath;
-                if (!findFileInShaderDirectories(path, fullPath))
-                {
-                    spDestroyCompileRequest(pSlangRequest);
-                    FALCOR_THROW("Can't find shader file {}", path);
-                }
+                const auto& fullPath = resolvedSources[moduleIndex][sourceIndex];
                 spAddTranslationUnitSourceFile(pSlangRequest, translationUnitIndex, fullPath.string().c_str());
             }
             else
@@ -858,7 +1071,7 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
         }
     }
 
-    return pSlangRequest;
+    return pSlangRequest.detach();
 }
 
 } // namespace Falcor

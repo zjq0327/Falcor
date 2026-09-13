@@ -20,6 +20,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     uint2 pixel = dispatchThreadID.xy;
     if (any(pixel >= gDimensions)) return;
+    measurementInit(pixel, kMeasureTemporal);
     uint index = pixelIndex(pixel);
     PathReservoir current = gFresh[index];
     PrimaryPathContext currentPrimary = gPrimary[index];
@@ -32,6 +33,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     pair.status = temporalNeighbor(pixel, pair.neighborIndex);
 #endif
     if (pair.status != 5) { writeTemporalDebug(pixel, float(pair.status)); return; }
+    measurementGeometryPair();
     uint previousIndex = pair.neighborIndex;
     PrimaryPathContext previousPrimary = gHistoryPrimary[previousIndex];
 
@@ -41,8 +43,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     // Equal screen coordinates do not imply equal domains when the camera moves.
     // Exact contexts do support the identity even for direct/delta/local-only paths.
-    bool identicalContext = all(currentPrimary.hit == previousPrimary.hit) &&
-        all(currentPrimary.direction == previousPrimary.direction);
+    bool identicalContext = samePrimaryContext(currentPrimary, previousPrimary);
     ShiftResult currentToHistory = {};
     ShiftResult historyToCurrent = {};
     if (identicalContext)
@@ -56,6 +57,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     {
         currentToHistory = shiftForPair(current.sample, currentPrimary, previousPrimary, pair.toNeighbor);
         historyToCurrent = shiftForPair(history.sample, previousPrimary, currentPrimary, pair.toCenter);
+        measurementShiftOutcome(any(current.sample.F > 0.f), currentToHistory.failure,
+            currentToHistory.jacobian > 0.f && any(currentToHistory.sample.F > 0.f));
+        measurementShiftOutcome(any(history.sample.F > 0.f), historyToCurrent.failure,
+            historyToCurrent.jacobian > 0.f && any(historyToCurrent.sample.F > 0.f));
         recordShiftCheck(pixel, current.sample, currentPrimary, previousPrimary, currentToHistory);
         recordShiftCheck(pixel, history.sample, previousPrimary, currentPrimary, historyToCurrent);
     }
@@ -77,6 +82,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     float incomingAccepted = historyToCurrent.jacobian > 0.f && any(historyToCurrent.sample.F > 0.f) ? 1.f : 0.f;
     float roundTripError = 0.f;
 #if GRIS_HAS_TEMPORAL_DEBUG
+    uint previousMeasurementPhase = measurementSetPhase(kMeasureValidation);
     if (!identicalContext)
     {
         if (currentToHistory.jacobian > 0.f && any(currentToHistory.sample.F > 0.f))
@@ -94,6 +100,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 abs(back.jacobian * historyToCurrent.jacobian - 1.f)));
         }
     }
+    measurementSetPhase(previousMeasurementPhase);
 #endif
     writeTemporalDebug(pixel, 5.f, history.M, incomingAccepted, roundTripError);
 }

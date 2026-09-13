@@ -90,6 +90,8 @@ public:
     MyPT(ref<Device> pDevice, const Properties& props);
 
     virtual Properties getProperties() const override;
+    Properties getResourceStats() const;
+    void resetSampling(uint32_t seed);
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
     virtual void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
     virtual void renderUI(Gui::Widgets& widget) override;
@@ -161,6 +163,8 @@ private:
     bool mUseImportanceSampling = true;
     /// Use multiple importance sampling (MIS) to combine NEE and BSDF sampling.
     bool mUseMIS = true;
+    /// Script-only material configuration for comparison with the Falcor 4.4 reference.
+    bool mReferenceLambertian = false;
     /// Fixed probability for russian roulette path termination.
     float mRRProbability = 0.2f;
 

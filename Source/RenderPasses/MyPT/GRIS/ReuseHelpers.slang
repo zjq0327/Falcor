@@ -10,6 +10,11 @@ StructuredBuffer<PathReservoir> gSpatialInput;
 Texture2D<float2> gMotionVector;
 RWTexture2D<float4> gShiftDebug;
 
+bool samePrimaryContext(PrimaryPathContext a, PrimaryPathContext b)
+{
+    return all(a.hit == b.hit) && all(a.direction == b.direction);
+}
+
 bool validTemporalGeometry(ShadingData current, ShadingData previous)
 {
     // Compare both surfaces in the previous camera's coordinate system. Comparing
@@ -121,7 +126,9 @@ void recordShiftCheck(uint2 pixel, PathSample sample, PrimaryPathContext source,
     float4 debug = gShiftDebug[pixel];
     if (cached.failure > 0 && cached.failure < 24) debug.w = float(uint(debug.w) | (1u << cached.failure));
 #if GRIS_SHIFT_STRATEGY == 2
+    uint previousMeasurementPhase = measurementSetPhase(kMeasureValidation);
     ShiftResult inlineResult = shiftInline(sample, source, destination);
+    measurementSetPhase(previousMeasurementPhase);
     float error = max(relativeContributionError(cached.sample.F, inlineResult.sample.F),
         abs(cached.jacobian - inlineResult.jacobian) / max(inlineResult.jacobian, 1e-8f));
     if (cached.failure != inlineResult.failure) error = max(error, 1.f);

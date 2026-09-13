@@ -11,6 +11,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     uint2 pixel = dispatchThreadID.xy;
     if (any(pixel >= gDimensions)) return;
+    measurementInit(pixel, kMeasureSpatial);
     uint index = pixelIndex(pixel);
     PrimaryPathContext primary = gPrimary[index];
     PathReservoir center = gSpatialInput[index]; // Frozen canonical sample for the entire round.
@@ -31,7 +32,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if GRIS_HAS_SPATIAL_DEBUG
     if (hasShiftIdentity(center.sample))
     {
+        uint previousMeasurementPhase = measurementSetPhase(kMeasureValidation);
         ShiftResult identity = shiftInline(center.sample, primary, primary, true);
+        measurementSetPhase(previousMeasurementPhase);
         identityError = max(relativeContributionError(identity.sample.F, center.sample.F), abs(identity.jacobian - 1.f));
     }
 #endif
@@ -53,8 +56,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         if (!validGeometry(centerSd, neighborSd)) continue;
         PathReservoir source = gSpatialInput[neighborIndex];
         ++validCount; // Count before testing contribution/support/visibility, as in the reference.
+        measurementGeometryPair();
 
         ShiftResult reverse = shiftForPair(center.sample, primary, neighborPrimary, pair.toNeighbor);
+        if (neighborIndex != index)
+            measurementShiftOutcome(any(center.sample.F > 0.f), reverse.failure,
+                reverse.jacobian > 0.f && any(reverse.sample.F > 0.f));
         recordShiftCheck(pixel, center.sample, primary, neighborPrimary, reverse);
         if (neighborIndex == index)
         {
@@ -68,6 +75,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             float3(pathTarget(reverse.sample.F), reverse.jacobian, source.M), 1.f);
 
         ShiftResult shifted = shiftForPair(source.sample, neighborPrimary, primary, pair.toCenter);
+        if (neighborIndex != index)
+            measurementShiftOutcome(any(source.sample.F > 0.f), shifted.failure,
+                shifted.jacobian > 0.f && any(shifted.sample.F > 0.f));
         recordShiftCheck(pixel, source.sample, neighborPrimary, primary, shifted);
         if (neighborIndex == index) shifted = reverse;
         // Algebraically equivalent to reference pHat(Fsrc)/J, without dividing by a small J.
@@ -80,7 +90,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if GRIS_HAS_SPATIAL_DEBUG
             if (neighborIndex != index)
             {
+                uint previousMeasurementPhase = measurementSetPhase(kMeasureValidation);
                 ShiftResult back = shiftInline(shifted.sample, primary, neighborPrimary);
+                measurementSetPhase(previousMeasurementPhase);
                 recordShiftFailure(pixel, back.failure);
                 float error = max(relativeContributionError(back.sample.F, source.sample.F), abs(back.jacobian * shifted.jacobian - 1.f));
                 roundTripError = max(roundTripError, error);

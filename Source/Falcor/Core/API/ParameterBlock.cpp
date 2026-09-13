@@ -266,8 +266,14 @@ ParameterBlock::ParameterBlock(
 )
     : mpDevice(pDevice.get()), mpProgramVersion(pProgramVersion), mpReflector(pReflection)
 {
-    FALCOR_GFX_CALL(mpDevice->getGfxDevice()->createMutableShaderObjectFromTypeLayout(
-        pReflection->getElementType()->getSlangTypeLayout(), mpShaderObject.writeRef()
+    // GFX caches standalone layouts and must retain the session that owns their types.
+    // The FromTypeLayout entry point uses GFX's device session, which does not own
+    // layouts reflected from a Falcor ProgramVersion.
+    auto pSlangSession = mpProgramVersion->getSlangSession();
+    auto pSlangType = pReflection->getElementType()->getSlangTypeLayout()->getType();
+    FALCOR_CHECK(pSlangSession && pSlangType, "Can't create a parameter block without its Slang session and type");
+    FALCOR_GFX_CALL(mpDevice->getGfxDevice()->createMutableShaderObject2(
+        pSlangSession, pSlangType, gfx::ShaderObjectContainerType::None, mpShaderObject.writeRef()
     ));
     initializeResourceBindings();
     createConstantBuffers(getRootVar());

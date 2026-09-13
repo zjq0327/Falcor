@@ -297,6 +297,9 @@ protected:
     );
 
     mutable Program* mpProgram;
+    // Slang components refer to code owned by their session. Keep it alive until
+    // all kernels, components and reflection data below have been destroyed.
+    Slang::ComPtr<slang::ISession> mpSlangSession;
     DefineList mDefines;
     ref<const ProgramReflection> mpReflector;
     std::string mName;

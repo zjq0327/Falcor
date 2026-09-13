@@ -7,6 +7,7 @@ target_sources(MyPT PRIVATE
     MyPT.rt.slang
     MyPTCommon.slang
     GRIS/Params.slang
+    GRIS/Measurement.slang
     GRIS/PathState.slang
     GRIS/PathReservoir.slang
     GRIS/PathBuilder.slang

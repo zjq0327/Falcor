@@ -1,7 +1,9 @@
 # MyPT 向 GRIS / ReSTIR PT 迁移的开发计划
 
 编写日期：2026-09-08  
-状态（2026-09-10）：M1–M5 已在各轮声明的支持范围内完成。M5 经完整恢复验收通过：同冻结构建的四组核心统计、新的全部 27 项边界、图像、Layered 和原入口检查均通过，原中断记录保留。继续在原有 PT / ReSTIR 上增量修改，不增加 UI 渲染模式。M0 的跨版本同场景 HDR 对拍及 M6 完整画质/性能对齐仍未完成；本轮详见[第四轮记录](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round4_results.md)。
+状态（2026-09-13）：M1–M5 保持原验收结论；M0 的跨版本同场景原始 HDR、参数与材质对照已完成。M6 已完成生命周期/参数绑定修复、三光组登记范围内的能量确认、最终原入口/边界回归及性能测量，UI 仍只有原 PT / ReSTIR。同 GPU 时间校准失败，正式比较未启动；DI 分工、部分末端 RC 与性能差距仍在，M6 整体效果/性能对齐未达成。详见[M6 实施与验收记录](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round5_results.md)。
+
+历史状态（保留原 2026-09-10 记录，不作为当前结论）：状态（2026-09-10）：M1–M5 已在各轮声明的支持范围内完成。M5 经完整恢复验收通过：同冻结构建的四组核心统计、新的全部 27 项边界、图像、Layered 和原入口检查均通过，原中断记录保留。继续在原有 PT / ReSTIR 上增量修改，不增加 UI 渲染模式。M0 的跨版本同场景 HDR 对拍及 M6 完整画质/性能对齐仍未完成；本轮详见[第四轮记录](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round4_results.md)。
 
 ## 1. 目标、范围与参考基线
 
@@ -313,12 +315,14 @@ M 表示复用置信权重，不等同于实际追踪射线数，也不等同于
 
 ### M0. 固定对照基线与数学约定
 
-- [ ] 保存当前和参考的有效参数、场景/相机、材质与光源配置、版本及当前截图/原始 HDR。
+- [x] 保存当前和参考的参数、场景/相机、材质与光源配置、版本及截图/原始 HDR；M6 已完成实际跨版本对照。参考完整属性 getter 不可用的字段以源码核对的请求配置与可观察 readback 区分记录，未伪造 getter 成功。
 - [x] 明确路径长度计数、PSS 的 F/W/M 语义、光照分工和零贡献规则。
-- [ ] 建立无累积、无去噪、固定曝光的调试脚本；核对两版 Falcor 的材质解释。（本地脚本已完成，跨版本材质/HDR 对拍未完成。）
-- [ ] 按第 8 节固定验收场景、区域和阈值，记录参考程序能否正常运行。
+- [x] 建立无累积、无去噪、固定曝光的调试脚本；跨版本材质/HDR 对照已完成。M6 显式匹配参考 Lambert、完整 BSDF、路径截断和光照分工；不表示两版默认材质或噪声逐路径相同。
+- [x] 按第 8 节固定共享场景、ROI 与门槛，参考程序已实际完成三光组和 realtime/offline 对照。中央 ROI 未触发暗区分支；该分支和未登记材质/场景保持未覆盖。
 
 **完成条件：** 有可重复的对照命令和参数记录；尚无实测时明确标为“未测”，不以文档描述当作通过。
+
+M0 当前完成证据：[三光组 raw 合同](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/additional_light_groups_raw_audit.json)、[12 组同配置检查点 HDR 比较](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-cpu/same_configuration_support_gate_v1/summary.json)及[参考物理配置源码记录](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-reference/final_alignment_notes.md)。M1–M5 和第一轮任务中的“跨版本未测”保留为当时历史状态，以本节及 M6 最新实测状态为当前结论。
 
 ### M1. 调度骨架与基础类型
 
@@ -409,11 +413,79 @@ M 表示复用置信权重，不等同于实际追踪射线数，也不等同于
 
 ### M6. 完整效果对齐与性能收敛
 
-- [ ] 先统一或记录 separatePathBSDF、终端 rc 表示与 DI 分工的差异，再对齐参考的 realtime / offline 两种配置并比较原始 HDR。
-- [ ] 单独验证 DI 输入，完成整体画面比较；按需要接入 NRD。
-- [ ] 记录每 pass GPU 时间、射线数、缓存大小及失败率，针对实测瓶颈优化。
-- [ ] 修复已定位的 Falcor 成功编译请求生命周期问题，并重新验证长进程中反复重建 shader 的资源占用；M5 数值验收先采用已记录的分进程执行。
-- [ ] 保存最终参数与对照结果，逐项标注相同、预期不同和待解决。
+#### M6 实施顺序与比较约定（2026-09-10，实施前补充）
+
+1. 保留 M5 的源码冻结、失败过程与最终验收文件，M6 的新证据写入独立目录。先记录当前二进制及成功重复编译的内存基线，再以局部 RAII 修复 `ProgramManager` 的编译请求所有权；覆盖成功、失败及异常退出，验证请求释放后的反射与实际 dispatch，以及同进程反复重建的资源趋势。
+2. 在原 MyPT 上增加可选测量输出和只读缓存信息，不增加渲染模式。射线按初始路径、时间前缀、时间连接、空间前缀、空间连接、额外验证、普通 PT 分组；计数只在实际发射处递增。失败率采用非零源路径的实际 shift 次数作分母。时间测试关闭全部会增加追踪的诊断输出，并与计数测试分开。
+3. 比较前显式统一材质和直接光：参考 Falcor 4.4 默认 Lambert，当前 Falcor 8 默认 Frostbite。新增脚本可选 Lambert 对齐配置，默认材质行为不变；参考采用 `separatePathBSDF=false`，两端匹配有限路径截断、RR=0、Center/1、Mip0。反弹计数按实际循环核对：当前 `maxBounces=8` 内部传 9，对应参考 `maxSurfaceBounces=8`，两者均包含深度 0..8 的 NEE 与第 9 条 BSDF 扩展上的发光到达，不能直接对齐内部常量。修正现有普通 PT 的 seed 参数未接入问题，以便获取真实独立运行。先比较间接光，再分别验证解析光、发光面、环境光和合成的完整 HDR。参考外部 DI 的资源依赖及内部/外部开关必须显式记录，禁止重复相加。
+4. 使用同机器、共享静态场景，保存两端原始 HDR、配置和来源哈希；测量 realtime（N1/K3/R1/H20）和 offline（N32/K6/R3、关闭时间复用），同时比较同配置和同 GPU 时间的误差。先做小分辨率试运行，再按独立完整种子序列累积；初始预算为 8 个种子、每种子 256 帧，参考原生 PT 间接部分每帧 64 spp；完整光照另加下面预注册的 DI 预算，不能称为总共 64 spp。若第 8 节的 1% 区间或参考精度不足，按相同协议增加预算，不能改门槛。暗区以线性 RGB 均值小于 0.001 定义，绝对误差容差 0.0001。预算与实际执行状态均保留，不以样本不足替代通过。
+5. 根据实测 GPU 时间、射线、缓存和失败率选择局部优化，验证优化前后 HDR 与诊断等价；保留原有材质数值稳定性修复。记录终端 rc 表示、组件拆分、DI 所有权和两个 Falcor 版本的其余差异。原始 HDR 是验收输入，NRD 仅在有明确显示需求时另接，不能修正或掩盖估计器误差。
+6. 将全部实测结果、最终脚本参数、已通过/失败/样本不足/未测项目写入 M6 结果文档，并复核原 `MyPT.py` 启动入口。只有满足现有完成条件后才勾选对应项目。
+
+完整直接光对照修订（实施前，旧 full 配置尚未执行）：源码核对发现参考 `disableDirectIllumination=false,useDirectLighting=false` 不等于完整光照。primary NEE 未进入参考 ReSTIR reservoir（`PathBuilder.slang:123` 拒收长度 0）；native PT 的首次普通反射发光面命中又在 `PathTracer.slang:1025` 被关闭，不能只恢复内部 NEE 的 MIS 半份贡献。旧 full 配置无效，不用于验收，也不放宽 1% 门槛。原 Demo 的外部 DI 为 `ScreenSpaceReSTIRPass`，但其没有公开独立 seedOffset。本轮共享 opaque rough、无相机可见发光体/背景场景采用现有第二个 `ReSTIRPTPass` 输出 NEE-only DI：native PathTracing，四项 max bounce 全为 0，NEE 开、MIS 关、BSDF importance 开，内部直接光开、外部 DI 关、T/S 关；在首个普通反射 scatter query 前按原有最后顶点规则终止。其 color 接主参考 GI 的 directLighting；主参考算法和 PT baseline 均设内部直接光关、外部 DI 开。参考工程源码与 DLL 不改。
+
+完整光照固定预算为算法 GI 原配置 + DI1 spp，baseline GI64 spp + DI64 spp。GI seeds 保持 `[1103,2203,3301,4409,5501,6607,7703,8803]`，对应 DI seeds 固定为 `[1001103,1002203,1003301,1004409,1005501,1006607,1007703,1008803]`；每个种子 256 帧、无排除 warmup。DI seeds 不沿用同一条重置后的序列。完整图 GPU 时间包含 DI Pass，同时单列 DI / 主 PT 时间，父图与子阶段不可重复相加。正式 full 运行前用新输出目录完成低预算 DI 正值、full=GI+DI（只加一次）及同 seed 原始输出重放检查。新 helper 前版本、旧未执行 full 配置和已执行 indirect 的全部哈希保存在 `build/gris-m6-reference/external_di_revision/before`；indirect 的属性、图和预算含义不变，已跑证据不重写。详细公式/末端表示与限制见 [源码对齐记录](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-reference/final_alignment_notes.md)。
+
+实施记录：第一版仅将编译请求改成作用域 RAII，在隔离的核心 A/B 测试中触发启动阶段访问异常（`build/gris-m6-memory/after`，退出码 `0xC0000005`），尚未进入场景测试。该版本不构成修复通过；必须补齐 Slang 编译会话与反射所依赖对象的所有权，并先通过启动和生命周期回归，再继续资源与画质验收。失败目录保留，后续采用新输出目录。
+
+后续稳定性记录：`after_session` 保留会话后完成了 4 次图重建，图像哈希与旧构建一致，但第 5 次重建仍以 `0xC0000005` 退出，不能据前几轮内存趋稳判定修复通过。新增的 ShaderString 生命周期测试与 RootBufferParamBlock GPU 测试通过（前者 6 个执行通过、1 个原有跳过，后者 4 个通过），但不覆盖该长进程崩溃。下一步先保存异常调用栈，并排除修改公共 C++ 类型布局后旧插件与新核心混用的影响；任何涉及布局的最终验证都必须使用一致重建的依赖二进制。补充核查反射 layout 的确切 component 所有者，以及内核、PSO 和延迟释放资源所依赖的会话生命周期。故障未定位并通过同进程复测前，本项保持未完成。
+
+反射所有权复现：`build/gris-m6-memory/slang-composite-probe/results` 的 8 组 CPU 对照始终保留 session、global 和 entry component；4 组保留确切 composite 的测试全部通过，4 组释放它后再查旧 layout 的测试全部失败（布局地址复用为其他入口或访问异常）。据此修复 `createProgramKernels()` 返回后 `ProgramReflection` 仍借用局部 composite 布局的问题：反射对象必须持有其确切 layout 所有者和关联会话，不能只保留语义相同的 constituent components。该复现证明这一生命周期缺口，不单独证明它就是 Mogwai 第 5 轮崩溃的唯一原因。
+
+GFX 缓存修复约定（实施前补充）：精确版本 Slang 2024.1.34 的 `RendererBase::createMutableShaderObjectFromTypeLayout()` 使用设备会话缓存外部布局，缓存 key 为布局裸地址；现有 Falcor 参数块通过此接口创建，编译会话释放后存在地址复用风险。改用显式传入所属会话的公开接口前，验证原布局与生成布局的字段、数组、资源绑定和嵌套参数块一致。为避免正确持有会话后重复图重建保留多份相同导入模块，在 `ProgramManager` 仅按完整编译配方复用会话（深值配置、完整源模块内容/路径和有序参数），暂不合并任意不同程序。缓存命中检查依赖文件修改，热重载清理相应缓存，失败编译不能留下污染的可复用条目。补充同名生成模块但不同内容、宏/参数变化、导入文件修改、失败后恢复及同会话重复编译测试；最终仍以原有资源预算和长进程工作负载验收，不通过永久保留全部旧请求解决崩溃。
+
+测量前补充：参考 `PathTracer.slang:1249` 的 Hybrid 前缀在 NEE 前返回，`:1269` 的 RandomReplay 仅对目标 NEE 贡献槽执行可见性，其余步骤仅推进随机数。当前共享 trace 循环的无用查询可能被 Slang 的 `__NoSideEffect` 优化删除，而外加原子计数仍存活。为避免报告不存在的射线，在插桩验收前显式按 `PathBuilder` 的贡献槽过滤控制查询：finite-prefix 不发 NEE 可见性，完整 replay 只检查目标 NEE，忽略的贡献不发可见性；保留各光源采样和 BSDF 求值的随机数消耗及顺序。目标 NEE 完成后的无用末段查询也显式跳过，保留原采样状态推进。该处理先验证输出与映射一致性，性能结论仍由实测给出。
+
+独立种子运行补充：增加脚本方法 `resetSampling(seed)`，在保留场景、程序和配置的情况下重置 PT 帧号、GRIS 帧号和历史，并发出原有采样刷新标志。数值批次按完整种子轨迹调用此方法，避免仅换运行时 seed 也重建整组 shader。插桩检查需对比该重置与原 `updatePass` 重建的同种子结果；编译资源压力测试仍使用原先的完整图重建协议。
+
+生命周期验收结果：统一 ALL_BUILD 后，编译请求 RAII + owned session + exact layout owner + 显式 GFX API2 + 完整配方会话缓存组合在 `build/gris-m6-memory/after_session_cache/report.json` 完成原固定 8 图重建，837.563 秒、runtime_unchanged=true，峰值私有内存 5,407,604,736 字节，预热后释放点净增 58,834,944 字节，低于原 8 GiB 上限；8 图颜色哈希均与旧构建相同。CompileSessionCache 3 项、ShaderString 7 项执行（另 1 原有跳过）、ParameterBlockSession 1 项、ParamBlockCB 1 项、RootBufferParamBlock 4 项通过。该项可记为规定工作负载通过，不宣称全部内存无泄漏。更高优先级 import 路径新增遮蔽文件需 force reload；`ProgramReflection.mpProgramVersion` 仍为借用，其全部 API 不能脱离版本生命周期使用。
+
+发光面可见性修复（实施前）：跨版本相机 ROI 深度逐位相同，但独立 8×256×64 初始路径均值仍显著低于参考，不能进入效果通过结论。CPU float32 几何复现确认，当前 `pathVisible` 偏移起点后仍使用原始采样方向/距离，仅缩短 `1e-5`；Falcor 8 的起点偏移为旧版 3 倍，shared 场景地板和箱顶的可见射线会先撞到光源自身。普通 PT 的同类阴影射线甚至保留整个原始距离。按参考 `PathTracer.generateEmissiveSample():627–631` 的双端偏移构造公共发光面可见性射线：偏移着色点和光源点，重算方向/长度；两条现有渲染路径共用，仅修正可见性段，BSDF/PDF/描述符仍按原采样点求值。环境/解析光与有限 RC 重连另有各自语义，不统一扩大 epsilon。修复前 HDR、时序和射线数据保留，修复后重新运行独立 PT 能量、完整/间接计数隔离及 M5 边界/原入口回归；不能把修复前后颜色变化作为逐位等价通过。
+
+实测局部优化（实施前）：修正发光面可见性后，640×360 realtime 间接光的 MyPT 平均 6.451 ms，SpatialReuse 占 3.368 ms，是主要成本；TemporalPathRetrace 仍占 0.249 ms。16 帧计数中，时间复用只有 230 个非恒等方向尝试，却执行了 101,215 条前缀最近命中射线和 36,357 条前缀阴影射线。现有 TemporalReuse 已在 primary hit 和 direction 完全相等时直接使用恒等映射，完全不读两个重放结果。将相同判据提取共用，并让 TemporalPathRetrace 在这一情形保留 pair 状态/邻居、跳过不用的前缀；不改变后续 MIS、历史权重、选择随机数或诊断路径。修复前后正式 profile 使用完全相同配置与预算，检查普通末帧及 16 帧 HDR 逐位一致、其它射线/失败计数不变、时间前缀射线减少；时间差只作为实测描述，不用一次运行宣称独立统计加速。空间重连的必要可见性和完整材质求值仍是主要成本，本次不降低邻居数或牺牲采样配置换速度。
+
+局部优化验证补充：普通末帧和 16 帧 HDR 已逐位一致；原“只有时间 prefix 两分量减少”的计数断言实际未满足，应保留而非改写成通过。除最近命中 101,215→9、普通阴影 36,357→3，时间 connection 还减少 113 次（339→226）。源码核对说明 noRC prefix 的重放也会为源 RC 支持域执行 reconnectionVisible；这些同属随后不被消费的前缀内部查询。其余 ray 分量与全部 shift 分量逐元素一致。计数通道按查询类型与时间/空间阶段分类，不能机械地映射成某一个 Pass；最终报告将明确这一点。正式能量门槛和逐位 HDR 验证不变。
+
+统计门控补充（实施前）：进一步确认 Hybrid compact noRC prefix 的返回值只消费 replayFound、rcIndex、F、terminal、light。其 atRc 支持可见性仅影响 rcBeforeFlags 和缓存 PDF，返回值不使用这些字段；`traceVisibilityRay` 标为 `__NoSideEffect`，存在编译器删除查询但保留计数的风险，不能把旧 113 次增量称为已实证的硬件射线。给共享 trace 增加默认开启的 evaluateSourceSupport，仅 Hybrid prefix 调用关闭，以独立嵌套 if 同时跳过这一查询和计数；完整 generation/Replay 保持原行为，atRc 的运输重参数化和全部随机状态保留。参考批次全部完成后主动停止了自有的下一项插桩进程，原因与 PID 核对记录在 `build/gris-m6-final/intentional-queue-stop.json`；不是新的崩溃。最终当前批次、插桩、性能和边界在新输出目录运行，参考源码/helper 未变的已完成结果继续使用。
+
+首轮能量记录：修补上述统计门控前，发光面 6 组主输出有 5 组满足原 ±1% 区间条件，realtime/indirect 为精度不足；三个区间上界约 1.282%、1.295%、1.659%，不记为通过，也不放宽门槛。同 seed 重跑不会增加独立证据。完成最终固定 8×256 矩阵后，如仍不足，将对该配置另行预登记独立种子、固定更长轨迹的确认批次，旧批次保留且不用于选择中途停止时刻；确认的具体预算在其执行前写明。
+
+#### M6 最新实测状态（2026-09-13）
+
+本节更新当前完成状态；前面的实施前约定、失败过程和旧预算统计全部保留。报告与源码哈希描述各自运行时身份，后续仅写回文档不应被称为 shader 变化。
+
+三光组 emissive/analytic/environment × baseline/realtime/offline × indirect/full 共 18 项主输出，原 8×256 预算为 14 项通过、4 项统计精度不足，没有将不足改成通过。随后三个 realtime indirect 与 environment realtime full 各自另行登记 8×4096 条件，共 131,072 帧，四项最终 color 及四阶段共 16 项检查全部进入原逐 RGB ±1% 区间；参考自身 95% 相对半宽均小于 0.25%。原 256 帧样本不合并、不覆盖，不使用中途误差决定停止。该结论限于所登记场景、材质和中央 3,456 像素 ROI；六份参考均值的 ROI 暗像素数均为 0，因此 RGB<0.001 的绝对 0.0001 暗区门仍未覆盖。证据：[四项独立 raw/区间审计](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/final_confirmation_raw_audit.json)、[暗区覆盖](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-cpu/dark_roi_coverage_support_gate_v1.json)。
+
+最终 support-gate shader 已完成 16 进程/344 帧的有限预算回归，包含 27 项 Hybrid/Replay/Reconnection 边界、5 项 temporal reset、三种 Layered 策略各 20 帧和原 MyPT.py/tutorial 入口 18 帧。已实际查看最终原入口 PNG，物体和显示输出正常，短累积仍有噪声。该检查不替代材质长期能量或整体收敛；原截图的 0x18 访问异常缺少该次转储，不能仅凭地址唯一归因。已复现的生命周期/参数绑定缺口与原固定 8 图工作负载的修复证据独立保留。见 [最终边界审计](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/final_bounded_regression_audit.json)、[最终入口截图](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-regression/final-support-gate/entry/MyPT-entry.ToneMapper.dst.0.png)。
+
+最终 20 个 profile、四组插桩和当前批次共 30 份结果已核验原始时间/计数与构建身份。以下比例是既有计时实现的描述性记录；后来发现参考读回同步缺口，精确帧对应尚未独立确认，不能将这些比例当作最终同时间验收。640×360 下当前完整图/参考完整图耗时：realtime indirect 2.674750、full 2.608140；offline indirect 1.898288、full 1.956803。SpatialReuse 是主要差距之一。实际 GRIS buffers 为 realtime 333,619,200 bytes、offline 351,129,600 bytes，不代表总显存；GPU 时间不把父图与子 Pass 重复相加。恒等前缀与 compact-prefix 支持查询门控已经实施并验证原始 HDR 等价，但最终 support-gate 单次 profile 没有显示加速，既有 profile 仍显示与参考有差距，精确比例待有效计时复测。见 [逐 Pass 性能/查询/失败率记录](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/final_performance_draft.md)。
+
+物理分工已经逐项核对：两端本轮使用 separatePathBSDF=false；当前部分发光/无限远终止归入 noRC Replay，参考另有终端 RC 表示。完整图当前将短 DI 与 GI 一起参与 reservoir，参考为 GI 复用后另加独立 DI-only 输出。参考完整图预算是算法 GI+DI1，高样本基线 GI64+DI64；不能简称总 64 spp。DI positivity、full=GI+DI 一次相加和原始输出检查已经执行，这些测试不会消除估计器结构差异。NRD 为可选后续显示，当前不以其修正原始 HDR。见 [M6 实施与验收记录](C:/Users/13243/Desktop/Restir/Falcor/Source/RenderPasses/MyPT/GRIS_round5_results.md) 的物理配置与 DI 段。
+
+同时间旧 v1/fix1 只保留作校准/描述性证据：第一版在 current Accumulate outputFormat 枚举转 JSON 时失败；修正后前 9 项通过，第 10 项 reference offline indirect 同进程 reset 的逐位门失败，后续未跑。顶层 RNG 构造器输入与有限参考基线存在交集，不能称 fresh 独立质量通过。旧 bitwise 失败、8×256 精度不足及原预算都没有被重写。
+
+参考重置诊断共有三个独立版本：首版因旧 Texture.width getter 需要 mip 参数在第 33 次调用失败；probe-fix1 的 original 变体完成 42 次调用但在第二次 profiler 辅助 NaN 的 JSON 序列化失败；probe-fix2 以显式 nonfinite tag 保留辅助统计并保持有效成本严格 finite，实际两个变体共 84 次调用完成。新两图内外的四帧及均值全部逐位相同，并等于两个旧失败进程的 repeat 1；旧 repeat 0 的前 3 帧与均值仍不同。instrumented 新数据的 packed VBuffer、depth 与公开 camera 全相同，但这一轮没有复现 HDR 微差，旧失败又没有逐帧 primary，不能因此定位旧差异的内部原因，也不能泛化为“随 repeat 稳定”或“fresh process 天然逐位确定”。见 [probe-fix2 完整诊断审计](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-cpu/reference_reset_probe_fix2_audit.json)、[全部捕获文件复核](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-cpu/reference_reset_probe_fix2_source_audit.json)。新实际 profiler 未出现非有限 tag，tag 分支由 CPU 反例覆盖。
+
+同 GPU 时间验收当前未通过。fresh_calibration_v1 登记 80 个独立进程，前 33 项通过，第 34 项 reference realtime full seed 300007 的计时加和检查失败，后 46 项未启动；实际共 5,278 次 render 调用。失败进程完成 223 次调用并正常退出，但业务状态是 failed，不能记为校准通过。旧 worker 在严格解码后才保存 raw Profiler，因此失败时间序列未落盘，不能判断超差幅度或具体帧。正式注册检查已拒绝该队列，四组最终 N 均为 null，正式同时间图像比较未启动。证据：[计时失败独立审计](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/fresh_calibration_timestamp_failure_audit_v1.json)、[正式注册拒绝](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/fresh_formal_readiness_after_timestamp_failure_v1.json)。
+
+参考计时源码另发现同步缺口：D3D12GpuTimer::apiResolve 将 ResolveQueryData 放入命令列表后立即 Map 读回，而该 Read buffer 的 Map 不负责等待 GPU。Profiler 又使用上一帧的双缓冲事件槽，因此旧读回值可能无法对应所假定的帧。这里是源码发现的风险，不能凭缺失的失败记录确认它就是本次异常的唯一原因。Direct3D 12 要求应用负责 CPU/GPU 访问同步，见 [Microsoft Map 文档](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12resource-map)。同步修订的构建和诊断状态单独记录；原参考 DLL、原门槛和失败证据保持原样。
+
+独立诊断 fix1 已完成 10 项 CPU 测试和输入检查，固定一次 223 calls，保存顺序为 raw Profiler → mean/last/depth → 原严格 decoder → 全 lane 诊断；原 v1 顺序缺口已保留，两个版本均未运行 GPU。诊断即使成功也不具备校准替代资格。见 [诊断说明](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-reference-timing-probe-fix1/README.md) 及 [独立复审](C:/Users/13243/Desktop/Restir/Falcor/build/gris-m6-final-review/reference_timing_probe_fix1_framework_review_v1.json)。
+
+同步修订仅在工作区 build/gris-reference-timer-sync-candidate-v1 中制作独立候选：Resolve 后显式标记 pending commands，再 flush(true) 等待，最后 Map。实际编译和链接均返回 0；4,801 个导出名称/序号、40 个依赖与原 DLL 相同，8,974 条原参考及构建输入的前后哈希全部未变。候选状态是 cpu_candidate_built_not_gpu_validated，没有部署到当前或参考程序；它尚未证明时间帧对应、渲染等价或旧异常根因。逐事件等待还会改变提交节奏，不能预先称性能等价。见 [候选构建报告](C:/Users/13243/Desktop/Restir/Falcor/build/gris-reference-timer-sync-candidate-v1/build_report.json)。
+
+本次收尾时另一个 Material 项目的 Mogwai 仍在运行，GPU 诊断暂停。该进程在 11:36:40 才启动，晚于 11:33:08–11:33:26 的旧校准失败，不构成旧失败的解释。本次文档写回会改变 Source 文档身份，写回前的两份原文及其余 Source 哈希单独归档；上述已登记未运行的诊断绑定写回前身份，后续应在新目录重新登记实际输入并先检查，不编辑旧 manifest 绕过冻结检查。
+
+后续顺序为：保存完整原始计时的独立诊断 → 验证所使用计时实现的帧对应及严格加和 → 在登记的新身份下完成全部四组校准 → 只按时间选择固定 N → 完成正式轨迹的实际时间与 HDR 误差比较。平均时间差 ≤2%、每条配对轨迹 ≤5% 的条件保持不变，不用同帧数 MSE、最近检查点或旧局部通过数据代替有效同时间结果。M6 的整体效果/性能对齐仍未达成。
+
+- [x] 统一或记录 separatePathBSDF、终端 RC 与 DI 分工差异，匹配 realtime/offline 配置并完成共享三光组原始 HDR 比较；已比较不代表逐路径、方差或全部效果相同。
+- [x] 单独验证参考 DI 输入及仅加一次的完整 HDR 合成，并完成共享场景完整图比较；当前 DI/GI 共用 reservoir 与参考外部 DI 分工仍不同。NRD 本轮无新增显示需求，未接入，不用于掩盖误差。
+- [x] 记录每 Pass GPU 时间、查询数、缓存大小和失败率，完成恒等前缀/无用支持查询局部优化及等价性核验。既有 profile 显示明显性能差距，精确比例待有效计时复测；不把测量与局部优化完成写成性能目标通过。
+- [x] 修复已定位的 Falcor 成功编译请求生命周期问题，并在原固定 8 图工作负载与 8 GiB 预算内重新验证同进程反复重建 shader；完整组合与保留限制见上文。M5 的既有分进程证据不改写。
+- [x] 将本轮实际参数、已通过结果、失败和未执行项写回计划及结果文档；同时间质量仍未验证，不将文档收尾记为 M6 整体验收通过。
+- [x] 完成登记范围内三光组能量条件与最终 16 进程/344 帧回归；未覆盖的暗区和其他长轨迹材质能量仍单列。
+- [ ] 完成有效预检支持的四组同 GPU 时间新实验并根据实际时间与图像结果判断质量。
+- [ ] 达成整体效果与性能接近参考 GRIS 的目标；现有 DI/末端表示及性能差距仍在。
 
 **依赖：** M5。  
 **完成条件：** 满足第 8 节定义的能量和质量标准；性能数据来自同机器同场景实测。不能因为 pass 名称齐全就标记为效果对齐。

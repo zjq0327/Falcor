@@ -107,7 +107,7 @@ public:
      * Set compiler arguments applied to all programs.
      * @param[in] args Compiler arguments.
      */
-    void setGlobalCompilerArguments(const std::vector<std::string>& args) { mGlobalCompilerArguments = args; }
+    void setGlobalCompilerArguments(const std::vector<std::string>& args);
 
     /**
      * Get compiler arguments applied to all programs.
@@ -145,7 +145,18 @@ public:
     void resetCompilationStats() { mCompilationStats = {}; }
 
 private:
-    SlangCompileRequest* createSlangCompileRequest(const Program& program) const;
+    SlangCompileRequest* createSlangCompileRequest(const Program& program, std::string& sessionKey) const;
+
+    struct CompileSession
+    {
+        Slang::ComPtr<slang::ISession> session;
+        std::unordered_map<std::string, time_t> fileTimes;
+        std::unordered_map<std::string, std::pair<std::filesystem::file_time_type, uintmax_t>> fileMetadata;
+    };
+
+    // Full length-prefixed recipe strings, not hashes or pointers into SessionDesc.
+    // Access follows the existing single-threaded Slang global-session contract.
+    mutable std::map<std::string, CompileSession> mCompileSessions;
 
     Device* mpDevice;
 

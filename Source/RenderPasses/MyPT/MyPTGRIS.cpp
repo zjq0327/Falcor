@@ -7,6 +7,36 @@ void MyPT::resetGRIS()
     mGRIS = {};
 }
 
+Properties MyPT::getResourceStats() const
+{
+    Properties stats;
+    uint64_t total = 0;
+    auto add = [&](const char* name, const ref<Buffer>& buffer)
+    {
+        Properties entry;
+        entry["bytes"] = buffer ? uint64_t(buffer->getSize()) : uint64_t(0);
+        entry["stride"] = buffer ? buffer->getStructSize() : 0u;
+        entry["elements"] = buffer ? buffer->getElementCount() : 0u;
+        stats[name] = entry;
+        if (buffer) total += buffer->getSize();
+    };
+    add("primary", mGRIS.primary);
+    add("fresh", mGRIS.fresh);
+    add("reference", mGRIS.reference);
+    add("temporal", mGRIS.temporal);
+    add("historyPrimary", mGRIS.historyPrimary);
+    add("historyReservoir", mGRIS.historyReservoir);
+    add("hybridPairs", mGRIS.hybridPairs);
+    add("spatial0", mGRIS.spatial[0]);
+    add("spatial1", mGRIS.spatial[1]);
+    stats["totalBufferBytes"] = total;
+    stats["width"] = mGRIS.dimensions.x;
+    stats["height"] = mGRIS.dimensions.y;
+    stats["ptSeedSupported"] = true;
+    stats["referenceLambertian"] = mReferenceLambertian;
+    return stats;
+}
+
 void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
 {
     FALCOR_CHECK(!mpScene->hasProceduralGeometry(), "GRIS currently supports triangle geometry only.");
@@ -66,6 +96,12 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     defines.add("GRIS_HAS_MOTION", data.getTexture("mvec") ? "1" : "0");
     defines.add("GRIS_HAS_SHIFT_DEBUG", data.getTexture("shiftDebug") ? "1" : "0");
     defines.add("GRIS_HAS_PATH_DEBUG", data.getTexture("pathDebug") ? "1" : "0");
+    defines.add("MYPT_HAS_RAY_STATS0", data.getTexture("rayStats0") ? "1" : "0");
+    defines.add("MYPT_HAS_RAY_STATS1", data.getTexture("rayStats1") ? "1" : "0");
+    defines.add("MYPT_HAS_RAY_STATS2", data.getTexture("rayStats2") ? "1" : "0");
+    defines.add("MYPT_HAS_TEMPORAL_SHIFT_STATS", data.getTexture("temporalShiftStats") ? "1" : "0");
+    defines.add("MYPT_HAS_SPATIAL_SHIFT_STATS", data.getTexture("spatialShiftStats") ? "1" : "0");
+    if (mReferenceLambertian) defines.add("DiffuseBrdf", "0");
     if (mpEmissiveSampler) defines.add(mpEmissiveSampler->getDefines());
 
     if (!mGRIS.generatePaths || defines != mGRIS.defines)
@@ -163,6 +199,17 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         var["gPrimary"] = mGRIS.primary;
         var["gFresh"] = mGRIS.fresh;
         var["gReference"] = mGRIS.reference;
+        // Each output is optional and compiles out of ordinary rendering.
+        auto bindMeasurement = [&](const char* output, const char* resource)
+        {
+            if (auto texture = data.getTexture(output))
+                if (auto member = var.findMember(resource); member.isValid()) member = texture;
+        };
+        bindMeasurement("rayStats0", "gRayStats0");
+        bindMeasurement("rayStats1", "gRayStats1");
+        bindMeasurement("rayStats2", "gRayStats2");
+        bindMeasurement("temporalShiftStats", "gTemporalShiftStats");
+        bindMeasurement("spatialShiftStats", "gSpatialShiftStats");
     };
     auto bindTransport = [&](const ref<ComputePass>& pass)
     {

@@ -1,5 +1,6 @@
 __exported import PathState;
 __exported import PathReservoir;
+__exported import Measurement;
 
 cbuffer CB
 {

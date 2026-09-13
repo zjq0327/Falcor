@@ -1203,12 +1203,20 @@ static void reflectShaderIO(
 
 ref<const ProgramReflection> ProgramReflection::create(
     ProgramVersion const* pProgramVersion,
-    slang::ShaderReflection* pSlangReflector,
-    const std::vector<slang::EntryPointLayout*>& pSlangEntryPointReflectors,
+    slang::IComponentType* pSlangGlobalScope,
+    const std::vector<Slang::ComPtr<slang::IComponentType>>& pSlangEntryPoints,
     std::string& log
 )
 {
-    return ref<const ProgramReflection>(new ProgramReflection(pProgramVersion, pSlangReflector, pSlangEntryPointReflectors, log));
+    FALCOR_CHECK(pSlangGlobalScope && pSlangGlobalScope->getSession(), "Missing Slang reflection component or session.");
+    for (const auto& pSlangEntryPoint : pSlangEntryPoints)
+    {
+        FALCOR_CHECK(
+            pSlangEntryPoint && pSlangEntryPoint->getSession() == pSlangGlobalScope->getSession(),
+            "Reflected Slang components must belong to the same session."
+        );
+    }
+    return ref<const ProgramReflection>(new ProgramReflection(pProgramVersion, pSlangGlobalScope, pSlangEntryPoints, log));
 }
 
 void ProgramReflection::finalize()
@@ -1466,12 +1474,26 @@ static ShaderType getShaderTypeFromSlangStage(SlangStage stage)
 
 ProgramReflection::ProgramReflection(
     ProgramVersion const* pProgramVersion,
-    slang::ShaderReflection* pSlangReflector,
-    const std::vector<slang::EntryPointLayout*>& pSlangEntryPointReflectors,
+    slang::IComponentType* pSlangGlobalScope,
+    const std::vector<Slang::ComPtr<slang::IComponentType>>& pSlangEntryPoints,
     std::string& log
 )
-    : mpProgramVersion(pProgramVersion), mpSlangReflector(pSlangReflector)
+    : mpSlangSession(pSlangGlobalScope->getSession()),
+      mpSlangGlobalScope(pSlangGlobalScope),
+      mpSlangEntryPoints(pSlangEntryPoints),
+      mpProgramVersion(pProgramVersion),
+      mpSlangReflector(pSlangGlobalScope->getLayout())
 {
+    auto pSlangReflector = mpSlangReflector;
+    FALCOR_CHECK(pSlangReflector, "Failed to obtain Slang global reflection layout.");
+    std::vector<slang::EntryPointLayout*> pSlangEntryPointReflectors;
+    for (const auto& pSlangEntryPoint : mpSlangEntryPoints)
+    {
+        auto pLayout = pSlangEntryPoint->getLayout();
+        FALCOR_CHECK(pLayout && pLayout->getEntryPointCount() > 0, "Failed to obtain Slang entry point reflection layout.");
+        pSlangEntryPointReflectors.push_back(pLayout->getEntryPointByIndex(0));
+    }
+
     // For Falcor's purposes, the global scope of a program can be treated
     // much like a user-defined `struct` type, where the fields are the
     // global shader parameters.

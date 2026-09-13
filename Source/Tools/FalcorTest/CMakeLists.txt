@@ -52,6 +52,8 @@ target_sources(FalcorTest PRIVATE
     Tests/Platform/MonitorInfoTests.cpp
     Tests/Platform/OSTests.cpp
 
+    Tests/Rendering/EmissiveVisibility.cpp
+    Tests/Rendering/EmissiveVisibility.cs.slang
     Tests/Rendering/Materials/BSDFIntegratorTests.cpp
     Tests/Rendering/Materials/RGLAcquisitionTests.cpp
     Tests/Rendering/Materials/MicrofacetTests.cpp
@@ -80,6 +82,7 @@ target_sources(FalcorTest PRIVATE
     Tests/Slang/Atomics.cs.slang
     Tests/Slang/CastFloat16.cpp
     Tests/Slang/CastFloat16.cs.slang
+    Tests/Slang/CompileSessionCache.cpp
     Tests/Slang/Float16Tests.cpp
     Tests/Slang/Float16Tests.cs.slang
     Tests/Slang/Float64Tests.cpp
@@ -90,6 +93,7 @@ target_sources(FalcorTest PRIVATE
     Tests/Slang/Int64Tests.cs.slang
     Tests/Slang/NestedStructs.cpp
     Tests/Slang/NestedStructs.cs.slang
+    Tests/Slang/ParameterBlockSession.cpp
     Tests/Slang/ShaderModel.cpp
     Tests/Slang/ShaderModel.cs.slang
     Tests/Slang/ShaderString.cpp

@@ -26,6 +26,10 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
 #include "Testing/UnitTest.h"
+#include "Core/API/Device.h"
+#include "Core/Program/ProgramManager.h"
+#include "Core/Program/ProgramVersion.h"
+#include <slang.h>
 #include <random>
 
 namespace Falcor
@@ -217,5 +221,146 @@ GPU_TEST(ShaderStringDynamicObject)
     {
         EXPECT_EQ(result[i], i * 997);
     }
+}
+
+GPU_TEST(ShaderStringCompileRequestLifetime)
+{
+    const char source[] = R"(
+        struct RetainedPayload { uint value; uint tag; };
+        RWStructuredBuffer<RetainedPayload> result;
+        [numthreads(1, 1, 1)]
+        void main(uint3 tid : SV_DispatchThreadID)
+        {
+            RetainedPayload p;
+            p.value = tid.x * 17 + 3;
+            p.tag = tid.x ^ 0x5a;
+            result[tid.x] = p;
+        }
+    )";
+    ProgramDesc desc;
+    desc.addShaderModule().addString(source);
+    desc.csEntry("main");
+    auto pDevice = ctx.getDevice();
+    auto pManager = pDevice->getProgramManager();
+    auto pProgram = Program::create(pDevice, desc);
+    std::string log;
+    auto pVersion = pManager->createProgramVersion(*pProgram, log);
+    ASSERT_MSG(pVersion != nullptr, log);
+
+    // Exercise both failure exits directly, without Program::link's interactive retry path.
+    {
+        ProgramDesc missingDesc;
+        missingDesc.addShaderLibrary("Tests/Slang/CompileRequestLifetime_MissingFile.cs.slang").csEntry("main");
+        auto pMissing = Program::create(pDevice, missingDesc);
+        std::string missingLog;
+        EXPECT_THROW_AS(pManager->createProgramVersion(*pMissing, missingLog), RuntimeError);
+    }
+    {
+        ProgramDesc invalidDesc;
+        invalidDesc.addShaderModule().addString("[numthreads(1,1,1)] void main() { undeclaredLifetimeTestSymbol; }");
+        invalidDesc.csEntry("main");
+        auto pInvalid = Program::create(pDevice, invalidDesc);
+        std::string invalidLog;
+        EXPECT(pManager->createProgramVersion(*pInvalid, invalidLog) == nullptr);
+        EXPECT(invalidLog.find("undeclaredLifetimeTestSymbol") != std::string::npos);
+    }
+
+    // Components borrow session-owned code. Exercise the session after the successful request
+    // and unrelated failed requests have been destroyed, without retaining a session in this test.
+    {
+        auto pSession = pVersion->getSlangSession();
+        ASSERT(pSession != nullptr);
+        EXPECT(pSession == pVersion->getSlangGlobalScope()->getSession());
+        EXPECT(pSession == pVersion->getSlangEntryPoint(0)->getSession());
+        slang::IComponentType* components[] = {pVersion->getSlangGlobalScope(), pVersion->getSlangEntryPoint(0)};
+        Slang::ComPtr<slang::IComponentType> pComposite;
+        ASSERT(SLANG_SUCCEEDED(pSession->createCompositeComponentType(components, 2, pComposite.writeRef())));
+        ASSERT(pComposite != nullptr);
+        auto pLayout = pComposite->getLayout();
+        ASSERT(pLayout != nullptr);
+        EXPECT(pLayout->findTypeByName("RetainedPayload") != nullptr);
+        EXPECT_EQ(pLayout->getEntryPointCount(), 1);
+    }
+
+    // The successful request has left scope. This first findType lookup consults the retained
+    // Slang reflector instead of its name cache, after unrelated failed requests were destroyed.
+    auto pType = pVersion->getReflector()->findType("RetainedPayload");
+    ASSERT(pType != nullptr);
+    EXPECT_EQ(pType->getByteSize(), 8);
+    auto pTag = pType->findMember("tag");
+    ASSERT(pTag != nullptr);
+    EXPECT_EQ(pTag->getByteOffset(), 4);
+    auto pGlobalLayout = pVersion->getSlangGlobalScope()->getLayout();
+    ASSERT(pGlobalLayout != nullptr);
+    EXPECT(pGlobalLayout->findTypeByName("RetainedPayload") != nullptr);
+    auto pEntryLayout = pVersion->getSlangEntryPoint(0)->getLayout()->getEntryPointByIndex(0);
+    ASSERT(pEntryLayout != nullptr);
+    EXPECT_EQ(uint32_t(pEntryLayout->getStage()), uint32_t(SLANG_STAGE_COMPUTE));
+
+    // A subsequent compile must recover, and kernels must still specialize and execute after
+    // their frontend request has been released. Buffer allocation also consumes reflected stride.
+    ctx.createProgram(desc);
+    ctx.allocateStructuredBuffer("result", kSize);
+    ctx.runProgram(kSize, 1, 1);
+    const auto values = ctx.readBuffer<uint2>("result");
+    ASSERT_EQ(values.size(), kSize);
+    for (uint32_t i = 0; i < kSize; ++i)
+    {
+        EXPECT_EQ(values[i].x, i * 17 + 3);
+        EXPECT_EQ(values[i].y, i ^ 0x5a);
+    }
+}
+
+GPU_TEST(ShaderStringSpecializedReflectionLifetime)
+{
+    const char source[] = R"(
+        struct SpecializedPayload { float4 color; uint tag; };
+        RWStructuredBuffer<SpecializedPayload> result;
+        [numthreads(1, 1, 1)]
+        void main(uint3 tid : SV_DispatchThreadID)
+        {
+            SpecializedPayload p;
+            p.color = float4(tid, 1);
+            p.tag = tid.x + 19;
+            result[tid.x] = p;
+        }
+    )";
+    ProgramDesc desc;
+    desc.addShaderModule().addString(source);
+    desc.csEntry("main");
+    auto pDevice = ctx.getDevice();
+    auto pProgram = Program::create(pDevice, desc);
+    auto pVersion = pProgram->getActiveVersion();
+    auto pVars = ProgramVars::create(pDevice, pProgram.get());
+    ref<const ProgramReflection> pSpecializedReflector;
+    {
+        std::string log;
+        // Bypass the version's kernel cache so only the returned reflector survives this scope.
+        auto pKernels = pDevice->getProgramManager()->createProgramKernels(*pProgram, *pVersion, *pVars, log);
+        ASSERT_MSG(pKernels != nullptr, log);
+        pSpecializedReflector = pKernels->getReflector();
+    }
+
+    // Force other exact composites/layouts to be allocated and released in the same session.
+    // This exposes a raw layout borrowed from createProgramKernels' destroyed local composite.
+    auto pSession = pVersion->getSlangSession();
+    for (uint32_t i = 0; i < 64; ++i)
+    {
+        Slang::ComPtr<slang::IComponentType> pRenamedEntry, pComposite;
+        std::string entryName = "replacement_" + std::to_string(i);
+        ASSERT(SLANG_SUCCEEDED(pVersion->getSlangEntryPoint(0)->renameEntryPoint(entryName.c_str(), pRenamedEntry.writeRef())));
+        slang::IComponentType* components[] = {pVersion->getSlangGlobalScope(), pRenamedEntry.get()};
+        ASSERT(SLANG_SUCCEEDED(pSession->createCompositeComponentType(components, 2, pComposite.writeRef())));
+        ASSERT(pComposite->getLayout() != nullptr);
+    }
+
+    // This first name lookup must reach the retained specialized Slang layout, not a Falcor cache.
+    auto pType = pSpecializedReflector->findType("SpecializedPayload");
+    ASSERT(pType != nullptr);
+    EXPECT_EQ(pType->getByteSize(), 20);
+    auto pTag = pType->findMember("tag");
+    ASSERT(pTag != nullptr);
+    EXPECT_EQ(pTag->getByteOffset(), 16);
+    EXPECT_EQ(pType->getSlangTypeLayout()->getSize(), 20);
 }
 } // namespace Falcor

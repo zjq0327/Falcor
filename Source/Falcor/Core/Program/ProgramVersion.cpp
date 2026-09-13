@@ -164,7 +164,7 @@ const EntryPointKernel* ProgramKernels::getKernel(ShaderType type) const
 }
 
 ProgramVersion::ProgramVersion(Program* pProgram, slang::IComponentType* pSlangGlobalScope)
-    : mpProgram(pProgram), mpSlangGlobalScope(pSlangGlobalScope)
+    : mpProgram(pProgram), mpSlangSession(pSlangGlobalScope->getSession()), mpSlangGlobalScope(pSlangGlobalScope)
 {
     FALCOR_ASSERT(pProgram);
 }
@@ -253,7 +253,7 @@ ref<const ProgramKernels> ProgramVersion::getKernels(Device* pDevice, ProgramVar
 
 slang::ISession* ProgramVersion::getSlangSession() const
 {
-    return getSlangGlobalScope()->getSession();
+    return mpSlangSession;
 }
 
 slang::IComponentType* ProgramVersion::getSlangGlobalScope() const
