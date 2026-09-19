@@ -34,6 +34,7 @@ Properties MyPT::getResourceStats() const
     stats["height"] = mGRIS.dimensions.y;
     stats["ptSeedSupported"] = true;
     stats["referenceLambertian"] = mReferenceLambertian;
+    stats["nrc"] = getNRCStats();
     return stats;
 }
 
@@ -67,9 +68,9 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     // Sampler specialization can change with scene lighting, independently of UI options.
     if (mpScene->useEmissiveLights())
     {
-        if (!mpEmissiveSampler)
-            mpEmissiveSampler = std::make_unique<EmissivePowerSampler>(context, mpScene->getILightCollection(context));
-        mpEmissiveSampler->update(context, mpScene->getILightCollection(context));
+        if (!mGRIS.emissiveSampler)
+            mGRIS.emissiveSampler = std::make_unique<EmissivePowerSampler>(context, mpScene->getILightCollection(context));
+        mGRIS.emissiveSampler->update(context, mpScene->getILightCollection(context));
     }
     if (mpScene->useEnvLight() && (!mGRIS.envSampler || mGRIS.envSampler->getEnvMap() != mpScene->getEnvMap()))
         mGRIS.envSampler = std::make_unique<EnvMapSampler>(mpDevice, mpScene->getEnvMap());
@@ -102,7 +103,7 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     defines.add("MYPT_HAS_TEMPORAL_SHIFT_STATS", data.getTexture("temporalShiftStats") ? "1" : "0");
     defines.add("MYPT_HAS_SPATIAL_SHIFT_STATS", data.getTexture("spatialShiftStats") ? "1" : "0");
     if (mReferenceLambertian) defines.add("DiffuseBrdf", "0");
-    if (mpEmissiveSampler) defines.add(mpEmissiveSampler->getDefines());
+    if (mGRIS.emissiveSampler) defines.add(mGRIS.emissiveSampler->getDefines());
 
     if (!mGRIS.generatePaths || defines != mGRIS.defines)
     {
@@ -216,7 +217,7 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         auto var = pass->getRootVar();
         mpScene->bindShaderDataForRaytracing(context, var["gScene"]);
         if (mpScene->useEnvLight()) mGRIS.envSampler->bindShaderData(var["gEnvSampler"]);
-        if (mpEmissiveSampler) mpEmissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
+        if (mGRIS.emissiveSampler) mGRIS.emissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
     };
     auto bindHistory = [&](const ref<ComputePass>& pass)
     {

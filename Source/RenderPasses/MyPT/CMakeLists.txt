@@ -4,6 +4,13 @@ target_sources(MyPT PRIVATE
     MyPT.cpp
     MyPT.h
     MyPTGRIS.cpp
+    MyPTNRC.cpp
+    NRC/NrcIntegration.cpp
+    NRC/NrcIntegration.h
+    NRC/NrcAdapter.slang
+    NRC/NrcPathTrace.rt.slang
+    NRC/NrcResolve.cs.slang
+    PT/PathTransport.slang
     MyPT.rt.slang
     MyPTCommon.slang
     GRIS/Params.slang
@@ -26,5 +33,8 @@ target_sources(MyPT PRIVATE
 )
 
 target_copy_shaders(MyPT RenderPasses/MyPT)
+
+include(NRC/NrcSdk.cmake)
+target_enable_nrc(MyPT)
 
 target_source_group(MyPT "RenderPasses")

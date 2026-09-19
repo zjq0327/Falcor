@@ -31,6 +31,7 @@
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Rendering/Lights/EmissiveLightSampler.h"
 #include "Rendering/Lights/EnvMapSampler.h"
+#include "NRC/NrcIntegration.h"
 
 using namespace Falcor;
 
@@ -56,6 +57,7 @@ public:
     {
         PT,     ///< Brute-force path tracing (default).
         ReSTIR, ///< Complete-path RIS and temporal/spatial GRIS.
+        NRC,    ///< Path tracing with neural radiance cache termination.
     };
 
     FALCOR_ENUM_INFO(
@@ -63,6 +65,7 @@ public:
         {
             {Mode::PT, "PT"},
             {Mode::ReSTIR, "ReSTIR"},
+            {Mode::NRC, "NRC"},
         }
     );
 
@@ -90,13 +93,17 @@ public:
     MyPT(ref<Device> pDevice, const Properties& props);
 
     virtual Properties getProperties() const override;
+    virtual void setProperties(const Properties& props) override;
     Properties getResourceStats() const;
     void resetSampling(uint32_t seed);
+    void resetNrcCache();
+    void reloadShaders();
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
     virtual void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
     virtual void renderUI(Gui::Widgets& widget) override;
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     virtual void onSceneUpdates(RenderContext* pRenderContext, Scene::UpdateFlags updates) override;
+    virtual void onHotReload(HotReloadFlags reloaded) override;
     virtual bool onMouseEvent(const MouseEvent& mouseEvent) override { return false; }
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
 
@@ -105,6 +112,9 @@ private:
     void prepareVars();
     void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData);
     void resetGRIS();
+    void executeNRC(RenderContext* context, const RenderData& data);
+    void resetNRC();
+    Properties getNRCStats() const;
 
     // Internal state
 
@@ -168,6 +178,44 @@ private:
     /// Fixed probability for russian roulette path termination.
     float mRRProbability = 0.2f;
 
+    bool mNrcUseCache = true;
+    bool mNrcTrainCache = true;
+    uint32_t mNrcTrainingMaxBounces = 8;
+    uint32_t mNrcTrainingIterations = 4;
+    float mNrcTerminationThreshold = 0.1f;
+    float mNrcFeatureSize = 0.01f;
+    float mNrcUnbiasedTrainingRatio = 0.0625f;
+    bool mNrcResetRequested = true;
+    uint64_t mNrcCacheGeneration = 0;
+    Mode mLastExecutedMode = Mode::PT;
+    Scene::UpdateFlags mNrcPendingSceneUpdates = Scene::UpdateFlags::None;
+
+    struct NrcTracer
+    {
+        ref<Program> program;
+        ref<RtBindingTable> bindingTable;
+        ref<RtProgramVars> vars;
+        DefineList defines;
+    };
+    struct
+    {
+        std::unique_ptr<NrcIntegration> integration;
+        std::unique_ptr<EmissiveLightSampler> emissiveSampler;
+        NrcTracer update;
+        NrcTracer query;
+        ref<ComputePass> resolve;
+        ref<Texture> explicitColor;
+        uint2 dimensions = uint2(0);
+        float3 sceneBoundsMin = float3(0.f);
+        float3 sceneBoundsMax = float3(0.f);
+        bool boundsValid = false;
+        float4x4 accumulationViewProj = float4x4::identity();
+        float2 accumulationLens = float2(0.f);
+        uint32_t frameIndex = 0;
+        bool failed = false;
+        std::string status = NrcIntegration::getBuildStatus();
+    } mNRC;
+
     // Runtime data
 
     /// Frame count since scene was loaded.
@@ -196,6 +244,7 @@ private:
         ref<Buffer> hybridPairs;
         ref<Buffer> spatial[2];
         std::unique_ptr<EnvMapSampler> envSampler;
+        std::unique_ptr<EmissiveLightSampler> emissiveSampler;
         DefineList defines;
         uint2 dimensions = uint2(0);
         uint32_t frameIndex = 0;

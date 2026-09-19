@@ -41,6 +41,8 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
         pybind11::class_<MyPT, RenderPass, ref<MyPT>> pass(m, "MyPT");
         pass.def_property_readonly("resourceStats", [](const MyPT& p) { return p.getResourceStats().toPython(); });
         pass.def("resetSampling", &MyPT::resetSampling, pybind11::arg("seed"));
+        pass.def("resetNrcCache", &MyPT::resetNrcCache);
+        pass.def("reloadShaders", &MyPT::reloadShaders);
     });
 }
 
@@ -107,6 +109,13 @@ void MyPT::parseProperties(const Properties& props)
     {
         if (key == kMode)
             mMode = value;
+        else if (key == "nrcUseCache") mNrcUseCache = value;
+        else if (key == "nrcTrainCache") mNrcTrainCache = value;
+        else if (key == "nrcTrainingMaxBounces") mNrcTrainingMaxBounces = value;
+        else if (key == "nrcTrainingIterations") mNrcTrainingIterations = value;
+        else if (key == "nrcTerminationThreshold") mNrcTerminationThreshold = value;
+        else if (key == "nrcFeatureSize") mNrcFeatureSize = value;
+        else if (key == "nrcUnbiasedTrainingRatio") mNrcUnbiasedTrainingRatio = value;
         else if (key == kShiftStrategy)
             mShiftStrategy = value;
         else if (key == kSpecularRoughnessThreshold)
@@ -161,6 +170,13 @@ void MyPT::parseProperties(const Properties& props)
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
     FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
+    FALCOR_CHECK(mNrcTrainingMaxBounces >= 1 && mNrcTrainingMaxBounces <= 64, "nrcTrainingMaxBounces must be in [1, 64].");
+    FALCOR_CHECK(mNrcTrainingIterations >= 1 && mNrcTrainingIterations <= 16, "nrcTrainingIterations must be in [1, 16].");
+    FALCOR_CHECK(std::isfinite(mNrcTerminationThreshold) && mNrcTerminationThreshold > 0.f && mNrcTerminationThreshold <= 10.f,
+        "nrcTerminationThreshold must be in (0, 10].");
+    FALCOR_CHECK(std::isfinite(mNrcFeatureSize) && mNrcFeatureSize > 0.f, "nrcFeatureSize must be positive and finite.");
+    FALCOR_CHECK(std::isfinite(mNrcUnbiasedTrainingRatio) && mNrcUnbiasedTrainingRatio >= 0.f && mNrcUnbiasedTrainingRatio <= 1.f,
+        "nrcUnbiasedTrainingRatio must be in [0, 1].");
     FALCOR_CHECK(mSpecularRoughnessThreshold >= 0.f && mSpecularRoughnessThreshold <= 1.f,
         "specularRoughnessThreshold must be in [0, 1].");
     FALCOR_CHECK(mNearFieldDistance >= 0.f && mNearFieldDistance <= 100.f, "nearFieldDistance must be in [0, 100].");
@@ -181,6 +197,13 @@ Properties MyPT::getProperties() const
 {
     Properties props;
     props[kMode] = mMode;
+    props["nrcUseCache"] = mNrcUseCache;
+    props["nrcTrainCache"] = mNrcTrainCache;
+    props["nrcTrainingMaxBounces"] = mNrcTrainingMaxBounces;
+    props["nrcTrainingIterations"] = mNrcTrainingIterations;
+    props["nrcTerminationThreshold"] = mNrcTerminationThreshold;
+    props["nrcFeatureSize"] = mNrcFeatureSize;
+    props["nrcUnbiasedTrainingRatio"] = mNrcUnbiasedTrainingRatio;
     props[kShiftStrategy] = mShiftStrategy;
     props[kSpecularRoughnessThreshold] = mSpecularRoughnessThreshold;
     props[kNearFieldDistance] = mNearFieldDistance;
@@ -207,6 +230,16 @@ Properties MyPT::getProperties() const
     props[kSpatialDepthThreshold] = mSpatialDepthThreshold;
     props[kSpatialNormalThreshold] = mSpatialNormalThreshold;
     return props;
+}
+
+void MyPT::setProperties(const Properties& props)
+{
+    const auto previous = getProperties();
+    try { parseProperties(props); }
+    catch (...) { parseProperties(previous); throw; }
+    mOptionsChanged = true;
+    // Freezing training preserves the learned state; only retry failed initialization.
+    if (mNRC.failed) mNrcResetRequested = true;
 }
 
 RenderPassReflection MyPT::reflect(const CompileData& compileData)
@@ -244,13 +277,28 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
         reflector.addOutput(name, "Eligible pairs, nonzero source direction attempts, failed directions, positive directions")
             .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
 
+    for (const char* name : {"nrcExplicit", "nrcCached", "nrcSdkReference"})
+        reflector.addOutput(name, "NRC explicit or cached linear radiance")
+            .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    for (const char* name : {"nrcQueryDebug", "nrcTrainingDebug"})
+        reflector.addOutput(name, "NRC actual scatter rays, shadow rays, visited vertices, cache queries/training records")
+            .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
     return reflector;
 }
 
 void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    if (mLastExecutedMode != mMode)
+    {
+        if (mLastExecutedMode == Mode::NRC) resetNRC();
+        if (mMode == Mode::NRC) resetGRIS();
+        mLastExecutedMode = mMode;
+        mOptionsChanged = true;
+    }
+    for (const char* name : {"nrcExplicit", "nrcCached", "nrcSdkReference"})
+        if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
     // Optional measurements are accumulated across passes and spatial rounds in this frame.
-    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats"})
+    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats", "nrcQueryDebug", "nrcTrainingDebug"})
         if (auto output = renderData.getTexture(name))
         {
             pRenderContext->uavBarrier(output.get());
@@ -268,7 +316,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
 
     // Resolve writes every diagnostic pixel in ReSTIR. PT/no-scene diagnostics are explicitly zero.
-    if (!mpScene || mMode == Mode::PT)
+    if (!mpScene || mMode != Mode::ReSTIR)
         for (const char* name : {"ptReference", "reservoirF", "reservoirDebug", "initialColor", "spatialDebug", "temporalColor", "temporalDebug", "shiftDebug", "pathDebug"})
             if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
 
@@ -307,6 +355,12 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (mMode == Mode::ReSTIR)
     {
         executeGRIS(pRenderContext, renderData);
+        return;
+    }
+
+    if (mMode == Mode::NRC && mNrcUseCache && mMaxBounces > 0)
+    {
+        executeNRC(pRenderContext, renderData);
         return;
     }
 
@@ -354,6 +408,13 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (auto output = renderData.getTexture("rayStats2")) var["gRayStats2"] = output;
     mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(renderData.getDefaultTextureDims(), 1));
 
+    if (mMode == Mode::NRC)
+    {
+        mNRC.status = mMaxBounces == 0 ? "Direct lighting only; cache bypassed" : "Cache disabled; ordinary PT";
+        if (auto output = renderData.getTexture("nrcExplicit"))
+            pRenderContext->copyResource(output.get(), renderData.getTexture("color").get());
+    }
+
     mFrameCount++;
 }
 
@@ -393,11 +454,23 @@ void MyPT::renderUI(Gui::Widgets& widget)
             widget.tooltip("Defensive Pairwise MIS with the selected shift strategy. Reconnection Jacobian ratios are limited to 11 in either direction. Zero neighbors or rounds bypass reuse.");
         }
     }
-    dirty |= widget.var("Max bounces", mMaxBounces, 0u, 65535u);
-    widget.tooltip("0 = direct lighting; 1 = one indirect bounce. Shared by PT and ReSTIR.");
+    if (mMode == Mode::NRC)
+    {
+        widget.text(mNRC.status);
+        dirty |= widget.checkbox("Use radiance cache", mNrcUseCache);
+        dirty |= widget.checkbox("Train cache", mNrcTrainCache);
+        dirty |= widget.var("Cache termination threshold", mNrcTerminationThreshold, 0.001f, 10.f, 0.01f);
+        widget.tooltip("Lower values end paths earlier. This trades detail for less tracing and noise.");
+        dirty |= widget.var("Training iterations", mNrcTrainingIterations, 1u, 16u);
+        if (widget.button("Reset cache")) resetNrcCache();
+    }
+    dirty |= widget.var(mMode == Mode::NRC ? "Max explicit bounces" : "Max bounces", mMaxBounces, 0u, 65535u);
+    widget.tooltip(mMode == Mode::NRC ? "0 = direct lighting only. The cache can predict illumination beyond the explicit tracing limit."
+        : "0 = direct lighting; 1 = one indirect bounce. Shared by PT and ReSTIR.");
     dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
     dirty |= widget.checkbox("Use importance sampling", mUseImportanceSampling);
-    dirty |= widget.checkbox("Use MIS", mUseMIS);
+    if (mMode == Mode::NRC && mNrcUseCache && mMaxBounces > 0) widget.text("MIS enabled for NRC");
+    else dirty |= widget.checkbox("Use MIS", mUseMIS);
     dirty |= widget.var("RR Probability", mRRProbability, 0.f, 0.95f);
     widget.tooltip("Termination probability. Use 0 for the first-round comparison.");
     mOptionsChanged |= dirty;
@@ -405,6 +478,8 @@ void MyPT::renderUI(Gui::Widgets& widget)
 
 void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    resetNRC();
+    mNrcPendingSceneUpdates = Scene::UpdateFlags::None;
     resetGRIS();
     mPendingSceneUpdates = Scene::UpdateFlags::None;
     // Clear data for previous scene.
@@ -466,6 +541,7 @@ void MyPT::onSceneUpdates(RenderContext*, Scene::UpdateFlags updates)
 {
     // RenderGraph retains changes made while another graph was active.
     mPendingSceneUpdates |= updates;
+    mNrcPendingSceneUpdates |= updates;
 }
 
 void MyPT::resetSampling(uint32_t seed)
