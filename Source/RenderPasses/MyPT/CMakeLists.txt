@@ -10,6 +10,11 @@ target_sources(MyPT PRIVATE
     NRC/NrcAdapter.slang
     NRC/NrcPathTrace.rt.slang
     NRC/NrcResolve.cs.slang
+    NRC/NrcQueryTrainingData.slang
+    NRC/NrcQueryRecording.slang
+    NRC/NrcPrepareQueryTraining.cs.slang
+    NRC/NrcBuildTrainingFromQuery.cs.slang
+    NRC/NrcQueryWithTrainingRecords.rt.slang
     PT/PathTransport.slang
     MyPT.rt.slang
     MyPTCommon.slang

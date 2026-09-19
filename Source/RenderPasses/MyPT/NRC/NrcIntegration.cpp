@@ -486,7 +486,7 @@ bool NrcIntegration::beginFrame(RenderContext* context, const FrameSettings& set
         frame.trainingTerminationHeuristicThreshold = settings.terminationThreshold;
         frame.maxExpectedAverageRadianceValue = settings.maxExpectedAverageRadiance;
         frame.selfTrainingAttenuation = settings.selfTrainingAttenuation;
-        frame.proportionUnbiased = settings.unbiasedTrainingRatio;
+        frame.proportionUnbiased = 0.f; // QueryPT supplies all training records; no independent long paths.
         frame.numTrainingIterations = settings.trainingIterations;
         frame.resolveMode = static_cast<NrcResolveMode>(settings.resolveMode);
         p.prepareBuffers(context);

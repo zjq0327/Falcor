@@ -1,6 +1,6 @@
 # MyPT 的 NRC 模式
 
-NRC 是 MyPT 的第三个模式，与原有 `PT`、`ReSTIR` 并列。它从普通 PT 生成显式路径，使用 NVIDIA Neural Radiance Cache 预测合适终点之后的辐射量，并用独立的训练路径在线更新网络。NRC 模式使用同一个场景、VBuffer 和 `color` 输出，不运行 GRIS 的 reservoir 或时空重采样。
+NRC 是 MyPT 的第三个模式，与原有 `PT`、`ReSTIR` 并列。它从普通 PT 生成显式路径，使用 NVIDIA Neural Radiance Cache 预测合适终点之后的辐射量。训练固定复用 QueryPT 已有路径（QueryOnly），不发射独立训练射线。NRC 模式使用同一个场景、VBuffer 和 `color` 输出，不运行 GRIS 的 reservoir 或时空重采样。
 
 当前后端面向 Windows、D3D12 和 SDK 支持的 NVIDIA RTX GPU。网络是有近似偏差的辐射缓存；是否改善画质或总耗时，需要在目标场景中测量。
 
@@ -56,7 +56,7 @@ cmake --build build/windows-vs2022 --config Release --target MyPT
 ```python
 g = render_graph_MyPTNRC(
     maxBounces=8,
-    nrcTrainingMaxBounces=8,
+    nrcQueryTrainingMaxVertices=9,
     nrcTerminationThreshold=0.1,
     nrcTrainingIterations=4,
 )
@@ -66,18 +66,50 @@ MyPT 接受并序列化以下 NRC 属性：
 
 - `mode="NRC"`：选择第三模式；原有字符串 `PT`、`ReSTIR` 保持有效。
 - `nrcUseCache`：是否使用缓存，MyPT 默认 `True`。关闭时直接走普通 PT，停止训练和缓存注入。
-- `nrcTrainCache`：是否在线训练，默认 `True`。关闭后继续查询当前网络，但不执行 Update 路径和网络训练。
-- `nrcTrainingMaxBounces`：训练路径的显式反弹上限，范围 `[1, 64]`，MyPT 默认 `8`。适配层使用 `maxPathVertices = nrcTrainingMaxBounces + 1`，包含主表面顶点。
+- `nrcTrainCache`：是否在线训练，默认 `True`。关闭后继续查询当前网络，停止训练记录、准备 compute 和网络训练。
+- `nrcQueryTrainingMaxVertices`：QueryOnly 每条所选路径的记录容量，范围 `[2, 65]`，默认 `9`。超出容量时整条训练记录排除，渲染继续；此参数不改变追踪深度。
 - `nrcTrainingIterations`：每帧训练迭代预算，范围 `[1, 16]`，默认 `4`。训练分辨率依据 SDK 建议计算，并限制在当前输出尺寸内。
 - `nrcTerminationThreshold`：终止启发式阈值，范围 `(0, 10]`，MyPT 默认 `0.1`。较小的值倾向于更早查询网络，改变显式追踪工作量和缓存近似误差。
 - `nrcFeatureSize`：世界空间中最小可分辨特征尺度，必须为正有限值，默认 `0.01`；改变它会触发 SDK 重配置。
-- `nrcUnbiasedTrainingRatio`：SDK 标记为 `unbiased`、延长显式追踪的训练路径比例，范围 `[0, 1]`，默认 `0.0625`。这是脚本可用的诊断参数，可用于 RR 策略的受控验证；该名称不表示整个 NRC 图像估计无偏。
 
-演示脚本使用 `maxBounces=8`、`nrcTrainingMaxBounces=8`、`nrcTerminationThreshold=0.1`，训练深度和阈值与普通菜单的 NRC 默认值一致；另外设置 `rrProbability=0`、`computeDirect=True`、`useMIS=True`。测量脚本有意使用训练深度 `12`、阈值 `0.01` 等更容易触发缓存的测试配置，这些不是产品默认值。
+演示脚本使用 `maxBounces=8`、`nrcQueryTrainingMaxVertices=9`、`nrcTerminationThreshold=0.1`，另外设置 `rrProbability=0`、`computeDirect=True`、`useMIS=True`。测量脚本使用阈值 `0.01` 等更容易触发缓存的测试配置，这些不是产品默认值。
+
+Independent 已删除，界面不再提供 Training source。旧配置中的 `nrcTrainingSource`（包括旧的 `"QueryOnly"` 值）、`nrcTrainingMaxBounces` 和 `nrcUnbiasedTrainingRatio` 需要移除；传入这些旧参数会报告错误。无需指定训练源，记录容量通过 `nrcQueryTrainingMaxVertices` 设置。
 
 NRC 界面将 `maxBounces` 显示为 **Max explicit bounces**。正值限制主路径的显式间接反弹；网络仍可预测更深的传输，所以它不是最终图像光传输深度的严格上限。直接光估计仍可能产生额外的可见性或 BSDF 探测射线。`maxBounces=0` 强制走普通 PT 的直接光路径，完全跳过缓存训练和尾部注入。
 
 实际启用缓存且 `maxBounces>0` 时，NRC 固定启用 MIS，界面显示 `MIS enabled for NRC`。缓存关闭或零反弹的普通 PT 路径仍使用原有 `useMIS` 设置。
+
+## QueryOnly 第一版管线
+
+选择 NRC 模式后即使用此管线。对现有 pass 设置：
+
+```python
+pt.set_properties({"mode": "NRC", "nrcTrainCache": True, "nrcQueryTrainingMaxVertices": 9})
+```
+
+`scripts/MyPTNRC.py` 与 `scripts/MyPTNRCQueryOnly.py` 两个入口均使用相同的 QueryOnly 管线：
+
+```powershell
+& ./build/windows-vs2022/bin/Release/Mogwai.exe --script scripts/MyPTNRCQueryOnly.py
+```
+
+```text
+BeginFrame
+  → PrepareQueryTraining       选择 owner、清空槽状态；compute，无射线
+  → QueryPTWithRecords         原有渲染追踪，同时记录选中路径的局部传输
+  → BuildTrainingFromQuery     写 SDK 训练记录及末端 bootstrap query；compute，无射线
+  → QueryAndTrain              批量推理、传播目标、训练
+  → Resolve → EndFrame
+```
+
+每个 SDK 训练槽在对应像素块选择一个 owner，每帧轮换。记录器独立累计局部光照和 BSDF/RR 权重，不重置渲染累计量，不消耗渲染随机数。缓存点原有 direct-probe 的结果归入该点，停止后的表面不会变成新的训练顶点。训练冻结时跳过两个新增 compute pass，并使用无记录 QueryPT。
+
+缓存终止使用最后一个已有顶点的独立网络查询做 bootstrap；probe miss 不关闭该尾部。真实 miss、吸收和 RR 死亡关闭训练末端，存活路径保留 RR 补偿。硬深度、记录溢出、探测链上限和非有限记录会排除整条训练样本。`computeDirect=False` 时从后续完整表面开始记录，避免把主表面缺失的直接光当作零标签。
+
+这些短路径没有新增的深层真值；缓存终点对自身的 bootstrap 不属于新的间接光观测。冷启动、深层覆盖和动态恢复仍需测量。零额外射线也不意味着总耗时一定降低：记录、额外 payload、buffer 和网络查询仍有成本。
+
+专项回归入口为 `scripts/nrc_validation/query_only.py`，结果保存在新的 `build/nrc-validation/query-only-*` 目录。实施细节与测量见 [QueryOnly 实施记录](../NRC_query_only_implementation.md)。
 
 ## 训练、冻结和重置
 
@@ -137,6 +169,7 @@ color = nrcExplicit + nrcCached
 - `nrcCached`：经过前缀 throughput 调制后的网络贡献。
 - `nrcQueryDebug`：每个查询像素的 `uint4` 统计，依次为实际 scatter rays、shadow rays、访问顶点数、缓存查询数。
 - `nrcTrainingDebug`：训练路径的同类 `uint4` 统计，最后一项为写出的训练记录数；记录写入对应的全分辨率 owner 像素。
+- `nrcQueryTrainingDebug`：QueryOnly 的 `uint4`，依次为终止原因、记录顶点数、交给 SDK 的有效顶点数、bootstrap query 数；写入 owner 像素。原因编码为 0=空/未结束，1=缓存，2=真实 miss，3=吸收，4=RR，5=硬深度，6=溢出，7=探测上限，8=非有限值。未选像素为零；选中路径的分母为训练尺寸乘积。QueryOnly 的 `nrcTrainingDebug.xyz` 恒为零，`.w` 为有效记录顶点数，不能将记录数当作新发射射线数。
 - `nrcSdkReference`：以同一批查询及网络输出调用 SDK Resolve 的结果，用于核对自定义合成；不会额外训练，但会增加一次合成工作。
 
 `render_graph_MyPTNRC(diagnostics=True)` 会标记常用颜色和计数输出。需要官方对照时额外执行：
@@ -145,7 +178,7 @@ color = nrcExplicit + nrcCached
 g.markOutput("MyPT.nrcSdkReference")
 ```
 
-`pt.resourceStats["nrc"]` 提供构建/可用性状态、失败原因、`cacheGeneration`、帧数、训练尺寸和公开 buffer 字节数。`cacheGeneration` 是缓存生命周期或配置变化的代号，重配置也可能使其增加，不能单凭它证明网络权重已清空。公开 buffer 字节数不包含全部网络或 CUDA 内部显存。
+`pt.resourceStats["nrc"]` 提供构建/可用性状态、失败原因、`cacheGeneration`、帧数、训练尺寸、`trainingSource`、`queryTrainingBufferBytes` 和 SDK 公开 buffer 字节数。冻结后复用记录缓冲，故记录缓冲字节数可以非零。`cacheGeneration` 是缓存生命周期或配置变化的代号，重配置也可能使其增加，不能单凭它证明网络权重已清空。公开 buffer 字节数不包含全部网络或 CUDA 内部显存。
 
 要定位 D3D12 接口问题，可从 PowerShell 启用诊断并启动调试层：
 
@@ -161,7 +194,7 @@ Remove-Item Env:MYPT_NRC_DIAGNOSTICS
 
 ## D3D12 集成约定
 
-公开缓冲由 Falcor 按 SDK 的 element count、stride、共享 heap、UAV 和初始状态要求创建。Update/Query shaders、SDK 推理训练和 Resolve 都使用同一个 Falcor D3D12 队列。
+公开缓冲由 Falcor 按 SDK 的 element count、stride、共享 heap、UAV 和初始状态要求创建。QueryPT、训练记录 compute、SDK 推理训练和 Resolve 都使用同一个 Falcor D3D12 队列。
 
 SDK 的原生调用会更改 descriptor heaps、root signatures 和 pipeline 状态。当前 Slang gfx 版本仅关闭 encoder、失效化 descriptor heap 缓存还不够，因此每次原生 SDK 调用后执行 `submit(false)`，让下一段 Falcor 工作使用全新的命令列表。这一步不会让 CPU 等待 GPU；不能为了减少提交次数直接删除，否则可能重新出现错误的状态绑定或设备移除。
 

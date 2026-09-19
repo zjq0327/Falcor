@@ -180,11 +180,10 @@ private:
 
     bool mNrcUseCache = true;
     bool mNrcTrainCache = true;
-    uint32_t mNrcTrainingMaxBounces = 8;
+    uint32_t mNrcQueryTrainingMaxVertices = 9;
     uint32_t mNrcTrainingIterations = 4;
     float mNrcTerminationThreshold = 0.1f;
     float mNrcFeatureSize = 0.01f;
-    float mNrcUnbiasedTrainingRatio = 0.0625f;
     bool mNrcResetRequested = true;
     uint64_t mNrcCacheGeneration = 0;
     Mode mLastExecutedMode = Mode::PT;
@@ -201,8 +200,11 @@ private:
     {
         std::unique_ptr<NrcIntegration> integration;
         std::unique_ptr<EmissiveLightSampler> emissiveSampler;
-        NrcTracer update;
         NrcTracer query;
+        ref<ComputePass> prepareQueryTraining;
+        ref<ComputePass> buildQueryTraining;
+        ref<Buffer> queryTrainingPaths;
+        ref<Buffer> queryTrainingVertices;
         ref<ComputePass> resolve;
         ref<Texture> explicitColor;
         uint2 dimensions = uint2(0);

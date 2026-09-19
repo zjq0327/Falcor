@@ -69,6 +69,9 @@ import RenderPasses.MyPT.GRIS.Measurement;
 #ifndef MYPT_NRC
 #define MYPT_NRC 0
 #endif
+#ifndef MYPT_NRC_QUERY_RECORDS
+#define MYPT_NRC_QUERY_RECORDS 0
+#endif
 
 cbuffer CB
 {
@@ -134,6 +137,9 @@ struct ScatterRayData
     float3 nrcProbeRestoreThroughput;
     uint nrcProbeSegments;
     bool nrcPreviousDelta;
+#if MYPT_NRC_QUERY_RECORDS
+    NrcQueryRecording recording;
+#endif
 #endif
 
     /**
@@ -156,6 +162,9 @@ struct ScatterRayData
         this.nrcProbeRestoreThroughput = 0.f;
         this.nrcProbeSegments = 0u;
         this.nrcPreviousDelta = false;
+#if MYPT_NRC_QUERY_RECORDS
+        this.recording = nrcRecordInit(DispatchRaysIndex().xy);
+#endif
 #endif
     }
 };
@@ -357,6 +366,9 @@ bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3
 #endif
         rayData.normal = sd.getOrientedFaceNormal();
         rayData.thp *= bsdfSample.weight;
+#if MYPT_NRC_QUERY_RECORDS
+        rayData.recording.beta *= bsdfSample.weight;
+#endif
         return any(rayData.thp > 0.f);
     }
 
@@ -374,9 +386,16 @@ bool terminatePathByRussianRoulette(inout ScatterRayData rayData, float u)
     if (u < gRRProbability)
     {
         rayData.terminated = true;
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordEnd(rayData.recording, kRecordRR);
+        rayData.recording.beta = 0.f;
+#endif
         return true;
     }
     rayData.thp /= (1.f - gRRProbability);
+#if MYPT_NRC_QUERY_RECORDS
+    rayData.recording.beta /= (1.f - gRRProbability);
+#endif
     return false;
 }
 
@@ -400,11 +419,7 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     nrcMeasurementAdd(uint4(0u, 0u, 1u, 0u));
 #endif
     // Add emitted light.
-    if (kUseEmissiveLights && (kComputeDirect || rayData.pathLength > 0
-#if MYPT_NRC && NRC_UPDATE
-        || gNrcUseCache != 0
-#endif
-    ))
+    if (kUseEmissiveLights && (kComputeDirect || rayData.pathLength > 0))
     {
         float3 emission = mi.getProperties(sd).emission;
         // This hit came from a BSDF-sampled scatter ray, and the previous vertex performed NEE
@@ -412,11 +427,7 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
         // Apply the MIS weight to avoid double counting with the NEE strategy.
         // Note: the first scatter-ray hit has pathLength == 0, so the condition matches the
         // outer emission condition (kComputeDirect || pathLength > 0).
-        if (kComputeDirect || rayData.pathLength > 0
-#if MYPT_NRC && NRC_UPDATE
-            || gNrcUseCache != 0
-#endif
-        )
+        if (kComputeDirect || rayData.pathLength > 0)
         {
             TriangleLightHit lightHit;
             TriangleHit triangleHit = hit.getTriangleHit();
@@ -441,6 +452,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
             }
         }
         rayData.radiance += rayData.thp * emission;
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordRadiance(rayData.recording, emission);
+#endif
     }
 
 #if MYPT_NRC
@@ -454,6 +468,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
         if (rayData.nrcProbeSegments >= kNrcMaxDirectProbeSegments)
         {
             stop = true;
+#if MYPT_NRC_QUERY_RECORDS
+            nrcRecordEnd(rayData.recording, kRecordProbeLimit);
+#endif
             NrcSetDebugPathTerminationReason(rayData.nrcState, NrcDebugPathTerminationReason::MaxPathVertices);
         }
         if (stop)
@@ -465,7 +482,13 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
         // No NRC hit/miss state updates or RR within this separate estimator.
         // A skipped glass/unsupported material still uses its actual transport.
         if (kUseAnalyticLights || kUseEmissiveLights)
-            rayData.radiance += rayData.thp * evalDirect(sd, mi, rayData.sg);
+        {
+            float3 direct = evalDirect(sd, mi, rayData.sg);
+            rayData.radiance += rayData.thp * direct;
+#if MYPT_NRC_QUERY_RECORDS
+            nrcRecordRadiance(rayData.recording, direct);
+#endif
+        }
         if (!generateScatterRay(sd, mi, sd.computeRayOrigin(), rayData))
         {
             rayData.thp = rayData.nrcProbeRestoreThroughput;
@@ -480,13 +503,12 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     }
 #endif
     // Check whether to terminate based on max depth.
-    if (rayData.pathLength >= kMaxBounces
-#if MYPT_NRC && NRC_UPDATE
-        && gNrcUseCache == 0
-#endif
-    )
+    if (rayData.pathLength >= kMaxBounces)
     {
         rayData.terminated = true;
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordEnd(rayData.recording, kRecordDepth);
+#endif
         return;
     }
 
@@ -497,23 +519,11 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
         // Attribute BSDF-hit emission to the previous segment BEFORE NRC
         // finalizes it. Features describe scattered radiance, not self emission.
         NrcSurfaceAttributes surface = nrcSurface(sd, mi);
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordHit(rayData.recording, surface);
+#endif
         nrcProgress = NrcUpdateOnHit(nrcContext(), rayData.nrcState, surface,
             RayTCurrent(), rayData.pathLength + 1u, rayData.thp, rayData.radiance);
-#if NRC_UPDATE
-        uint trainingLastBounce = min(gNrcTrainingMaxBounces, gNrcConstants.maxPathVertices - 1u);
-        if (rayData.pathLength + 1u >= trainingLastBounce)
-        {
-            if (surface.isDeltaLobe)
-            {
-                // A skipped/unsupported hard endpoint cannot supply new cache
-                // features. Treat its untraced tail as the finite cutoff.
-                rayData.thp = 0.f;
-                rayData.terminated = true;
-                return;
-            }
-            nrcProgress = NrcProgressState::TerminateAfterDirectLighting;
-        }
-#endif
         if (nrcProgress == NrcProgressState::TerminateImmediately)
         {
             rayData.terminated = true;
@@ -529,11 +539,17 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     {
         float3 Lr = evalDirect(sd, mi, rayData.sg);
         rayData.radiance += rayData.thp * Lr;
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordRadiance(rayData.recording, Lr);
+#endif
     }
 
 #if MYPT_NRC
     if (gNrcUseCache != 0 && nrcProgress == NrcProgressState::TerminateAfterDirectLighting)
     {
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordEnd(rayData.recording, kRecordCache);
+#endif
         // This is a direct-light probe, not a transition to a bootstrap vertex.
         // Preserve the query/last training vertex throughput across the probe.
         rayData.nrcProbeRestoreThroughput = rayData.thp;
@@ -557,9 +573,6 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
 #endif
     if (terminatePathByRussianRoulette(rayData, sampleNext1D(rayData.sg)))
     {
-#if MYPT_NRC && NRC_UPDATE
-        if (gNrcUseCache != 0) rayData.thp = 0.f;
-#endif
         return;
     }
 #if MYPT_NRC
@@ -570,8 +583,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     // The raygen shader will continue the path based on the returned payload.
     if (!generateScatterRay(sd, mi, rayOrigin, rayData))
     {
-#if MYPT_NRC && NRC_UPDATE
-        if (gNrcUseCache != 0) rayData.thp = 0.f;
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordEnd(rayData.recording, kRecordAbsorbed);
+        rayData.recording.beta = 0.f;
 #endif
         rayData.terminated = true;
         return;
@@ -584,9 +598,6 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
 float3 traceNrcPath(uint2 pixel, uint2 frameDim)
 {
     uint sampleFrame = gSeed == 0 ? gFrameCount : jenkinsHash(gFrameCount ^ jenkinsHash(gSeed));
-#if NRC_UPDATE
-    sampleFrame = jenkinsHash(sampleFrame ^ 0x85ebca6bu);
-#endif
     SampleGenerator sg = SampleGenerator(pixel, sampleFrame);
     for (uint i = 0; i < gPRNGDimension; i++) sampleNext1D(sg);
     ScatterRayData rayData = ScatterRayData(sg);
@@ -599,35 +610,35 @@ float3 traceNrcPath(uint2 pixel, uint2 frameDim)
         nrcMeasurementAdd(uint4(0u, 0u, 1u, 0u));
         ShadingData sd = loadShadingData(hit, primaryDirection);
         let mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
-        // Always establish the primary spread radius and training vertex. Keep
+        // Always establish the primary spread radius. Keep
         // primary shading explicit even in diagnostic heuristic configurations.
         NrcContext context = nrcContext();
         context.constants.enableTerminationHeuristic = 1u;
+#if MYPT_NRC_QUERY_RECORDS
+        // When camera direct is hidden, start recording at the next supported
+        // surface: do not fabricate the primary's unobserved direct lighting.
+        if (kComputeDirect) nrcRecordHit(rayData.recording, nrcSurface(sd, mi));
+#endif
         NrcUpdateOnHit(context, rayData.nrcState, nrcSurface(sd, mi),
             length(sd.posW - gScene.camera.getPosition()), 0u, rayData.thp, rayData.radiance);
-#if NRC_UPDATE
-        // Camera-direct suppression is a Query display option, never a change
-        // to the light transport that the network is trained to represent.
-        rayData.radiance += evalDirect(sd, mi, rayData.sg);
-#else
         if (kComputeDirect)
         {
             primaryEmission = mi.getProperties(sd).emission;
-            rayData.radiance += evalDirect(sd, mi, rayData.sg);
-        }
+            float3 direct = evalDirect(sd, mi, rayData.sg);
+            rayData.radiance += direct;
+#if MYPT_NRC_QUERY_RECORDS
+            nrcRecordRadiance(rayData.recording, direct);
 #endif
+        }
         if (!generateScatterRay(sd, mi, sd.computeRayOrigin(), rayData))
         {
             rayData.terminated = true;
-#if NRC_UPDATE
-            rayData.thp = 0.f;
+#if MYPT_NRC_QUERY_RECORDS
+            nrcRecordEnd(rayData.recording, kRecordAbsorbed);
+            rayData.recording.beta = 0.f;
 #endif
         }
-#if NRC_UPDATE
-        uint traceLimit = gNrcTrainingMaxBounces;
-#else
         uint traceLimit = kMaxBounces;
-#endif
         // The terminal local-light estimator may cross skipped delta/unsupported
         // vertices. Its separate finite safety budget bounds reflective cycles.
         for (uint depth = 0u; depth <= traceLimit + kNrcMaxDirectProbeSegments && !rayData.terminated; depth++)
@@ -639,13 +650,11 @@ float3 traceNrcPath(uint2 pixel, uint2 frameDim)
         primaryEmission = kUseEnvBackground ? gScene.envMap.eval(primaryDirection) : kDefaultBackgroundColor;
     }
     NrcWriteFinalPathInfo(nrcContext(), rayData.nrcState, rayData.thp, rayData.radiance);
-#if NRC_UPDATE
-    nrcMeasurementAdd(uint4(0u, 0u, 0u, NrcGetVertexCount(rayData.nrcState.packedData)));
-    return 0.f;
-#else
+#if MYPT_NRC_QUERY_RECORDS
+    nrcRecordFinish(rayData.recording);
+#endif
     nrcMeasurementAdd(uint4(0u, 0u, 0u, rayData.nrcState.queryBufferIndex != 0xffffffffu ? 1u : 0u));
     return primaryEmission + rayData.radiance;
-#endif
 }
 #endif
 
@@ -755,17 +764,23 @@ void scatterMiss(inout ScatterRayData rayData)
     rayData.terminated = true;
 
     // Add contribution from distant light (env map) in this direction.
-    if (kUseEnvLight && (kComputeDirect || rayData.pathLength > 0
-#if MYPT_NRC && NRC_UPDATE
-        || gNrcUseCache != 0
-#endif
-    ))
+    if (kUseEnvLight && (kComputeDirect || rayData.pathLength > 0))
     {
         float3 Le = gScene.envMap.eval(WorldRayDirection());
         rayData.radiance += rayData.thp * Le;
+#if MYPT_NRC_QUERY_RECORDS
+        nrcRecordRadiance(rayData.recording, Le);
+#endif
     }
 #if MYPT_NRC
     if (rayData.nrcDirectProbe) rayData.thp = rayData.nrcProbeRestoreThroughput;
+#if MYPT_NRC_QUERY_RECORDS
+    if (!rayData.nrcDirectProbe)
+    {
+        nrcRecordEnd(rayData.recording, kRecordMiss);
+        rayData.recording.beta = 0.f;
+    }
+#endif
 #endif
 }
 
@@ -822,14 +837,11 @@ void rayGen()
     uint2 pixel = DispatchRaysIndex().xy;
     uint2 frameDim = DispatchRaysDimensions().xy;
 #if MYPT_NRC
-    pixel = nrcOwnerPixel(pixel);
     frameDim = gNrcFrameDim;
 #endif
 
     float3 color = tracePath(pixel, frameDim);
 
-#if !(MYPT_NRC && NRC_UPDATE)
     gOutputColor[pixel] = float4(color, 1.f);
-#endif
 }
 

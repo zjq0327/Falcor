@@ -111,11 +111,12 @@ void MyPT::parseProperties(const Properties& props)
             mMode = value;
         else if (key == "nrcUseCache") mNrcUseCache = value;
         else if (key == "nrcTrainCache") mNrcTrainCache = value;
-        else if (key == "nrcTrainingMaxBounces") mNrcTrainingMaxBounces = value;
+        else if (key == "nrcTrainingSource" || key == "nrcTrainingMaxBounces" || key == "nrcUnbiasedTrainingRatio")
+            FALCOR_THROW("NRC option '{}' was removed. NRC now trains only from QueryPT; remove this option and use nrcQueryTrainingMaxVertices for record capacity.", key);
+        else if (key == "nrcQueryTrainingMaxVertices") mNrcQueryTrainingMaxVertices = value;
         else if (key == "nrcTrainingIterations") mNrcTrainingIterations = value;
         else if (key == "nrcTerminationThreshold") mNrcTerminationThreshold = value;
         else if (key == "nrcFeatureSize") mNrcFeatureSize = value;
-        else if (key == "nrcUnbiasedTrainingRatio") mNrcUnbiasedTrainingRatio = value;
         else if (key == kShiftStrategy)
             mShiftStrategy = value;
         else if (key == kSpecularRoughnessThreshold)
@@ -170,13 +171,12 @@ void MyPT::parseProperties(const Properties& props)
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
     FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
-    FALCOR_CHECK(mNrcTrainingMaxBounces >= 1 && mNrcTrainingMaxBounces <= 64, "nrcTrainingMaxBounces must be in [1, 64].");
+    FALCOR_CHECK(mNrcQueryTrainingMaxVertices >= 2 && mNrcQueryTrainingMaxVertices <= 65,
+        "nrcQueryTrainingMaxVertices must be in [2, 65].");
     FALCOR_CHECK(mNrcTrainingIterations >= 1 && mNrcTrainingIterations <= 16, "nrcTrainingIterations must be in [1, 16].");
     FALCOR_CHECK(std::isfinite(mNrcTerminationThreshold) && mNrcTerminationThreshold > 0.f && mNrcTerminationThreshold <= 10.f,
         "nrcTerminationThreshold must be in (0, 10].");
     FALCOR_CHECK(std::isfinite(mNrcFeatureSize) && mNrcFeatureSize > 0.f, "nrcFeatureSize must be positive and finite.");
-    FALCOR_CHECK(std::isfinite(mNrcUnbiasedTrainingRatio) && mNrcUnbiasedTrainingRatio >= 0.f && mNrcUnbiasedTrainingRatio <= 1.f,
-        "nrcUnbiasedTrainingRatio must be in [0, 1].");
     FALCOR_CHECK(mSpecularRoughnessThreshold >= 0.f && mSpecularRoughnessThreshold <= 1.f,
         "specularRoughnessThreshold must be in [0, 1].");
     FALCOR_CHECK(mNearFieldDistance >= 0.f && mNearFieldDistance <= 100.f, "nearFieldDistance must be in [0, 100].");
@@ -199,11 +199,10 @@ Properties MyPT::getProperties() const
     props[kMode] = mMode;
     props["nrcUseCache"] = mNrcUseCache;
     props["nrcTrainCache"] = mNrcTrainCache;
-    props["nrcTrainingMaxBounces"] = mNrcTrainingMaxBounces;
+    props["nrcQueryTrainingMaxVertices"] = mNrcQueryTrainingMaxVertices;
     props["nrcTrainingIterations"] = mNrcTrainingIterations;
     props["nrcTerminationThreshold"] = mNrcTerminationThreshold;
     props["nrcFeatureSize"] = mNrcFeatureSize;
-    props["nrcUnbiasedTrainingRatio"] = mNrcUnbiasedTrainingRatio;
     props[kShiftStrategy] = mShiftStrategy;
     props[kSpecularRoughnessThreshold] = mSpecularRoughnessThreshold;
     props[kNearFieldDistance] = mNearFieldDistance;
@@ -283,6 +282,8 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
     for (const char* name : {"nrcQueryDebug", "nrcTrainingDebug"})
         reflector.addOutput(name, "NRC actual scatter rays, shadow rays, visited vertices, cache queries/training records")
             .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("nrcQueryTrainingDebug", "NRC QueryOnly: termination reason, recorded vertices, accepted vertices, bootstrap queries")
+        .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
     return reflector;
 }
 
@@ -298,7 +299,7 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     for (const char* name : {"nrcExplicit", "nrcCached", "nrcSdkReference"})
         if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
     // Optional measurements are accumulated across passes and spatial rounds in this frame.
-    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats", "nrcQueryDebug", "nrcTrainingDebug"})
+    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats", "nrcQueryDebug", "nrcTrainingDebug", "nrcQueryTrainingDebug"})
         if (auto output = renderData.getTexture(name))
         {
             pRenderContext->uavBarrier(output.get());
@@ -459,6 +460,8 @@ void MyPT::renderUI(Gui::Widgets& widget)
         widget.text(mNRC.status);
         dirty |= widget.checkbox("Use radiance cache", mNrcUseCache);
         dirty |= widget.checkbox("Train cache", mNrcTrainCache);
+        dirty |= widget.var("Recorded vertices", mNrcQueryTrainingMaxVertices, 2u, 65u);
+        widget.tooltip("Train from existing QueryPT segments only. No training rays. Incomplete/overflow paths are excluded.");
         dirty |= widget.var("Cache termination threshold", mNrcTerminationThreshold, 0.001f, 10.f, 0.01f);
         widget.tooltip("Lower values end paths earlier. This trades detail for less tracing and noise.");
         dirty |= widget.var("Training iterations", mNrcTrainingIterations, 1u, 16u);

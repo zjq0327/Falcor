@@ -5,14 +5,15 @@
 #define NRC_PACK_PATH_16BITS 0
 // The host supplies the SDK include directory for source and deployed shaders.
 #include "Nrc.hlsli"
+#if !NRC_QUERY
+#error MyPT NRC tracing supports only SDK query mode. Training records are built by compute.
+#endif
 
 cbuffer NrcCB { NrcConstants gNrcConstants; }
 cbuffer NrcRuntimeCB
 {
     uint2 gNrcFrameDim;
-    uint2 gNrcTrainingDim;
     uint gNrcUseCache;
-    uint gNrcTrainingMaxBounces;
 }
 
 RWStructuredBuffer<NrcPackedQueryPathInfo> gNrcQueryPathInfo;
@@ -28,39 +29,13 @@ static const uint kNrcMaxDirectProbeSegments = 64u;
 #ifndef MYPT_HAS_NRC_QUERY_DEBUG
 #define MYPT_HAS_NRC_QUERY_DEBUG 0
 #endif
-#ifndef MYPT_HAS_NRC_TRAINING_DEBUG
-#define MYPT_HAS_NRC_TRAINING_DEBUG 0
-#endif
 #if MYPT_HAS_NRC_QUERY_DEBUG
 globallycoherent RWTexture2D<uint4> gNrcQueryDebug;
 #endif
-#if MYPT_HAS_NRC_TRAINING_DEBUG
-globallycoherent RWTexture2D<uint4> gNrcTrainingDebug;
-#endif
-
-// The host limits trainingDimensions to frameDimensions. Disjoint integer cells
-// give every training path a unique full-resolution owner even at odd sizes.
-uint2 nrcOwnerPixel(uint2 dispatchPixel)
-{
-#if NRC_UPDATE
-    uint2 begin = dispatchPixel * gNrcFrameDim / gNrcTrainingDim;
-    uint2 end = (dispatchPixel + 1u) * gNrcFrameDim / gNrcTrainingDim;
-    uint h = jenkinsHash(dispatchPixel.x + dispatchPixel.y * gNrcTrainingDim.x);
-    uint2 jitter = uint2(jenkinsHash(h ^ gFrameCount), jenkinsHash(h ^ gFrameCount ^ 0x9e3779b9u));
-    return begin + jitter % max(uint2(1u), end - begin);
-#else
-    return dispatchPixel;
-#endif
-}
 
 void nrcMeasurementAdd(uint4 delta)
 {
-#if NRC_UPDATE && MYPT_HAS_NRC_TRAINING_DEBUG
-    uint2 owner = nrcOwnerPixel(DispatchRaysIndex().xy);
-    DeviceMemoryBarrier();
-    gNrcTrainingDebug[owner] = gNrcTrainingDebug[owner] + delta;
-    DeviceMemoryBarrier();
-#elif !NRC_UPDATE && MYPT_HAS_NRC_QUERY_DEBUG
+#if MYPT_HAS_NRC_QUERY_DEBUG
     uint2 owner = DispatchRaysIndex().xy;
     DeviceMemoryBarrier();
     gNrcQueryDebug[owner] = gNrcQueryDebug[owner] + delta;
@@ -106,5 +81,9 @@ NrcSurfaceAttributes nrcSurface(ShadingData sd, IMaterialInstance mi)
     surface.isDeltaLobe = !supported;
     return surface;
 }
+
+#if MYPT_NRC_QUERY_RECORDS
+#include "NrcQueryRecording.slang"
+#endif
 
 #endif

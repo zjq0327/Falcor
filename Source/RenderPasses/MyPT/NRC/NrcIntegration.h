@@ -28,7 +28,6 @@ public:
         float terminationThreshold = 0.1f;
         float maxExpectedAverageRadiance = 1.f;
         float selfTrainingAttenuation = 1.f;
-        float unbiasedTrainingRatio = 0.0625f;
         uint32_t trainingIterations = 4;
         uint32_t resolveMode = 0;
     };

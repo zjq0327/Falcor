@@ -63,6 +63,9 @@ Properties MyPT::getNRCStats() const
     stats["cacheGeneration"] = mNrcCacheGeneration;
     stats["frameIndex"] = mNRC.frameIndex;
     stats["trainingEnabled"] = mMode == Mode::NRC && mNrcUseCache && mMaxBounces > 0 && mNrcTrainCache;
+    stats["trainingSource"] = "QueryOnly";
+    stats["queryTrainingBufferBytes"] = (mNRC.queryTrainingPaths ? uint64_t(mNRC.queryTrainingPaths->getSize()) : 0ull) +
+        (mNRC.queryTrainingVertices ? uint64_t(mNRC.queryTrainingVertices->getSize()) : 0ull);
     stats["publicBufferBytes"] = sdk ? sdk->getPublicBufferBytes() : uint64_t(0);
     stats["explicitTextureBytes"] = mNRC.explicitColor ? uint64_t(mNRC.dimensions.x) * mNRC.dimensions.y * 16 : uint64_t(0);
     const auto dimensions = sdk ? sdk->getTrainingDimensions() : uint2(0);
@@ -103,7 +106,12 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
         };
         const bool staleResolve = mNRC.resolve &&
             mNRC.resolve->getVars()->getReflection() != mNRC.resolve->getProgram()->getReflector();
-        if (stale(mNRC.update) || stale(mNRC.query) || staleResolve) resetNRC();
+        auto staleCompute = [](const ref<ComputePass>& pass)
+        {
+            return pass && pass->getVars() && pass->getVars()->getReflection() != pass->getProgram()->getReflector();
+        };
+        if (stale(mNRC.query) || staleResolve ||
+            staleCompute(mNRC.prepareQueryTraining) || staleCompute(mNRC.buildQueryTraining)) resetNRC();
         // Explicit reset creates a new SDK context to ensure a fresh network,
         // independent of the SDK's buffer-reconfiguration policy.
         if (mNrcResetRequested && mNRC.integration && mNRC.integration->isInitialized()) resetNRC();
@@ -129,7 +137,8 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
         config.sceneBoundsMin = mNRC.sceneBoundsMin;
         config.sceneBoundsMax = mNRC.sceneBoundsMax;
         config.smallestResolvableFeatureSize = mNrcFeatureSize;
-        config.maxPathVertices = mNrcTrainingMaxBounces + 1;
+        const bool recordQueries = mNrcTrainCache;
+        config.maxPathVertices = mNrcQueryTrainingMaxVertices;
         config.trainingIterations = mNrcTrainingIterations;
         config.requestReset = mNrcResetRequested;
         const auto oldCompleted = sdk.getFramesCompleted();
@@ -165,14 +174,53 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
             mNRC.emissiveSampler->update(context, mpScene->getILightCollection(context));
         }
 
-        auto prepare = [&](NrcTracer& tracer, bool update)
+        if (recordQueries)
         {
+            DefineList defines;
+            defines.add("MYPT_HAS_NRC_TRAINING_DEBUG", data.getTexture("nrcTrainingDebug") ? "1" : "0");
+            defines.add("MYPT_HAS_NRC_QUERY_TRAINING_DEBUG", data.getTexture("nrcQueryTrainingDebug") ? "1" : "0");
+            auto create = [&](ref<ComputePass>& pass, const char* filename)
+            {
+                if (!pass)
+                {
+                    ProgramDesc desc;
+                    desc.addShaderLibrary(std::string("RenderPasses/MyPT/NRC/") + filename).csEntry("main");
+                    addNrcIncludePath(desc);
+                    pass = ComputePass::create(mpDevice, desc, defines);
+                }
+                else if (pass->getProgram()->addDefines(defines)) pass->setVars(nullptr);
+            };
+            create(mNRC.prepareQueryTraining, "NrcPrepareQueryTraining.cs.slang");
+            create(mNRC.buildQueryTraining, "NrcBuildTrainingFromQuery.cs.slang");
+            const auto trainingDim = sdk.getTrainingDimensions();
+            const uint64_t count = uint64_t(trainingDim.x) * trainingDim.y;
+            FALCOR_CHECK(count * mNrcQueryTrainingMaxVertices <= UINT32_MAX, "NRC query training allocation overflow");
+            auto var = mNRC.buildQueryTraining->getRootVar();
+            if (!mNRC.queryTrainingPaths || mNRC.queryTrainingPaths->getElementCount() != count)
+                mNRC.queryTrainingPaths = mpDevice->createStructuredBuffer(var["gQueryTrainingPaths"], uint32_t(count));
+            if (!mNRC.queryTrainingVertices || mNRC.queryTrainingVertices->getElementCount() != count * mNrcQueryTrainingMaxVertices)
+                mNRC.queryTrainingVertices = mpDevice->createStructuredBuffer(var["gQueryTrainingVertices"], uint32_t(count * mNrcQueryTrainingMaxVertices));
+        }
+        auto bindRecords = [&](const ShaderVar& var)
+        {
+            auto cb = var["QueryTrainingCB"];
+            cb["gRecordFrameDim"] = dimensions;
+            cb["gRecordTrainingDim"] = sdk.getTrainingDimensions();
+            cb["gRecordFrameIndex"] = mFrameCount;
+            cb["gRecordMaxVertices"] = mNrcQueryTrainingMaxVertices;
+            if (auto field = var.findMember("gQueryTrainingPaths"); field.isValid()) field = mNRC.queryTrainingPaths;
+            if (auto field = var.findMember("gQueryTrainingVertices"); field.isValid()) field = mNRC.queryTrainingVertices;
+        };
+        auto prepareQuery = [&]()
+        {
+            auto& tracer = mNRC.query;
             DefineList defines = mpScene->getSceneDefines();
             defines.add(mpSampleGenerator->getDefines());
             if (mNRC.emissiveSampler) defines.add(mNRC.emissiveSampler->getDefines());
-            defines.add("NRC_UPDATE", update ? "1" : "0");
-            defines.add("MAX_BOUNCES", std::to_string(update ? mNrcTrainingMaxBounces : mMaxBounces));
-            defines.add("COMPUTE_DIRECT", update || mComputeDirect ? "1" : "0");
+            defines.add("NRC_QUERY", "1");
+            defines.add("MYPT_NRC_QUERY_RECORDS", recordQueries ? "1" : "0");
+            defines.add("MAX_BOUNCES", std::to_string(mMaxBounces));
+            defines.add("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
             defines.add("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
             defines.add("USE_MIS", "1");
             defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
@@ -181,7 +229,6 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
             defines.add("USE_ENV_BACKGROUND", mpScene->useEnvBackground() ? "1" : "0");
             defines.add("MYPT_HAS_RAY_STATS2", "0");
             defines.add("MYPT_HAS_NRC_QUERY_DEBUG", data.getTexture("nrcQueryDebug") ? "1" : "0");
-            defines.add("MYPT_HAS_NRC_TRAINING_DEBUG", data.getTexture("nrcTrainingDebug") ? "1" : "0");
             defines.add("is_valid_gVBuffer", "1");
             defines.add("is_valid_gViewW", data.getTexture("viewW") ? "1" : "0");
             defines.add("is_valid_gMotionVector", "0");
@@ -191,9 +238,10 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
             {
                 ProgramDesc desc;
                 desc.addShaderModules(mpScene->getShaderModules());
-                desc.addShaderLibrary(kNrcShader);
+                desc.addShaderLibrary(recordQueries ?
+                    "RenderPasses/MyPT/NRC/NrcQueryWithTrainingRecords.rt.slang" : kNrcShader);
                 addNrcIncludePath(desc);
-                desc.setMaxPayloadSize(256);
+                desc.setMaxPayloadSize(recordQueries ? 384 : 256);
                 desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
                 desc.setMaxTraceRecursionDepth(2);
                 auto raygen = desc.addRayGen("rayGen");
@@ -221,46 +269,57 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
             mpSampleGenerator->bindShaderData(var);
             if (mNRC.emissiveSampler) mNRC.emissiveSampler->bindShaderData(var["gMyPTEmissiveSampler"]);
             sdk.bindShaderData(var);
+            if (recordQueries) bindRecords(var);
             auto cb = var["CB"];
             cb["gFrameCount"] = mFrameCount;
-            cb["gSeed"] = update ? mSeed ^ 0x5a17c9e3u : mSeed;
+            cb["gSeed"] = mSeed;
             const auto& dict = data.getDictionary();
             cb["gPRNGDimension"] = dict.keyExists(kRenderPassPRNGDimension) ? dict[kRenderPassPRNGDimension] : 0u;
             cb["gRRProbability"] = mRRProbability;
             auto nrcCB = var["NrcRuntimeCB"];
             nrcCB["gNrcFrameDim"] = dimensions;
-            nrcCB["gNrcTrainingDim"] = sdk.getTrainingDimensions();
             nrcCB["gNrcUseCache"] = 1u;
-            nrcCB["gNrcTrainingMaxBounces"] = mNrcTrainingMaxBounces;
             var["gVBuffer"] = data.getTexture("vbuffer");
             if (data.getTexture("viewW")) var["gViewW"] = data.getTexture("viewW");
             if (var.findMember("gOutputColor").isValid()) var["gOutputColor"] = mNRC.explicitColor;
             if (var.findMember("gNrcQueryDebug").isValid()) var["gNrcQueryDebug"] = data.getTexture("nrcQueryDebug");
-            if (var.findMember("gNrcTrainingDebug").isValid()) var["gNrcTrainingDebug"] = data.getTexture("nrcTrainingDebug");
         };
 
         NrcIntegration::FrameSettings frame;
         frame.trainTheCache = mNrcTrainCache;
         frame.trainingIterations = mNrcTrainingIterations;
         frame.terminationThreshold = mNrcTerminationThreshold;
-        frame.unbiasedTrainingRatio = mNrcUnbiasedTrainingRatio;
         FALCOR_CHECK(sdk.beginFrame(context, frame), "{}", sdk.getError());
         checkpoint("BeginFrame");
-        if (mNrcTrainCache)
+        if (recordQueries)
         {
-            FALCOR_PROFILE(context, "NRC.UpdatePT");
-            prepare(mNRC.update, true);
-            sdk.prepareForPathTracing(context);
-            mpScene->raytrace(context, mNRC.update.program.get(), mNRC.update.vars, uint3(sdk.getTrainingDimensions(), 1));
+            FALCOR_PROFILE(context, "NRC.PrepareQueryTraining");
+            bindRecords(mNRC.prepareQueryTraining->getRootVar());
+            mNRC.prepareQueryTraining->execute(context, uint3(sdk.getTrainingDimensions(), 1));
+            context->uavBarrier(mNRC.queryTrainingPaths.get());
         }
-        checkpoint("UpdatePT");
+        checkpoint("PrepareQueryTraining");
         {
             FALCOR_PROFILE(context, "NRC.QueryPT");
-            prepare(mNRC.query, false);
+            prepareQuery();
             sdk.prepareForPathTracing(context);
             mpScene->raytrace(context, mNRC.query.program.get(), mNRC.query.vars, uint3(dimensions, 1));
         }
         checkpoint("QueryPT");
+        if (recordQueries)
+        {
+            FALCOR_PROFILE(context, "NRC.BuildTrainingFromQuery");
+            context->uavBarrier(mNRC.queryTrainingPaths.get());
+            context->uavBarrier(mNRC.queryTrainingVertices.get());
+            auto var = mNRC.buildQueryTraining->getRootVar();
+            bindRecords(var);
+            sdk.prepareForPathTracing(context);
+            sdk.bindShaderData(var);
+            if (auto texture = data.getTexture("nrcTrainingDebug")) var["gNrcTrainingDebug"] = texture;
+            if (auto texture = data.getTexture("nrcQueryTrainingDebug")) var["gNrcQueryTrainingDebug"] = texture;
+            mNRC.buildQueryTraining->execute(context, uint3(sdk.getTrainingDimensions(), 1));
+        }
+        checkpoint("BuildTrainingFromQuery");
         if (auto explicitOutput = data.getTexture("nrcExplicit"))
             context->copyResource(explicitOutput.get(), mNRC.explicitColor.get());
         {
