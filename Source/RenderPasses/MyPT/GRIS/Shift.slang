@@ -117,7 +117,8 @@ ShiftResult reconnectPath(PathSample source, ShadingData sourcePrimary, ShadingD
     float3 first = evalGRISBSDF(destination, primaryMaterial, connection, evaluation) / p1;
 
     bool neeAtRc = source.terminal == PathTerminal::NEE && source.surfaceScatters == source.rcIndex + 1;
-    bool hitAfterRc = source.terminal != PathTerminal::NEE && source.surfaceScatters == source.rcIndex + 1;
+    bool hitAfterRc = (source.terminal == PathTerminal::Emission || source.terminal == PathTerminal::Environment) &&
+        source.surfaceScatters == source.rcIndex + 1;
     precise float p2 = evalGRISBSDFPdf(rc, rcMaterial, source.rcWi, bool(USE_IMPORTANCE_SAMPLING));
     float denominator = neeAtRc ? source.lightPdf : p2;
     if (!positiveFinite(denominator)) return failedShift(kShiftAfterDenominator);
@@ -175,6 +176,7 @@ bool sameReplaySlot(PathSample source, PathTerminal terminal, PathLight light)
 
 ShiftResult replayPath(PathSample source, PrimaryPathContext destination, uint maxScatters, float rr)
 {
+    if (source.terminal == PathTerminal::Cache) return failedShift(kShiftUnsupported);
     PathSample replayed = traceReplayContribution(destination, source, maxScatters, rr);
     if (replayed.surfaceScatters != source.surfaceScatters || !sameReplaySlot(source, replayed.terminal, replayed.light))
         return failedShift(kShiftTerminal);

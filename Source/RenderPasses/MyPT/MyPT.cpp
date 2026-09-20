@@ -42,6 +42,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
         pass.def_property_readonly("resourceStats", [](const MyPT& p) { return p.getResourceStats().toPython(); });
         pass.def("resetSampling", &MyPT::resetSampling, pybind11::arg("seed"));
         pass.def("resetNrcCache", &MyPT::resetNrcCache);
+        pass.def("resetPGCache", &MyPT::resetPGCache);
         pass.def("reloadShaders", &MyPT::reloadShaders);
     });
 }
@@ -105,12 +106,28 @@ MyPT::MyPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 
 void MyPT::parseProperties(const Properties& props)
 {
+    // Resolve the target mode before its cache toggle, independent of key order.
+    mMode = props.get(kMode, mMode);
     for (const auto& [key, value] : props)
     {
         if (key == kMode)
             mMode = value;
-        else if (key == "nrcUseCache") mNrcUseCache = value;
+        else if (key == "pgUseGuiding") mPGUseGuiding = value;
+        else if (key == "pgTrain") mPGTrain = value;
+        else if (key == "pgGuideFraction") mPGGuideFraction = value;
+        else if (key == "pgTrainingFraction") mPGTrainingFraction = value;
+        else if (key == "pgTrainingIterations") mPGTrainingIterations = value;
+        else if (key == "pgInitialEpochSpp") mPGInitialEpochSpp = value;
+        else if (key == "pgTreeBudgetMB") mPGTreeBudgetMB = value;
+        else if (key == "pgRecordBudgetMB") mPGRecordBudgetMB = value;
+        else if (key == "pgSpatialThreshold") mPGSpatialThreshold = value;
+        else if (key == "pgDirectionalThreshold") mPGDirectionalThreshold = value;
+        else if (key == "pgMaxSpatialDepth") mPGMaxSpatialDepth = value;
+        else if (key == "pgMaxDirectionalDepth") mPGMaxDirectionalDepth = value;
+        else if (key == "nrcUseCache") nrcUseCache() = value;
         else if (key == "nrcTrainCache") mNrcTrainCache = value;
+        else if (key == "nrcQueryDepth") mNrcQueryDepth = value;
+        else if (key == "nrcRecordWhileFrozen") mNrcRecordWhileFrozen = value;
         else if (key == "nrcTrainingSource" || key == "nrcTrainingMaxBounces" || key == "nrcUnbiasedTrainingRatio")
             FALCOR_THROW("NRC option '{}' was removed. NRC now trains only from QueryPT; remove this option and use nrcQueryTrainingMaxVertices for record capacity.", key);
         else if (key == "nrcQueryTrainingMaxVertices") mNrcQueryTrainingMaxVertices = value;
@@ -171,6 +188,20 @@ void MyPT::parseProperties(const Properties& props)
             logWarning("Unknown property '{}' in MyPT properties.", key);
     }
     FALCOR_CHECK(mGIRISCandidateCount <= 64, "giRISCandidateCount must be in [0, 64].");
+    FALCOR_CHECK(std::isfinite(mPGGuideFraction) && mPGGuideFraction >= 0.f && mPGGuideFraction < 1.f,
+        "pgGuideFraction must be in [0, 1) to retain BSDF support.");
+    FALCOR_CHECK(std::isfinite(mPGTrainingFraction) && mPGTrainingFraction > 0.f && mPGTrainingFraction <= 1.f,
+        "pgTrainingFraction must be in (0, 1].");
+    FALCOR_CHECK(mPGTrainingIterations >= 1 && mPGTrainingIterations <= 24 && mPGInitialEpochSpp >= 1 && mPGInitialEpochSpp <= 1024,
+        "PG training iterations must be in [1,24], initial epoch spp in [1,1024].");
+    FALCOR_CHECK(mPGTreeBudgetMB >= 1 && mPGTreeBudgetMB <= 4096 && mPGRecordBudgetMB >= 1 && mPGRecordBudgetMB <= 4096,
+        "PG memory budgets must be in [1,4096] MiB.");
+    FALCOR_CHECK(mPGSpatialThreshold >= 1 && std::isfinite(mPGDirectionalThreshold) && mPGDirectionalThreshold > 0.f &&
+        mPGDirectionalThreshold <= 1.f && mPGMaxSpatialDepth >= 1 && mPGMaxSpatialDepth <= 24 && mPGMaxDirectionalDepth >= 1 && mPGMaxDirectionalDepth <= 16,
+        "Invalid PG subdivision threshold or maximum depth.");
+    FALCOR_CHECK(mNrcQueryDepth >= 2 && mNrcQueryDepth < 65536, "nrcQueryDepth must be in [2, 65535].");
+    FALCOR_CHECK(mMode != Mode::ReSTIR || !nrcUseCache() || mMaxBounces == 0 || mGIRISCandidateCount == 0 ||
+        mShiftStrategy == ShiftStrategy::Reconnection, "ReSTIR with NRC enabled currently supports Reconnection only.");
     FALCOR_CHECK(mNrcQueryTrainingMaxVertices >= 2 && mNrcQueryTrainingMaxVertices <= 65,
         "nrcQueryTrainingMaxVertices must be in [2, 65].");
     FALCOR_CHECK(mNrcTrainingIterations >= 1 && mNrcTrainingIterations <= 16, "nrcTrainingIterations must be in [1, 16].");
@@ -197,8 +228,22 @@ Properties MyPT::getProperties() const
 {
     Properties props;
     props[kMode] = mMode;
-    props["nrcUseCache"] = mNrcUseCache;
+    props["pgUseGuiding"] = mPGUseGuiding;
+    props["pgTrain"] = mPGTrain;
+    props["pgGuideFraction"] = mPGGuideFraction;
+    props["pgTrainingFraction"] = mPGTrainingFraction;
+    props["pgTrainingIterations"] = mPGTrainingIterations;
+    props["pgInitialEpochSpp"] = mPGInitialEpochSpp;
+    props["pgTreeBudgetMB"] = mPGTreeBudgetMB;
+    props["pgRecordBudgetMB"] = mPGRecordBudgetMB;
+    props["pgSpatialThreshold"] = mPGSpatialThreshold;
+    props["pgDirectionalThreshold"] = mPGDirectionalThreshold;
+    props["pgMaxSpatialDepth"] = mPGMaxSpatialDepth;
+    props["pgMaxDirectionalDepth"] = mPGMaxDirectionalDepth;
+    props["nrcUseCache"] = nrcUseCache();
     props["nrcTrainCache"] = mNrcTrainCache;
+    props["nrcQueryDepth"] = mNrcQueryDepth;
+    props["nrcRecordWhileFrozen"] = mNrcRecordWhileFrozen;
     props["nrcQueryTrainingMaxVertices"] = mNrcQueryTrainingMaxVertices;
     props["nrcTrainingIterations"] = mNrcTrainingIterations;
     props["nrcTerminationThreshold"] = mNrcTerminationThreshold;
@@ -233,10 +278,37 @@ Properties MyPT::getProperties() const
 
 void MyPT::setProperties(const Properties& props)
 {
+    const bool optionsWereChanged = mOptionsChanged;
     const auto previous = getProperties();
+    const bool previousNrcUseCache = mNrcUseCache;
+    const bool previousRestirUseNrc = mRestirUseNrc;
     try { parseProperties(props); }
-    catch (...) { parseProperties(previous); throw; }
-    mOptionsChanged = true;
+    catch (...)
+    {
+        mNrcUseCache = previousNrcUseCache;
+        mRestirUseNrc = previousRestirUseNrc;
+        parseProperties(previous);
+        throw;
+    }
+    bool trainingOnly = mMode == Mode::ReSTIR;
+    for (const auto& [key, value] : props)
+        if (key != "nrcTrainCache" && key != "nrcRecordWhileFrozen") trainingOnly = false;
+    mOptionsChanged |= !trainingOnly;
+    if (mMode == Mode::PG)
+    {
+        bool pgTrainingOnly = true;
+        for (const auto& [key, value] : props)
+        {
+            if (key != "pgTrain" && key != "pgTrainingIterations") pgTrainingOnly = false;
+            // These change the transport target or the layout/refinement contract.
+            if (key == kMaxBounces || key == kComputeDirect || key == kUseImportanceSampling || key == kRRProbability ||
+                key == "referenceLambertian" || key == "pgInitialEpochSpp" || key == "pgTreeBudgetMB" ||
+                key == "pgSpatialThreshold" || key == "pgDirectionalThreshold" || key == "pgMaxSpatialDepth" ||
+                key == "pgMaxDirectionalDepth") mPGResetRequested = true;
+        }
+        // Freeze/resume does not change the estimated image or discard its accumulation.
+        if (pgTrainingOnly) mOptionsChanged = optionsWereChanged;
+    }
     // Freezing training preserves the learned state; only retry failed initialization.
     if (mNRC.failed) mNrcResetRequested = true;
 }
@@ -284,6 +356,10 @@ RenderPassReflection MyPT::reflect(const CompileData& compileData)
             .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addOutput("nrcQueryTrainingDebug", "NRC QueryOnly: termination reason, recorded vertices, accepted vertices, bootstrap queries")
         .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("initialEstimate", "Mean of completed candidate trees, including cached tails")
+        .format(ResourceFormat::RGBA32Float).flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addOutput("nrcCandidateDebug", "GRIS NRC: render queries, negative predictions, invalid predictions, owner candidate plus one")
+        .format(ResourceFormat::RGBA32Uint).flags(RenderPassReflection::Field::Flags::Optional);
     return reflector;
 }
 
@@ -291,15 +367,16 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     if (mLastExecutedMode != mMode)
     {
-        if (mLastExecutedMode == Mode::NRC) resetNRC();
-        if (mMode == Mode::NRC) resetGRIS();
+        if (mLastExecutedMode == Mode::NRC || mLastExecutedMode == Mode::ReSTIR) resetNRC();
+        if (mLastExecutedMode == Mode::PG || mMode == Mode::PG) resetPG();
+        resetGRIS();
         mLastExecutedMode = mMode;
         mOptionsChanged = true;
     }
-    for (const char* name : {"nrcExplicit", "nrcCached", "nrcSdkReference"})
+    for (const char* name : {"nrcExplicit", "nrcCached", "nrcSdkReference", "initialEstimate"})
         if (auto output = renderData.getTexture(name)) pRenderContext->clearTexture(output.get(), float4(0.f));
     // Optional measurements are accumulated across passes and spatial rounds in this frame.
-    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats", "nrcQueryDebug", "nrcTrainingDebug", "nrcQueryTrainingDebug"})
+    for (const char* name : {"rayStats0", "rayStats1", "rayStats2", "temporalShiftStats", "spatialShiftStats", "nrcQueryDebug", "nrcTrainingDebug", "nrcQueryTrainingDebug", "nrcCandidateDebug"})
         if (auto output = renderData.getTexture(name))
         {
             pRenderContext->uavBarrier(output.get());
@@ -353,13 +430,25 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         logWarning("Depth-of-field requires the '{}' input. Expect incorrect shading.", kInputViewDir);
     }
 
-    if (mMode == Mode::ReSTIR)
+    if (mMode == Mode::PG)
     {
-        executeGRIS(pRenderContext, renderData);
+        executePG(pRenderContext, renderData);
         return;
     }
 
-    if (mMode == Mode::NRC && mNrcUseCache && mMaxBounces > 0)
+    if (mMode == Mode::ReSTIR)
+    {
+        try { executeGRIS(pRenderContext, renderData); }
+        catch (...)
+        {
+            // An SDK frame cannot survive a failed shader compile/dispatch.
+            if (nrcUseCache()) { resetNRC(); mGRIS.historyValid = false; }
+            throw;
+        }
+        return;
+    }
+
+    if (mMode == Mode::NRC && nrcUseCache() && mMaxBounces > 0)
     {
         executeNRC(pRenderContext, renderData);
         return;
@@ -382,6 +471,10 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (layoutChanged) mTracer.pVars = nullptr;
 
     // Update the emissive light sampler and inject its defines before program vars are created.
+    // The light collection may not be ready during setScene(). Create lazily
+    // after getLightCollection() above so ordinary PT and PG use the same NEE.
+    if (!mpEmissiveSampler && mpScene->useEmissiveLights())
+        mpEmissiveSampler = std::make_unique<EmissivePowerSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
     if (mpEmissiveSampler)
     {
         mpEmissiveSampler->update(pRenderContext, mpScene->getILightCollection(pRenderContext));
@@ -422,9 +515,15 @@ void MyPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 void MyPT::renderUI(Gui::Widgets& widget)
 {
     bool dirty = widget.dropdown("Mode", mMode);
+    if (mMode == Mode::PG) renderPGUI(widget);
     if (mMode == Mode::ReSTIR)
     {
-        dirty |= widget.dropdown("Shift strategy", mShiftStrategy);
+        if (nrcUseCache())
+        {
+            if (mShiftStrategy != ShiftStrategy::Reconnection) { mShiftStrategy = ShiftStrategy::Reconnection; dirty = true; }
+            widget.text("NRC shift: Reconnection");
+        }
+        else dirty |= widget.dropdown("Shift strategy", mShiftStrategy);
         if (mShiftStrategy == ShiftStrategy::Hybrid)
         {
             dirty |= widget.var("Specular roughness threshold", mSpecularRoughnessThreshold, 0.f, 1.f);
@@ -455,15 +554,31 @@ void MyPT::renderUI(Gui::Widgets& widget)
             widget.tooltip("Defensive Pairwise MIS with the selected shift strategy. Reconnection Jacobian ratios are limited to 11 in either direction. Zero neighbors or rounds bypass reuse.");
         }
     }
-    if (mMode == Mode::NRC)
+    if (mMode == Mode::NRC || mMode == Mode::ReSTIR)
     {
         widget.text(mNRC.status);
-        dirty |= widget.checkbox("Use radiance cache", mNrcUseCache);
-        dirty |= widget.checkbox("Train cache", mNrcTrainCache);
+        dirty |= widget.checkbox("Use radiance cache", nrcUseCache());
+        // The cache may have been enabled below the shift controls this frame.
+        // Apply the restriction now, before execute() validates the combination.
+        if (mMode == Mode::ReSTIR && nrcUseCache() && mShiftStrategy != ShiftStrategy::Reconnection)
+        {
+            mShiftStrategy = ShiftStrategy::Reconnection;
+            dirty = true;
+        }
+        const bool trainingChanged = widget.checkbox("Train cache", mNrcTrainCache);
+        if (mMode != Mode::ReSTIR) dirty |= trainingChanged;
         dirty |= widget.var("Recorded vertices", mNrcQueryTrainingMaxVertices, 2u, 65u);
-        widget.tooltip("Train from existing QueryPT segments only. No training rays. Incomplete/overflow paths are excluded.");
-        dirty |= widget.var("Cache termination threshold", mNrcTerminationThreshold, 0.001f, 10.f, 0.01f);
-        widget.tooltip("Lower values end paths earlier. This trades detail for less tracing and noise.");
+        widget.tooltip("Train from existing path segments only (GRIS initial candidates in ReSTIR). No training rays. Incomplete/overflow paths are excluded.");
+        if (mMode == Mode::ReSTIR)
+        {
+            dirty |= widget.var("Cache query depth", mNrcQueryDepth, 2u, 65535u);
+            widget.tooltip("Primary is depth 0. Unsupported surfaces at this fixed depth continue explicit tracing.");
+        }
+        else
+        {
+            dirty |= widget.var("Cache termination threshold", mNrcTerminationThreshold, 0.001f, 10.f, 0.01f);
+            widget.tooltip("Lower values end paths earlier. This trades detail for less tracing and noise.");
+        }
         dirty |= widget.var("Training iterations", mNrcTrainingIterations, 1u, 16u);
         if (widget.button("Reset cache")) resetNrcCache();
     }
@@ -472,15 +587,19 @@ void MyPT::renderUI(Gui::Widgets& widget)
         : "0 = direct lighting; 1 = one indirect bounce. Shared by PT and ReSTIR.");
     dirty |= widget.checkbox("Evaluate direct illumination", mComputeDirect);
     dirty |= widget.checkbox("Use importance sampling", mUseImportanceSampling);
-    if (mMode == Mode::NRC && mNrcUseCache && mMaxBounces > 0) widget.text("MIS enabled for NRC");
+    if (mMode == Mode::PG) widget.text("MIS enabled for PG");
+    else if ((mMode == Mode::NRC || (mMode == Mode::ReSTIR && mGIRISCandidateCount > 0)) && nrcUseCache() && mMaxBounces > 0) widget.text("MIS enabled for NRC");
     else dirty |= widget.checkbox("Use MIS", mUseMIS);
     dirty |= widget.var("RR Probability", mRRProbability, 0.f, 0.95f);
     widget.tooltip("Termination probability. Use 0 for the first-round comparison.");
     mOptionsChanged |= dirty;
+    if (mMode == Mode::PG && dirty) mPGResetRequested = true;
 }
 
 void MyPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    resetPG();
+    mPGPendingSceneUpdates = Scene::UpdateFlags::None;
     resetNRC();
     mNrcPendingSceneUpdates = Scene::UpdateFlags::None;
     resetGRIS();
@@ -545,6 +664,7 @@ void MyPT::onSceneUpdates(RenderContext*, Scene::UpdateFlags updates)
     // RenderGraph retains changes made while another graph was active.
     mPendingSceneUpdates |= updates;
     mNrcPendingSceneUpdates |= updates;
+    mPGPendingSceneUpdates |= updates;
 }
 
 void MyPT::resetSampling(uint32_t seed)

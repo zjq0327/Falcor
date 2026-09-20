@@ -35,6 +35,8 @@
 
 using namespace Falcor;
 
+namespace Falcor::PG { class SDTree; }
+
 /**
  * Custom path tracer (MyPT).
  *
@@ -56,8 +58,9 @@ public:
     enum class Mode
     {
         PT,     ///< Brute-force path tracing (default).
-        ReSTIR, ///< Complete-path RIS and temporal/spatial GRIS.
+        ReSTIR, ///< Complete-path RIS and temporal/spatial GRIS, optionally with NRC.
         NRC,    ///< Path tracing with neural radiance cache termination.
+        PG,     ///< Independent SD-tree path guiding (no GRIS/NRC).
     };
 
     FALCOR_ENUM_INFO(
@@ -66,6 +69,7 @@ public:
             {Mode::PT, "PT"},
             {Mode::ReSTIR, "ReSTIR"},
             {Mode::NRC, "NRC"},
+            {Mode::PG, "PG"},
         }
     );
 
@@ -97,6 +101,7 @@ public:
     Properties getResourceStats() const;
     void resetSampling(uint32_t seed);
     void resetNrcCache();
+    void resetPGCache();
     void reloadShaders();
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
     virtual void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
@@ -109,12 +114,26 @@ public:
 
 private:
     void parseProperties(const Properties& props);
+    // ReSTIR opts in without changing the standalone NRC mode's default.
+    bool& nrcUseCache() { return mMode == Mode::ReSTIR ? mRestirUseNrc : mNrcUseCache; }
+    bool nrcUseCache() const { return mMode == Mode::ReSTIR ? mRestirUseNrc : mNrcUseCache; }
     void prepareVars();
     void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData);
     void resetGRIS();
     void executeNRC(RenderContext* context, const RenderData& data);
     void resetNRC();
     Properties getNRCStats() const;
+    bool prepareGRISNRC(RenderContext* context, const RenderData& data);
+    void prepareNrcTrainingResources(const RenderData& data);
+    void bindNrcTraining(const ShaderVar& var, uint2 dimensions, uint32_t frame, uint32_t candidates, uint32_t seed);
+    static void addNrcIncludePath(ProgramDesc& desc);
+    void executePG(RenderContext* context, const RenderData& data);
+    void resetPG();
+    void renderPGUI(Gui::Widgets& widget);
+    Properties getPGStats() const;
+    void bindPG(const ShaderVar& var, bool training);
+    void finalizePGEpoch(RenderContext* context, bool continueTraining);
+    void uploadPGTrees(RenderContext* context, bool includeBuild);
 
     // Internal state
 
@@ -178,8 +197,50 @@ private:
     /// Fixed probability for russian roulette path termination.
     float mRRProbability = 0.2f;
 
+    bool mPGUseGuiding = true;
+    bool mPGTrain = true;
+    float mPGGuideFraction = 0.5f;
+    float mPGTrainingFraction = 1.f / 16.f;
+    uint32_t mPGTrainingIterations = 6;
+    uint32_t mPGInitialEpochSpp = 1;
+    uint32_t mPGTreeBudgetMB = 64;
+    uint32_t mPGRecordBudgetMB = 128;
+    uint32_t mPGSpatialThreshold = 12000;
+    float mPGDirectionalThreshold = 0.01f;
+    uint32_t mPGMaxSpatialDepth = 20;
+    uint32_t mPGMaxDirectionalDepth = 10;
+    bool mPGResetRequested = true;
+    uint32_t mPGGeneration = 0;
+    Scene::UpdateFlags mPGPendingSceneUpdates = Scene::UpdateFlags::None;
+    struct
+    {
+        std::shared_ptr<PG::SDTree> tree;
+        ref<Program> program;
+        ref<RtBindingTable> bindingTable;
+        ref<RtProgramVars> vars;
+        DefineList defines;
+        ref<ComputePass> prepareRecords, buildTraining, buildDistribution;
+        ref<Buffer> readSpatial, readDirectional, buildSpatial, buildDirectional;
+        ref<Buffer> buildWeights, buildCounts, headers, vertices, diagnostics;
+        uint2 dimensions = uint2(0);
+        uint32_t tileSize = 4, pathCapacity = 0, verticesPerPath = 0;
+        uint32_t frameIndex = 0, epochsCompleted = 0, epochSpp = 0, epochTargetSpp = 1;
+        uint32_t epochLimit = 6, configuredIterations = 6;
+        uint64_t trainedPaths = 0, trainedVertices = 0, invalidSamples = 0, overflowPaths = 0;
+        uint64_t guidedSamples = 0, bsdfFallbackSamples = 0, trainedSecondaryVertices = 0;
+        bool frozen = false, wasTraining = false;
+        bool previousTrainRequest = true;
+        float4x4 viewProj = float4x4::identity();
+        float2 lens = float2(0.f);
+        double lastFinalizeMs = 0.0;
+        std::string status = "Not initialized";
+    } mPG;
+
     bool mNrcUseCache = true;
+    bool mRestirUseNrc = false;
     bool mNrcTrainCache = true;
+    uint32_t mNrcQueryDepth = 2;
+    bool mNrcRecordWhileFrozen = false; ///< Diagnostic: record/bootstrap without optimizing.
     uint32_t mNrcQueryTrainingMaxVertices = 9;
     uint32_t mNrcTrainingIterations = 4;
     float mNrcTerminationThreshold = 0.1f;
@@ -238,6 +299,9 @@ private:
         ref<ComputePass> spatialReuse;
         ref<ComputePass> resolve;
         ref<Buffer> primary;
+        ref<ComputePass> finalizeNrc;
+        ref<Buffer> nrcCandidates;
+        bool nrcActive = false;
         ref<Buffer> fresh;
         ref<Buffer> reference;
         ref<Buffer> temporal;

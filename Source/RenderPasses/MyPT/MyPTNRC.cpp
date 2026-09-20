@@ -8,15 +8,15 @@ namespace
 {
 const char kNrcShader[] = "RenderPasses/MyPT/NRC/NrcPathTrace.rt.slang";
 const char kNrcResolve[] = "RenderPasses/MyPT/NRC/NrcResolve.cs.slang";
+}
 
-void addNrcIncludePath(ProgramDesc& desc)
+void MyPT::addNrcIncludePath(ProgramDesc& desc)
 {
 #if FALCOR_HAS_NRC
     auto directory = getRuntimeDirectory() / "shaders/RenderPasses/MyPT/NRC/SDK";
     if (!std::filesystem::is_regular_file(directory / "Nrc.hlsli")) directory = FALCOR_NRC_SDK_INCLUDE_DIR;
     desc.addCompilerArguments({"-I", directory.string()});
 #endif
-}
 }
 
 void MyPT::resetNRC()
@@ -39,6 +39,7 @@ void MyPT::onHotReload(HotReloadFlags reloaded)
     mpDevice->getRenderContext()->submit(true);
     resetNRC();
     resetGRIS();
+    resetPG();
     mTracer.pVars = nullptr;
     mFrameCount = 0;
     mOptionsChanged = true;
@@ -62,8 +63,10 @@ Properties MyPT::getNRCStats() const
     stats["status"] = mNRC.status;
     stats["cacheGeneration"] = mNrcCacheGeneration;
     stats["frameIndex"] = mNRC.frameIndex;
-    stats["trainingEnabled"] = mMode == Mode::NRC && mNrcUseCache && mMaxBounces > 0 && mNrcTrainCache;
+    stats["trainingEnabled"] = (mMode == Mode::NRC || (mMode == Mode::ReSTIR && mGRIS.nrcActive)) &&
+        nrcUseCache() && mMaxBounces > 0 && mNrcTrainCache;
     stats["trainingSource"] = "QueryOnly";
+    stats["recordProducer"] = mMode == Mode::ReSTIR ? "GRISInitialCandidates" : "QueryPT";
     stats["queryTrainingBufferBytes"] = (mNRC.queryTrainingPaths ? uint64_t(mNRC.queryTrainingPaths->getSize()) : 0ull) +
         (mNRC.queryTrainingVertices ? uint64_t(mNRC.queryTrainingVertices->getSize()) : 0ull);
     stats["publicBufferBytes"] = sdk ? sdk->getPublicBufferBytes() : uint64_t(0);
@@ -174,42 +177,10 @@ void MyPT::executeNRC(RenderContext* context, const RenderData& data)
             mNRC.emissiveSampler->update(context, mpScene->getILightCollection(context));
         }
 
-        if (recordQueries)
-        {
-            DefineList defines;
-            defines.add("MYPT_HAS_NRC_TRAINING_DEBUG", data.getTexture("nrcTrainingDebug") ? "1" : "0");
-            defines.add("MYPT_HAS_NRC_QUERY_TRAINING_DEBUG", data.getTexture("nrcQueryTrainingDebug") ? "1" : "0");
-            auto create = [&](ref<ComputePass>& pass, const char* filename)
-            {
-                if (!pass)
-                {
-                    ProgramDesc desc;
-                    desc.addShaderLibrary(std::string("RenderPasses/MyPT/NRC/") + filename).csEntry("main");
-                    addNrcIncludePath(desc);
-                    pass = ComputePass::create(mpDevice, desc, defines);
-                }
-                else if (pass->getProgram()->addDefines(defines)) pass->setVars(nullptr);
-            };
-            create(mNRC.prepareQueryTraining, "NrcPrepareQueryTraining.cs.slang");
-            create(mNRC.buildQueryTraining, "NrcBuildTrainingFromQuery.cs.slang");
-            const auto trainingDim = sdk.getTrainingDimensions();
-            const uint64_t count = uint64_t(trainingDim.x) * trainingDim.y;
-            FALCOR_CHECK(count * mNrcQueryTrainingMaxVertices <= UINT32_MAX, "NRC query training allocation overflow");
-            auto var = mNRC.buildQueryTraining->getRootVar();
-            if (!mNRC.queryTrainingPaths || mNRC.queryTrainingPaths->getElementCount() != count)
-                mNRC.queryTrainingPaths = mpDevice->createStructuredBuffer(var["gQueryTrainingPaths"], uint32_t(count));
-            if (!mNRC.queryTrainingVertices || mNRC.queryTrainingVertices->getElementCount() != count * mNrcQueryTrainingMaxVertices)
-                mNRC.queryTrainingVertices = mpDevice->createStructuredBuffer(var["gQueryTrainingVertices"], uint32_t(count * mNrcQueryTrainingMaxVertices));
-        }
+        if (recordQueries) prepareNrcTrainingResources(data);
         auto bindRecords = [&](const ShaderVar& var)
         {
-            auto cb = var["QueryTrainingCB"];
-            cb["gRecordFrameDim"] = dimensions;
-            cb["gRecordTrainingDim"] = sdk.getTrainingDimensions();
-            cb["gRecordFrameIndex"] = mFrameCount;
-            cb["gRecordMaxVertices"] = mNrcQueryTrainingMaxVertices;
-            if (auto field = var.findMember("gQueryTrainingPaths"); field.isValid()) field = mNRC.queryTrainingPaths;
-            if (auto field = var.findMember("gQueryTrainingVertices"); field.isValid()) field = mNRC.queryTrainingVertices;
+            bindNrcTraining(var, dimensions, mFrameCount, 1u, 0u);
         };
         auto prepareQuery = [&]()
         {

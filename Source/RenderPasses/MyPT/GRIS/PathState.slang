@@ -9,7 +9,7 @@ struct PrimaryPathContext
     uint seed;
 };
 
-enum PathTerminal : uint { None = 0, Emission = 1, Environment = 2, NEE = 3 };
+enum PathTerminal : uint { None = 0, Emission = 1, Environment = 2, NEE = 3, Cache = 4 };
 enum PathLight : uint { None = 0, Emissive = 1, Environment = 2, Analytic = 3 };
 
 struct PathSample

@@ -8,6 +8,9 @@ import RenderPasses.MyPT.MyPTCommon;
 __exported import PathBuilder;
 __exported import BSDF;
 __exported import Measurement;
+#if GRIS_USE_NRC
+__exported import NrcQuery;
+#endif
 
 ParameterBlock<EnvMapSampler> gEnvSampler;
 
@@ -65,10 +68,14 @@ struct PathTraceResult
 {
     PathBuilder builder;
     HybridPrefix prefix;
+#if GRIS_USE_NRC
+    NrcCandidate nrc;
+#endif
 };
 
 PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxScatters, float rrProbability,
-    uint traceMode, PathSample target, float roughnessThreshold, float nearFieldDistance, bool evaluateSourceSupport = true)
+    uint traceMode, PathSample target, float roughnessThreshold, float nearFieldDistance, bool evaluateSourceSupport = true,
+    uint2 ownerPixel = uint2(0), uint candidateIndex = 0u, bool useNrc = false)
 {
     PathBuilder builder = PathBuilder(seed);
     builder.replayEnabled = traceMode != 0;
@@ -93,10 +100,24 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
     uint previousFlags = 0;
     bool previousRough = false;
     SceneRayQuery<true> query;
+#if GRIS_USE_NRC
+    NrcCandidate pending = (NrcCandidate)0;
+    pending.queryIndex = 0xffffffffu;
+    NrcQueryRecording recording = (NrcQueryRecording)0;
+    recording.slot = 0xffffffffu;
+    recording.beta = 1.f;
+    if (useNrc && traceMode == 0 && gNrcRecordEnabled != 0u) recording = nrcRecordInit(ownerPixel, candidateIndex);
+    float3 recordedScatterPrefix = 1.f;
+    bool directProbe = false;
+    uint probeStart = 0u;
+    uint loopLimit = maxScatters + (useNrc ? 64u : 0u);
+#else
+    uint loopLimit = maxScatters;
+#endif
 
     // Like the reference TracePass: complete each path in one dispatch, including
     // emission/miss at the last depth BEFORE the depth-termination check.
-    for (uint depth = 0; depth <= maxScatters; ++depth)
+    for (uint depth = 0; depth <= loopLimit; ++depth)
     {
         if (!hit.isValid())
         {
@@ -117,6 +138,10 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
             // The rc BSDF PDF changes during reconnection. Reevaluate its terminal MIS in Shift.
             builder.add(throughput * emission * mis, suffix * emission * (depth == builder.descriptor.rcIndex + 1 ? 1.f : mis), depth,
                 PathTerminal::Environment, PathLight::Environment, sg.rng.state, lightPdf, direction, false);
+#if GRIS_USE_NRC
+            nrcRecordRadiance(recording, emission * mis);
+            if (!directProbe) nrcRecordEnd(recording, kRecordMiss);
+#endif
             break;
         }
 
@@ -169,6 +194,12 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
                     // ray direction and the direction reconstructed from its hit position.
                     SampleGenerator evaluation = sg;
                     throughput = previousScatterPrefix * evalGRISBSDF(firstSd, firstMaterial, connection, evaluation) / p1;
+#if GRIS_USE_NRC
+                    // Match GRIS's stored-geometry parameterization without
+                    // deriving local training weights from a camera prefix.
+                    SampleGenerator recordEvaluation = sg;
+                    recording.beta = recordedScatterPrefix * evalGRISBSDF(firstSd, firstMaterial, connection, recordEvaluation) / p1;
+#endif
                     builder.descriptor.cachedJacobian.x = p1;
                     previousPdf = p1;
                     direction = connection;
@@ -209,7 +240,40 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
         builder.add(throughput * emission * emissionMIS, suffix * emission * (depth <= builder.descriptor.rcIndex + 1 ? 1.f : emissionMIS), depth,
             PathTerminal::Emission, PathLight::Emissive, emissionSeed, emissionPdf, direction, atRc);
 
+#if GRIS_USE_NRC
+        nrcRecordRadiance(recording, emission * emissionMIS);
+        NrcSurfaceAttributes surface = grisNrcSurface(sd, mi);
+        if (directProbe)
+        {
+            if (depth - probeStart >= 64u)
+            {
+                nrcRecordEnd(recording, kRecordProbeLimit);
+                break;
+            }
+            if (!surface.isDeltaLobe) break;
+        }
+        else
+        {
+            if (depth == maxScatters) { nrcRecordEnd(recording, kRecordDepth); break; }
+            if (depth > 0 || COMPUTE_DIRECT) nrcRecordHit(recording, surface);
+            if (useNrc && traceMode == 0 && depth == gNrcQueryDepth && depth > builder.descriptor.rcIndex && !surface.isDeltaLobe)
+            {
+                pending.queryIndex = grisNrcWriteQuery(surface);
+                pending.beta = throughput;
+                pending.suffix = suffix;
+                pending.cache = builder.descriptor;
+                pending.cache.terminal = PathTerminal::Cache;
+                pending.cache.light = PathLight::None;
+                pending.cache.surfaceScatters = depth;
+                pending.cache.terminalSeed = sg.rng.state;
+                nrcRecordEnd(recording, kRecordCache);
+                directProbe = true;
+                probeStart = depth;
+            }
+        }
+#else
         if (depth == maxScatters) break;
+#endif
 
 #if USE_ANALYTIC_LIGHTS
         // Analytic delta lights cannot be hit by BSDF rays and have no MIS competitor.
@@ -227,8 +291,13 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
                 {
                     // Explicit control flow is required with DisableShortCircuit.
                     if (pathVisible(sd, ls.dir, ls.distance))
+                    {
                         builder.add(throughput * local, atRc ? ls.Li : suffix * local, depth + 1,
                             PathTerminal::NEE, PathLight::Analytic, lightSeed, 1.f / invPdf, ls.dir, atRc);
+#if GRIS_USE_NRC
+                        nrcRecordRadiance(recording, local);
+#endif
+                    }
                 }
             }
         }
@@ -244,8 +313,13 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
                 if (traceMode != 2 && builder.acceptsContribution(depth + 1, PathTerminal::NEE, PathLight::Emissive) && any(local > 0.f))
                 {
                     if (emissivePathVisible(sd, ls))
+                    {
                         builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
                             PathTerminal::NEE, PathLight::Emissive, lightSeed, ls.pdf, ls.dir, atRc);
+#if GRIS_USE_NRC
+                        nrcRecordRadiance(recording, local);
+#endif
+                    }
                 }
             }
         }
@@ -261,8 +335,13 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
                 if (traceMode != 2 && builder.acceptsContribution(depth + 1, PathTerminal::NEE, PathLight::Environment) && any(local > 0.f))
                 {
                     if (pathVisible(sd, ls.dir, 1e30f))
+                    {
                         builder.add(throughput * local, atRc ? ls.Le : suffix * local, depth + 1,
                             PathTerminal::NEE, PathLight::Environment, lightSeed, ls.pdf, ls.dir, atRc);
+#if GRIS_USE_NRC
+                        nrcRecordRadiance(recording, local);
+#endif
+                    }
                 }
             }
         }
@@ -270,10 +349,24 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
         BSDFSample bs;
         // Preserve the existing RR control. Baseline scripts explicitly use zero.
         // Here RR reciprocals are carried in F; reservoir proposals therefore still use p=1.
-        if (depth > 0 && rrProbability > 0.f)
+        bool allowRR = true;
+#if GRIS_USE_NRC
+        allowRR = !directProbe;
+#endif
+        if (allowRR && depth > 0 && rrProbability > 0.f)
         {
-            if (sampleNext1D(sg) < rrProbability) break;
+            if (sampleNext1D(sg) < rrProbability)
+            {
+#if GRIS_USE_NRC
+                recording.beta = 0.f;
+                nrcRecordEnd(recording, kRecordRR);
+#endif
+                break;
+            }
             throughput /= 1.f - rrProbability;
+#if GRIS_USE_NRC
+            recording.beta /= 1.f - rrProbability;
+#endif
             if (builder.descriptor.rcIndex != 0xffffffff && depth > builder.descriptor.rcIndex) suffix /= 1.f - rrProbability;
         }
         if (traceMode == 2 && depth + 1 == target.rcIndex)
@@ -289,7 +382,16 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
         }
         previousScatterPrefix = throughput;
         previousScatterSeed = sg.rng.state;
-        if (!sampleMyPTBSDF(sd, mi, sg, bs, bool(USE_IMPORTANCE_SAMPLING))) break;
+#if GRIS_USE_NRC
+        recordedScatterPrefix = recording.beta;
+#endif
+        if (!sampleMyPTBSDF(sd, mi, sg, bs, bool(USE_IMPORTANCE_SAMPLING)))
+        {
+#if GRIS_USE_NRC
+            if (!directProbe) { recording.beta = 0.f; nrcRecordEnd(recording, kRecordAbsorbed); }
+#endif
+            break;
+        }
         if (!bs.isLobe(LobeType::Delta) && gScene.materials.getMaterialType(sd.materialID) == MaterialType::Standard)
         {
             // Falcor StandardBSDF.sample returns a selected-lobe weight but a mixture PDF.
@@ -297,12 +399,34 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
             // here (marginalize the lobe choice). Keep the transport random stream intact.
             SampleGenerator evaluation = sg;
             bs.pdf = evalGRISBSDFPdf(sd, mi, bs.wo, bool(USE_IMPORTANCE_SAMPLING));
-            if (bs.pdf <= 0.f) break;
+            if (bs.pdf <= 0.f || !isfinite(bs.pdf))
+            {
+#if GRIS_USE_NRC
+                nrcRecordEnd(recording, kRecordNumeric);
+#endif
+                break;
+            }
             bs.weight = evalGRISBSDF(sd, mi, bs.wo, evaluation) / bs.pdf;
         }
         throughput *= bs.weight;
-        if (any(!isfinite(throughput))) { builder.reservoir.invalidCount++; break; }
-        if (!any(throughput > 0.f)) break;
+#if GRIS_USE_NRC
+        recording.beta *= bs.weight;
+#endif
+        if (any(!isfinite(throughput)))
+        {
+            builder.reservoir.invalidCount++;
+#if GRIS_USE_NRC
+            nrcRecordEnd(recording, kRecordNumeric);
+#endif
+            break;
+        }
+        if (!any(throughput > 0.f))
+        {
+#if GRIS_USE_NRC
+            if (!directProbe) { recording.beta = 0.f; nrcRecordEnd(recording, kRecordAbsorbed); }
+#endif
+            break;
+        }
         if (atRc)
         {
             builder.descriptor.rcSeed = sg.rng.state;
@@ -353,6 +477,18 @@ PathTraceResult tracePathImpl(PrimaryPathContext primary, uint seed, uint maxSca
     PathTraceResult result;
     result.builder = builder;
     result.prefix = prefix;
+#if GRIS_USE_NRC
+    if (useNrc)
+    {
+        if (recording.reason == kRecordActive) nrcRecordEnd(recording, kRecordDepth);
+        nrcRecordFinish(recording);
+        grisNrcWritePath(ownerPixel, candidateIndex, pending.queryIndex, pending.beta);
+    }
+    pending.tree = builder.reservoir;
+    pending.explicitRadiance = builder.radiance;
+    pending.selectionState = builder.selection.rng.state;
+    result.nrc = pending;
+#endif
     return result;
 }
 

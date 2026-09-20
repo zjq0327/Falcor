@@ -29,12 +29,17 @@ Properties MyPT::getResourceStats() const
     add("hybridPairs", mGRIS.hybridPairs);
     add("spatial0", mGRIS.spatial[0]);
     add("spatial1", mGRIS.spatial[1]);
+    add("nrcCandidates", mGRIS.nrcCandidates);
+    stats["grisNrcActive"] = mGRIS.nrcActive;
+    stats["grisFrameIndex"] = mGRIS.frameIndex;
+    stats["historyValid"] = mGRIS.historyValid;
     stats["totalBufferBytes"] = total;
     stats["width"] = mGRIS.dimensions.x;
     stats["height"] = mGRIS.dimensions.y;
     stats["ptSeedSupported"] = true;
     stats["referenceLambertian"] = mReferenceLambertian;
     stats["nrc"] = getNRCStats();
+    stats["pg"] = getPGStats();
     return stats;
 }
 
@@ -43,6 +48,16 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     FALCOR_CHECK(!mpScene->hasProceduralGeometry(), "GRIS currently supports triangle geometry only.");
     const uint2 dimensions = data.getDefaultTextureDims();
     if (dimensions.x == 0 || dimensions.y == 0) { mGRIS.historyValid = false; return; }
+    const bool useNrc = prepareGRISNRC(context, data);
+    const bool recordNrc = useNrc && (mNrcTrainCache || mNrcRecordWhileFrozen);
+    if (useNrc != mGRIS.nrcActive)
+    {
+        mGRIS.historyValid = false;
+        auto& dict = data.getDictionary();
+        dict[kRenderPassRefreshFlags] = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None) |
+            RenderPassRefreshFlags::RenderOptionsChanged;
+    }
+    mGRIS.nrcActive = useNrc;
     const bool useSpatial = mSpatialReuse && mSpatialNeighborCount > 0 && mSpatialReuseRounds > 0;
     const auto& camera = mpScene->getCamera();
     const bool useTemporal = mTemporalReuse && mMaxHistoryLength > 0 && camera->getApertureRadius() == 0.f;
@@ -76,13 +91,18 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         mGRIS.envSampler = std::make_unique<EnvMapSampler>(mpDevice, mpScene->getEnvMap());
 
     DefineList defines = mpScene->getSceneDefines();
+    defines.add("GRIS_USE_NRC", useNrc ? "1" : "0");
+    defines.add("GRIS_HAS_INITIAL_ESTIMATE", data.getTexture("initialEstimate") ? "1" : "0");
+    defines.add("GRIS_HAS_NRC_CANDIDATE_DEBUG", data.getTexture("nrcCandidateDebug") ? "1" : "0");
+    defines.add("GRIS_HAS_NRC_EXPLICIT", useNrc && data.getTexture("nrcExplicit") ? "1" : "0");
+    defines.add("GRIS_HAS_NRC_CACHED", useNrc && data.getTexture("nrcCached") ? "1" : "0");
     defines.add("SAMPLE_GENERATOR_TYPE", std::to_string(SAMPLE_GENERATOR_TINY_UNIFORM));
     defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
     defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
     defines.add("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
     defines.add("USE_ENV_BACKGROUND", mpScene->useEnvBackground() ? "1" : "0");
     defines.add("GRIS_USE_NEE", "1");
-    defines.add("GRIS_USE_MIS", mUseMIS ? "1" : "0");
+    defines.add("GRIS_USE_MIS", (useNrc || mUseMIS) ? "1" : "0");
     defines.add("GRIS_SHIFT_STRATEGY", std::to_string(uint32_t(mShiftStrategy)));
     defines.add("COMPUTE_DIRECT", mComputeDirect ? "1" : "0");
     defines.add("USE_IMPORTANCE_SAMPLING", mUseImportanceSampling ? "1" : "0");
@@ -108,6 +128,7 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
     if (!mGRIS.generatePaths || defines != mGRIS.defines)
     {
         ProgramDesc base;
+        if (useNrc) addNrcIncludePath(base);
         // Replay evaluates the same transport in separately compiled passes.
         // Preserve floating-point operation ordering across their call contexts.
         base.setCompilerFlags(SlangCompilerFlags::FloatingPointModePrecise);
@@ -123,6 +144,8 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         };
         mGRIS.generatePaths = create("GeneratePaths.cs.slang");
         mGRIS.tracePaths = create("TracePaths.cs.slang");
+        mGRIS.finalizeNrc = useNrc ? create("FinalizeNrcCandidates.cs.slang") : nullptr;
+        mGRIS.nrcCandidates = nullptr;
         mGRIS.temporalPathRetrace = create("TemporalPathRetrace.cs.slang");
         mGRIS.spatialPathRetrace = create("SpatialPathRetrace.cs.slang");
         mGRIS.validateShift = create("ValidateShift.cs.slang");
@@ -151,6 +174,21 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         for (auto& buffer : mGRIS.spatial) buffer = nullptr;
         mGRIS.dimensions = dimensions;
         mGRIS.frameIndex = 0;
+    }
+    if (useNrc)
+    {
+        const uint64_t count = uint64_t(dimensions.x) * dimensions.y * mGIRISCandidateCount;
+        FALCOR_CHECK(count <= UINT32_MAX, "GRIS NRC candidate count overflow");
+        if (!mGRIS.nrcCandidates || mGRIS.nrcCandidates->getElementCount() != count)
+        {
+            auto var = mGRIS.finalizeNrc->getRootVar();
+            // Reflect the actual Slang stride before allocating a potentially
+            // large P*K array; Falcor buffer views use 32-bit byte offsets.
+            const auto layout = mpDevice->createStructuredBuffer(var["gNrcCandidates"], 1);
+            FALCOR_CHECK(count <= uint64_t(UINT32_MAX) / layout->getStructSize(),
+                "GRIS NRC pending candidates exceed 4 GiB; reduce resolution or giRISCandidateCount");
+            mGRIS.nrcCandidates = mpDevice->createStructuredBuffer(var["gNrcCandidates"], uint32_t(count));
+        }
     }
     if (useTemporal && !mGRIS.historyReservoir)
     {
@@ -232,6 +270,34 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         if (useHybrid) var["gHybridPairs"] = mGRIS.hybridPairs;
         if (auto texture = data.getTexture("shiftDebug")) var["gShiftDebug"] = texture;
     };
+    auto bindNrc = [&](const ref<ComputePass>& pass)
+    {
+        auto var = pass->getRootVar();
+        mNRC.integration->bindShaderData(var);
+        mNRC.integration->bindResolveData(var);
+        bindNrcTraining(var, dimensions, mGRIS.frameIndex, mGIRISCandidateCount, mSeed);
+        if (auto cb = var.findMember("GrisNrcCB"); cb.isValid())
+        {
+            cb["gNrcQueryDepth"] = mNrcQueryDepth;
+            cb["gNrcRecordEnabled"] = uint32_t(recordNrc);
+        }
+        if (auto field = var.findMember("gNrcCandidates"); field.isValid()) field = mGRIS.nrcCandidates;
+    };
+    if (useNrc)
+    {
+        NrcIntegration::FrameSettings frame;
+        frame.trainTheCache = mNrcTrainCache;
+        frame.trainingIterations = mNrcTrainingIterations;
+        FALCOR_CHECK(mNRC.integration->beginFrame(context, frame), "{}", mNRC.integration->getError());
+        if (recordNrc)
+        {
+            FALCOR_PROFILE(context, "NRC.PrepareQueryTraining");
+            bindNrcTraining(mNRC.prepareQueryTraining->getRootVar(), dimensions, mGRIS.frameIndex, mGIRISCandidateCount, mSeed);
+            mNRC.prepareQueryTraining->execute(context, uint3(mNRC.integration->getTrainingDimensions(), 1));
+            context->uavBarrier(mNRC.queryTrainingPaths.get());
+        }
+        mNRC.integration->prepareForPathTracing(context);
+    }
     {
         FALCOR_PROFILE(context, "GRIS.GeneratePaths");
         bind(mGRIS.generatePaths);
@@ -246,8 +312,41 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         bind(mGRIS.tracePaths);
         auto var = mGRIS.tracePaths->getRootVar();
         bindTransport(mGRIS.tracePaths);
+        if (useNrc) bindNrc(mGRIS.tracePaths);
         if (auto texture = data.getTexture("pathDebug")) var["gPathDebug"] = texture;
         mGRIS.tracePaths->execute(context, uint3(dimensions, 1));
+    }
+    if (useNrc)
+    {
+        auto& sdk = *mNRC.integration;
+        if (recordNrc)
+        {
+            FALCOR_PROFILE(context, "NRC.BuildTrainingFromQuery");
+            context->uavBarrier(mNRC.queryTrainingPaths.get());
+            context->uavBarrier(mNRC.queryTrainingVertices.get());
+            sdk.prepareForPathTracing(context);
+            auto var = mNRC.buildQueryTraining->getRootVar();
+            sdk.bindShaderData(var);
+            bindNrcTraining(var, dimensions, mGRIS.frameIndex, mGIRISCandidateCount, mSeed);
+            if (auto tex = data.getTexture("nrcTrainingDebug")) var["gNrcTrainingDebug"] = tex;
+            if (auto tex = data.getTexture("nrcQueryTrainingDebug")) var["gNrcQueryTrainingDebug"] = tex;
+            mNRC.buildQueryTraining->execute(context, uint3(sdk.getTrainingDimensions(), 1));
+        }
+        {
+            FALCOR_PROFILE(context, "NRC.QueryAndTrain");
+            FALCOR_CHECK(sdk.queryAndTrain(context), "{}", sdk.getError());
+        }
+        {
+            FALCOR_PROFILE(context, "GRIS.FinalizeNrcCandidates");
+            context->uavBarrier(mGRIS.nrcCandidates.get());
+            bind(mGRIS.finalizeNrc);
+            bindNrc(mGRIS.finalizeNrc);
+            auto var = mGRIS.finalizeNrc->getRootVar();
+            if (auto tex = data.getTexture("initialEstimate")) var["gInitialEstimate"] = tex;
+            if (auto tex = data.getTexture("nrcCandidateDebug")) var["gNrcCandidateDebug"] = tex;
+            if (auto tex = data.getTexture("pathDebug")) var["gPathDebug"] = tex;
+            mGRIS.finalizeNrc->execute(context, uint3(dimensions, 1));
+        }
     }
     if (auto texture = data.getTexture("shiftDebug"))
     {
@@ -324,6 +423,11 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         if (auto texture = data.getTexture("reservoirDebug")) var["gReservoirDebug"] = texture;
         if (auto texture = data.getTexture("initialColor")) var["gInitialColor"] = texture;
         if (auto texture = data.getTexture("temporalColor")) var["gTemporalColor"] = texture;
+        if (useNrc)
+        {
+            if (auto texture = data.getTexture("nrcExplicit")) var["gNrcExplicit"] = texture;
+            if (auto texture = data.getTexture("nrcCached")) var["gNrcCached"] = texture;
+        }
         mGRIS.resolve->execute(context, uint3(dimensions, 1));
     }
     if (useTemporal)
@@ -336,6 +440,12 @@ void MyPT::executeGRIS(RenderContext* context, const RenderData& data)
         mGRIS.previousViewProj = camera->getViewProjMatrixNoJitter();
         mGRIS.previousCameraPosition = camera->getPosition();
         mGRIS.historyValid = true;
+    }
+    if (useNrc)
+    {
+        FALCOR_PROFILE(context, "NRC.Submit");
+        FALCOR_CHECK(mNRC.integration->endFrame(context), "{}", mNRC.integration->getError());
+        ++mNRC.frameIndex;
     }
     ++mGRIS.frameIndex;
 }

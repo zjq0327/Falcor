@@ -6,6 +6,8 @@ RWTexture2D<float4> gReservoirF;
 RWTexture2D<float4> gReservoirDebug;
 RWTexture2D<float4> gInitialColor;
 RWTexture2D<float4> gTemporalColor;
+RWTexture2D<float4> gNrcExplicit;
+RWTexture2D<float4> gNrcCached;
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -16,6 +18,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     PathReservoir reservoir = gCurrent[index];
     float3 color = reservoir.sample.F * reservoir.W;
     gColor[pixel] = float4(color, 1.f);
+#if GRIS_HAS_NRC_EXPLICIT
+    gNrcExplicit[pixel] = float4(reservoir.sample.terminal == PathTerminal::Cache ? float3(0.f) : color, 1.f);
+#endif
+#if GRIS_HAS_NRC_CACHED
+    gNrcCached[pixel] = float4(reservoir.sample.terminal == PathTerminal::Cache ? color : float3(0.f), 1.f);
+#endif
 #if GRIS_HAS_TEMPORAL_COLOR
     PathReservoir temporal = gTemporal[index];
     gTemporalColor[pixel] = float4(temporal.sample.F * temporal.W, 1.f);

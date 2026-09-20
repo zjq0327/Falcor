@@ -72,6 +72,12 @@ import RenderPasses.MyPT.GRIS.Measurement;
 #ifndef MYPT_NRC_QUERY_RECORDS
 #define MYPT_NRC_QUERY_RECORDS 0
 #endif
+#ifndef MYPT_PG
+#define MYPT_PG 0
+#endif
+#if MYPT_PG && MYPT_NRC
+#error PG and NRC are independent transport modes.
+#endif
 
 cbuffer CB
 {
@@ -108,6 +114,11 @@ static const bool kUseEnvBackground = USE_ENV_BACKGROUND;
 static const float3 kDefaultBackgroundColor = float3(0, 0, 0);
 static const float kRayTMax = FLT_MAX;
 
+#if MYPT_PG
+#include "../PG/Sampling.slang"
+#include "../PG/PathRecording.slang"
+#endif
+
 /**
  * Payload for shadow ray.
  */
@@ -131,6 +142,10 @@ struct ScatterRayData
     float3 normal;    ///< Oriented face normal at the previous path vertex (for emissive PDF evaluation).
 
     SampleGenerator sg; ///< Per-ray state for the sample generator (up to 16B).
+#if MYPT_PG
+    PGRecording pgRecording;
+    bool pgPreviousDelta;
+#endif
 #if MYPT_NRC
     NrcPathState nrcState;
     bool nrcDirectProbe;
@@ -156,6 +171,10 @@ struct ScatterRayData
         this.pdf = 0.f;
         this.normal = float3(0, 0, 0);
         this.sg = sg;
+#if MYPT_PG
+        this.pgRecording = pgRecordInit(DispatchRaysIndex().xy);
+        this.pgPreviousDelta = false;
+#endif
 #if MYPT_NRC
         this.nrcState = (NrcPathState)0;
         this.nrcDirectProbe = false;
@@ -308,7 +327,11 @@ float3 evalDirectEmissive(const ShadingData sd, const IMaterialInstance mi, inou
     // Apply MIS weight against the BSDF sampling strategy.
     if (kUseMIS)
     {
+#if MYPT_PG
+        const float scatterPdf = evalPGScatterPdf(sd, mi, tls.dir, kUseImportanceSampling);
+#else
         const float scatterPdf = mi.evalPdf(sd, tls.dir, kUseImportanceSampling);
+#endif
         Li *= evalMIS(tls.pdf, scatterPdf);
     }
 
@@ -348,7 +371,12 @@ bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3
 {
     // Sample material.
     BSDFSample bsdfSample = {};
+#if MYPT_PG
+    if (samplePGScatter(sd, mi, rayData.sg, bsdfSample, kUseImportanceSampling,
+        rayData.pgRecording.slot != kPGInvalid))
+#else
     if (sampleMyPTBSDF(sd, mi, rayData.sg, bsdfSample, kUseImportanceSampling))
+#endif
     {
         rayData.origin = rayOrigin;
         if (bsdfSample.isLobe(LobeType::Transmission))
@@ -357,6 +385,9 @@ bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3
         }
         rayData.direction = bsdfSample.wo;
         rayData.pdf = bsdfSample.pdf;
+#if MYPT_PG
+        rayData.pgPreviousDelta = bsdfSample.isLobe(LobeType::Delta);
+#endif
 #if MYPT_NRC
         if (gNrcUseCache != 0)
         {
@@ -366,6 +397,14 @@ bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, float3
 #endif
         rayData.normal = sd.getOrientedFaceNormal();
         rayData.thp *= bsdfSample.weight;
+#if MYPT_PG
+        // Only directions whose actual scatter ray is followed have a measured
+        // incident-radiance suffix. A zero-BSDF null event is not retraced just
+        // for guiding; its preceding vertices retain the valid zero tail.
+        if (any(rayData.thp > 0.f))
+            pgRecordScatter(rayData.pgRecording, bsdfSample.wo, bsdfSample.pdf,
+                bsdfSample.weight, pgSupportsMaterial(sd, mi) && !rayData.pgPreviousDelta);
+#endif
 #if MYPT_NRC_QUERY_RECORDS
         rayData.recording.beta *= bsdfSample.weight;
 #endif
@@ -386,6 +425,9 @@ bool terminatePathByRussianRoulette(inout ScatterRayData rayData, float u)
     if (u < gRRProbability)
     {
         rayData.terminated = true;
+#if MYPT_PG
+        pgRecordEnd(rayData.pgRecording, kPGTerminationRR, 0.f);
+#endif
 #if MYPT_NRC_QUERY_RECORDS
         nrcRecordEnd(rayData.recording, kRecordRR);
         rayData.recording.beta = 0.f;
@@ -393,6 +435,9 @@ bool terminatePathByRussianRoulette(inout ScatterRayData rayData, float u)
         return true;
     }
     rayData.thp /= (1.f - gRRProbability);
+#if MYPT_PG
+    rayData.pgRecording.survivalScale = 1.f / (1.f - gRRProbability);
+#endif
 #if MYPT_NRC_QUERY_RECORDS
     rayData.recording.beta /= (1.f - gRRProbability);
 #endif
@@ -415,6 +460,10 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     let lod = ExplicitLodTextureSampler(0.f);
     let mi = gScene.materials.getMaterialInstance(sd, lod);
 
+#if MYPT_PG
+    float3 pgEmission = 0.f;
+    float pgHitMIS = 1.f;
+#endif
 #if MYPT_NRC
     nrcMeasurementAdd(uint4(0u, 0u, 1u, 0u));
 #endif
@@ -422,6 +471,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     if (kUseEmissiveLights && (kComputeDirect || rayData.pathLength > 0))
     {
         float3 emission = mi.getProperties(sd).emission;
+#if MYPT_PG
+        pgEmission = emission;
+#endif
         // This hit came from a BSDF-sampled scatter ray, and the previous vertex performed NEE
         // (the primary vertex does NEE when kComputeDirect, indirect vertices always do).
         // Apply the MIS weight to avoid double counting with the NEE strategy.
@@ -437,6 +489,11 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
             // With MIS disabled, keep the full emission (may double count with the NEE strategy).
             if (kUseMIS)
             {
+#if MYPT_PG
+                // Discrete delta events cannot compete with continuous NEE.
+                if (!rayData.pgPreviousDelta)
+                {
+#endif
 #if MYPT_NRC
                 // Delta BSDF samples have zero solid-angle PDF in Falcor. NEE
                 // cannot produce this discrete event, so its hit weight is one.
@@ -445,8 +502,16 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
                 {
 #endif
                 const float lightPdf = gMyPTEmissiveSampler.evalPdf(rayData.origin, rayData.normal, false, lightHit);
+#if MYPT_PG
+                pgHitMIS = evalMIS(rayData.pdf, lightPdf);
+                emission *= pgHitMIS;
+#else
                 emission *= evalMIS(rayData.pdf, lightPdf);
+#endif
 #if MYPT_NRC
+                }
+#endif
+#if MYPT_PG
                 }
 #endif
             }
@@ -457,6 +522,11 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
 #endif
     }
 
+#if MYPT_PG
+    // Record even the depth/RR terminal surface: its raw emission and local NEE
+    // are needed to recover the incident radiance at earlier vertices.
+    pgRecordVertex(rayData.pgRecording, sd.posW, pgEmission, pgHitMIS);
+#endif
 #if MYPT_NRC
     // A cache termination needs the BSDF strategy's local-light contribution
     // as well as NEE (and the PT has no environment NEE). SDK-skipped vertices
@@ -506,6 +576,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     if (rayData.pathLength >= kMaxBounces)
     {
         rayData.terminated = true;
+#if MYPT_PG
+        pgRecordEnd(rayData.pgRecording, kPGTerminationDepth, 0.f);
+#endif
 #if MYPT_NRC_QUERY_RECORDS
         nrcRecordEnd(rayData.recording, kRecordDepth);
 #endif
@@ -539,6 +612,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     {
         float3 Lr = evalDirect(sd, mi, rayData.sg);
         rayData.radiance += rayData.thp * Lr;
+#if MYPT_PG
+        pgRecordDirect(rayData.pgRecording, Lr);
+#endif
 #if MYPT_NRC_QUERY_RECORDS
         nrcRecordRadiance(rayData.recording, Lr);
 #endif
@@ -583,6 +659,9 @@ void handleHit(const HitInfo hit, inout ScatterRayData rayData)
     // The raygen shader will continue the path based on the returned payload.
     if (!generateScatterRay(sd, mi, rayOrigin, rayData))
     {
+#if MYPT_PG
+        pgRecordEnd(rayData.pgRecording, kPGTerminationAbsorbed, 0.f);
+#endif
 #if MYPT_NRC_QUERY_RECORDS
         nrcRecordEnd(rayData.recording, kRecordAbsorbed);
         rayData.recording.beta = 0.f;
@@ -704,21 +783,41 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
         // Compute ray origin for new rays spawned from the G-buffer.
         const float3 rayOrigin = sd.computeRayOrigin();
 
+#if MYPT_PG
+        float3 pgPrimaryEmission = 0.f;
+        float3 pgPrimaryDirect = 0.f;
+#endif
         if (kComputeDirect)
         {
             // Always output directly emitted light, independent of whether emissive materials are treated as light sources or not.
+#if MYPT_PG
+            pgPrimaryEmission = mi.getProperties(sd).emission;
+            pgPrimaryDirect = evalDirect(sd, mi, sg);
+            outColor += pgPrimaryEmission;
+            outColor += pgPrimaryDirect;
+#else
             outColor += mi.getProperties(sd).emission;
 
             outColor += evalDirect(sd, mi, sg);
+#endif
         }
 
         {
             // Prepare ray payload.
             ScatterRayData rayData = ScatterRayData(sg);
+#if MYPT_PG
+            pgRecordVertex(rayData.pgRecording, sd.posW, pgPrimaryEmission, 1.f);
+            pgRecordDirect(rayData.pgRecording, pgPrimaryDirect);
+#endif
 
             // Generate scatter ray.
             if (!generateScatterRay(sd, mi, rayOrigin, rayData))
+            {
                 rayData.terminated = true;
+#if MYPT_PG
+                pgRecordEnd(rayData.pgRecording, kPGTerminationAbsorbed, 0.f);
+#endif
+            }
 
             // Follow path into the scene and compute its total contribution.
             for (uint depth = 0; depth <= kMaxBounces && !rayData.terminated; depth++)
@@ -728,6 +827,9 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
 
             // Store contribution from scatter ray.
             outColor += rayData.radiance;
+#if MYPT_PG
+            pgRecordFinish(rayData.pgRecording);
+#endif
         }
     }
     else
@@ -755,6 +857,9 @@ float3 tracePath(const uint2 pixel, const uint2 frameDim)
 [shader("miss")]
 void scatterMiss(inout ScatterRayData rayData)
 {
+#if MYPT_PG
+    float3 pgTerminalEmission = 0.f;
+#endif
 #if MYPT_NRC
     // A visibility/direct-light probe missing the scene says nothing about the
     // untraced indirect tail at its parent vertex. Do not disable bootstrap.
@@ -768,10 +873,16 @@ void scatterMiss(inout ScatterRayData rayData)
     {
         float3 Le = gScene.envMap.eval(WorldRayDirection());
         rayData.radiance += rayData.thp * Le;
+#if MYPT_PG
+        pgTerminalEmission = Le;
+#endif
 #if MYPT_NRC_QUERY_RECORDS
         nrcRecordRadiance(rayData.recording, Le);
 #endif
     }
+#if MYPT_PG
+    pgRecordEnd(rayData.pgRecording, kPGTerminationMiss, pgTerminalEmission);
+#endif
 #if MYPT_NRC
     if (rayData.nrcDirectProbe) rayData.thp = rayData.nrcProbeRestoreThroughput;
 #if MYPT_NRC_QUERY_RECORDS

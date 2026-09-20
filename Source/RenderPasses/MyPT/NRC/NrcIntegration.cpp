@@ -404,6 +404,14 @@ bool NrcIntegration::configure(RenderContext* context, const Configuration& sett
         context->submit(true);
         nrc::BuffersAllocationInfo allocations = {};
         if (!p.check(nrc::d3d12::Context::GetBuffersAllocationInfo(configuration, allocations), "GetBuffersAllocationInfo")) return false;
+        const uint64_t queryPaths = uint64_t(settings.frameDimensions.x) * settings.frameDimensions.y * settings.samplesPerPixel;
+        const uint64_t trainingPaths = uint64_t(configuration.trainingDimensions.x) * configuration.trainingDimensions.y;
+        auto capacity = [&](nrc::BufferIdx index) { return allocations.allocationInfo[size_t(index)].elementCount; };
+        FALCOR_CHECK(capacity(nrc::BufferIdx::QueryPathInfo) >= queryPaths &&
+            capacity(nrc::BufferIdx::QueryRadianceParams) >= queryPaths + trainingPaths &&
+            capacity(nrc::BufferIdx::QueryRadiance) >= queryPaths + trainingPaths &&
+            capacity(nrc::BufferIdx::TrainingPathVertices) >= trainingPaths * settings.maxPathVertices,
+            "NRC SDK allocation does not cover render and QueryOnly bootstrap queries");
         std::array<ref<Buffer>, kBufferCount> buffers;
         nrc::d3d12::Buffers nativeBuffers = {};
         std::array<Resource::State, kBufferCount> initialStates;
