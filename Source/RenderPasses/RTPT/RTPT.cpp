@@ -1,7 +1,29 @@
 #include "RTPT.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Scene/Material/StandardMaterial.h"
+#include "Utils/SampleGenerators/HaltonSamplePattern.h"
 #include <limits>
+
+namespace
+{
+struct NRDOutput
+{
+    const char* name;
+    const char* shaderName;
+    ResourceFormat format;
+};
+const NRDOutput kNRDOutputs[] = {
+    {"nrdDiffuseRadianceHitDist", "gNRDDiffuseRadianceHitDist", ResourceFormat::RGBA32Float},
+    {"nrdSpecularRadianceHitDist", "gNRDSpecularRadianceHitDist", ResourceFormat::RGBA32Float},
+    {"nrdEmission", "gNRDEmission", ResourceFormat::RGBA32Float},
+    {"nrdDiffuseReflectance", "gNRDDiffuseReflectance", ResourceFormat::RGBA32Float},
+    {"nrdSpecularReflectance", "gNRDSpecularReflectance", ResourceFormat::RGBA32Float},
+    {"nrdResidualRadiance", "gNRDResidualRadiance", ResourceFormat::RGBA32Float},
+    {"normWRoughnessMaterialID", "gNRDNormalRoughness", ResourceFormat::RGB10A2Unorm},
+    {"viewZ", "gNRDViewZ", ResourceFormat::R32Float},
+    {"mvecW", "gNRDMotionW", ResourceFormat::RGBA32Float},
+};
+}
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
@@ -18,6 +40,7 @@ void RTPT::setProperties(const Properties& props)
 {
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
+    bool enableNRD = mEnableNRD;
     for (const auto& [key, value] : props)
     {
         if (key == "samplesPerPixel") samplesPerPixel = value;
@@ -27,13 +50,17 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "useNEE") useNEE = value;
         else if (key == "useRussianRoulette") useRussianRoulette = value;
         else if (key == "accumulate") accumulate = value;
+        else if (key == "enableNRD") enableNRD = value;
         else FALCOR_THROW("Unknown RTPT property '{}'.", key);
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
     FALCOR_CHECK(rrStartBounce >= 1 && rrStartBounce <= 64, "RTPT rrStartBounce must be in [1, 64].");
+    FALCOR_CHECK(!enableNRD || (samplesPerPixel == 1 && !accumulate),
+        "RTPT NRD mode requires samplesPerPixel=1 and accumulate=false; NRD manages temporal history.");
+    const bool modeChanged = enableNRD != mEnableNRD;
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
-        seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate;
+        seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate || modeChanged;
     mSamplesPerPixel = samplesPerPixel;
     mMaxBounces = maxBounces;
     mRRStartBounce = rrStartBounce;
@@ -41,6 +68,14 @@ void RTPT::setProperties(const Properties& props)
     mUseNEE = useNEE;
     mUseRussianRoulette = useRussianRoulette;
     mAccumulate = accumulate;
+    mEnableNRD = enableNRD;
+    if (modeChanged)
+    {
+        mpComputePass = nullptr;
+        mpCameraPattern = nullptr;
+        mpJitterCamera = nullptr;
+        requestRecompile();
+    }
 }
 
 Properties RTPT::getProperties() const
@@ -53,6 +88,7 @@ Properties RTPT::getProperties() const
     props["useNEE"] = mUseNEE;
     props["useRussianRoulette"] = mUseRussianRoulette;
     props["accumulate"] = mAccumulate;
+    props["enableNRD"] = mEnableNRD;
     return props;
 }
 
@@ -65,6 +101,13 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
     reflection.addOutput("noisyColor", "Linear HDR radiance sampled during the current frame")
         .format(ResourceFormat::RGBA32Float)
         .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+    if (mEnableNRD)
+    {
+        for (const auto& output : kNRDOutputs)
+            reflection.addOutput(output.name, "Current-frame NRD signal or primary-hit guide")
+                .format(output.format)
+                .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+    }
     return reflection;
 }
 
@@ -72,6 +115,7 @@ void RTPT::reset()
 {
     mSampleOffset = 0;
     mAccumulatedSamples = 0;
+    mResetNRDHistory = true;
 }
 
 void RTPT::validateScene() const
@@ -98,6 +142,8 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mpComputePass = nullptr;
     mpEnvMapSampler = nullptr;
     mLightingMask = ~0u;
+    mpCameraPattern = nullptr;
+    mpJitterCamera = nullptr;
     reset();
     if (mpScene)
     {
@@ -142,6 +188,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("USE_ENV_BACKGROUND", mpScene->useEnvBackground() ? "1" : "0");
         defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
+        defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
     }
 }
@@ -154,6 +201,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     {
         pRenderContext->clearTexture(color.get());
         pRenderContext->clearTexture(noisyColor.get());
+        if (mEnableNRD)
+            for (const auto& output : kNRDOutputs)
+                pRenderContext->clearTexture(renderData.getTexture(output.name).get());
         return;
     }
 
@@ -170,7 +220,17 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         sceneChanged |= (mpScene->getCamera()->getChanges() & ~(Camera::Changes::Jitter | Camera::Changes::History)) != Camera::Changes::None;
     auto& dict = renderData.getDictionary();
     const auto refreshFlags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
-    if (sceneChanged || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
+    // Motion is reprojected by NRD. Only discontinuities discard its history.
+    const auto discontinuities = IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::GeometryChanged |
+        IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::EmissiveMaterialsChanged |
+        IScene::UpdateFlags::EnvMapChanged | IScene::UpdateFlags::EnvMapPropertiesChanged |
+        IScene::UpdateFlags::LightIntensityChanged | IScene::UpdateFlags::LightPropertiesChanged |
+        IScene::UpdateFlags::LightCountChanged | IScene::UpdateFlags::RenderSettingsChanged |
+        IScene::UpdateFlags::RecompileNeeded;
+    bool nrdDiscontinuity = (updates & discontinuities) != IScene::UpdateFlags::None;
+    if (is_set(updates, IScene::UpdateFlags::CameraPropertiesChanged))
+        nrdDiscontinuity |= is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum);
+    if ((mEnableNRD ? nrdDiscontinuity : sceneChanged) || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
     mOptionsChanged = false;
 
     const uint2 frameDim(color->getWidth(), color->getHeight());
@@ -181,10 +241,23 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
         reset();
     }
+    if (mEnableNRD && (!mpCameraPattern || mpJitterCamera != mpScene->getCamera()))
+    {
+        mpCameraPattern = HaltonSamplePattern::create(32);
+        mpJitterCamera = mpScene->getCamera();
+        mpJitterCamera->setPatternGenerator(mpCameraPattern, 1.f / float2(frameDim));
+        mResetNRDHistory = true;
+    }
+    else if (mEnableNRD)
+        mpJitterCamera->setPatternGenerator(mpCameraPattern, 1.f / float2(frameDim));
     prepareProgram(pRenderContext);
     if (mSampleOffset > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel ||
         mAccumulatedSamples > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel)
         reset();
+
+    if (mEnableNRD && mResetNRDHistory)
+        dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
+    mResetNRDHistory = false;
 
     auto var = mpComputePass->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
@@ -204,6 +277,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     var["gColor"] = color;
     var["gNoisyColor"] = noisyColor;
     var["gAccumulation"] = mpAccumulation;
+    if (mEnableNRD)
+        for (const auto& output : kNRDOutputs)
+            var[output.shaderName] = renderData.getTexture(output.name);
     pRenderContext->uavBarrier(mpAccumulation.get());
     mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
 
@@ -213,7 +289,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
 void RTPT::renderUI(Gui::Widgets& widget)
 {
-    bool changed = widget.var("Samples per pixel", mSamplesPerPixel, 1u, 1024u);
+    bool changed = false;
+    if (mEnableNRD)
+        widget.text("NRD: 1 primary sample, one path per active diffuse/specular lobe.");
+    else
+        changed |= widget.var("Samples per pixel", mSamplesPerPixel, 1u, 1024u);
     changed |= widget.var("Max BSDF bounces", mMaxBounces, 1u, 64u);
     widget.tooltip("Number of BSDF scatter events. The final ray only collects emission or environment light.", true);
     changed |= widget.checkbox("Next-event estimation", mUseNEE);
@@ -221,8 +301,10 @@ void RTPT::renderUI(Gui::Widgets& widget)
     changed |= widget.checkbox("Russian roulette", mUseRussianRoulette);
     changed |= widget.var("RR start bounce", mRRStartBounce, 1u, 64u);
     changed |= widget.var("Seed", mSeed);
-    changed |= widget.checkbox("Progressive accumulation", mAccumulate);
-    changed |= widget.button("Reset accumulation");
-    widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
+    if (!mEnableNRD)
+        changed |= widget.checkbox("Progressive accumulation", mAccumulate);
+    changed |= widget.button(mEnableNRD ? "Reset NRD history" : "Reset accumulation");
+    if (!mEnableNRD)
+        widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
     mOptionsChanged |= changed;
 }

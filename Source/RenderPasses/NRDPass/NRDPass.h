@@ -66,6 +66,7 @@ public:
     static ref<NRDPass> create(ref<Device> pDevice, const Properties& props) { return make_ref<NRDPass>(pDevice, props); }
 
     NRDPass(ref<Device> pDevice, const Properties& props);
+    ~NRDPass() override;
 
     virtual Properties getProperties() const override;
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
@@ -91,6 +92,7 @@ private:
     bool mEnabled = true;
     DenoisingMethod mDenoisingMethod = DenoisingMethod::RelaxDiffuseSpecular;
     bool mRecreateDenoiser = false;
+    bool mResetHistory = true;
     bool mWorldSpaceMotion = true;
     float mMaxIntensity = 1000.f;
     float mDisocclusionThreshold = 2.f;

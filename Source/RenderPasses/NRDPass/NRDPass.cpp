@@ -29,6 +29,7 @@
 #include "Core/API/NativeHandleTraits.h"
 
 #include "NRDPass.h"
+#include "RenderGraph/RenderPassStandardFlags.h"
 #include "RenderPasses/Shared/Denoising/NRDConstants.slang"
 
 namespace
@@ -284,6 +285,12 @@ NRDPass::NRDPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
     }
 }
 
+NRDPass::~NRDPass()
+{
+    if (mpDenoiser)
+        nrd::DestroyDenoiser(*mpDenoiser);
+}
+
 Properties NRDPass::getProperties() const
 {
     Properties props;
@@ -431,7 +438,33 @@ void NRDPass::compile(RenderContext* pRenderContext, const CompileData& compileD
 void NRDPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     if (!mpScene)
+    {
+        mResetHistory = true;
+        if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
+        {
+            pRenderContext->clearTexture(renderData.getTexture(kOutputFilteredDiffuseRadianceHitDist).get());
+            pRenderContext->clearTexture(renderData.getTexture(kOutputFilteredSpecularRadianceHitDist).get());
+        }
+        else if (mDenoisingMethod == DenoisingMethod::RelaxDiffuse)
+        {
+            pRenderContext->clearTexture(renderData.getTexture(kOutputFilteredDiffuseRadianceHitDist).get());
+        }
+        else if (mDenoisingMethod == DenoisingMethod::SpecularReflectionMv)
+        {
+            pRenderContext->clearTexture(renderData.getTexture(kOutputReflectionMotionVectors).get());
+        }
+        else if (mDenoisingMethod == DenoisingMethod::SpecularDeltaMv)
+        {
+            pRenderContext->clearTexture(renderData.getTexture(kOutputDeltaMotionVectors).get());
+        }
         return;
+    }
+
+    // Upstream passes signal discontinuities here. Ordinary camera and object
+    // motion is handled by NRD reprojection and should preserve its history.
+    const auto refreshFlags = renderData.getDictionary().getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
+    if (refreshFlags != RenderPassRefreshFlags::None)
+        mResetHistory = true;
 
     bool enabled = false;
     enabled = mEnabled;
@@ -442,6 +475,8 @@ void NRDPass::execute(RenderContext* pRenderContext, const RenderData& renderDat
     }
     else
     {
+        // A disabled frame leaves history stale, so discard it when re-enabled.
+        mResetHistory = true;
         if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
         {
             pRenderContext->blit(
@@ -497,6 +532,8 @@ void NRDPass::renderUI(Gui::Widgets& widget)
     widget.text(name);
 
     widget.checkbox("Enabled", mEnabled);
+    if (widget.button("Reset history"))
+        mResetHistory = true;
 
     if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
     {
@@ -673,6 +710,7 @@ void NRDPass::renderUI(Gui::Widgets& widget)
 void NRDPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
+    mResetHistory = true;
 }
 
 static void* nrdAllocate(void* userArg, size_t size, size_t alignment)
@@ -818,6 +856,8 @@ static void copyMatrix(float* dstMatrix, const float4x4& srcMatrix)
 void NRDPass::reinit()
 {
     // Create a new denoiser instance.
+    if (mpDenoiser)
+        nrd::DestroyDenoiser(*mpDenoiser);
     mpDenoiser = nullptr;
 
     const nrd::LibraryDesc& libraryDesc = nrd::GetLibraryDesc();
@@ -838,6 +878,8 @@ void NRDPass::reinit()
 
     createResources();
     createPipelines();
+    mRecreateDenoiser = false;
+    mResetHistory = true;
 }
 
 void NRDPass::createPipelines()
@@ -1075,7 +1117,7 @@ void NRDPass::executeInternal(RenderContext* pRenderContext, const RenderData& r
     // Initialize common settings.
     float4x4 viewMatrix = mpScene->getCamera()->getViewMatrix();
     float4x4 projMatrix = mpScene->getCamera()->getData().projMatNoJitter;
-    if (mFrameIndex == 0)
+    if (mFrameIndex == 0 || mResetHistory)
     {
         mPrevViewMatrix = viewMatrix;
         mPrevProjMatrix = projMatrix;
@@ -1085,13 +1127,17 @@ void NRDPass::executeInternal(RenderContext* pRenderContext, const RenderData& r
     copyMatrix(mCommonSettings.viewToClipMatrixPrev, mPrevProjMatrix);
     copyMatrix(mCommonSettings.worldToViewMatrix, viewMatrix);
     copyMatrix(mCommonSettings.worldToViewMatrixPrev, mPrevViewMatrix);
-    // NRD's convention for the jitter is: [-0.5; 0.5] sampleUv = pixelUv + cameraJitter
-    mCommonSettings.cameraJitter[0] = -mpScene->getCamera()->getJitterX();
-    mCommonSettings.cameraJitter[1] = mpScene->getCamera()->getJitterY();
+    // Camera stores jitter in normalized UV units; NRD expects pixel offsets
+    // in [-0.5; 0.5]. Preserve the image-space X/Y sign convention.
+    mCommonSettings.cameraJitter[0] = -mpScene->getCamera()->getJitterX() * mScreenSize.x;
+    mCommonSettings.cameraJitter[1] = mpScene->getCamera()->getJitterY() * mScreenSize.y;
     mCommonSettings.denoisingRange = kNRDDepthRange;
     mCommonSettings.disocclusionThreshold = mDisocclusionThreshold * 0.01f;
     mCommonSettings.frameIndex = mFrameIndex;
     mCommonSettings.isMotionVectorInWorldSpace = mWorldSpaceMotion;
+    // CLEAR_AND_RESTART also initializes newly allocated NRD texture pools.
+    // Explicitly return to CONTINUE on the next dispatch frame.
+    mCommonSettings.accumulationMode = mResetHistory ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
 
     mPrevViewMatrix = viewMatrix;
     mPrevProjMatrix = projMatrix;
@@ -1102,6 +1148,7 @@ void NRDPass::executeInternal(RenderContext* pRenderContext, const RenderData& r
     uint32_t dispatchDescNum = 0;
     nrd::Result result = nrd::GetComputeDispatches(*mpDenoiser, mCommonSettings, dispatchDescs, dispatchDescNum);
     FALCOR_ASSERT(result == nrd::Result::SUCCESS);
+    mResetHistory = false;
 
     for (uint32_t i = 0; i < dispatchDescNum; i++)
     {

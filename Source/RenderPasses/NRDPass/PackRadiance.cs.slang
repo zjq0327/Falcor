@@ -28,8 +28,6 @@
 #define NRD_COMPILER_DXC
 #include "nrd/Shaders/Include/NRD.hlsli"
 
-import Utils.Color.ColorHelpers;
-
 #ifndef NRD_METHOD
 // NRD_METHOD must be defined in order to use this module.
 #error "NRD_METHOD not defined!"
@@ -53,14 +51,21 @@ cbuffer PerImageCB
 void clampRadiance(inout float3 diffuseRadiance, inout float3 specularRadiance)
 {
     static const float kEpsilon = 1e-6f;
+#if NRD_METHOD == NRD_METHOD_RELAX_DIFFUSE_SPECULAR
+    // NRD 3.1 RELAX stores squared BT.601 luminance in FP16 moments.
+    // Clamp in that same space so saturated colors respect the intensity limit.
+    static const float3 kLuminanceWeights = float3(0.299f, 0.587f, 0.114f);
+#else
+    static const float3 kLuminanceWeights = float3(0.2126f, 0.7152f, 0.0722f);
+#endif
 
-    float lDiff = luminance(diffuseRadiance);
+    float lDiff = dot(diffuseRadiance, kLuminanceWeights);
     if (lDiff > kEpsilon)
     {
         diffuseRadiance *= min(gMaxIntensity / lDiff, 1.f);
     }
 
-    float lSpec = luminance(specularRadiance);
+    float lSpec = dot(specularRadiance, kLuminanceWeights);
     if (lSpec > kEpsilon)
     {
         specularRadiance *= min(gMaxIntensity / lSpec, 1.f);

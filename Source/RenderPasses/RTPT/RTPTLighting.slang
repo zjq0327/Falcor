@@ -54,7 +54,21 @@ float rtptEnvironmentLightPdf(float3 dir)
 {
 #if USE_ENV_LIGHT
     const float probability = rtptLightCategoryProbabilities().x;
-    if (probability > 0.f) return probability * gEnvMapSampler.evalPdf(dir);
+    if (probability > 0.f)
+    {
+        // Avoid an in-place swizzle fold: on the current D3D12 shader path
+        // it produces inconsistent sample/MIS PDFs. Preserve both components
+        // before folding the lower hemisphere.
+        const float3 localDir = gScene.envMap.toLocal(dir);
+        const float r = sqrt(max(0.f, 1.f - abs(localDir.z)));
+        const float v = r * atan2(abs(localDir.y), abs(localDir.x)) * M_2_PI;
+        const float u = r - v;
+        const float2 folded = localDir.z < 0.f ? float2(1.f - v, 1.f - u) : float2(u, v);
+        const float2 uv = folded * sign(localDir.xy) * 0.5f + 0.5f;
+        const float integral = gEnvMapSampler.importanceMap.Load(int3(0, 0, gEnvMapSampler.importanceBaseMip));
+        const float importance = gEnvMapSampler.importanceMap.SampleLevel(gEnvMapSampler.importanceSampler, uv, 0);
+        return probability * (importance / integral) * M_1_4PI;
+    }
 #endif
     return 0.f;
 }
@@ -175,3 +189,22 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGene
     SceneRayQuery<true> query;
     return query.traceVisibilityRay(ls.visibilityRay) ? contribution : float3(0.f);
 }
+
+#if ENABLE_NRD
+/** Evaluate a previously sampled and visibility-tested light for one component.
+    A diffuse continuation and a specular continuation are both generated, so
+    each component competes with its own BSDF PDF rather than the mixed PDF.
+*/
+float3 rtptEvaluateDirectComponent(ShadingData sd, IMaterialInstance mi, RTPTLightSample ls, inout SampleGenerator sg)
+{
+    float misWeight = 1.f;
+    if (!ls.analytic)
+    {
+        const float bsdfPdf = mi.evalPdf(sd, ls.dir);
+        if (!isfinite(bsdfPdf)) return float3(0.f);
+        misWeight = rtptPowerHeuristic(ls.pdf, bsdfPdf);
+    }
+    const float3 contribution = mi.eval(sd, ls.dir, sg) * ls.LiOverPdf * misWeight;
+    return all(isfinite(contribution)) ? contribution : float3(0.f);
+}
+#endif

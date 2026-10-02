@@ -3,6 +3,7 @@
 #include "RenderGraph/RenderPass.h"
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
+#include "Utils/SampleGenerators/CPUSampleGenerator.h"
 
 using namespace Falcor;
 
@@ -32,6 +33,8 @@ private:
     ref<SampleGenerator> mpSampleGenerator;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
     ref<Texture> mpAccumulation;
+    ref<CPUSampleGenerator> mpCameraPattern;
+    ref<Camera> mpJitterCamera;
 
     uint32_t mSamplesPerPixel = 1;
     uint32_t mMaxBounces = 4;
@@ -40,6 +43,8 @@ private:
     bool mUseNEE = true;
     bool mUseRussianRoulette = true;
     bool mAccumulate = true;
+    bool mEnableNRD = false;
+    bool mResetNRDHistory = true;
 
     uint2 mFrameDim = uint2(0);
     uint32_t mSampleOffset = 0;

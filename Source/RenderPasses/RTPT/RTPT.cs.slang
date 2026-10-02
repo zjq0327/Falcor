@@ -12,6 +12,11 @@ import Rendering.Lights.EmissiveUniformSampler;
 import Rendering.Lights.EmissiveLightSamplerInterface;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 
+#if ENABLE_NRD
+import Rendering.Materials.IsotropicGGX;
+import RenderPasses.Shared.Denoising.NRDConstants;
+#endif
+
 struct RTPTParams
 {
     uint2 frameDim;
@@ -28,14 +33,32 @@ struct RTPTParams
 
 ConstantBuffer<RTPTParams> gParams;
 #if USE_ENV_LIGHT
-EnvMapSampler gEnvMapSampler;
+// Keep the sampler's textures, sampler state and uniforms in their own
+// parameter block so the GFX resource layout is valid in compute dispatches.
+ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #endif
 RWTexture2D<float4> gColor;
 RWTexture2D<float4> gNoisyColor;
 RWTexture2D<float4> gAccumulation;
 
+#if ENABLE_NRD
+// Radiance stays linear and unencoded here. NRDPass performs its own packing.
+RWTexture2D<float4> gNRDDiffuseRadianceHitDist;
+RWTexture2D<float4> gNRDSpecularRadianceHitDist;
+RWTexture2D<float4> gNRDEmission;
+RWTexture2D<float4> gNRDDiffuseReflectance;
+RWTexture2D<float4> gNRDSpecularReflectance;
+RWTexture2D<float4> gNRDResidualRadiance;
+RWTexture2D<float4> gNRDNormalRoughness;
+RWTexture2D<float> gNRDViewZ;
+RWTexture2D<float4> gNRDMotionW;
+#endif
+
 #include "RTPTLighting.slang"
 #include "RTPTIntegrator.slang"
+#if ENABLE_NRD
+#include "RTPTNRD.slang"
+#endif
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -52,7 +75,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         const uint sampleIndex = gParams.sampleOffset + s + gParams.seed * 0x9e3779b9u;
         SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
         const Ray primaryRay = rtptGenerateCameraRay(pixel, sg);
+#if ENABLE_NRD
+        // NRD mode uses one shared primary sample and one continuation per
+        // reflection component. The host enforces 1 spp without PT accumulation.
+        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg);
+#else
         const float3 sampleRadiance = rtptTracePath(primaryRay, sg);
+#endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
     }
 

@@ -2,6 +2,10 @@
 
 Ray rtptGenerateCameraRay(uint2 pixel, inout SampleGenerator sg)
 {
+#if ENABLE_NRD
+    // Radiance, first-hit guides and NRD reprojection share camera jitter.
+    return gScene.camera.computeRayPinhole(pixel, gParams.frameDim);
+#else
     // Own subpixel jitter so accumulating a stationary camera remains valid.
     // External camera jitter is deliberately ignored; this version is pinhole.
     const float2 p = (float2(pixel) + sampleNext2D(sg)) / float2(gParams.frameDim);
@@ -10,6 +14,7 @@ Ray rtptGenerateCameraRay(uint2 pixel, inout SampleGenerator sg)
     const float3 direction = normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW);
     const float inverseCosine = 1.f / dot(normalize(camera.cameraW), direction);
     return Ray(camera.posW, direction, camera.nearZ * inverseCosine, camera.farZ * inverseCosine);
+#endif
 }
 
 float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
@@ -93,7 +98,7 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
             if (all(isfinite(contribution))) radiance += contribution;
         }
 
-        BSDFSample bs;
+        BSDFSample bs = {};
         if (!mi.sample(sd, sg, bs)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         previousDelta = bs.isLobe(LobeType::Delta);
