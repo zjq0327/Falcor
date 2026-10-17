@@ -1,0 +1,5 @@
+# Static VeachAjar variant for RTPT's reflection-only surface integrator.
+sceneBuilder.importScene("VeachAjar.pyscene")
+
+# Keep the original scene intact; RTPT does not yet support glass transmission.
+sceneBuilder.getMaterial("Pot1").specularTransmission = 0.0
