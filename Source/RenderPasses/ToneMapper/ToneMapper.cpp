@@ -36,6 +36,7 @@ const char kSrc[] = "src";
 const char kDst[] = "dst";
 
 // Scripting options.
+const char kEnabled[] = "enabled";
 const char kOutputSize[] = "outputSize";
 const char kOutputFormat[] = "outputFormat";
 const char kFixedOutputSize[] = "fixedOutputSize";
@@ -84,6 +85,7 @@ const float kWhitePointMax = 25000.f;
 static void regToneMapper(pybind11::module& m)
 {
     pybind11::class_<ToneMapper, RenderPass, ref<ToneMapper>> pass(m, "ToneMapper");
+    pass.def_property(kEnabled, &ToneMapper::isEnabled, &ToneMapper::setEnabled);
     pass.def_property(kExposureCompensation, &ToneMapper::getExposureCompensation, &ToneMapper::setExposureCompensation);
     pass.def_property(kAutoExposure, &ToneMapper::getAutoExposure, &ToneMapper::setAutoExposure);
     pass.def_property(kExposureValue, &ToneMapper::getExposureValue, &ToneMapper::setExposureValue);
@@ -133,7 +135,9 @@ void ToneMapper::parseProperties(const Properties& props)
 {
     for (const auto& [key, value] : props)
     {
-        if (key == kOutputSize)
+        if (key == kEnabled)
+            mEnabled = value;
+        else if (key == kOutputSize)
             mOutputSizeSelection = value;
         else if (key == kOutputFormat)
             mOutputFormat = value;
@@ -173,6 +177,7 @@ void ToneMapper::parseProperties(const Properties& props)
 Properties ToneMapper::getProperties() const
 {
     Properties props;
+    props[kEnabled] = mEnabled;
     props[kOutputSize] = mOutputSizeSelection;
     if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
         props[kFixedOutputSize] = mFixedOutputSize;
@@ -214,6 +219,12 @@ void ToneMapper::execute(RenderContext* pRenderContext, const RenderData& render
     auto pSrc = renderData.getTexture(kSrc);
     auto pDst = renderData.getTexture(kDst);
     FALCOR_ASSERT(pSrc && pDst);
+
+    if (!mEnabled)
+    {
+        pRenderContext->blit(pSrc->getSRV(), pDst->getRTV());
+        return;
+    }
 
     // Issue warning if image will be resampled. The render pass supports this but image quality may suffer.
     if (pSrc->getWidth() != pDst->getWidth() || pSrc->getHeight() != pDst->getHeight())
@@ -304,6 +315,9 @@ void ToneMapper::updateExposureValue()
 
 void ToneMapper::renderUI(Gui::Widgets& widget)
 {
+    widget.checkbox("Enabled", mEnabled);
+    if (!mEnabled) return;
+
     // Controls for output size.
     // When output size requirements change, we'll trigger a graph recompile to update the render pass I/O sizes.
     if (widget.dropdown("Output size", mOutputSizeSelection))

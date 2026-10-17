@@ -1,0 +1,39 @@
+@echo off
+setlocal
+pushd "%~dp0" || exit /b 1
+
+rem Module switches: 1 = enabled, 0 = disabled. These are local to this launch.
+set "RTPT_SHARC_ENABLED=1"
+set "RTPT_NRD_ENABLED=1"
+set "RTPT_ACCUMULATION_ENABLED=1"
+set "RTPT_TONEMAPPER_ENABLED=1"
+
+set "RTPT_EXE=build\windows-vs2022\bin\Release\Mogwai.exe"
+rem Main entry point: keep the complete integrated rendering pipeline here.
+set "RTPT_SCRIPT=scripts\RTPTSHARCNRD.py"
+set "RTPT_SCENE=Source\Data\VeachAjar\VeachAjarRTPT.pyscene"
+
+if not exist "%RTPT_EXE%" (
+    echo Mogwai.exe was not found. Build the Release configuration first.
+    pause
+    popd
+    exit /b 1
+)
+if not exist "%RTPT_SCRIPT%" (
+    echo RTPT render script was not found: %RTPT_SCRIPT%
+    pause
+    popd
+    exit /b 1
+)
+if not exist "%RTPT_SCENE%" (
+    echo VeachAjar scene was not found: %RTPT_SCENE%
+    pause
+    popd
+    exit /b 1
+)
+
+"%RTPT_EXE%" --device-type d3d12 --script "%RTPT_SCRIPT%" --scene "%RTPT_SCENE%"
+set "RTPT_EXIT_CODE=%ERRORLEVEL%"
+popd
+if not "%RTPT_EXIT_CODE%"=="0" pause
+exit /b %RTPT_EXIT_CODE%

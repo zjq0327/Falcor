@@ -12,8 +12,10 @@ import Rendering.Lights.EmissiveUniformSampler;
 import Rendering.Lights.EmissiveLightSamplerInterface;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 
-#if ENABLE_NRD
+#if ENABLE_NRD || ENABLE_SHARC
 import Rendering.Materials.IsotropicGGX;
+#endif
+#if ENABLE_NRD
 import RenderPasses.Shared.Denoising.NRDConstants;
 #endif
 
@@ -41,6 +43,15 @@ RWTexture2D<float4> gColor;
 RWTexture2D<float4> gNoisyColor;
 RWTexture2D<float4> gAccumulation;
 
+#if ENABLE_SHARC
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 1
+#endif
+RWTexture2D<float4> gSharcDebug;
+RWTexture2D<float4> gSharcCacheRadiance;
+RWTexture2D<float4> gSharcStats;
+#endif
+
 #if ENABLE_NRD
 // Radiance stays linear and unencoded here. NRDPass performs its own packing.
 RWTexture2D<float4> gNRDDiffuseRadianceHitDist;
@@ -55,6 +66,7 @@ RWTexture2D<float4> gNRDMotionW;
 #endif
 
 #include "RTPTLighting.slang"
+#include "RTPTSharc.slang"
 #include "RTPTIntegrator.slang"
 #if ENABLE_NRD
 #include "RTPTNRD.slang"
@@ -67,6 +79,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (any(pixel >= gParams.frameDim)) return;
 
     float3 frameAverage = 0.f;
+    RTPTSharcStats sharcStats = {};
     for (uint s = 0; s < gParams.samplesPerPixel; ++s)
     {
         // Offset the absolute sample index by an odd seed stride. Unlike XOR,
@@ -78,12 +91,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if ENABLE_NRD
         // NRD mode uses one shared primary sample and one continuation per
         // reflection component. The host enforces 1 spp without PT accumulation.
-        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg);
+        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg, sharcStats);
 #else
-        const float3 sampleRadiance = rtptTracePath(primaryRay, sg);
+        const float3 sampleRadiance = rtptTracePath(primaryRay, sg, sharcStats);
 #endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
     }
+#if ENABLE_SHARC
+    rtptWriteSharcDebug(pixel, sharcStats);
+#endif
 
     gNoisyColor[pixel] = float4(frameAverage, 1.f);
     float3 result = frameAverage;

@@ -17,7 +17,7 @@ Ray rtptGenerateCameraRay(uint2 pixel, inout SampleGenerator sg)
 #endif
 }
 
-float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
+float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
 {
     float3 radiance = 0.f;
     float3 throughput = 1.f;
@@ -26,6 +26,10 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
     float previousBsdfPdf = 0.f;
     bool previousDelta = true;
     bool previousUsedNEE = false;
+#if ENABLE_SHARC && SHARC_QUERY
+    bool previousDiffuse = false;
+    float previousRoughness = 0.f;
+#endif
     SceneRayQuery<true> query;
 
     // bounce is the number of completed BSDF scatters. At maxBounces we
@@ -34,6 +38,9 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
     for (uint bounce = 0; bounce <= gParams.maxBounces; ++bounce)
     {
         float hitT;
+#if ENABLE_SHARC && SHARC_QUERY
+        ++sharcStats.radianceRays;
+#endif
         const HitInfo hit = query.traceRay(ray, hitT);
         if (!hit.isValid())
         {
@@ -69,6 +76,17 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
         sd.mtl.setActiveLobes(uint(LobeType::Reflection));
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
         const BSDFProperties properties = mi.getProperties(sd);
+#if ENABLE_SHARC && SHARC_QUERY
+        if (bounce == 0) rtptCaptureSharcPrimary(sd, properties, sharcStats);
+        float3 cachedRadiance;
+        if (rtptTrySharcQuery(sd, mi, properties, bounce, previousDelta, previousDiffuse, previousRoughness,
+            length(sd.posW - previousPosition), sharcStats, cachedRadiance))
+        {
+            const float3 contribution = throughput * cachedRadiance;
+            if (all(isfinite(contribution))) radiance += contribution;
+            break;
+        }
+#endif
         float3 emission = properties.emission;
         // Match sampleTriangle(): profile angle uses the outward geometric
         // normal and direction from emitter to receiver. StandardMaterial
@@ -102,6 +120,10 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg)
         if (!mi.sample(sd, sg, bs)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         previousDelta = bs.isLobe(LobeType::Delta);
+#if ENABLE_SHARC && SHARC_QUERY
+        previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
+        previousRoughness = properties.roughness;
+#endif
         // A delta sample has a discrete probability; it does not compete in MIS.
         if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
         throughput *= bs.weight; // Already f * cos / pdf; do not divide again.

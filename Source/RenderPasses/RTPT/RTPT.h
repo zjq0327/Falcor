@@ -27,9 +27,17 @@ private:
     void reset();
     void validateScene() const;
     void prepareProgram(RenderContext* pRenderContext);
+    void bindSHARC(const ShaderVar& rootVar);
+    void executeSHARC(RenderContext* pRenderContext);
+    void clearSHARC(RenderContext* pRenderContext);
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
+    ref<ComputePass> mpSHARCUpdate;
+    ref<ComputePass> mpSHARCResolve;
+    ref<Buffer> mpSHARCHashEntries;
+    ref<Buffer> mpSHARCAccumulation;
+    ref<Buffer> mpSHARCResolved;
     ref<SampleGenerator> mpSampleGenerator;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
     ref<Texture> mpAccumulation;
@@ -43,12 +51,30 @@ private:
     bool mUseNEE = true;
     bool mUseRussianRoulette = true;
     bool mAccumulate = true;
+    uint32_t mMaxAccumulationFrames = 0; // 0 means unlimited.
     bool mEnableNRD = false;
     bool mResetNRDHistory = true;
+    bool mEnableSHARC = false;
+    bool mSHARCEnabled = true;
+    bool mSHARCUseCache = true;
+    bool mSHARCFreeze = false;
+    bool mResetSHARCCache = true;
+    uint32_t mSHARCEntries = 1u << 20;
+    uint32_t mSHARCUpdateStride = 5;
+    uint32_t mSHARCUpdateBounces = 8;
+    uint32_t mSHARCMinBounce = 1;
+    uint32_t mSHARCAccumulationFrames = 32;
+    uint32_t mSHARCStaleFrames = 128;
+    uint32_t mSHARCDebugMode = 0;
+    uint32_t mSHARCFrameIndex = 0;
+    float mSHARCSceneScale = 64.f;
+    float mSHARCMinRoughness = 0.4f;
+    float3 mSHARCCameraPositionPrev = float3(0.f);
 
     uint2 mFrameDim = uint2(0);
     uint32_t mSampleOffset = 0;
     uint32_t mAccumulatedSamples = 0;
+    uint32_t mAccumulatedFrames = 0;
     uint32_t mLightingMask = ~0u;
     bool mOptionsChanged = true;
 };

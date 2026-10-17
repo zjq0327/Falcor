@@ -10,6 +10,7 @@ def render_graph_RTPT():
         "useRussianRoulette": True,
         "rrStartBounce": 3,
         "accumulate": True,
+        "maxAccumulationFrames": 0,  # 0 means unlimited; each frame adds samplesPerPixel samples.
         "seed": 0,
     }), "RTPT")
     graph.markOutput("RTPT.color")

@@ -71,6 +71,8 @@ public:
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
 
     // Scripting functions
+    bool isEnabled() const { return mEnabled; }
+    void setEnabled(bool enabled) { mEnabled = enabled; }
     void setExposureCompensation(float exposureCompensation);
     void setAutoExposure(bool autoExposure);
     void setExposureValue(float exposureValue);
@@ -100,6 +102,7 @@ public:
     ExposureMode getExposureMode() const { return mExposureMode; }
 
 private:
+    bool mEnabled = true;
     void parseProperties(const Properties& props);
 
     void createToneMapPass();

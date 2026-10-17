@@ -38,7 +38,8 @@ float3 rtptTraceNRDContinuation(
     IMaterialInstance primaryMI,
     uint primaryLobes,
     inout SampleGenerator sg,
-    out float firstHitDistance
+    out float firstHitDistance,
+    inout RTPTSharcStats sharcStats
 )
 {
     firstHitDistance = kRTPTNRDMissDistance;
@@ -56,6 +57,10 @@ float3 rtptTraceNRDContinuation(
     float3 previousNormal = primarySD.getOrientedFaceNormal();
     float previousBsdfPdf = bs.pdf;
     bool previousUsedNEE = gParams.useNEE != 0 && !previousDelta;
+#if ENABLE_SHARC && SHARC_QUERY
+    bool previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
+    float previousRoughness = primaryMI.getProperties(primarySD).roughness;
+#endif
     Ray ray = Ray(primarySD.computeRayOrigin(), bs.wo);
     SceneRayQuery<true> query;
 
@@ -64,6 +69,9 @@ float3 rtptTraceNRDContinuation(
     for (uint bounce = 1; bounce <= gParams.maxBounces; ++bounce)
     {
         float hitT;
+#if ENABLE_SHARC && SHARC_QUERY
+        ++sharcStats.radianceRays;
+#endif
         const HitInfo hit = query.traceRay(ray, hitT);
         if (bounce == 1 && hit.isValid())
             firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, hitT));
@@ -89,6 +97,18 @@ float3 rtptTraceNRDContinuation(
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
         if (bounce == 1)
             firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, length(sd.posW - primarySD.posW)));
+
+#if ENABLE_SHARC && SHARC_QUERY
+        const BSDFProperties sharcProperties = mi.getProperties(sd);
+        float3 cachedRadiance;
+        if (rtptTrySharcQuery(sd, mi, sharcProperties, bounce, previousDelta, previousDiffuse, previousRoughness,
+            length(sd.posW - previousPosition), sharcStats, cachedRadiance))
+        {
+            const float3 contribution = throughput * cachedRadiance;
+            if (all(isfinite(contribution))) radiance += contribution;
+            break;
+        }
+#endif
 
 #if USE_EMISSIVE_LIGHTS
         float3 emission = mi.getProperties(sd).emission;
@@ -117,6 +137,10 @@ float3 rtptTraceNRDContinuation(
         if (!mi.sample(sd, sg, bs)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         previousDelta = bs.isLobe(LobeType::Delta);
+#if ENABLE_SHARC && SHARC_QUERY
+        previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
+        previousRoughness = sharcProperties.roughness;
+#endif
         if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
         throughput *= bs.weight;
         if (!all(isfinite(throughput)) || !any(throughput > 0.f)) break;
@@ -151,7 +175,7 @@ void rtptWriteNRDSignals(uint2 pixel, RTPTNRDSignals signals)
     gNRDMotionW[pixel] = float4(signals.motionW, 0.f);
 }
 
-float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg)
+float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
 {
     RTPTNRDSignals signals = {};
     signals.diffuseReflectance = 1.f;
@@ -161,6 +185,9 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg)
 
     SceneRayQuery<true> query;
     float hitT;
+#if ENABLE_SHARC && SHARC_QUERY
+    ++sharcStats.radianceRays;
+#endif
     const HitInfo hit = query.traceRay(ray, hitT);
     if (!hit.isValid())
     {
@@ -182,6 +209,9 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg)
         sd.mtl.setActiveLobes(uint(LobeType::Reflection));
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
         const BSDFProperties properties = mi.getProperties(sd);
+#if ENABLE_SHARC && SHARC_QUERY
+        rtptCaptureSharcPrimary(sd, properties, sharcStats);
+#endif
         signals.emission = properties.emission;
         if (sd.frontFacing && gScene.materials.hasLightProfile(materialID))
             signals.emission *= gScene.materials.evalLightProfile(dot(sd.faceN, sd.V));
@@ -214,13 +244,13 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg)
             }
         }
         if (hasDiffuse)
-            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), sg, signals.diffuseHitDistance);
+            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), sg, signals.diffuseHitDistance, sharcStats);
         if (hasSpecular)
-            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), sg, signals.specularHitDistance);
+            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), sg, signals.specularHitDistance, sharcStats);
         if (hasDeltaSpecular)
         {
             float unusedDistance;
-            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), sg, unusedDistance);
+            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), sg, unusedDistance, sharcStats);
         }
         // NRD deliberately excludes surfaces outside its denoising range.
         // Preserve their energy through the unfiltered residual channel.

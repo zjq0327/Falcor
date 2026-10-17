@@ -462,7 +462,14 @@ void NRDPass::execute(RenderContext* pRenderContext, const RenderData& renderDat
 
     // Upstream passes signal discontinuities here. Ordinary camera and object
     // motion is handled by NRD reprojection and should preserve its history.
-    const auto refreshFlags = renderData.getDictionary().getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
+    auto& dict = renderData.getDictionary();
+    auto refreshFlags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
+    if (mOptionsChanged)
+    {
+        refreshFlags |= RenderPassRefreshFlags::RenderOptionsChanged;
+        dict[kRenderPassRefreshFlags] = refreshFlags;
+        mOptionsChanged = false;
+    }
     if (refreshFlags != RenderPassRefreshFlags::None)
         mResetHistory = true;
 
@@ -524,6 +531,16 @@ void NRDPass::execute(RenderContext* pRenderContext, const RenderData& renderDat
     }
 }
 
+void NRDPass::setEnabled(bool enabled)
+{
+    if (mEnabled != enabled)
+    {
+        mEnabled = enabled;
+        mResetHistory = true;
+        mOptionsChanged = true;
+    }
+}
+
 void NRDPass::renderUI(Gui::Widgets& widget)
 {
     const nrd::LibraryDesc& nrdLibraryDesc = nrd::GetLibraryDesc();
@@ -531,9 +548,13 @@ void NRDPass::renderUI(Gui::Widgets& widget)
     _snprintf_s(name, 255, "NRD Library v%u.%u.%u", nrdLibraryDesc.versionMajor, nrdLibraryDesc.versionMinor, nrdLibraryDesc.versionBuild);
     widget.text(name);
 
-    widget.checkbox("Enabled", mEnabled);
+    if (bool enabled = mEnabled; widget.checkbox("Enabled", enabled))
+        setEnabled(enabled);
     if (widget.button("Reset history"))
+    {
         mResetHistory = true;
+        mOptionsChanged = true;
+    }
 
     if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
     {
@@ -1316,7 +1337,14 @@ void NRDPass::dispatch(RenderContext* pRenderContext, const RenderData& renderDa
     mpDevice->getUploadHeap()->release(cbAllocation);
 }
 
+static void regNRDPass(pybind11::module& m)
+{
+    pybind11::class_<NRDPass, RenderPass, ref<NRDPass>> pass(m, "NRDPass");
+    pass.def_property(kEnabled, &NRDPass::isEnabled, &NRDPass::setEnabled);
+}
+
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, NRDPass>();
+    ScriptBindings::registerBinding(regNRDPass);
 }

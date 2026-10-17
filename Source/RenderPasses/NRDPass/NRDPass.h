@@ -75,6 +75,9 @@ public:
     virtual void renderUI(Gui::Widgets& widget) override;
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
 
+    bool isEnabled() const { return mEnabled; }
+    void setEnabled(bool enabled);
+
 private:
     ref<Scene> mpScene;
     uint2 mScreenSize{};
@@ -90,6 +93,7 @@ private:
     nrd::Denoiser* mpDenoiser = nullptr;
 
     bool mEnabled = true;
+    bool mOptionsChanged = true;
     DenoisingMethod mDenoisingMethod = DenoisingMethod::RelaxDiffuseSpecular;
     bool mRecreateDenoiser = false;
     bool mResetHistory = true;

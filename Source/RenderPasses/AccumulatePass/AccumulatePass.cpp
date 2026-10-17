@@ -124,6 +124,13 @@ RenderPassReflection AccumulatePass::reflect(const CompileData& compileData)
     return reflector;
 }
 
+void AccumulatePass::compile(RenderContext* pRenderContext, const CompileData& compileData)
+{
+    // Graph compilation can replace the output texture even at the same size.
+    // A completed accumulation must not leave that new output unwritten.
+    reset();
+}
+
 void AccumulatePass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     if (mAutoReset)
@@ -155,21 +162,6 @@ void AccumulatePass::execute(RenderContext* pRenderContext, const RenderData& re
         }
     }
 
-    // Check if we reached max number of frames to accumulate and handle overflow.
-    if (mMaxFrameCount > 0 && mFrameCount == mMaxFrameCount)
-    {
-        switch (mOverflowMode)
-        {
-        case OverflowMode::Stop:
-            return;
-        case OverflowMode::Reset:
-            reset();
-            break;
-        case OverflowMode::EMA:
-            break;
-        }
-    }
-
     // Grab our input/output buffers.
     ref<Texture> pSrc = renderData.getTexture(kInputChannel);
     ref<Texture> pDst = renderData.getTexture(kOutputChannel);
@@ -194,6 +186,22 @@ void AccumulatePass::execute(RenderContext* pRenderContext, const RenderData& re
     {
         logError("AccumulatePass I/O sizes don't match. The pass will be disabled.");
         mEnabled = false;
+    }
+
+    // Handle output changes and disabled accumulation before retaining a
+    // completed image, so resizing or bypassing the pass always takes effect.
+    if (mEnabled && mMaxFrameCount > 0 && mFrameCount >= mMaxFrameCount)
+    {
+        switch (mOverflowMode)
+        {
+        case OverflowMode::Stop:
+            return;
+        case OverflowMode::Reset:
+            reset();
+            break;
+        case OverflowMode::EMA:
+            break;
+        }
     }
 
     // Decide action based on current configuration:
@@ -343,8 +351,12 @@ void AccumulatePass::renderUI(Gui::Widgets& widget)
             );
         }
 
-        const std::string text = std::string("Frames accumulated ") + std::to_string(mFrameCount);
+        std::string text = std::string("Frames accumulated ") + std::to_string(mFrameCount);
+        if (mMaxFrameCount > 0 && mPrecisionMode != Precision::SingleCompensated)
+            text += " / " + std::to_string(mMaxFrameCount);
         widget.text(text);
+        if (mMaxFrameCount > 0 && mFrameCount >= mMaxFrameCount && mOverflowMode == OverflowMode::Stop)
+            widget.text("Accumulation complete.");
     }
 }
 
