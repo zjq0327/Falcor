@@ -2,8 +2,8 @@ from falcor import *
 import os
 
 
-def _module_enabled(name):
-    value = os.environ.get(name, "1").strip()
+def _module_enabled(name, default="1"):
+    value = os.environ.get(name, default).strip()
     if value not in ("0", "1"):
         raise ValueError(f"{name} must be 0 (disabled) or 1 (enabled), got {value!r}")
     return value == "1"
@@ -21,6 +21,20 @@ def render_graph_RTPTSHARCNRD():
         "accumulate": False,
         "seed": 0,
         "enableSHARC": True,
+        "enablePG": True,
+        "pgEnabled": _module_enabled("RTPT_PG_ENABLED"),
+        "pgUseGuiding": True,
+        "pgFreeze": False,
+        "pgDetailedDiagnostics": _module_enabled("RTPT_PG_DIAGNOSTICS_ENABLED", "0"),
+        "pgGuideFraction": 0.5,
+        "pgCoarseLevels": 2,
+        "pgTreeBudgetMB": 64,
+        "pgRecordBudgetMB": 128,
+        "pgPublishInterval": 16,
+        "pgMaxRegions": 16384,
+        "pgMaxNodesPerRegion": 85,
+        "pgUpdateStride": 5,
+        "pgUpdateBounces": 8,
         "sharcEnabled": _module_enabled("RTPT_SHARC_ENABLED"),
         "sharcEntries": 1048576,
         "sharcUpdateStride": 5,

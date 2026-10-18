@@ -4,6 +4,7 @@
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
+#include "RTPTPG.h"
 
 using namespace Falcor;
 
@@ -22,19 +23,34 @@ public:
     void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
+    Properties getPGStatistics() const;
+    void resetPG() { mResetPG = true; mOptionsChanged = true; }
 
 private:
     void reset();
     void validateScene() const;
     void prepareProgram(RenderContext* pRenderContext);
     void bindSHARC(const ShaderVar& rootVar);
-    void executeSHARC(RenderContext* pRenderContext);
     void clearSHARC(RenderContext* pRenderContext);
+    void executeTraining(RenderContext* pRenderContext);
+    void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
-    ref<ComputePass> mpSHARCUpdate;
     ref<ComputePass> mpSHARCResolve;
+    ref<ComputePass> mpSparseUpdate;
+    ref<ComputePass> mpPGPrepare;
+    ref<ComputePass> mpPGTrain;
+    std::unique_ptr<RTPTPG::Manager> mpPG;
+    RTPTPG::Settings mPGSettings;
+    bool mEnablePG = false;
+    bool mResetPG = true;
+    bool mPGTrainingThisFrame = false;
+    bool mSharedTrainingThisFrame = false;
+    uint32_t mPGUpdateStride = 5;
+    uint32_t mPGUpdateBounces = 8;
+    uint32_t mPGFrameIndex = 0;
+    float3 mPGCameraPosition = float3(0.f);
     ref<Buffer> mpSHARCHashEntries;
     ref<Buffer> mpSHARCAccumulation;
     ref<Buffer> mpSHARCResolved;

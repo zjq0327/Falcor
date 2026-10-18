@@ -3,6 +3,15 @@ add_plugin(RTPT)
 target_sources(RTPT PRIVATE
     RTPT.cpp
     RTPT.h
+    RTPTPG.h
+    RTPTPG.cpp
+    RTPTGrid.slang
+    RTPTPGTypes.slang
+    RTPTPG.slang
+    RTPTSampling.slang
+    RTPTPGPrepare.cs.slang
+    RTPTPGTrain.cs.slang
+    RTPTSparseUpdate.cs.slang
     RTPT.cs.slang
     RTPTIntegrator.slang
     RTPTLighting.slang

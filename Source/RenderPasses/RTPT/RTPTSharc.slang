@@ -107,6 +107,7 @@ bool rtptTrySharcQuery(
     BSDFProperties properties,
     uint bounce,
     bool previousDelta,
+    bool previousGuideSelected,
     bool previousDiffuse,
     float previousRoughness,
     float segmentLength,
@@ -119,6 +120,18 @@ bool rtptTrySharcQuery(
         bounce >= gParams.maxBounces || previousDelta || properties.roughness < gSharcSettings.minRoughness ||
         any(properties.emission > 0.f) || (mi.getLobeTypes(sd) & uint(LobeType::DeltaReflection)) != 0)
         return false;
+
+    // A guide can be narrower than the previous BSDF. The BSDF roughness
+    // footprint below therefore does not justify a cached termination on
+    // a guide-selected edge. Keep tracing that edge; later BSDF edges may
+    // still terminate in SHaRC under its existing rules.
+    if (previousGuideSelected)
+    {
+#if ENABLE_PG
+        rtptPGCount(RTPT_PG_DIAG_CACHE_SKIP);
+#endif
+        return false;
+    }
 
     const uint level = HashGridGetLevel(sd.posW, gSharc.hashGridParameters);
     const float voxelSize = HashGridGetVoxelSize(level, gSharc.hashGridParameters);

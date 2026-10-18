@@ -23,8 +23,9 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
     float3 throughput = 1.f;
     float3 previousPosition = 0.f;
     float3 previousNormal = 0.f;
-    float previousBsdfPdf = 0.f;
+    float previousContinuationPdf = 0.f;
     bool previousDelta = true;
+    bool previousGuideSelected = false;
     bool previousUsedNEE = false;
 #if ENABLE_SHARC && SHARC_QUERY
     bool previousDiffuse = false;
@@ -55,7 +56,7 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
             {
                 float misWeight = 1.f;
                 if (previousUsedNEE && !previousDelta)
-                    misWeight = rtptPowerHeuristic(previousBsdfPdf, rtptEnvironmentLightPdf(ray.dir));
+                    misWeight = rtptPowerHeuristic(previousContinuationPdf, rtptEnvironmentLightPdf(ray.dir));
                 const float3 contribution = throughput * gScene.envMap.eval(ray.dir) * misWeight;
                 if (all(isfinite(contribution))) radiance += contribution;
             }
@@ -79,7 +80,7 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
 #if ENABLE_SHARC && SHARC_QUERY
         if (bounce == 0) rtptCaptureSharcPrimary(sd, properties, sharcStats);
         float3 cachedRadiance;
-        if (rtptTrySharcQuery(sd, mi, properties, bounce, previousDelta, previousDiffuse, previousRoughness,
+        if (rtptTrySharcQuery(sd, mi, properties, bounce, previousDelta, previousGuideSelected, previousDiffuse, previousRoughness,
             length(sd.posW - previousPosition), sharcStats, cachedRadiance))
         {
             const float3 contribution = throughput * cachedRadiance;
@@ -101,27 +102,28 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
             if (previousUsedNEE && !previousDelta)
             {
                 const float lightPdf = rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd);
-                misWeight = rtptPowerHeuristic(previousBsdfPdf, lightPdf);
+                misWeight = rtptPowerHeuristic(previousContinuationPdf, lightPdf);
             }
             const float3 contribution = throughput * emission * misWeight;
             if (all(isfinite(contribution))) radiance += contribution;
         }
 
         if (bounce == gParams.maxBounces) break;
+        const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
         if (previousUsedNEE)
         {
-            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sg);
+            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
             if (all(isfinite(contribution))) radiance += contribution;
         }
 
         BSDFSample bs = {};
-        if (!mi.sample(sd, sg, bs)) break;
+        if (!rtptSampleContinuation(sd, mi, sampling, sg, bs, previousGuideSelected)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         previousDelta = bs.isLobe(LobeType::Delta);
 #if ENABLE_SHARC && SHARC_QUERY
-        previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
+        previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
         previousRoughness = properties.roughness;
 #endif
         // A delta sample has a discrete probability; it does not compete in MIS.
@@ -138,7 +140,7 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
 
         previousPosition = sd.posW;
         previousNormal = sd.getOrientedFaceNormal();
-        previousBsdfPdf = bs.pdf;
+        previousContinuationPdf = bs.pdf;
         ray = Ray(sd.computeRayOrigin(), bs.wo);
 #else
         break;

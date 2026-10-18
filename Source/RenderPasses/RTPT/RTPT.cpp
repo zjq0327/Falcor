@@ -2,6 +2,7 @@
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Scene/Material/StandardMaterial.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
+#include "Utils/Timing/Profiler.h"
 #include <cmath>
 #include <limits>
 
@@ -38,10 +39,17 @@ const Gui::DropdownList kSHARCCapacities = {
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, RTPT>();
+    ScriptBindings::registerBinding([](pybind11::module& m)
+    {
+        pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
+        pass.def_property_readonly("pgStats", [](const RTPT& self) { return self.getPGStatistics().toPython(); });
+        pass.def("resetPG", &RTPT::resetPG);
+    });
 }
 
 RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
+    mpPG = std::make_unique<RTPTPG::Manager>(mpDevice);
     setProperties(props);
     mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_UNIFORM);
 }
@@ -58,6 +66,9 @@ void RTPT::setProperties(const Properties& props)
     uint32_t sharcMinBounce = mSHARCMinBounce, sharcAccumulationFrames = mSHARCAccumulationFrames;
     uint32_t sharcStaleFrames = mSHARCStaleFrames, sharcDebugMode = mSHARCDebugMode;
     float sharcSceneScale = mSHARCSceneScale, sharcMinRoughness = mSHARCMinRoughness;
+    bool enablePG = mEnablePG;
+    auto pg = mPGSettings;
+    uint32_t pgUpdateStride = mPGUpdateStride, pgUpdateBounces = mPGUpdateBounces;
     for (const auto& [key, value] : props)
     {
         if (key == "samplesPerPixel") samplesPerPixel = value;
@@ -82,6 +93,22 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "sharcDebugMode") sharcDebugMode = value;
         else if (key == "sharcSceneScale") sharcSceneScale = value;
         else if (key == "sharcMinRoughness") sharcMinRoughness = value;
+        else if (key == "enablePG") enablePG = value;
+        else if (key == "pgEnabled") pg.enabled = value;
+        else if (key == "pgUseGuiding") pg.useGuiding = value;
+        else if (key == "pgFreeze") pg.trainingEnabled = !bool(value);
+        else if (key == "pgDetailedDiagnostics") pg.detailedDiagnostics = value;
+        else if (key == "pgGuideFraction") pg.guideFraction = value;
+        else if (key == "pgTreeBudgetMB") pg.treeBudgetMiB = value;
+        else if (key == "pgRecordBudgetMB") pg.recordBudgetMiB = value;
+        else if (key == "pgCoarseLevels") pg.coarseLevels = value;
+        else if (key == "pgPublishInterval") pg.pollFrames = value;
+        else if (key == "pgMaxRegions") pg.maxRegions = value;
+        else if (key == "pgMaxNodesPerRegion") pg.maxNodesPerRegion = value;
+        else if (key == "pgMaxDirectionalDepth") pg.maxDirectionalDepth = value;
+        else if (key == "pgDirectionalThreshold") pg.directionalThreshold = value;
+        else if (key == "pgUpdateStride") pgUpdateStride = value;
+        else if (key == "pgUpdateBounces") pgUpdateBounces = value;
         else FALCOR_THROW("Unknown RTPT property '{}'.", key);
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
@@ -91,6 +118,19 @@ void RTPT::setProperties(const Properties& props)
         "RTPT NRD mode requires samplesPerPixel=1 and accumulate=false; NRD manages temporal history.");
     FALCOR_CHECK(!enableSHARC || !accumulate,
         "RTPT SHaRC mode requires accumulate=false; its world-space cache changes between frames.");
+    FALCOR_CHECK(!enablePG || !accumulate, "RTPT PG requires accumulate=false; use the independent FrameAccumulation pass.");
+    FALCOR_CHECK(pgUpdateStride >= 1 && pgUpdateStride <= 64 && pgUpdateBounces >= 1 && pgUpdateBounces <= 32,
+        "PG update stride must be in [1,64] and bounces in [1,32].");
+    FALCOR_CHECK(pg.treeBudgetMiB >= 16 && pg.treeBudgetMiB <= 1024 && pg.recordBudgetMiB >= 1 && pg.recordBudgetMiB <= 2048,
+        "PG model budget must be in [16,1024] MiB and record budget in [1,2048] MiB.");
+    FALCOR_CHECK(pg.coarseLevels <= 8 && pg.pollFrames >= 1 && pg.pollFrames <= 1024 && pg.maxRegions >= 1 && pg.maxRegions <= 65536,
+        "Invalid PG coarse level, publish interval or region limit.");
+    FALCOR_CHECK(pg.maxNodesPerRegion >= 1 && pg.maxNodesPerRegion <= 1024 &&
+        pg.maxDirectionalDepth >= 1 && pg.maxDirectionalDepth <= 16 &&
+        std::isfinite(pg.directionalThreshold) && pg.directionalThreshold > 0.f && pg.directionalThreshold <= 1.f,
+        "Invalid PG directional tree limits.");
+    FALCOR_CHECK(std::isfinite(pg.guideFraction) && pg.guideFraction >= 0.f && pg.guideFraction < 1.f,
+        "PG guide fraction must be in [0,1), preserving BSDF support.");
     FALCOR_CHECK(sharcEntries >= (1u << 16) && sharcEntries <= (1u << 22) && (sharcEntries & (sharcEntries - 1)) == 0,
         "SHaRC entries must be a power of two in [65536, 4194304].");
     FALCOR_CHECK(sharcUpdateStride >= 1 && sharcUpdateStride <= 32 && sharcUpdateBounces >= 1 && sharcUpdateBounces <= 32,
@@ -101,10 +141,17 @@ void RTPT::setProperties(const Properties& props)
         "SHaRC accumulation frames must be in [1, 1024] and stale frames in [8, 1024].");
     FALCOR_CHECK(std::isfinite(sharcSceneScale) && sharcSceneScale > 0.f && std::isfinite(sharcMinRoughness) &&
         sharcMinRoughness >= 0.f && sharcMinRoughness <= 1.f, "Invalid SHaRC scene scale or minimum roughness.");
-    if (enableSHARC)
+    if (enableSHARC || enablePG)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
             "RTPT SHaRC currently requires D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
-    const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC;
+    const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enablePG != mEnablePG;
+    const bool pgStructureChanged = enablePG != mEnablePG || pg.coarseLevels != mPGSettings.coarseLevels ||
+        pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
+        pg.maxNodesPerRegion != mPGSettings.maxNodesPerRegion || pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
+    const bool pgDepthChanged = pg.maxDirectionalDepth != mPGSettings.maxDirectionalDepth;
+    const bool pgRecordsChanged = pg.recordBudgetMiB != mPGSettings.recordBudgetMiB || pgUpdateStride != mPGUpdateStride;
+    const bool pgSignalChanged = pgStructureChanged || pg.enabled != mPGSettings.enabled || pg.useGuiding != mPGSettings.useGuiding ||
+        pg.guideFraction != mPGSettings.guideFraction;
     const bool sharcStructureChanged = enableSHARC != mEnableSHARC || sharcEntries != mSHARCEntries ||
         sharcSceneScale != mSHARCSceneScale || sharcUpdateBounces != mSHARCUpdateBounces;
     const bool sharcSignalChanged = sharcStructureChanged || sharcUseCache != mSHARCUseCache ||
@@ -112,12 +159,16 @@ void RTPT::setProperties(const Properties& props)
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
-        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged;
+        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged;
+    mResetPG |= pgStructureChanged || pgDepthChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     if (sharcEntries != mSHARCEntries)
         mpSHARCHashEntries = mpSHARCAccumulation = mpSHARCResolved = nullptr;
     if (modeChanged || sharcUpdateBounces != mSHARCUpdateBounces)
-        mpSHARCUpdate = mpSHARCResolve = nullptr;
+    {
+        mpSHARCResolve = nullptr;
+        mpSparseUpdate = nullptr;
+    }
     mSamplesPerPixel = samplesPerPixel;
     mMaxBounces = maxBounces;
     mRRStartBounce = rrStartBounce;
@@ -140,9 +191,20 @@ void RTPT::setProperties(const Properties& props)
     mSHARCDebugMode = sharcDebugMode;
     mSHARCSceneScale = sharcSceneScale;
     mSHARCMinRoughness = sharcMinRoughness;
+    mEnablePG = enablePG;
+    mPGSettings = pg;
+    mPGUpdateStride = pgUpdateStride;
+    mPGUpdateBounces = pgUpdateBounces;
+    if (pgStructureChanged || pgDepthChanged)
+    {
+        // Drop parameter-block references before rebuilding bounded PG pools.
+        mpComputePass = mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
+    }
+    else if (pgRecordsChanged) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
     if (modeChanged)
     {
         mpComputePass = nullptr;
+        mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
         mpCameraPattern = nullptr;
         mpJitterCamera = nullptr;
         requestRecompile();
@@ -174,6 +236,79 @@ Properties RTPT::getProperties() const
     props["sharcDebugMode"] = mSHARCDebugMode;
     props["sharcSceneScale"] = mSHARCSceneScale;
     props["sharcMinRoughness"] = mSHARCMinRoughness;
+    props["enablePG"] = mEnablePG;
+    props["pgEnabled"] = mPGSettings.enabled;
+    props["pgUseGuiding"] = mPGSettings.useGuiding;
+    props["pgFreeze"] = !mPGSettings.trainingEnabled;
+    props["pgDetailedDiagnostics"] = mPGSettings.detailedDiagnostics;
+    props["pgGuideFraction"] = mPGSettings.guideFraction;
+    props["pgTreeBudgetMB"] = mPGSettings.treeBudgetMiB;
+    props["pgRecordBudgetMB"] = mPGSettings.recordBudgetMiB;
+    props["pgCoarseLevels"] = mPGSettings.coarseLevels;
+    props["pgPublishInterval"] = mPGSettings.pollFrames;
+    props["pgMaxRegions"] = mPGSettings.maxRegions;
+    props["pgMaxNodesPerRegion"] = mPGSettings.maxNodesPerRegion;
+    props["pgMaxDirectionalDepth"] = mPGSettings.maxDirectionalDepth;
+    props["pgDirectionalThreshold"] = mPGSettings.directionalThreshold;
+    props["pgUpdateStride"] = mPGUpdateStride;
+    props["pgUpdateBounces"] = mPGUpdateBounces;
+    return props;
+}
+
+Properties RTPT::getPGStatistics() const
+{
+    Properties props;
+    const auto& s = mpPG->getStatistics();
+    props["enabled"] = mEnablePG && mPGSettings.enabled;
+    props["trainingEnabled"] = mPGSettings.trainingEnabled;
+    props["detailedDiagnostics"] = mPGSettings.detailedDiagnostics;
+    props["regions"] = s.regions;
+    props["readyRegions"] = s.readyRegions;
+    props["observedZeroRegions"] = s.observedZeroRegions;
+    props["readNodes"] = s.readNodes;
+    props["buildNodes"] = s.buildNodes;
+    props["nodeCapacity"] = s.nodeCapacity;
+    props["trainingFrames"] = s.trainingFrames;
+    props["publications"] = s.publications;
+    props["modelBytes"] = s.modelBytes;
+    props["modelReservedBytes"] = s.modelReservedBytes;
+    props["recordBytes"] = s.recordBytes;
+    props["recordReservedBytes"] = s.recordReservedBytes;
+    props["lastPublishMs"] = s.lastPublishMs;
+    props["publishCalls"] = s.publishCalls;
+    props["totalPublishMs"] = s.totalPublishMs;
+    props["maxPublishMs"] = s.maxPublishMs;
+    props["lastDrainMs"] = s.lastDrainMs;
+    props["totalDrainMs"] = s.totalDrainMs;
+    props["lastReadbackMs"] = s.lastReadbackMs;
+    props["totalReadbackMs"] = s.totalReadbackMs;
+    props["lastCpuRebuildMs"] = s.lastCpuRebuildMs;
+    props["totalCpuRebuildMs"] = s.totalCpuRebuildMs;
+    props["lastUploadMs"] = s.lastUploadMs;
+    props["totalUploadMs"] = s.totalUploadMs;
+    props["lastReadbackBytes"] = s.lastReadbackBytes;
+    props["totalReadbackBytes"] = s.totalReadbackBytes;
+    props["lastUploadBytes"] = s.lastUploadBytes;
+    props["totalUploadBytes"] = s.totalUploadBytes;
+    props["lastDrainWaits"] = s.lastDrainWaits;
+    props["totalDrainWaits"] = s.totalDrainWaits;
+    props["lastReadbackWaits"] = s.lastReadbackWaits;
+    props["totalReadbackWaits"] = s.totalReadbackWaits;
+    props["lastUploadWaits"] = s.lastUploadWaits;
+    props["totalUploadWaits"] = s.totalUploadWaits;
+    props["lastZeroFastPathRegions"] = s.lastZeroFastPathRegions;
+    props["totalZeroFastPathRegions"] = s.totalZeroFastPathRegions;
+    props["requestOverflow"] = s.requestOverflow;
+    props["invalidSamples"] = s.invalidSamples;
+    props["recordOverflow"] = s.recordOverflow;
+    props["accumulationOverflow"] = s.accumulationOverflow;
+    props["admissionRejected"] = s.admissionRejected;
+    props["actualStride"] = mpPG->getRecordStride();
+    props["pathCapacity"] = mpPG->getPathCapacity();
+    props["generation"] = mpPG->getGeneration();
+    props["sharedTraining"] = mSharedTrainingThisFrame;
+    for (uint32_t i = 0; i < s.diagnostics.size(); ++i)
+        props["diagnostic" + std::to_string(i)] = s.diagnostics[i];
     return props;
 }
 
@@ -231,12 +366,14 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
     mpComputePass = nullptr;
-    mpSHARCUpdate = mpSHARCResolve = nullptr;
+    mpSHARCResolve = nullptr;
+    mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
     mpEnvMapSampler = nullptr;
     mLightingMask = ~0u;
     mpCameraPattern = nullptr;
     mpJitterCamera = nullptr;
     mResetSHARCCache = true;
+    mResetPG = true;
     reset();
     if (mpScene)
     {
@@ -260,8 +397,9 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     {
         mLightingMask = lightingMask;
         mpComputePass = nullptr;
-        mpSHARCUpdate = nullptr;
+        mpSparseUpdate = nullptr;
         mResetSHARCCache = true;
+        mResetPG = true;
         reset();
     }
     if (mpScene->useEnvLight())
@@ -271,7 +409,8 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     }
     else mpEnvMapSampler = nullptr;
 
-    if (!mpComputePass || (mEnableSHARC && !mpSHARCUpdate))
+    if (!mpComputePass || ((mEnableSHARC || mEnablePG) && !mpSparseUpdate) ||
+        (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && !mpSHARCResolve))
     {
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
@@ -285,10 +424,14 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
-        if (mEnableSHARC)
+        defines.add("ENABLE_PG", mEnablePG ? "1" : "0");
+        if (mEnableSHARC || mEnablePG)
         {
             desc.setShaderModel(ShaderModel::SM6_6);
             desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+        }
+        if (mEnableSHARC)
+        {
             defines.add("SHARC_MATERIAL_DEMODULATION", "1");
             defines.add("SHARC_SEPARATE_EMISSIVE", "1");
             defines.add("SHARC_ENABLE_CACHE_RESAMPLING", "0");
@@ -303,11 +446,11 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         }
         if (!mpComputePass)
             mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
-        if (mEnableSHARC && !mpSHARCUpdate)
+        if ((mEnableSHARC || mEnablePG) && !mpSparseUpdate)
         {
             ProgramDesc updateDesc;
             updateDesc.addShaderModules(mpScene->getShaderModules());
-            updateDesc.addShaderLibrary("RenderPasses/RTPT/RTPTSharcUpdate.cs.slang").csEntry("main");
+            updateDesc.addShaderLibrary("RenderPasses/RTPT/RTPTSparseUpdate.cs.slang").csEntry("main");
             updateDesc.addTypeConformances(mpScene->getTypeConformances());
             updateDesc.setShaderModel(ShaderModel::SM6_6);
             updateDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
@@ -315,13 +458,33 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             updateDefines.add("ENABLE_NRD", "0");
             updateDefines.add("SHARC_UPDATE", "1");
             updateDefines.add("SHARC_QUERY", "0");
-            mpSHARCUpdate = ComputePass::create(mpDevice, updateDesc, updateDefines, true);
+            mpSparseUpdate = ComputePass::create(mpDevice, updateDesc, updateDefines, true);
+        }
+        if (mEnableSHARC && !mpSHARCResolve)
+        {
             ProgramDesc resolveDesc;
             resolveDesc.addShaderLibrary("RenderPasses/RTPT/RTPTSharcResolve.cs.slang").csEntry("main");
             resolveDesc.setShaderModel(ShaderModel::SM6_6);
             resolveDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+            auto updateDefines = defines;
             updateDefines.add("SHARC_UPDATE", "0");
+            updateDefines.add("SHARC_QUERY", "0");
+            updateDefines.add("ENABLE_PG", "0");
             mpSHARCResolve = ComputePass::create(mpDevice, resolveDesc, updateDefines, true);
+        }
+        if (mEnablePG)
+        {
+            DefineList pgDefines;
+            pgDefines.add("ENABLE_PG", "1");
+            auto makePGPass = [&](const char* file)
+            {
+                ProgramDesc pgDesc;
+                pgDesc.addShaderLibrary(file).csEntry("main");
+                pgDesc.setShaderModel(ShaderModel::SM6_6);
+                return ComputePass::create(mpDevice, pgDesc, pgDefines, true);
+            };
+            if (!mpPGPrepare) mpPGPrepare = makePGPass("RenderPasses/RTPT/RTPTPGPrepare.cs.slang");
+            if (!mpPGTrain) mpPGTrain = makePGPass("RenderPasses/RTPT/RTPTPGTrain.cs.slang");
         }
     }
 }
@@ -339,7 +502,8 @@ void RTPT::bindSHARC(const ShaderVar& rootVar)
     sharc["accumulationBuffer"] = mpSHARCAccumulation;
     sharc["resolvedBuffer"] = mpSHARCResolved;
     sharc["radianceScale"] = 1000.f;
-    auto settings = rootVar["gSharcSettings"];
+    auto settings = rootVar.findMember("gSharcSettings");
+    if (!settings.isValid()) return;
     settings["frameDim"] = mFrameDim;
     settings["updateStride"] = mSHARCUpdateStride;
     settings["frameIndex"] = mSHARCFrameIndex;
@@ -366,25 +530,17 @@ void RTPT::clearSHARC(RenderContext* pRenderContext)
     mResetSHARCCache = false;
 }
 
-void RTPT::executeSHARC(RenderContext* pRenderContext)
+void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg)
 {
-    if (!mpSHARCHashEntries)
-    {
-        mpSHARCHashEntries = mpDevice->createStructuredBuffer(8u, mSHARCEntries);
-        mpSHARCAccumulation = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
-        mpSHARCResolved = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
-        mResetSHARCCache = true;
-    }
-    if (mResetSHARCCache) clearSHARC(pRenderContext);
-    if (!mSHARCEnabled || mSHARCFreeze) return;
-    auto var = mpSHARCUpdate->getRootVar();
+    FALCOR_PROFILE(pRenderContext, "SparseTrace");
+    auto var = mpSparseUpdate->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
     mpSampleGenerator->bindShaderData(var);
     if (mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
     auto params = var["gParams"];
     params["frameDim"] = mFrameDim;
     params["samplesPerPixel"] = 1u;
-    params["maxBounces"] = mSHARCUpdateBounces;
+    params["maxBounces"] = bounces;
     params["rrStartBounce"] = mRRStartBounce;
     params["seed"] = mSeed;
     params["sampleOffset"] = mSampleOffset;
@@ -392,16 +548,88 @@ void RTPT::executeSHARC(RenderContext* pRenderContext)
     params["useNEE"] = mUseNEE ? 1u : 0u;
     params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
     params["accumulate"] = 0u;
-    bindSHARC(var);
-    const uint2 updateDim = (mFrameDim + mSHARCUpdateStride - 1u) / mSHARCUpdateStride;
-    mpSHARCUpdate->execute(pRenderContext, uint3(updateDim, 1));
-    pRenderContext->uavBarrier(mpSHARCHashEntries.get());
-    pRenderContext->uavBarrier(mpSHARCAccumulation.get());
-    bindSHARC(mpSHARCResolve->getRootVar());
-    mpSHARCResolve->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
-    pRenderContext->uavBarrier(mpSHARCHashEntries.get());
-    pRenderContext->uavBarrier(mpSHARCAccumulation.get());
-    pRenderContext->uavBarrier(mpSHARCResolved.get());
+    if (mEnableSHARC) bindSHARC(var);
+    if (mEnablePG) mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
+    auto sparse = var["gSparseSettings"];
+    sparse["frameDim"] = mFrameDim;
+    sparse["updateStride"] = stride;
+    sparse["frameIndex"] = frameIndex;
+    sparse["updateBounces"] = bounces;
+    sparse["writeSHARC"] = sharc ? 1u : 0u;
+    sparse["recordPG"] = pg ? 1u : 0u;
+    const uint2 updateDim = (mFrameDim + stride - 1u) / stride;
+    mpSparseUpdate->execute(pRenderContext, uint3(updateDim, 1));
+    if (mEnablePG) mpPG->barrierTraining(pRenderContext);
+    if (mEnableSHARC)
+    {
+        pRenderContext->uavBarrier(mpSHARCHashEntries.get());
+        pRenderContext->uavBarrier(mpSHARCAccumulation.get());
+        pRenderContext->uavBarrier(mpSHARCResolved.get());
+    }
+}
+
+void RTPT::executeTraining(RenderContext* pRenderContext)
+{
+    mPGTrainingThisFrame = mSharedTrainingThisFrame = false;
+    if (mEnableSHARC)
+    {
+        if (!mpSHARCHashEntries)
+        {
+            mpSHARCHashEntries = mpDevice->createStructuredBuffer(8u, mSHARCEntries);
+            mpSHARCAccumulation = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCResolved = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mResetSHARCCache = true;
+        }
+        if (mResetSHARCCache) clearSHARC(pRenderContext);
+    }
+    const bool sharc = mEnableSHARC && mSHARCEnabled && !mSHARCFreeze;
+    bool pg = mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled;
+    if (mEnablePG)
+    {
+        const bool rebuilt = mpPG->prepare(pRenderContext, mPGSettings, mFrameDim, mPGUpdateBounces, mPGUpdateStride);
+        if (mResetPG || rebuilt)
+        {
+            mpPG->reset(pRenderContext);
+            mPGFrameIndex = 0;
+            mPGCameraPosition = mpScene->getCamera()->getPosition();
+            mResetPG = false;
+            reset();
+        }
+        pg &= mpPG->getPathCapacity() > 0;
+        if (pg)
+        {
+            FALCOR_PROFILE(pRenderContext, "PGPrepare");
+            mpPG->beginFrame(pRenderContext);
+            mpPG->bind(mpPGPrepare->getRootVar(), mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, true);
+            mpPGPrepare->execute(pRenderContext, uint3(mpPG->getPathCapacity(), 1, 1));
+            mpPG->barrierTraining(pRenderContext);
+        }
+    }
+    const bool shared = sharc && pg && mpPG->getRecordStride() == mSHARCUpdateStride && mPGUpdateBounces == mSHARCUpdateBounces;
+    mSharedTrainingThisFrame = shared;
+    if (shared) dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, mSHARCFrameIndex, true, true);
+    else
+    {
+        if (sharc) dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, mSHARCFrameIndex, true, false);
+        if (pg) dispatchSparse(pRenderContext, mpPG->getRecordStride(), mPGUpdateBounces, mPGFrameIndex, false, true);
+    }
+    if (pg)
+    {
+        FALCOR_PROFILE(pRenderContext, "PGTrain");
+        mpPG->bind(mpPGTrain->getRootVar(), mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, true);
+        mpPGTrain->execute(pRenderContext, uint3(mpPG->getPathCapacity(), 1, 1));
+        mpPG->barrierTraining(pRenderContext);
+        mPGTrainingThisFrame = true;
+    }
+    if (sharc)
+    {
+        FALCOR_PROFILE(pRenderContext, "SHARCResolve");
+        bindSHARC(mpSHARCResolve->getRootVar());
+        mpSHARCResolve->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
+        pRenderContext->uavBarrier(mpSHARCHashEntries.get());
+        pRenderContext->uavBarrier(mpSHARCAccumulation.get());
+        pRenderContext->uavBarrier(mpSHARCResolved.get());
+    }
 }
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -425,7 +653,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (is_set(updates, IScene::UpdateFlags::RecompileNeeded) || is_set(updates, IScene::UpdateFlags::GeometryChanged))
     {
         mpComputePass = nullptr;
-        mpSHARCUpdate = nullptr;
+        mpSparseUpdate = nullptr;
     }
     if (is_set(updates, IScene::UpdateFlags::GeometryChanged) || is_set(updates, IScene::UpdateFlags::MaterialsChanged))
         validateScene();
@@ -452,13 +680,21 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const auto sharcInvalidations = discontinuities & ~IScene::UpdateFlags::CameraSwitched;
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
     if ((updates & (sharcInvalidations | movingScene)) != IScene::UpdateFlags::None)
+    {
         mResetSHARCCache = true;
+        mResetPG = true;
+    }
+    // First PG version has no LOD hysteresis or cross-LOD model retention.
+    // Actual camera translation restarts PG; projection jitter changes no position.
+    if (mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition))
+        mResetPG = true;
     if ((mEnableNRD ? nrdDiscontinuity : sceneChanged) || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
     mOptionsChanged = false;
 
     const uint2 frameDim(color->getWidth(), color->getHeight());
     if (any(frameDim != mFrameDim) || !mpAccumulation)
     {
+        if (mEnablePG) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
         mFrameDim = frameDim;
         mpAccumulation = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
             ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
@@ -483,16 +719,16 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         pRenderContext->copyResource(color.get(), mpAccumulation.get());
         return;
     }
-    if (mEnableSHARC)
+    if (mEnableSHARC || mEnablePG)
     {
-        if (mResetSHARCCache) mResetNRDHistory = true;
-        executeSHARC(pRenderContext);
+        if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mResetPG)) mResetNRDHistory = true;
+        executeTraining(pRenderContext);
     }
     if (mSampleOffset > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel ||
         mAccumulatedSamples > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel)
         reset();
 
-    if (mEnableNRD && mResetNRDHistory)
+    if ((mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
 
@@ -524,8 +760,21 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         var["gSharcCacheRadiance"] = renderData.getTexture("sharcCacheRadiance");
         var["gSharcStats"] = renderData.getTexture("sharcStats");
     }
+    if (mEnablePG)
+        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false);
     pRenderContext->uavBarrier(mpAccumulation.get());
-    mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
+    {
+        FALCOR_PROFILE(pRenderContext, "MainRender");
+        mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
+    }
+    if (mPGTrainingThisFrame)
+    {
+        FALCOR_PROFILE(pRenderContext, "PGPublishCPU");
+        // A normal proposal publication never invalidates NRD or the final
+        // 128-frame accumulation. Explicit controls/scene resets do above.
+        mpPG->finishTrainingFrame(pRenderContext);
+        ++mPGFrameIndex;
+    }
 
     mSampleOffset += mSamplesPerPixel;
     mAccumulatedSamples = mAccumulate ? mAccumulatedSamples + mSamplesPerPixel : 0u;
@@ -541,6 +790,8 @@ void RTPT::renderUI(Gui::Widgets& widget)
 {
     bool changed = false;
     const bool previousNEE = mUseNEE;
+    const bool previousRR = mUseRussianRoulette;
+    const uint32_t previousSeed = mSeed;
     if (mEnableNRD)
         widget.text("NRD: 1 primary sample, one path per active diffuse/specular lobe.");
     else
@@ -552,7 +803,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
     changed |= widget.checkbox("Russian roulette", mUseRussianRoulette);
     changed |= widget.var("RR start bounce", mRRStartBounce, 1u, 64u);
     changed |= widget.var("Seed", mSeed);
-    if (!mEnableNRD && !mEnableSHARC)
+    if (!mEnableNRD && !mEnableSHARC && !mEnablePG)
     {
         changed |= widget.checkbox("Progressive accumulation", mAccumulate);
         if (mAccumulate)
@@ -569,7 +820,8 @@ void RTPT::renderUI(Gui::Widgets& widget)
     if (!mEnableNRD)
         widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
     mOptionsChanged |= changed;
-    mResetSHARCCache |= previousNEE != mUseNEE;
+    mResetSHARCCache |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
+    mResetPG |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
     if (mEnableSHARC)
     {
         auto sharcWidget = widget.group("SHaRC");
@@ -611,6 +863,64 @@ void RTPT::renderUI(Gui::Widgets& widget)
                 mResetSHARCCache = true;
                 mOptionsChanged = true;
             }
+        }
+    }
+    if (mEnablePG)
+    {
+        auto pgWidget = widget.group("PG");
+        if (pgWidget)
+        {
+            Properties props;
+            bool value = mPGSettings.enabled;
+            if (pgWidget.checkbox("Enabled", value)) props["pgEnabled"] = value;
+            pgWidget.tooltip("Enable guiding and training independently of SHaRC. Switching resets NRD and final accumulation.", true);
+            value = mPGSettings.useGuiding;
+            if (pgWidget.checkbox("Use guiding", value)) props["pgUseGuiding"] = value;
+            value = !mPGSettings.trainingEnabled;
+            if (pgWidget.checkbox("Freeze training", value)) props["pgFreeze"] = value;
+            value = mPGSettings.detailedDiagnostics;
+            if (pgWidget.checkbox("Detailed diagnostics enabled", value)) props["pgDetailedDiagnostics"] = value;
+            pgWidget.tooltip("Count queries and training activity with GPU atomics. Error counters stay enabled. Toggling preserves the model and image history.", true);
+            float fraction = mPGSettings.guideFraction;
+            if (pgWidget.var("Guide fraction", fraction, 0.f, 0.95f)) props["pgGuideFraction"] = fraction;
+            uint32_t number = mPGSettings.coarseLevels;
+            if (pgWidget.var("Coarser grid levels", number, 0u, 8u)) props["pgCoarseLevels"] = number;
+            number = mPGUpdateStride;
+            if (pgWidget.var("Training tile size", number, 1u, 64u)) props["pgUpdateStride"] = number;
+            number = mPGUpdateBounces;
+            if (pgWidget.var("Training bounces", number, 1u, 32u)) props["pgUpdateBounces"] = number;
+            number = mPGSettings.pollFrames;
+            if (pgWidget.var("Publish interval", number, 1u, 1024u)) props["pgPublishInterval"] = number;
+            number = mPGSettings.treeBudgetMiB;
+            if (pgWidget.var("Model budget (MiB)", number, 16u, 1024u)) props["pgTreeBudgetMB"] = number;
+            number = mPGSettings.recordBudgetMiB;
+            if (pgWidget.var("Record budget (MiB)", number, 1u, 2048u)) props["pgRecordBudgetMB"] = number;
+            number = mPGSettings.maxRegions;
+            if (pgWidget.var("Max regions", number, 1u, 65536u)) props["pgMaxRegions"] = number;
+            number = mPGSettings.maxNodesPerRegion;
+            if (pgWidget.var("Max nodes per region", number, 1u, 1024u)) props["pgMaxNodesPerRegion"] = number;
+            number = mPGSettings.maxDirectionalDepth;
+            if (pgWidget.var("Max direction depth", number, 1u, 16u)) props["pgMaxDirectionalDepth"] = number;
+            if (!props.empty()) setProperties(props);
+            if (pgWidget.button("Reset PG")) resetPG();
+            const auto& stats = mpPG->getStatistics();
+            pgWidget.text("Ready regions: " + std::to_string(stats.readyRegions) + " / " + std::to_string(stats.regions));
+            pgWidget.text("Direction nodes (read/build): " + std::to_string(stats.readNodes) + " / " + std::to_string(stats.buildNodes));
+            pgWidget.text("Training frames / publications: " + std::to_string(stats.trainingFrames) + " / " + std::to_string(stats.publications));
+            pgWidget.text("Actual tile size: " + std::to_string(mpPG->getRecordStride()));
+            pgWidget.text("Model reserved MiB: " + std::to_string(double(stats.modelReservedBytes) / (1024. * 1024.)));
+            pgWidget.text("Record MiB: " + std::to_string(double(stats.recordBytes) / (1024. * 1024.)));
+            pgWidget.text("Last publish ms: " + std::to_string(stats.lastPublishMs));
+            pgWidget.text("Publish mean / max ms: " + std::to_string(stats.publishCalls ? stats.totalPublishMs / stats.publishCalls : 0.) +
+                " / " + std::to_string(stats.maxPublishMs));
+            pgWidget.text("Last publish waits (drain/read/upload): " + std::to_string(stats.lastDrainWaits) + " / " +
+                std::to_string(stats.lastReadbackWaits) + " / " + std::to_string(stats.lastUploadWaits));
+            if (!mPGSettings.detailedDiagnostics) pgWidget.text("Detailed activity counters paused; error counters remain enabled.");
+            pgWidget.text("Invalid / record overflow / accumulation overflow: " + std::to_string(stats.invalidSamples) + " / " +
+                std::to_string(stats.recordOverflow) + " / " + std::to_string(stats.accumulationOverflow));
+            pgWidget.text(mSharedTrainingThisFrame ? "Sparse training shared with SHaRC." : "Separate sparse update settings or inactive consumer.");
+            pgWidget.text("PG-selected edges trace on; SHaRC termination remains on BSDF-selected edges.");
+            pgWidget.text("Camera translation resets PG. LOD hysteresis, old LOD retention and maturity fallback are deferred.");
         }
     }
 }

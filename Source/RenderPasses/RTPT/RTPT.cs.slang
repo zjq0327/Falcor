@@ -65,6 +65,7 @@ RWTexture2D<float> gNRDViewZ;
 RWTexture2D<float4> gNRDMotionW;
 #endif
 
+#include "RTPTSampling.slang"
 #include "RTPTLighting.slang"
 #include "RTPTSharc.slang"
 #include "RTPTIntegrator.slang"

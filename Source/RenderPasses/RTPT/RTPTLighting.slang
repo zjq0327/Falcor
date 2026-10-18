@@ -1,5 +1,7 @@
 #pragma once
 
+#include "RTPTSampling.slang"
+
 // All directional PDFs in this file are measured in solid angle. LiOverPdf
 // includes both the light category probability and the sampler's own PDF.
 struct RTPTLightSample
@@ -168,7 +170,7 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
         all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
 }
 
-float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg)
+float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg)
 {
     RTPTLightSample ls;
     if (!rtptSampleLight(sd, sg, ls)) return float3(0.f);
@@ -178,9 +180,9 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGene
     float misWeight = 1.f;
     if (!ls.analytic)
     {
-        const float bsdfPdf = mi.evalPdf(sd, ls.dir);
-        if (!isfinite(bsdfPdf)) return float3(0.f);
-        misWeight = rtptPowerHeuristic(ls.pdf, bsdfPdf);
+        const float continuationPdf = rtptContinuationPdf(sd, mi, sampling, ls.dir);
+        if (!isfinite(continuationPdf)) return float3(0.f);
+        misWeight = rtptPowerHeuristic(ls.pdf, continuationPdf);
     }
 
     // mi.eval() already includes the shading-normal cosine.
@@ -190,19 +192,26 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGene
     return query.traceVisibilityRay(ls.visibilityRay) ? contribution : float3(0.f);
 }
 
+// Sparse cache updates intentionally retain the original BSDF-only transport.
+float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg)
+{
+    return rtptEstimateDirect(sd, mi, rtptBSDFSamplingContext(), sg);
+}
+
 #if ENABLE_NRD
 /** Evaluate a previously sampled and visibility-tested light for one component.
     A diffuse continuation and a specular continuation are both generated, so
-    each component competes with its own BSDF PDF rather than the mixed PDF.
+    each component competes with its own BSDF/guide continuation density.
 */
-float3 rtptEvaluateDirectComponent(ShadingData sd, IMaterialInstance mi, RTPTLightSample ls, inout SampleGenerator sg)
+float3 rtptEvaluateDirectComponent(
+    ShadingData sd, IMaterialInstance mi, RTPTLightSample ls, RTPTSamplingContext sampling, inout SampleGenerator sg)
 {
     float misWeight = 1.f;
     if (!ls.analytic)
     {
-        const float bsdfPdf = mi.evalPdf(sd, ls.dir);
-        if (!isfinite(bsdfPdf)) return float3(0.f);
-        misWeight = rtptPowerHeuristic(ls.pdf, bsdfPdf);
+        const float continuationPdf = rtptContinuationPdf(sd, mi, sampling, ls.dir);
+        if (!isfinite(continuationPdf)) return float3(0.f);
+        misWeight = rtptPowerHeuristic(ls.pdf, continuationPdf);
     }
     const float3 contribution = mi.eval(sd, ls.dir, sg) * ls.LiOverPdf * misWeight;
     return all(isfinite(contribution)) ? contribution : float3(0.f);
