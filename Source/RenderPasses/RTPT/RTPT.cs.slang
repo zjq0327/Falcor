@@ -72,6 +72,9 @@ RWTexture2D<float4> gNRDMotionW;
 #if ENABLE_NRD
 #include "RTPTNRD.slang"
 #endif
+#if ENABLE_VXPG
+#include "RTPTVXPGIntegrator.slang"
+#endif
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -92,9 +95,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if ENABLE_NRD
         // NRD mode uses one shared primary sample and one continuation per
         // reflection component. The host enforces 1 spp without PT accumulation.
-        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg, sharcStats);
+        float3 sampleRadiance;
+#if ENABLE_VXPG
+        if (rtptVXPGRenderingActive()) sampleRadiance = rtptVXPGTraceNRD(primaryRay, pixel, sampleIndex, sharcStats);
+        else
+#endif
+        sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg, sharcStats);
 #else
-        const float3 sampleRadiance = rtptTracePath(primaryRay, sg, sharcStats);
+        float3 sampleRadiance;
+#if ENABLE_VXPG
+        if (rtptVXPGRenderingActive()) sampleRadiance = rtptVXPGTracePath(primaryRay, pixel, sampleIndex, sharcStats);
+        else
+#endif
+        sampleRadiance = rtptTracePath(primaryRay, sg, sharcStats);
 #endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
     }

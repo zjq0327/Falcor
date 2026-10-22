@@ -2,4 +2,8 @@ NVIDIA Spatially Hashed Radiance Cache (SHaRC) 1.8.3
 Source: https://github.com/NVIDIA-RTX/SHARC
 Commit: 4e21b585c33c83d723ca9a1e11bbb1090d145793
 Files: include/HashGridCommon.h, include/HashGridTypes.h, include/SharcCommon.h, include/SharcTypes.h
-The upstream headers are unmodified. See License.md for the NVIDIA SDK license.
+See License.md for the NVIDIA SDK license; copyright notices are retained.
+RTPT modification (2026-10-19): SharcCommon.h has an opt-in
+RTPT_SHARC_SPLIT_RESOLVE path with immutable hash/resolved inputs and separate
+resolve destinations for VXPG-A's paired local/suffix cache. The default path
+is unchanged. No shared Falcor framework or material implementation is modified.

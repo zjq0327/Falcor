@@ -180,6 +180,10 @@
 
 #include "SharcTypes.h"
 
+#ifndef RTPT_SHARC_SPLIT_RESOLVE
+#define RTPT_SHARC_SPLIT_RESOLVE 0
+#endif
+
 struct SharcParameters
 {
     HashGridParameters hashGridParameters;
@@ -188,6 +192,12 @@ struct SharcParameters
 
     RW_STRUCTURED_BUFFER(accumulationBuffer, SharcAccumulationData);
     RW_STRUCTURED_BUFFER(resolvedBuffer, SharcPackedData);
+#if RTPT_SHARC_SPLIT_RESOLVE
+    // RTPT A: immutable source/hash snapshot, separate destinations. This
+    // keeps the local/suffix histories and adjacent-LOD weights identical.
+    RW_STRUCTURED_BUFFER(resolvedDestination, SharcPackedData);
+    RW_STRUCTURED_BUFFER(hashEntriesDestination, HashGridKey);
+#endif
 };
 
 struct SharcState
@@ -823,6 +833,17 @@ HashGridKey SharcGetAdjacentLevelHashKey(HashGridKey hashGridKey, HashGridParame
     return modifiedHashGridKey;
 }
 
+#if RTPT_SHARC_SPLIT_RESOLVE
+#if SHARC_ENABLE_FADE_ACCELERATION
+#error Paired RTPT resolve requires a common fade policy; the integration uses SHARC_ENABLE_FADE_ACCELERATION=0.
+#endif
+#define RTPT_SHARC_RESOLVED_OUTPUT(p) p.resolvedDestination
+#define RTPT_SHARC_HASH_OUTPUT(p) p.hashEntriesDestination
+#else
+#define RTPT_SHARC_RESOLVED_OUTPUT(p) p.resolvedBuffer
+#define RTPT_SHARC_HASH_OUTPUT(p) p.hashGridData.hashEntriesBuffer
+#endif
+
 void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcResolveParameters resolveParameters)
 {
     if (entryIndex >= sharcParameters.hashGridData.capacity)
@@ -830,7 +851,13 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
 
     HashGridKey hashGridKey = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex);
     if (hashGridKey == HASH_GRID_INVALID_HASH_KEY)
+    {
+#if RTPT_SHARC_SPLIT_RESOLVE
+        BUFFER_AT_OFFSET(RTPT_SHARC_RESOLVED_OUTPUT(sharcParameters), entryIndex) = SharcZeroPackedData();
+        BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex) = SharcZeroAccumulationData();
+#endif
         return;
+    }
 
     bool isResponsiveSignal = false;
 #if SHARC_ENABLE_RESPONSIVE_LIGHTING
@@ -858,19 +885,22 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
         SharcAccumulationData zeroAccumulationData = SharcZeroAccumulationData();
         SharcPackedData zeroPackedData = SharcZeroPackedData();
 
-        BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex) = HASH_GRID_INVALID_HASH_KEY;
+        BUFFER_AT_OFFSET(RTPT_SHARC_HASH_OUTPUT(sharcParameters), entryIndex) = HASH_GRID_INVALID_HASH_KEY;
         BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex) = zeroAccumulationData;
-        BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = zeroPackedData;
+        BUFFER_AT_OFFSET(RTPT_SHARC_RESOLVED_OUTPUT(sharcParameters), entryIndex) = zeroPackedData;
         return;
     }
     else if (sampleNum == 0 && !isResponsiveSignal)
     {
         // Resolve dispatches exactly one thread per entry, so no atomic is needed.
-        BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex).sampleData = resolvedData.sampleData + ((1 << SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET) | (1 << SHARC_STALE_FRAME_NUM_BIT_OFFSET));
+#if RTPT_SHARC_SPLIT_RESOLVE
+        BUFFER_AT_OFFSET(RTPT_SHARC_RESOLVED_OUTPUT(sharcParameters), entryIndex) = resolvedData;
+#endif
+        BUFFER_AT_OFFSET(RTPT_SHARC_RESOLVED_OUTPUT(sharcParameters), entryIndex).sampleData = resolvedData.sampleData + ((1 << SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET) | (1 << SHARC_STALE_FRAME_NUM_BIT_OFFSET));
 #if SHARC_ENABLE_FADE_ACCELERATION
         uint bitOffset = resolveParameters.frameIndex % 32u;
         uint bit = 1u << bitOffset;
-        BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex).sampleDataExt = resolvedData.sampleDataExt | bit;
+        BUFFER_AT_OFFSET(RTPT_SHARC_RESOLVED_OUTPUT(sharcParameters), entryIndex).sampleDataExt = resolvedData.sampleDataExt | bit;
 #endif // SHARC_ENABLE_FADE_ACCELERATION
         return;
     }
@@ -971,7 +1001,7 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
     }
 #endif // SHARC_BLEND_ADJACENT_LEVELS
 
-    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum, sharcVoxelData.sampleDataExt);
+    BUFFER_AT_OFFSET(RTPT_SHARC_RESOLVED_OUTPUT(sharcParameters), entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum, sharcVoxelData.sampleDataExt);
 
 #if !SHARC_ENABLE_RESPONSIVE_LIGHTING
     // Clear buffer entry for the next frame
@@ -979,3 +1009,6 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
     BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex) = zeroAccumulationData;
 #endif // !SHARC_ENABLE_RESPONSIVE_LIGHTING
 }
+
+#undef RTPT_SHARC_RESOLVED_OUTPUT
+#undef RTPT_SHARC_HASH_OUTPUT

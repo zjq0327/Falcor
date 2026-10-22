@@ -10,6 +10,8 @@ struct RTPTLightSample
     float3 LiOverPdf;
     float pdf;
     bool analytic;
+    float3 targetPosition;
+    bool finiteTarget;
     Ray visibilityRay;
 };
 
@@ -139,6 +141,8 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
         result.dir = ls.dir;
         result.LiOverPdf = ls.Le / result.pdf;
         const float3 lightOrigin = computeRayOrigin(ls.posW, ls.normalW);
+        result.targetPosition = ls.posW;
+        result.finiteTarget = true;
         const float3 shadowVector = lightOrigin - origin;
         const float distance = length(shadowVector);
         if (!(distance > 0.f) || !isfinite(distance)) return false;

@@ -1,4 +1,34 @@
-# RTPT、PG、SHaRC 与 NRD
+# RTPT、VXPG、PG、SHaRC 与 NRD
+
+## VXPG 接入与使用
+
+VXPG 已接入普通 PT 和主图的 NRD diffuse/specular 路径，所有求交保持 ComputePass + RayQuery。独立模型包含三角形裁剪的包围体素、当前帧 BRDF 光照注入、128 位可见性描述、MRCS K-means++ 聚类、Morton GPU 排序、簇内树和超像素顶层树。构建及发布不做每帧 CPU 分布读回；窗口中的 Read GPU statistics 会主动读取一次诊断快照。
+
+体素质量为正光照观察的平均值乘包围盒最大面面积。顶层按每个超像素/体素簇的 32 对实际成员估计材质贡献、距离衰减和可见性，并保留 5% 几何重要性正则化；超像素成员收集、前缀和、散射与建树全部在 GPU 上完成。
+
+统一入口仍为根目录 `RTPR_START.cmd`，加载 VeachAjar 和 `scripts/RTPTSHARCNRD.py`，默认输出 `ToneMapper.dst`，保留 SHaRC、NRD、最终 128 帧 Stop 累积和 ToneMapper。交付默认 **VXPG 开启、ShortBranch A、PG 缓存关闭**。完整行为见 [实施计划](VXPG_IMPLEMENTATION_PLAN.md) 和 [接口契约](VXPG_DESIGN_CONTRACT.md)。
+
+CMD 顶部的 `RTPT_GUIDING_MODE` 选择 `BSDF`、`PG` 或 `VXPG`；`RTPT_VXPG_ENABLED=1/0` 控制 VXPG，窗口中对应 **RTPT → Guiding mode** 和 **VXPG → Enabled**。未选中的旧 PG 不采样、不训练，参数保留。VXPG 的 **Use guiding** 只停止采样；**Freeze updates** 停止模型构建；**Reset VXPG** 使模型失效并重建。冻结后改变相机、几何或光照会先回退 BSDF，解冻后恢复。
+
+两个版本都在第一跳加入 VXPG，只允许物理 bounce=0/1 使用它，bounce>=2 仅 BRDF：
+
+- `RTPT_VXPG_ESTIMATOR=ShortBranch`：A。在每个实际展开且可引导的顶点，先独立完成 PG 短支路，再处理 BRDF 主路径。BRDF 命中 SHaRC 时立即终止自身后续，当前 PG 已完成。PG 不递归；真实首个命中不属于所选体素时作为空样本，不重抽、不改走 BRDF。
+- `RTPT_VXPG_PG_SHARC_ENABLED=0/1`：A 的 PG SHaRC 开关，窗口中为 **VXPG → PG SHaRC → Enabled**。关闭时 PG 计算真实直接光与自发光；开启且缓存资格/配对记录有效时返回完整缓存，否则仍计算真实局部项。缓存存在不会使 PG 被丢弃。局部项用 p/q 分配，后缀只在 H_G=1 的区域用 p/(p+H_G*q) 分配，BRDF 与 PG 共同使用同一命中事件的资格规则。
+- `RTPT_VXPG_ESTIMATOR=MixturePath`：B。先按 Guide fraction 选择 BRDF/PG，再追踪并按实际混合密度继续完整路径。PG 来源的当前边不查询 SHaRC，后续 BRDF 边仍可查询。A 的 PG 缓存设置在 B 中保留但不生效。
+
+NRD 两个分量各自使用自己的条件 PDF、贡献和首次 BRDF 距离。A 使用已有主 BRDF 射线；B 首表面选中 PG 时，额外从同一个表面发射独立的同分量 BRDF 距离射线，仅做一次最近有效求交。它不计算亮度、阴影或缓存，不继续反弹，不增加递归。普通 PT 没有该辅助射线。
+
+主图关闭下游 NRD 滤波时，仍保留 `enableNRD=True` 的分量信号路径用于直通合成，因此 B 的距离辅助也仍保留。要测没有该成本的普通 PT，使用 `enableNRD=False` 的测试图；不能把下游滤波开关的关闭当成切换到了普通 PT。
+
+A 的缓存 C/R 与 full 共用 hash、计数、调制和历史规则，使用不可变快照 Resolve。额外内存为 **120 B/entry**，默认 1M 项额外占用 120 MiB；该内存与 VXPG 模型预算分开报告。PG 缓存开关不改变训练目标，也不因切换而重新预热缓存。SHaRC 仍是近似缓存：插值/足迹、有限历史和更新路径长度都可能引入误差，MIS 不会消除这些近似。A 的 PG 缓存默认关闭，用于对照实验。
+
+`RTPT_VXPG_VISIBILITY_ENABLED=1/0` 对应 **Visibility Enabled**；关闭时停止可见性/聚类构建，使用全局体素分布。`RTPT_VXPG_DEBUG_ENABLED=1/0` 对应 **Debug Enabled**；关闭额外调试追踪/绘制，独立 `RTPT.vxpgDebug` 输出保持可用。Debug view 可查看体素、超像素、体素簇与可见性描述，均不接入 NRD。模型容量溢出、零质量、预算不足或冻结后失效时回退 BSDF，诊断快照和 `vxpgStats` 显示原因。
+
+参考为 [VXPG 固定提交](https://github.com/SuikaSibyl/SIByLEngine2023/tree/8c1adad28c16e07592bc79122cb9d0c9738699bc)。本项目采用等价的 GPU radix sort 和按 Morton 次序组织的簇堆，使用明确条件化的模糊超像素和正反一致 PDF；并非原 Vulkan 实验代码的逐位移植。细小/远处病态盒子使用保守包围锥，锥外/盒外失败保留空质量。当前支持 RTPT 既有的反射型 StandardMaterial 三角形场景、alpha 纹理、实例变换；skinning/顶点缓存形变尚未验证，明确回退 BSDF，不修改共享框架。
+
+2026-10-22 按用户要求删除 RTPT/VXPG 专项测试：`tests/RTPT/` 下的验证脚本、基准脚本、依赖清单和两个专用场景（共 6 个文件），以及 FalcorTest 的 6 个 `RTPTVXPG*` C++/Slang 文件、对应 CMake 注册和运行目录中的测试 shader 副本。Falcor 通用测试、正式渲染代码、主入口、优化计划及历史性能报告保留。下述 10 项 GPU 测试和脚本运行结果属于删除前的历史证据，相关命令当前不可直接重跑；日常运行继续使用 `RTPR_START.cmd`。
+
+Release 构建、10 项 GPU 测试和主图组合回归通过。**当前没有性能优势**：RTX 5070 的 VeachAjar 1080p 完整图，旧 PG/A缓存关/A缓存开/B 分别约 15.58/41.14/41.40/36.71 ms；短时 raw HDR 质量也未优于旧 PG。默认 A 是固定双样本实验基线。协议、显存、缓存近似、自发光材质连续编辑的共享内存限制及全部证据见 [验收结果](VXPG_VALIDATION_RESULTS.md)。
 
 ## 当前修改范围与 Material 恢复状态
 

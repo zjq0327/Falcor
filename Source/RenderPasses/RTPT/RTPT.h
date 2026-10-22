@@ -5,6 +5,7 @@
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include "RTPTPG.h"
+#include "RTPTVXPG.h"
 
 using namespace Falcor;
 
@@ -25,12 +26,15 @@ public:
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getPGStatistics() const;
     void resetPG() { mResetPG = true; mOptionsChanged = true; }
+    Properties getVXPGStatistics() const;
+    void resetVXPG() { mpVXPG->invalidate(); mOptionsChanged = true; }
 
 private:
     void reset();
     void validateScene() const;
     void prepareProgram(RenderContext* pRenderContext);
-    void bindSHARC(const ShaderVar& rootVar);
+    void bindSHARC(const ShaderVar& rootVar, bool resolve = false);
+    bool usesPairedSharc() const;
     void clearSHARC(RenderContext* pRenderContext);
     void executeTraining(RenderContext* pRenderContext);
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
@@ -43,6 +47,11 @@ private:
     ref<ComputePass> mpPGTrain;
     std::unique_ptr<RTPTPG::Manager> mpPG;
     RTPTPG::Settings mPGSettings;
+    std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
+    RTPTVXPG::Settings mVXPGSettings;
+    std::string mVXPGDiagnosticText;
+    RTPTVXPG::GuidingMode mGuidingMode = RTPTVXPG::GuidingMode::PG;
+    bool mEnableVXPG = false;
     bool mEnablePG = false;
     bool mResetPG = true;
     bool mPGTrainingThisFrame = false;
@@ -54,6 +63,9 @@ private:
     ref<Buffer> mpSHARCHashEntries;
     ref<Buffer> mpSHARCAccumulation;
     ref<Buffer> mpSHARCResolved;
+    ref<Buffer> mpSHARCHashSnapshot, mpSHARCResolvedNext;
+    ref<Buffer> mpSHARCLocalAccumulation, mpSHARCLocalResolved, mpSHARCLocalNext;
+    ref<Buffer> mpSHARCSuffixAccumulation, mpSHARCSuffixResolved, mpSHARCSuffixNext;
     ref<SampleGenerator> mpSampleGenerator;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
     ref<Texture> mpAccumulation;

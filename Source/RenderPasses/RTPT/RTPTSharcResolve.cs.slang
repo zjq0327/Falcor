@@ -11,4 +11,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     resolve.staleFrameNumMax = gSharcSettings.staleFrames;
     resolve.frameIndex = gSharcSettings.frameIndex;
     SharcResolveEntry(dispatchThreadID.x, gSharc, resolve);
+#if RTPT_SHARC_PAIR
+    SharcResolveEntry(dispatchThreadID.x, gSharcLocal, resolve);
+    SharcResolveEntry(dispatchThreadID.x, gSharcSuffix, resolve);
+#endif
 }

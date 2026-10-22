@@ -84,7 +84,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
 #endif
             if (!all(isfinite(environment))) { valid = false; break; }
 #if ENABLE_SHARC
-            if (gSparseSettings.writeSHARC != 0u) SharcUpdateMiss(gSharc, sharcState, environment * hitMIS);
+            if (gSparseSettings.writeSHARC != 0u) rtptSharcUpdateMiss(sharcState, environment * hitMIS);
 #endif
             // A terminal pseudo-vertex preserves raw environment and arrival MIS separately.
             if (record)
@@ -131,7 +131,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         if (bounce == gSparseSettings.updateBounces)
         {
 #if ENABLE_SHARC
-            if (gSparseSettings.writeSHARC != 0u) SharcUpdateMiss(gSharc, sharcState, emission * hitMIS);
+            if (gSparseSettings.writeSHARC != 0u) rtptSharcUpdateMiss(sharcState, emission * hitMIS);
 #endif
             if (record) rtptPGStoreVertex(path, count, vertex, valid);
             break;
@@ -143,8 +143,8 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         if (gSparseSettings.writeSHARC != 0u)
         {
             const SharcHitData cacheHit = rtptMakeSharcHit(sd, properties, emission * hitMIS);
-            if (!SharcUpdateHit(gSharc, sharcState, cacheHit, vertex.direct, sampleNext1D(sg)))
-                SharcUpdateMiss(gSharc, sharcState, vertex.direct + emission * hitMIS);
+            if (!rtptSharcUpdateHit(sharcState, cacheHit, vertex.direct, sampleNext1D(sg)))
+                rtptSharcUpdateMiss(sharcState, vertex.direct + emission * hitMIS);
         }
 #endif
         BSDFSample bs = {};

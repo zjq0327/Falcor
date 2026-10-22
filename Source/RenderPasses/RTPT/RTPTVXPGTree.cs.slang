@@ -1,0 +1,154 @@
+#include "RTPTVXPGDistribution.slang"
+
+cbuffer VXPGClusterBuild { uint sortShift; uint sortCapacity; uint sortGroups; uint treeLevel; };
+RWStructuredBuffer<uint2> gVXPGSortInput;
+RWStructuredBuffer<uint2> gVXPGSortOutput;
+RWStructuredBuffer<uint> gVXPGHistogram;
+RWStructuredBuffer<uint> gVXPGBinOffsets;
+
+uint rtptVXPGMorton(uint3 xyz)
+{
+    uint result=0;
+    for (uint bit=0;bit<7;++bit)
+        result|=((xyz.x>>bit)&1u)<<(3*bit) | ((xyz.y>>bit)&1u)<<(3*bit+1) | ((xyz.z>>bit)&1u)<<(3*bit+2);
+    return result;
+}
+
+[numthreads(256,1,1)]
+void encodeVoxels(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x>=sortCapacity) return;
+    uint2 code=uint2(RTPT_VXPG_INVALID);
+    if (tid.x<min(gVXPGState[3],gVXPGParams.activeCapacity))
+    {
+        code=uint2((gVXPGCluster[tid.x]<<21)|rtptVXPGMorton(rtptVXPGUnflatten(gVXPGCompact[tid.x])),tid.x);
+    }
+    gVXPGSortOutput[tid.x]=code;
+}
+
+groupshared uint histogram[256];
+groupshared uint keys[256];
+[numthreads(256,1,1)]
+void radixHistogram(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex, uint3 group : SV_GroupID)
+{
+    histogram[lane]=0;
+    GroupMemoryBarrierWithGroupSync();
+    if (tid.x<sortCapacity)
+        InterlockedAdd(histogram[(gVXPGSortInput[tid.x].x>>sortShift)&255u],1u);
+    GroupMemoryBarrierWithGroupSync();
+    gVXPGHistogram[group.x*256+lane]=histogram[lane];
+}
+
+[numthreads(256,1,1)]
+void radixPrefix(uint lane : SV_GroupIndex)
+{
+    uint sum=0;
+    for (uint group=0;group<sortGroups;++group)
+    {
+        const uint offset=group*256+lane;
+        const uint count=gVXPGHistogram[offset];
+        gVXPGHistogram[offset]=sum;
+        sum+=count;
+    }
+    histogram[lane]=sum;
+    GroupMemoryBarrierWithGroupSync();
+    // 256-bin scan is bounded and independent of active voxel count.
+    if (lane==0)
+    {
+        uint prefix=0;
+        for (uint bin=0;bin<256;++bin) { gVXPGBinOffsets[bin]=prefix; prefix+=histogram[bin]; }
+    }
+}
+
+[numthreads(256,1,1)]
+void radixScatter(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex, uint3 group : SV_GroupID)
+{
+    const uint2 code=tid.x<sortCapacity?gVXPGSortInput[tid.x]:uint2(RTPT_VXPG_INVALID);
+    const uint bin=(code.x>>sortShift)&255u;
+    keys[lane]=bin;
+    GroupMemoryBarrierWithGroupSync();
+    if (tid.x>=sortCapacity) return;
+    // Stable rank within this block. No wave-size assumption or CPU readback.
+    uint rank=0;
+    for (uint i=0;i<lane;++i) if (keys[i]==bin) ++rank;
+    const uint offset=gVXPGBinOffsets[bin]+gVXPGHistogram[group.x*256+bin]+rank;
+    gVXPGSortOutput[offset]=code;
+}
+
+[numthreads(1,1,1)]
+void allocateForest(uint3 tid : SV_DispatchThreadID)
+{
+    uint first=0, nodes=0, nonempty=0;
+    for (uint c=0;c<32;++c)
+    {
+        const uint count=gVXPGClusterInfo[c].y;
+        uint leaves=1;
+        while (leaves<count) leaves*=2;
+        gVXPGClusterInfo[c]=uint4(first,count,nodes,leaves);
+        if (count>0) ++nonempty;
+        first+=count;
+        nodes+=2*leaves;
+    }
+    // Sum(nextPow2(n)) < 2*N plus empty cluster roots.
+    gVXPGClusterState[1]=nonempty;
+    gVXPGClusterState[4]=nodes;
+    if (nodes>4*gVXPGParams.activeCapacity+64) InterlockedAdd(gVXPGState[11],1u);
+}
+
+[numthreads(256,1,1)]
+void initializeForest(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x>=4*gVXPGParams.activeCapacity+64) return;
+    RTPTVXPGNode node={};
+    node.compact=RTPT_VXPG_INVALID;
+    gVXPGForest[tid.x]=node;
+}
+
+[numthreads(256,1,1)]
+void forestLeaves(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x>=min(gVXPGState[3],gVXPGParams.activeCapacity)) return;
+    const uint compact=gVXPGSortInput[tid.x].y;
+    const uint cell=gVXPGCompact[compact], cluster=gVXPGCluster[compact];
+    const uint4 info=gVXPGClusterInfo[cluster];
+    const uint leaf=info.z+info.w+tid.x-info.x;
+    RTPTVXPGNode node={};
+    node.lo=rtptVXPGWorldMin(cell); node.hi=rtptVXPGWorldMax(cell);
+    node.mass=gVXPGMass[compact]; node.compact=compact;
+    gVXPGForest[leaf]=node;
+    gVXPGCompactToLeaf[compact]=leaf-info.z;
+}
+
+[numthreads(256,1,1)]
+void forestLevel(uint3 tid : SV_DispatchThreadID)
+{
+    const uint c=tid.y;
+    if (c>=gVXPGParams.clusterCount) return;
+    const uint4 info=gVXPGClusterInfo[c];
+    const uint offset=info.w>>treeLevel;
+    if (offset==0 || tid.x>=offset) return;
+    const uint node=info.z+offset+tid.x;
+    const RTPTVXPGNode left=gVXPGForest[info.z+2*(offset+tid.x)];
+    const RTPTVXPGNode right=gVXPGForest[info.z+2*(offset+tid.x)+1];
+    RTPTVXPGNode parent={};
+    parent.mass=left.mass+right.mass;
+    parent.lo=left.mass>0.f?(right.mass>0.f?min(left.lo,right.lo):left.lo):right.lo;
+    parent.hi=left.mass>0.f?(right.mass>0.f?max(left.hi,right.hi):left.hi):right.hi;
+    parent.compact=RTPT_VXPG_INVALID;
+    gVXPGForest[node]=parent;
+}
+
+[numthreads(1,1,1)]
+void publishClusters(uint3 tid : SV_DispatchThreadID)
+{
+    float sum=0.f;
+    for (uint c=0;c<gVXPGParams.clusterCount;++c)
+    {
+        const uint4 info=gVXPGClusterInfo[c];
+        sum+=gVXPGForest[info.z+1].mass;
+    }
+    const float root=gVXPGGlobalTree[1];
+    const bool valid=gVXPGClusterState[1]>0 && isfinite(sum) && root>0.f && abs(sum-root)<=max(1.e-4f,root*1.e-4f);
+    gVXPGClusterState[6]=valid?gVXPGParams.generation:0;
+    if (!valid && root>0.f) InterlockedAdd(gVXPGState[11],1u);
+}

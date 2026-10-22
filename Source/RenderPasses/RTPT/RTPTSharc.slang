@@ -40,6 +40,7 @@ struct RTPTSharcSettings
 };
 
 ParameterBlock<SharcParameters> gSharc;
+#include "RTPTSharcPairCommon.slang"
 ConstantBuffer<RTPTSharcSettings> gSharcSettings;
 
 #if SHARC_UPDATE || SHARC_QUERY
@@ -152,6 +153,30 @@ bool rtptTrySharcQuery(
     ++stats.cacheTerminations;
     return true;
 }
+
+#if RTPT_SHARC_PAIR
+// No counters or side effects: also used at a BRDF hit to answer the
+// hypothetical PG eligibility question in the same path-event space.
+bool rtptSharcPairEligible(ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce,
+    bool previousDelta, bool guideSource, bool allowGuide, bool previousDiffuse, float previousRoughness, float segmentLength)
+{
+    if (gSharcSettings.useCache == 0 || bounce == 0 || bounce < gSharcSettings.minBounce ||
+        bounce >= gParams.maxBounces || previousDelta || properties.roughness < gSharcSettings.minRoughness ||
+        any(properties.emission > 0.f) || (mi.getLobeTypes(sd) & uint(LobeType::DeltaReflection)) != 0) return false;
+    if (guideSource && !allowGuide) return false;
+    const uint level = HashGridGetLevel(sd.posW, gSharc.hashGridParameters);
+    const float voxelSize = HashGridGetVoxelSize(level, gSharc.hashGridParameters);
+    if (!(segmentLength >= voxelSize)) return false;
+    if (!previousDiffuse)
+    {
+        const float alpha = previousRoughness * previousRoughness;
+        const float alpha2 = alpha * alpha;
+        const float footprint = 2.f * segmentLength * sqrt(0.5f * alpha2 / max(1.e-6f, 1.f-alpha2));
+        if (!(footprint >= voxelSize)) return false;
+    }
+    return true;
+}
+#endif
 
 float3 rtptSharcOccupancy(uint2 pixel)
 {

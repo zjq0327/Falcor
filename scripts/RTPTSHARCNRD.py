@@ -9,6 +9,13 @@ def _module_enabled(name, default="1"):
     return value == "1"
 
 
+def _choice(name, choices, default):
+    value = os.environ.get(name, default).strip()
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {choices}, got {value!r}")
+    return value
+
+
 def render_graph_RTPTSHARCNRD():
     graph = RenderGraph("RTPTSHARCNRD")
     graph.addPass(createPass("RTPT", {
@@ -22,6 +29,13 @@ def render_graph_RTPTSHARCNRD():
         "seed": 0,
         "enableSHARC": True,
         "enablePG": True,
+        "enableVXPG": True,
+        "guidingMode": _choice("RTPT_GUIDING_MODE", ("BSDF", "PG", "VXPG"), "VXPG"),
+        "vxpgEnabled": _module_enabled("RTPT_VXPG_ENABLED", "1"),
+        "vxpgEstimator": _choice("RTPT_VXPG_ESTIMATOR", ("ShortBranch", "MixturePath"), "ShortBranch"),
+        "vxpgPGUseCache": _module_enabled("RTPT_VXPG_PG_SHARC_ENABLED", "0"),
+        "vxpgVisibilityEnabled": _module_enabled("RTPT_VXPG_VISIBILITY_ENABLED"),
+        "vxpgDebugEnabled": _module_enabled("RTPT_VXPG_DEBUG_ENABLED", "0"),
         "pgEnabled": _module_enabled("RTPT_PG_ENABLED"),
         "pgUseGuiding": True,
         "pgFreeze": False,
@@ -106,6 +120,7 @@ def render_graph_RTPTSHARCNRD():
     graph.markOutput("FrameAccumulation.output")
     graph.markOutput("RTPT.sharcCacheRadiance")
     graph.markOutput("RTPT.sharcStats")
+    graph.markOutput("RTPT.vxpgDebug")
     return graph
 
 

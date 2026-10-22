@@ -5,10 +5,23 @@ target_sources(RTPT PRIVATE
     RTPT.h
     RTPTPG.h
     RTPTPG.cpp
+    RTPTVXPG.h
+    RTPTVXPG.cpp
     RTPTGrid.slang
     RTPTPGTypes.slang
     RTPTPG.slang
     RTPTSampling.slang
+    RTPTVXPGMath.slang
+    RTPTVXPGGeometry.slang
+    RTPTVXPGTypes.slang
+    RTPTVXPGGeometry.cs.slang
+    RTPTVXPGInject.cs.slang
+    RTPTVXPGPrepare.cs.slang
+    RTPTVXPGSampling.slang
+    RTPTVXPGIntegrator.slang
+    RTPTVXPGDistribution.slang
+    RTPTVXPGVisibility.cs.slang
+    RTPTVXPGTree.cs.slang
     RTPTPGPrepare.cs.slang
     RTPTPGTrain.cs.slang
     RTPTSparseUpdate.cs.slang
@@ -17,6 +30,7 @@ target_sources(RTPT PRIVATE
     RTPTLighting.slang
     RTPTNRD.slang
     RTPTSharc.slang
+    RTPTSharcPairCommon.slang
     RTPTSharcUpdate.cs.slang
     RTPTSharcResolve.cs.slang
 )

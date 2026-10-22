@@ -44,12 +44,15 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("pgStats", [](const RTPT& self) { return self.getPGStatistics().toPython(); });
         pass.def("resetPG", &RTPT::resetPG);
+        pass.def_property_readonly("vxpgStats", [](const RTPT& self) { return self.getVXPGStatistics().toPython(); });
+        pass.def("resetVXPG", &RTPT::resetVXPG);
     });
 }
 
 RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
     mpPG = std::make_unique<RTPTPG::Manager>(mpDevice);
+    mpVXPG = std::make_unique<RTPTVXPG::Manager>(mpDevice);
     setProperties(props);
     mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_UNIFORM);
 }
@@ -68,6 +71,9 @@ void RTPT::setProperties(const Properties& props)
     float sharcSceneScale = mSHARCSceneScale, sharcMinRoughness = mSHARCMinRoughness;
     bool enablePG = mEnablePG;
     auto pg = mPGSettings;
+    auto vxpg = mVXPGSettings;
+    auto guidingMode = mGuidingMode;
+    bool enableVXPG = mEnableVXPG;
     uint32_t pgUpdateStride = mPGUpdateStride, pgUpdateBounces = mPGUpdateBounces;
     for (const auto& [key, value] : props)
     {
@@ -94,6 +100,32 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "sharcSceneScale") sharcSceneScale = value;
         else if (key == "sharcMinRoughness") sharcMinRoughness = value;
         else if (key == "enablePG") enablePG = value;
+        else if (key == "enableVXPG") enableVXPG = value;
+        else if (key == "guidingMode")
+        {
+            const std::string mode = value;
+            FALCOR_CHECK(mode == "BSDF" || mode == "PG" || mode == "VXPG", "Invalid RTPT guiding mode '{}'.", mode);
+            guidingMode = mode == "BSDF" ? RTPTVXPG::GuidingMode::BSDF : mode == "PG" ? RTPTVXPG::GuidingMode::PG : RTPTVXPG::GuidingMode::VXPG;
+        }
+        else if (key == "vxpgEstimator")
+        {
+            const std::string mode = value;
+            FALCOR_CHECK(mode == "ShortBranch" || mode == "MixturePath", "Invalid VXPG estimator '{}'.", mode);
+            vxpg.estimator = mode == "ShortBranch" ? RTPTVXPG::Estimator::ShortBranch : RTPTVXPG::Estimator::MixturePath;
+        }
+        else if (key == "vxpgEnabled") vxpg.enabled = value;
+        else if (key == "vxpgUseGuiding") vxpg.useGuiding = value;
+        else if (key == "vxpgFreezeUpdates") vxpg.freezeUpdates = value;
+        else if (key == "vxpgPGUseCache") vxpg.pgUseCache = value;
+        else if (key == "vxpgVisibilityEnabled") vxpg.visibilityEnabled = value;
+        else if (key == "vxpgDebugEnabled") vxpg.debugEnabled = value;
+        else if (key == "vxpgDebugMode") vxpg.debugMode = value;
+        else if (key == "vxpgGuideFraction") vxpg.guideFraction = value;
+        else if (key == "vxpgGridResolution") vxpg.gridResolution = value;
+        else if (key == "vxpgMaxVoxels") vxpg.maxVoxels = value;
+        else if (key == "vxpgClusterCount") vxpg.clusterCount = value;
+        else if (key == "vxpgSuperpixelSize") vxpg.superpixelSize = value;
+        else if (key == "vxpgBudgetMB") vxpg.budgetMiB = value;
         else if (key == "pgEnabled") pg.enabled = value;
         else if (key == "pgUseGuiding") pg.useGuiding = value;
         else if (key == "pgFreeze") pg.trainingEnabled = !bool(value);
@@ -119,6 +151,8 @@ void RTPT::setProperties(const Properties& props)
     FALCOR_CHECK(!enableSHARC || !accumulate,
         "RTPT SHaRC mode requires accumulate=false; its world-space cache changes between frames.");
     FALCOR_CHECK(!enablePG || !accumulate, "RTPT PG requires accumulate=false; use the independent FrameAccumulation pass.");
+    FALCOR_CHECK(!enableVXPG || !accumulate, "RTPT VXPG requires accumulate=false; use the independent FrameAccumulation pass.");
+    RTPTVXPG::Manager::validate(vxpg);
     FALCOR_CHECK(pgUpdateStride >= 1 && pgUpdateStride <= 64 && pgUpdateBounces >= 1 && pgUpdateBounces <= 32,
         "PG update stride must be in [1,64] and bounces in [1,32].");
     FALCOR_CHECK(pg.treeBudgetMiB >= 16 && pg.treeBudgetMiB <= 1024 && pg.recordBudgetMiB >= 1 && pg.recordBudgetMiB <= 2048,
@@ -141,10 +175,22 @@ void RTPT::setProperties(const Properties& props)
         "SHaRC accumulation frames must be in [1, 1024] and stale frames in [8, 1024].");
     FALCOR_CHECK(std::isfinite(sharcSceneScale) && sharcSceneScale > 0.f && std::isfinite(sharcMinRoughness) &&
         sharcMinRoughness >= 0.f && sharcMinRoughness <= 1.f, "Invalid SHaRC scene scale or minimum roughness.");
-    if (enableSHARC || enablePG)
+    if (enableSHARC || enablePG || enableVXPG)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
             "RTPT SHaRC currently requires D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
-    const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enablePG != mEnablePG;
+    const bool newPairedSharc = enableSHARC && enableVXPG && guidingMode == RTPTVXPG::GuidingMode::VXPG &&
+        vxpg.enabled && vxpg.estimator == RTPTVXPG::Estimator::ShortBranch;
+    const bool pairedChanged = newPairedSharc != usesPairedSharc();
+    const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enablePG != mEnablePG || enableVXPG != mEnableVXPG ||
+        guidingMode != mGuidingMode || pairedChanged;
+    const bool vxpgStructureChanged = enableVXPG != mEnableVXPG || vxpg.gridResolution != mVXPGSettings.gridResolution ||
+        vxpg.maxVoxels != mVXPGSettings.maxVoxels || vxpg.clusterCount != mVXPGSettings.clusterCount ||
+        vxpg.superpixelSize != mVXPGSettings.superpixelSize || vxpg.budgetMiB != mVXPGSettings.budgetMiB;
+    const bool vxpgSignalChanged = vxpgStructureChanged || guidingMode != mGuidingMode || vxpg.enabled != mVXPGSettings.enabled ||
+        vxpg.useGuiding != mVXPGSettings.useGuiding || vxpg.estimator != mVXPGSettings.estimator ||
+        vxpg.pgUseCache != mVXPGSettings.pgUseCache || vxpg.visibilityEnabled != mVXPGSettings.visibilityEnabled ||
+        vxpg.guideFraction != mVXPGSettings.guideFraction;
+    if (vxpgStructureChanged) mpVXPG->invalidate();
     const bool pgStructureChanged = enablePG != mEnablePG || pg.coarseLevels != mPGSettings.coarseLevels ||
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
         pg.maxNodesPerRegion != mPGSettings.maxNodesPerRegion || pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
@@ -159,11 +205,17 @@ void RTPT::setProperties(const Properties& props)
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
-        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged;
+        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || vxpgSignalChanged;
     mResetPG |= pgStructureChanged || pgDepthChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
+    mResetSHARCCache |= pairedChanged;
     if (sharcEntries != mSHARCEntries)
+    {
         mpSHARCHashEntries = mpSHARCAccumulation = mpSHARCResolved = nullptr;
+        mpSHARCHashSnapshot = mpSHARCResolvedNext = nullptr;
+        mpSHARCLocalAccumulation = mpSHARCLocalResolved = mpSHARCLocalNext = nullptr;
+        mpSHARCSuffixAccumulation = mpSHARCSuffixResolved = mpSHARCSuffixNext = nullptr;
+    }
     if (modeChanged || sharcUpdateBounces != mSHARCUpdateBounces)
     {
         mpSHARCResolve = nullptr;
@@ -193,6 +245,9 @@ void RTPT::setProperties(const Properties& props)
     mSHARCMinRoughness = sharcMinRoughness;
     mEnablePG = enablePG;
     mPGSettings = pg;
+    mEnableVXPG = enableVXPG;
+    mVXPGSettings = vxpg;
+    mGuidingMode = guidingMode;
     mPGUpdateStride = pgUpdateStride;
     mPGUpdateBounces = pgUpdateBounces;
     if (pgStructureChanged || pgDepthChanged)
@@ -237,6 +292,22 @@ Properties RTPT::getProperties() const
     props["sharcSceneScale"] = mSHARCSceneScale;
     props["sharcMinRoughness"] = mSHARCMinRoughness;
     props["enablePG"] = mEnablePG;
+    props["enableVXPG"] = mEnableVXPG;
+    props["guidingMode"] = mGuidingMode == RTPTVXPG::GuidingMode::BSDF ? "BSDF" : mGuidingMode == RTPTVXPG::GuidingMode::PG ? "PG" : "VXPG";
+    props["vxpgEstimator"] = mVXPGSettings.estimator == RTPTVXPG::Estimator::ShortBranch ? "ShortBranch" : "MixturePath";
+    props["vxpgEnabled"] = mVXPGSettings.enabled;
+    props["vxpgUseGuiding"] = mVXPGSettings.useGuiding;
+    props["vxpgFreezeUpdates"] = mVXPGSettings.freezeUpdates;
+    props["vxpgPGUseCache"] = mVXPGSettings.pgUseCache;
+    props["vxpgVisibilityEnabled"] = mVXPGSettings.visibilityEnabled;
+    props["vxpgDebugEnabled"] = mVXPGSettings.debugEnabled;
+    props["vxpgDebugMode"] = mVXPGSettings.debugMode;
+    props["vxpgGuideFraction"] = mVXPGSettings.guideFraction;
+    props["vxpgGridResolution"] = mVXPGSettings.gridResolution;
+    props["vxpgMaxVoxels"] = mVXPGSettings.maxVoxels;
+    props["vxpgClusterCount"] = mVXPGSettings.clusterCount;
+    props["vxpgSuperpixelSize"] = mVXPGSettings.superpixelSize;
+    props["vxpgBudgetMB"] = mVXPGSettings.budgetMiB;
     props["pgEnabled"] = mPGSettings.enabled;
     props["pgUseGuiding"] = mPGSettings.useGuiding;
     props["pgFreeze"] = !mPGSettings.trainingEnabled;
@@ -259,7 +330,7 @@ Properties RTPT::getPGStatistics() const
 {
     Properties props;
     const auto& s = mpPG->getStatistics();
-    props["enabled"] = mEnablePG && mPGSettings.enabled;
+    props["enabled"] = mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG && mPGSettings.enabled;
     props["trainingEnabled"] = mPGSettings.trainingEnabled;
     props["detailedDiagnostics"] = mPGSettings.detailedDiagnostics;
     props["regions"] = s.regions;
@@ -312,6 +383,65 @@ Properties RTPT::getPGStatistics() const
     return props;
 }
 
+Properties RTPT::getVXPGStatistics() const
+{
+    Properties props;
+    props["selected"] = mGuidingMode == RTPTVXPG::GuidingMode::VXPG;
+    props["enabled"] = mEnableVXPG && mVXPGSettings.enabled;
+    props["ready"] = mpVXPG->isReady();
+    props["generation"] = mpVXPG->getGeneration();
+    props["estimatedBytes"] = mpVXPG->getEstimatedBytes();
+    props["allocatedPayloadBytes"] = mpVXPG->getPayloadBytes();
+    props["fallbackReason"] = mpVXPG->getFallbackReason();
+    const bool selectedEnabled = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled;
+    const auto counters = selectedEnabled && mpVXPG->isReady() ? mpVXPG->readCounters() : std::array<uint32_t,32>{};
+    props["ready"] = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled && mVXPGSettings.useGuiding &&
+        mpVXPG->isReady() && counters[5] == mpVXPG->getGeneration();
+    if (mpVXPG->isReady() && counters[5] == 0) props["fallbackReason"] = "No valid voxel distribution; using BSDF";
+    if (counters[1] != 0) props["fallbackReason"] = (counters[1]&2u) != 0 ?
+        "Non-finite triangle geometry; using BSDF" : "Geometry job capacity exceeded; reduce grid resolution";
+    else if (counters[4] != 0) props["fallbackReason"] = "Active voxel capacity exceeded; increase capacity or reduce grid resolution";
+    else if (counters[11] != 0) props["fallbackReason"] = "Invalid/non-finite proposal data; using BSDF";
+    props["pairedCacheBytes"] = usesPairedSharc() ? uint64_t(mSHARCEntries) * 120ull : 0ull;
+    props["sharcFrameIndex"] = mSHARCFrameIndex;
+    props["geometryJobs"] = counters[0];
+    props["geometryOverflow"] = counters[1];
+    props["occupiedCells"] = counters[2];
+    props["activeVoxels"] = counters[3];
+    props["distributionOverflow"] = counters[4];
+    props["gpuReady"] = counters[5];
+    props["guideAttempts"] = counters[6];
+    props["guideAccepted"] = counters[7];
+    props["guideRejected"] = counters[8];
+    props["distanceRays"] = counters[9];
+    props["pgCacheHits"] = counters[10];
+    props["invalidSamples"] = counters[11];
+    props["injectedObservations"] = counters[12];
+    props["hypotheticalPGCacheChecks"] = counters[13];
+    props["primaryGuideAttempts"] = counters[14];
+    props["secondGuideAttempts"] = counters[15];
+    props["injectionShadowRays"] = counters[16];
+    props["injectionPrimaryRays"] = counters[17];
+    props["injectionSecondaryRays"] = counters[18];
+    props["actualGuideRays"] = counters[19];
+    props["brdfRays"] = counters[20];
+    props["primaryRays"] = counters[21];
+    props["pgShadowRays"] = counters[22];
+    props["mainShadowRays"] = counters[23];
+    props["brdfCacheHits"] = counters[24];
+    props["positiveThroughputPairs"] = counters[25];
+    props["gatheredShadingPoints"] = counters[26];
+    const auto cluster = selectedEnabled && mpVXPG->isReady() ? mpVXPG->readClusterCounters() : std::array<uint32_t,8>{};
+    props["validSuperpixels"] = cluster[0];
+    props["nonemptyClusters"] = cluster[1];
+    props["visibilityRays"] = cluster[2];
+    props["visiblePairs"] = cluster[3];
+    props["forestNodes"] = cluster[4];
+    props["topRows"] = cluster[5];
+    props["clusterReady"] = mVXPGSettings.visibilityEnabled && cluster[6] == mpVXPG->getGeneration();
+    return props;
+}
+
 RenderPassReflection RTPT::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflection;
@@ -333,6 +463,10 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
             reflection.addOutput(output, "SHaRC visualization or current-frame cache diagnostics")
                 .format(ResourceFormat::RGBA32Float)
                 .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+    if (mEnableVXPG)
+        reflection.addOutput("vxpgDebug", "VXPG voxel/proposal diagnostics, independent of NRD")
+            .format(ResourceFormat::RGBA32Float)
+            .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
     return reflection;
 }
 
@@ -365,6 +499,7 @@ void RTPT::validateScene() const
 void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
+    mpVXPG->setScene(pScene);
     mpComputePass = nullptr;
     mpSHARCResolve = nullptr;
     mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
@@ -374,6 +509,7 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mpJitterCamera = nullptr;
     mResetSHARCCache = true;
     mResetPG = true;
+    mpVXPG->invalidate();
     reset();
     if (mpScene)
     {
@@ -385,6 +521,8 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 
 void RTPT::prepareProgram(RenderContext* pRenderContext)
 {
+    const bool compilePG = mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG;
+    const bool compileVXPG = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG;
     // Request the mesh light collection before querying useEmissiveLights().
     if (mpScene->getRenderSettings().useEmissiveLights)
         mpScene->getILightCollection(pRenderContext);
@@ -396,6 +534,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     if (lightingMask != mLightingMask)
     {
         mLightingMask = lightingMask;
+        mpVXPG->invalidateLighting();
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
         mResetSHARCCache = true;
@@ -409,8 +548,8 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     }
     else mpEnvMapSampler = nullptr;
 
-    if (!mpComputePass || ((mEnableSHARC || mEnablePG) && !mpSparseUpdate) ||
-        (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && !mpSHARCResolve))
+    if (!mpComputePass || ((mEnableSHARC || compilePG) && !mpSparseUpdate) ||
+        (compilePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && !mpSHARCResolve))
     {
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
@@ -424,8 +563,10 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
-        defines.add("ENABLE_PG", mEnablePG ? "1" : "0");
-        if (mEnableSHARC || mEnablePG)
+        defines.add("ENABLE_PG", compilePG ? "1" : "0");
+        defines.add("ENABLE_VXPG", compileVXPG ? "1" : "0");
+        defines.add("RTPT_SHARC_PAIR", usesPairedSharc() ? "1" : "0");
+        if (mEnableSHARC || mEnablePG || mEnableVXPG)
         {
             desc.setShaderModel(ShaderModel::SM6_6);
             desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
@@ -446,7 +587,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         }
         if (!mpComputePass)
             mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
-        if ((mEnableSHARC || mEnablePG) && !mpSparseUpdate)
+        if ((mEnableSHARC || compilePG) && !mpSparseUpdate)
         {
             ProgramDesc updateDesc;
             updateDesc.addShaderModules(mpScene->getShaderModules());
@@ -470,9 +611,10 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             updateDefines.add("SHARC_UPDATE", "0");
             updateDefines.add("SHARC_QUERY", "0");
             updateDefines.add("ENABLE_PG", "0");
+            updateDefines.add("RTPT_SHARC_SPLIT_RESOLVE", usesPairedSharc() ? "1" : "0");
             mpSHARCResolve = ComputePass::create(mpDevice, resolveDesc, updateDefines, true);
         }
-        if (mEnablePG)
+        if (compilePG)
         {
             DefineList pgDefines;
             pgDefines.add("ENABLE_PG", "1");
@@ -489,19 +631,36 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     }
 }
 
-void RTPT::bindSHARC(const ShaderVar& rootVar)
+bool RTPT::usesPairedSharc() const
 {
-    auto sharc = rootVar["gSharc"];
-    auto grid = sharc["hashGridParameters"];
-    grid["cameraPosition"] = mpScene->getCamera()->getPosition();
-    grid["logarithmBase"] = 2.f;
-    grid["sceneScale"] = mSHARCSceneScale;
-    grid["levelBias"] = 0.f;
-    sharc["hashGridData"]["capacity"] = mSHARCEntries;
-    sharc["hashGridData"]["hashEntriesBuffer"] = mpSHARCHashEntries;
-    sharc["accumulationBuffer"] = mpSHARCAccumulation;
-    sharc["resolvedBuffer"] = mpSHARCResolved;
-    sharc["radianceScale"] = 1000.f;
+    return mEnableSHARC && mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG &&
+        mVXPGSettings.enabled && mVXPGSettings.estimator == RTPTVXPG::Estimator::ShortBranch;
+}
+
+void RTPT::bindSHARC(const ShaderVar& rootVar, bool resolve)
+{
+    auto bind = [&](const char* name, const ref<Buffer>& accumulation, const ref<Buffer>& source, const ref<Buffer>& destination)
+    {
+        auto sharc = rootVar.findMember(name);
+        if (!sharc.isValid()) return;
+        auto grid = sharc["hashGridParameters"];
+        grid["cameraPosition"] = mpScene->getCamera()->getPosition();
+        grid["logarithmBase"] = 2.f;
+        grid["sceneScale"] = mSHARCSceneScale;
+        grid["levelBias"] = 0.f;
+        sharc["hashGridData"]["capacity"] = mSHARCEntries;
+        sharc["hashGridData"]["hashEntriesBuffer"] = resolve && usesPairedSharc() ? mpSHARCHashSnapshot : mpSHARCHashEntries;
+        sharc["accumulationBuffer"] = accumulation;
+        sharc["resolvedBuffer"] = source;
+        sharc["radianceScale"] = 1000.f;
+        auto output = sharc.findMember("resolvedDestination");
+        if (output.isValid()) output = destination;
+        output = sharc.findMember("hashEntriesDestination");
+        if (output.isValid()) output = mpSHARCHashEntries;
+    };
+    bind("gSharc", mpSHARCAccumulation, mpSHARCResolved, mpSHARCResolvedNext);
+    bind("gSharcLocal", mpSHARCLocalAccumulation, mpSHARCLocalResolved, mpSHARCLocalNext);
+    bind("gSharcSuffix", mpSHARCSuffixAccumulation, mpSHARCSuffixResolved, mpSHARCSuffixNext);
     auto settings = rootVar.findMember("gSharcSettings");
     if (!settings.isValid()) return;
     settings["frameDim"] = mFrameDim;
@@ -522,6 +681,13 @@ void RTPT::clearSHARC(RenderContext* pRenderContext)
     pRenderContext->clearUAV(mpSHARCHashEntries->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(mpSHARCAccumulation->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(mpSHARCResolved->getUAV().get(), uint4(0));
+    for (const auto& buffer : {mpSHARCHashSnapshot, mpSHARCResolvedNext, mpSHARCLocalAccumulation, mpSHARCLocalResolved,
+        mpSHARCLocalNext, mpSHARCSuffixAccumulation, mpSHARCSuffixResolved, mpSHARCSuffixNext})
+    {
+        if (!buffer) continue;
+        pRenderContext->clearUAV(buffer->getUAV().get(), uint4(0));
+        pRenderContext->uavBarrier(buffer.get());
+    }
     pRenderContext->uavBarrier(mpSHARCHashEntries.get());
     pRenderContext->uavBarrier(mpSHARCAccumulation.get());
     pRenderContext->uavBarrier(mpSHARCResolved.get());
@@ -549,7 +715,8 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
     params["accumulate"] = 0u;
     if (mEnableSHARC) bindSHARC(var);
-    if (mEnablePG) mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
+    if (mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG)
+        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
     auto sparse = var["gSparseSettings"];
     sparse["frameDim"] = mFrameDim;
     sparse["updateStride"] = stride;
@@ -559,18 +726,28 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     sparse["recordPG"] = pg ? 1u : 0u;
     const uint2 updateDim = (mFrameDim + stride - 1u) / stride;
     mpSparseUpdate->execute(pRenderContext, uint3(updateDim, 1));
-    if (mEnablePG) mpPG->barrierTraining(pRenderContext);
+    if (mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG) mpPG->barrierTraining(pRenderContext);
     if (mEnableSHARC)
     {
         pRenderContext->uavBarrier(mpSHARCHashEntries.get());
         pRenderContext->uavBarrier(mpSHARCAccumulation.get());
         pRenderContext->uavBarrier(mpSHARCResolved.get());
+        if (usesPairedSharc())
+        {
+            pRenderContext->uavBarrier(mpSHARCLocalAccumulation.get());
+            pRenderContext->uavBarrier(mpSHARCSuffixAccumulation.get());
+        }
     }
 }
 
 void RTPT::executeTraining(RenderContext* pRenderContext)
 {
     mPGTrainingThisFrame = mSharedTrainingThisFrame = false;
+    // Query resources remain UAVs. Order the preceding frame's reads before
+    // clearing, sparse writes or reusing a previous paired resolve destination.
+    for (const auto& buffer : {mpSHARCHashEntries,mpSHARCAccumulation,mpSHARCResolved,mpSHARCHashSnapshot,mpSHARCResolvedNext,
+        mpSHARCLocalAccumulation,mpSHARCLocalResolved,mpSHARCLocalNext,mpSHARCSuffixAccumulation,mpSHARCSuffixResolved,mpSHARCSuffixNext})
+        if (buffer) pRenderContext->uavBarrier(buffer.get());
     if (mEnableSHARC)
     {
         if (!mpSHARCHashEntries)
@@ -580,13 +757,33 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
             mpSHARCResolved = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
             mResetSHARCCache = true;
         }
+        if (usesPairedSharc() && !mpSHARCHashSnapshot)
+        {
+            mpSHARCHashSnapshot = mpDevice->createStructuredBuffer(8u, mSHARCEntries);
+            mpSHARCResolvedNext = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCLocalAccumulation = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCLocalResolved = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCLocalNext = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCSuffixAccumulation = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCSuffixResolved = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mpSHARCSuffixNext = mpDevice->createStructuredBuffer(16u, mSHARCEntries);
+            mResetSHARCCache = true;
+        }
+        else if (!usesPairedSharc())
+        {
+            mpSHARCHashSnapshot = mpSHARCResolvedNext = nullptr;
+            mpSHARCLocalAccumulation = mpSHARCLocalResolved = mpSHARCLocalNext = nullptr;
+            mpSHARCSuffixAccumulation = mpSHARCSuffixResolved = mpSHARCSuffixNext = nullptr;
+        }
         if (mResetSHARCCache) clearSHARC(pRenderContext);
     }
     const bool sharc = mEnableSHARC && mSHARCEnabled && !mSHARCFreeze;
-    bool pg = mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled;
-    if (mEnablePG)
+    bool pg = mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG && mPGSettings.enabled && mPGSettings.trainingEnabled;
+    if (mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG)
     {
-        const bool rebuilt = mpPG->prepare(pRenderContext, mPGSettings, mFrameDim, mPGUpdateBounces, mPGUpdateStride);
+        auto effectivePG = mPGSettings;
+        effectivePG.enabled &= mGuidingMode == RTPTVXPG::GuidingMode::PG;
+        const bool rebuilt = mpPG->prepare(pRenderContext, effectivePG, mFrameDim, mPGUpdateBounces, mPGUpdateStride);
         if (mResetPG || rebuilt)
         {
             mpPG->reset(pRenderContext);
@@ -624,8 +821,20 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
     if (sharc)
     {
         FALCOR_PROFILE(pRenderContext, "SHARCResolve");
-        bindSHARC(mpSHARCResolve->getRootVar());
+        if (usesPairedSharc()) pRenderContext->copyResource(mpSHARCHashSnapshot.get(), mpSHARCHashEntries.get());
+        bindSHARC(mpSHARCResolve->getRootVar(), true);
         mpSHARCResolve->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
+        if (usesPairedSharc())
+        {
+            pRenderContext->uavBarrier(mpSHARCResolvedNext.get());
+            pRenderContext->uavBarrier(mpSHARCLocalNext.get());
+            pRenderContext->uavBarrier(mpSHARCSuffixNext.get());
+            pRenderContext->uavBarrier(mpSHARCLocalAccumulation.get());
+            pRenderContext->uavBarrier(mpSHARCSuffixAccumulation.get());
+            std::swap(mpSHARCResolved, mpSHARCResolvedNext);
+            std::swap(mpSHARCLocalResolved, mpSHARCLocalNext);
+            std::swap(mpSHARCSuffixResolved, mpSHARCSuffixNext);
+        }
         pRenderContext->uavBarrier(mpSHARCHashEntries.get());
         pRenderContext->uavBarrier(mpSHARCAccumulation.get());
         pRenderContext->uavBarrier(mpSHARCResolved.get());
@@ -634,6 +843,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    mPGTrainingThisFrame = mSharedTrainingThisFrame = false;
     auto color = renderData.getTexture("color");
     auto noisyColor = renderData.getTexture("noisyColor");
     if (!mpScene)
@@ -646,6 +856,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         if (mEnableSHARC)
             for (const auto* output : kSHARCOutputs)
                 pRenderContext->clearTexture(renderData.getTexture(output).get());
+        if (mEnableVXPG) pRenderContext->clearTexture(renderData.getTexture("vxpgDebug").get());
         return;
     }
 
@@ -654,6 +865,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     {
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
+        mpVXPG->setScene(mpScene);
     }
     if (is_set(updates, IScene::UpdateFlags::GeometryChanged) || is_set(updates, IScene::UpdateFlags::MaterialsChanged))
         validateScene();
@@ -662,7 +874,13 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // Ignore jitter/history-only camera updates: RTPT owns its pixel sampling.
     bool sceneChanged = (updates & ~IScene::UpdateFlags::CameraPropertiesChanged) != IScene::UpdateFlags::None;
     if (is_set(updates, IScene::UpdateFlags::CameraPropertiesChanged))
-        sceneChanged |= (mpScene->getCamera()->getChanges() & ~(Camera::Changes::Jitter | Camera::Changes::History)) != Camera::Changes::None;
+    {
+        const bool viewChanged = (mpScene->getCamera()->getChanges() & ~(Camera::Changes::Jitter | Camera::Changes::History)) != Camera::Changes::None;
+        sceneChanged |= viewChanged;
+        if (viewChanged) mpVXPG->invalidateDistribution();
+    }
+    if ((updates & (IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::CameraMoved)) != IScene::UpdateFlags::None)
+        mpVXPG->invalidateDistribution();
     auto& dict = renderData.getDictionary();
     const auto refreshFlags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
     // Motion is reprojected by NRD. Only discontinuities discard its history.
@@ -683,6 +901,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     {
         mResetSHARCCache = true;
         mResetPG = true;
+        mpVXPG->invalidate();
     }
     // First PG version has no LOD hysteresis or cross-LOD model retention.
     // Actual camera translation restarts PG; projection jitter changes no position.
@@ -719,16 +938,29 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         pRenderContext->copyResource(color.get(), mpAccumulation.get());
         return;
     }
-    if (mEnableSHARC || mEnablePG)
+    if (mEnableVXPG)
     {
-        if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mResetPG)) mResetNRDHistory = true;
+        mpVXPG->configure(mVXPGSettings, mFrameDim);
+        auto debug = renderData.getTexture("vxpgDebug");
+        pRenderContext->clearTexture(debug.get());
+        if (mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled)
+            mpVXPG->buildGeometry(pRenderContext, debug);
+    }
+    if (mEnableSHARC || (mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG))
+    {
+        if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG && mResetPG)) mResetNRDHistory = true;
         executeTraining(pRenderContext);
+    }
+    if (mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled)
+    {
+        mpVXPG->updateLighting(pRenderContext, mpEnvMapSampler.get(), mSeed, mUseNEE, mSampleOffset, mEnableNRD);
+        mpVXPG->renderDebug(pRenderContext, renderData.getTexture("vxpgDebug"));
     }
     if (mSampleOffset > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel ||
         mAccumulatedSamples > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel)
         reset();
 
-    if ((mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory)
+    if ((mEnableNRD || mEnablePG || mEnableSHARC || mEnableVXPG) && mResetNRDHistory)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
 
@@ -760,8 +992,10 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         var["gSharcCacheRadiance"] = renderData.getTexture("sharcCacheRadiance");
         var["gSharcStats"] = renderData.getTexture("sharcStats");
     }
-    if (mEnablePG)
+    if (mEnablePG && mGuidingMode == RTPTVXPG::GuidingMode::PG)
         mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false);
+    if (mEnableVXPG)
+        mpVXPG->bind(var, mSampleOffset, mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled && mpVXPG->isReady());
     pRenderContext->uavBarrier(mpAccumulation.get());
     {
         FALCOR_PROFILE(pRenderContext, "MainRender");
@@ -803,7 +1037,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
     changed |= widget.checkbox("Russian roulette", mUseRussianRoulette);
     changed |= widget.var("RR start bounce", mRRStartBounce, 1u, 64u);
     changed |= widget.var("Seed", mSeed);
-    if (!mEnableNRD && !mEnableSHARC && !mEnablePG)
+    if (!mEnableNRD && !mEnableSHARC && !mEnablePG && !mEnableVXPG)
     {
         changed |= widget.checkbox("Progressive accumulation", mAccumulate);
         if (mAccumulate)
@@ -822,6 +1056,88 @@ void RTPT::renderUI(Gui::Widgets& widget)
     mOptionsChanged |= changed;
     mResetSHARCCache |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
     mResetPG |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
+    if (mEnablePG || mEnableVXPG)
+    {
+        uint32_t mode = uint32_t(mGuidingMode);
+        const Gui::DropdownList modes = {{0, "BSDF"}, {1, "PG"}, {2, "VXPG"}};
+        if (widget.dropdown("Guiding mode", modes, mode))
+        {
+            Properties props;
+            props["guidingMode"] = mode == 0 ? "BSDF" : mode == 1 ? "PG" : "VXPG";
+            setProperties(props);
+        }
+    }
+    if (mEnableVXPG)
+    {
+        auto vx = widget.group("VXPG");
+        if (vx)
+        {
+            Properties props;
+            bool flag = mVXPGSettings.enabled;
+            if (vx.checkbox("Enabled", flag)) props["vxpgEnabled"] = flag;
+            flag = mVXPGSettings.useGuiding;
+            if (vx.checkbox("Use guiding", flag)) props["vxpgUseGuiding"] = flag;
+            flag = mVXPGSettings.freezeUpdates;
+            if (vx.checkbox("Freeze updates", flag)) props["vxpgFreezeUpdates"] = flag;
+            uint32_t estimator = uint32_t(mVXPGSettings.estimator);
+            const Gui::DropdownList estimators = {{0, "A: ShortBranch"}, {1, "B: MixturePath"}};
+            if (vx.dropdown("Estimator", estimators, estimator))
+                props["vxpgEstimator"] = estimator == 0 ? "ShortBranch" : "MixturePath";
+            float fraction = mVXPGSettings.guideFraction;
+            if (vx.var("Guide fraction (B)", fraction, 0.f, 0.95f)) props["vxpgGuideFraction"] = fraction;
+            vx.text("VXPG applies at physical bounce 0 and 1 only.");
+            auto cache = vx.group("PG SHaRC");
+            if (cache)
+            {
+                flag = mVXPGSettings.pgUseCache;
+                if (cache.checkbox("Enabled", flag)) props["vxpgPGUseCache"] = flag;
+                if (mVXPGSettings.estimator != RTPTVXPG::Estimator::ShortBranch)
+                    cache.text("Not applicable to B; stored setting is preserved.");
+                else if (!mEnableSHARC || !mSHARCEnabled || !mSHARCUseCache)
+                    cache.text("Inactive: SHaRC cache queries are disabled.");
+                cache.tooltip("A only: use full SHaRC on eligible PG hits; otherwise evaluate local lighting and end the branch. Resets NRD and final accumulation.", true);
+            }
+            uint32_t number = mVXPGSettings.gridResolution;
+            const Gui::DropdownList grids = {{16, "16"}, {32, "32"}, {64, "64"}, {128, "128"}};
+            if (vx.dropdown("Grid resolution", grids, number)) props["vxpgGridResolution"] = number;
+            number = mVXPGSettings.maxVoxels;
+            if (vx.var("Active voxel capacity", number, 256u, 262144u)) props["vxpgMaxVoxels"] = number;
+            number = mVXPGSettings.clusterCount;
+            if (vx.var("Clusters", number, 1u, 32u)) props["vxpgClusterCount"] = number;
+            number = mVXPGSettings.superpixelSize;
+            if (vx.var("Superpixel size", number, 8u, 64u)) props["vxpgSuperpixelSize"] = number;
+            number = mVXPGSettings.budgetMiB;
+            if (vx.var("Resource budget (MiB)", number, 32u, 2048u)) props["vxpgBudgetMB"] = number;
+            flag = mVXPGSettings.visibilityEnabled;
+            if (vx.checkbox("Visibility Enabled", flag)) props["vxpgVisibilityEnabled"] = flag;
+            flag = mVXPGSettings.debugEnabled;
+            if (vx.checkbox("Debug Enabled", flag)) props["vxpgDebugEnabled"] = flag;
+            uint32_t debugMode = mVXPGSettings.debugMode;
+            const Gui::DropdownList debugModes = {{0, "Voxel bounds"}, {1, "Superpixel ID"}, {2, "Voxel cluster ID"}, {3, "Visibility descriptor"}};
+            if (vx.dropdown("Debug view", debugModes, debugMode)) props["vxpgDebugMode"] = debugMode;
+            if (!props.empty()) setProperties(props);
+            if (vx.button("Reset VXPG")) resetVXPG();
+            if (mGuidingMode != RTPTVXPG::GuidingMode::VXPG) vx.text("Not selected; settings preserved.");
+            else if (!mVXPGSettings.enabled) vx.text("Disabled; using BSDF.");
+            else if (!mVXPGSettings.useGuiding) vx.text("Sampling disabled; using BSDF.");
+            else if (!mpVXPG->isReady()) vx.text("Using BSDF: " + mpVXPG->getFallbackReason());
+            else vx.text("VXPG selected; GPU-valid proposals are used, otherwise BSDF.");
+            if (vx.button("Read GPU statistics"))
+            {
+                const auto s = mpVXPG->readCounters();
+                const auto c = mpVXPG->readClusterCounters();
+                mVXPGDiagnosticText = "Snapshot generation " + std::to_string(mpVXPG->getGeneration()) +
+                    ": " + (s[5] == mpVXPG->getGeneration() ? "ready" : "BSDF fallback") +
+                    ", voxels " + std::to_string(s[3]) + ", clusters " + std::to_string(c[1]) +
+                    ", accepted " + std::to_string(s[7]) + "/" + std::to_string(s[6]) +
+                    ", geometry overflow " + std::to_string(s[1]) + ", voxel overflow " + std::to_string(s[4]) +
+                    ", invalid " + std::to_string(s[11]);
+            }
+            if (!mVXPGDiagnosticText.empty()) vx.text(mVXPGDiagnosticText);
+            vx.text("Estimated resource MiB: " + std::to_string(double(mpVXPG->getEstimatedBytes()) / (1024. * 1024.)));
+            if (usesPairedSharc()) vx.text("Paired SHaRC extra MiB: " + std::to_string(double(uint64_t(mSHARCEntries)*120ull)/(1024.*1024.)));
+        }
+    }
     if (mEnableSHARC)
     {
         auto sharcWidget = widget.group("SHaRC");
@@ -870,6 +1186,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
         auto pgWidget = widget.group("PG");
         if (pgWidget)
         {
+            if (mGuidingMode != RTPTVXPG::GuidingMode::PG) pgWidget.text("Not selected; no guiding or training. Settings preserved.");
             Properties props;
             bool value = mPGSettings.enabled;
             if (pgWidget.checkbox("Enabled", value)) props["pgEnabled"] = value;
