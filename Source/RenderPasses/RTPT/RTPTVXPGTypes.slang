@@ -1,5 +1,13 @@
 #pragma once
 
+#ifndef RTPT_VXPG_DETAILED_DIAGNOSTICS
+#define RTPT_VXPG_DETAILED_DIAGNOSTICS 0
+#endif
+
+#ifndef RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY
+#define RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY 1
+#endif
+
 static const uint RTPT_VXPG_INVALID = 0xffffffffu;
 static const uint RTPT_VXPG_STATE_JOBS = 0;
 static const uint RTPT_VXPG_STATE_GEOMETRY_OVERFLOW = 1;
@@ -10,7 +18,7 @@ static const uint RTPT_VXPG_STATE_READY = 5;
 static const uint RTPT_VXPG_STATE_ATTEMPTS = 6;
 static const uint RTPT_VXPG_STATE_ACCEPTED = 7;
 static const uint RTPT_VXPG_STATE_REJECTED = 8;
-static const uint RTPT_VXPG_STATE_DISTANCE_RAYS = 9;
+// Slot 9 is reserved; the removed MixturePath estimator used it for distance rays.
 static const uint RTPT_VXPG_STATE_PG_CACHE_HITS = 10;
 static const uint RTPT_VXPG_STATE_INVALID = 11;
 static const uint RTPT_VXPG_STATE_INJECTED = 12;
@@ -23,6 +31,8 @@ static const uint RTPT_VXPG_STATE_PRIMARY_RAYS = 21;
 static const uint RTPT_VXPG_STATE_PG_SHADOW = 22;
 static const uint RTPT_VXPG_STATE_MAIN_SHADOW = 23;
 static const uint RTPT_VXPG_STATE_BRDF_CACHE_HITS = 24;
+// Slot 27 is reserved for stable diagnostic counter indices.
+static const uint RTPT_VXPG_STATE_SHARED_PATHS = 28;
 
 struct RTPTVXPGParams
 {
@@ -38,8 +48,6 @@ struct RTPTVXPGParams
     uint generation;
     uint enabled;
     uint useGuiding;
-    uint estimator;
-    float guideFraction;
     uint pgUseCache;
     uint visibilityEnabled;
     uint debugEnabled;
@@ -73,6 +81,11 @@ RWStructuredBuffer<RTPTVXPGClusterSeed> gVXPGSeeds;
 RWStructuredBuffer<uint> gVXPGCluster;
 // x: sorted leaf range start, y: count, z: heap allocation, w: leaf base.
 RWStructuredBuffer<uint4> gVXPGClusterInfo;
+// The record stays 32 bytes. Build-time lo/hi are an AABB until its only parent
+// has consumed it; forestLevel then stores center in lo and radius in hi.x.
+// Roots are converted by publishClusters. Published/frozen nodes use only the
+// query representation; a rebuild initializes fresh AABBs before conversion.
+// With RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY=0, lo/hi remain AABBs throughout.
 struct RTPTVXPGNode { float3 lo; float mass; float3 hi; uint compact; };
 RWStructuredBuffer<RTPTVXPGNode> gVXPGForest;
 RWStructuredBuffer<uint> gVXPGCompactToLeaf;
@@ -89,6 +102,22 @@ RWStructuredBuffer<uint> gVXPGSuperpixelPoints;
 // 0: valid superpixels, 1: nonempty clusters, 2: visibility rays,
 // 3: visible pairs, 4: forest node allocation, 5: top rows, 6: publication.
 RWStructuredBuffer<uint> gVXPGClusterState;
+
+// Activity observations only. Algorithm state, capacity/overflow checks and
+// invalid-data counters must keep their unconditional writes.
+void rtptVXPGCount(uint index, uint amount = 1u)
+{
+#if RTPT_VXPG_DETAILED_DIAGNOSTICS
+    InterlockedAdd(gVXPGState[index], amount);
+#endif
+}
+
+void rtptVXPGCountVisibility(uint index, uint amount = 1u)
+{
+#if RTPT_VXPG_DETAILED_DIAGNOSTICS
+    InterlockedAdd(gVXPGClusterState[index], amount);
+#endif
+}
 
 uint rtptVXPGHash(uint x)
 {

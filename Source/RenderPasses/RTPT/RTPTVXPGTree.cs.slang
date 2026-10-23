@@ -119,6 +119,15 @@ void forestLeaves(uint3 tid : SV_DispatchThreadID)
     gVXPGCompactToLeaf[compact]=leaf-info.z;
 }
 
+RTPTVXPGNode rtptVXPGFinalizeNode(RTPTVXPGNode node)
+{
+    const float3 center=0.5f*(node.lo+node.hi);
+    const float radius=0.5f*length(node.hi-node.lo);
+    node.lo=center;
+    node.hi=float3(radius,0.f,0.f);
+    return node;
+}
+
 [numthreads(256,1,1)]
 void forestLevel(uint3 tid : SV_DispatchThreadID)
 {
@@ -136,6 +145,13 @@ void forestLevel(uint3 tid : SV_DispatchThreadID)
     parent.hi=left.mass>0.f?(right.mass>0.f?max(left.hi,right.hi):left.hi):right.hi;
     parent.compact=RTPT_VXPG_INVALID;
     gVXPGForest[node]=parent;
+#if RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY
+    // This level's parents [offset,2*offset) and children [2*offset,4*offset)
+    // are disjoint, and each child has exactly one consumer. The next dispatch
+    // reads the still-unconverted parents, after the existing forest barrier.
+    gVXPGForest[info.z+2*(offset+tid.x)]=rtptVXPGFinalizeNode(left);
+    gVXPGForest[info.z+2*(offset+tid.x)+1]=rtptVXPGFinalizeNode(right);
+#endif
 }
 
 [numthreads(1,1,1)]
@@ -145,7 +161,13 @@ void publishClusters(uint3 tid : SV_DispatchThreadID)
     for (uint c=0;c<gVXPGParams.clusterCount;++c)
     {
         const uint4 info=gVXPGClusterInfo[c];
-        sum+=gVXPGForest[info.z+1].mass;
+        const RTPTVXPGNode clusterRoot=gVXPGForest[info.z+1];
+        sum+=clusterRoot.mass;
+#if RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY
+        // Roots have no parent consumer; this also handles single-leaf and
+        // empty clusters. The host barriers the forest before top-tree queries.
+        gVXPGForest[info.z+1]=rtptVXPGFinalizeNode(clusterRoot);
+#endif
     }
     const float root=gVXPGGlobalTree[1];
     const bool valid=gVXPGClusterState[1]>0 && isfinite(sum) && root>0.f && abs(sum-root)<=max(1.e-4f,root*1.e-4f);

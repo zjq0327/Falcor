@@ -7,7 +7,6 @@
 namespace RTPTVXPG
 {
 enum class GuidingMode : uint32_t { BSDF, PG, VXPG };
-enum class Estimator : uint32_t { ShortBranch, MixturePath };
 
 struct Settings
 {
@@ -17,9 +16,9 @@ struct Settings
     bool pgUseCache = false;
     bool visibilityEnabled = true;
     bool debugEnabled = false;
+    bool detailedDiagnostics = false;
+    bool sharedInjectionEnabled = false;
     uint32_t debugMode = 0;
-    Estimator estimator = Estimator::ShortBranch;
-    float guideFraction = 0.5f;
     uint32_t gridResolution = 64;
     uint32_t maxVoxels = 65536;
     uint32_t clusterCount = 32;
@@ -39,11 +38,21 @@ public:
     void invalidateLighting();
     void setScene(const Falcor::ref<Falcor::Scene>& scene);
     void buildGeometry(Falcor::RenderContext* context, const Falcor::ref<Falcor::Texture>& debugOutput);
+    // Prepare/clear observation buffers before sparse SHaRC/VXPG training.
+    void prepareLighting(Falcor::RenderContext* context);
+    bool canInjectShared() const { return mLightingPrepared && mSettings.sharedInjectionEnabled; }
+    uint32_t getLightingFrameIndex() const { return mLightingFrameIndex; }
+    void barrierInjection(Falcor::RenderContext* context) const;
     void updateLighting(Falcor::RenderContext* context, Falcor::EnvMapSampler* envSampler, uint32_t seed, bool useNEE,
         uint32_t sampleOffset, bool useNRD);
+    // Must be called even when guiding/model updates are disabled or frozen.
+    void beginFrame() { mLightingPrepared = false; }
     void bind(const Falcor::ShaderVar& root, uint32_t frameIndex, bool active) const;
     std::array<uint32_t, 32> readCounters() const;
     std::array<uint32_t, 8> readClusterCounters() const;
+    void invalidateDiagnosticSnapshot() { mModelDiagnosticsAvailable = false; }
+    bool hasModelDiagnostics() const { return mSettings.detailedDiagnostics && mModelDiagnosticsAvailable; }
+    uint32_t getModelDiagnosticsFrameIndex() const { return mModelDiagnosticsFrameIndex; }
     void renderDebug(Falcor::RenderContext* context, const Falcor::ref<Falcor::Texture>& output);
     uint32_t getGeneration() const { return mGeneration; }
     uint64_t getEstimatedBytes() const { return mEstimatedBytes; }
@@ -62,9 +71,12 @@ private:
     uint32_t mGeneration = 1;
     uint64_t mEstimatedBytes = 0;
     uint64_t mScreenAllocationBytes = 0;
+    bool mLightingPrepared = false;
     bool mReady = false;
     bool mGeometryValid = false;
     bool mDistributionValid = false;
+    bool mModelDiagnosticsAvailable = false;
+    uint32_t mModelDiagnosticsFrameIndex = 0;
     Falcor::ref<Falcor::Scene> mpScene;
     Falcor::ref<Falcor::Buffer> mpBoundMin, mpBoundMax, mpState, mpInverse;
     Falcor::ref<Falcor::Buffer> mpTriangles, mpTriangleRanges, mpJobs, mpDispatchArgs;

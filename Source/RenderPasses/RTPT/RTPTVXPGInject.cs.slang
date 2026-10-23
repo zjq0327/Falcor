@@ -11,6 +11,7 @@ import Rendering.Lights.EmissiveUniformSampler;
 import Rendering.Lights.EmissiveLightSamplerInterface;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 #include "RTPTVXPGTypes.slang"
+#include "RTPTCamera.slang"
 
 struct RTPTVXPGInjectParams { uint seed; uint useNEE; uint sampleOffset; uint useNRD; };
 ConstantBuffer<RTPTVXPGInjectParams> gParams;
@@ -20,6 +21,11 @@ ParameterBlock<EnvMapSampler> gEnvMapSampler;
 // Reuse the RTPT light system with guiding disabled for this independent model.
 #include "RTPTSampling.slang"
 #include "RTPTLighting.slang"
+#include "RTPTVXPGTraining.slang"
+
+#ifndef RTPT_VXPG_SHARED_INJECTION
+#define RTPT_VXPG_SHARED_INJECTION 0
+#endif
 
 bool rtptVXPGShadeHit(HitInfo hit, Ray ray, out ShadingData sd, out uint materialID)
 {
@@ -37,52 +43,42 @@ bool rtptVXPGShadeHit(HitInfo hit, Ray ray, out ShadingData sd, out uint materia
 #endif
 }
 
-[numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID)
+bool rtptVXPGProducePrimary(uint2 pixel, out Ray ray, out HitInfo hit)
 {
-    if (any(tid.xy >= gVXPGParams.frameDim)) return;
-    gVXPGPrimaryPosition[tid.xy] = 0.f;
-    gVXPGPrimaryNormal[tid.xy] = 0.f;
-    if(gVXPGParams.visibilityEnabled!=0) gVXPGPrimaryHit[tid.xy]=0u;
-    if (gVXPGState[RTPT_VXPG_STATE_GEOMETRY_OVERFLOW] != 0) return;
-    // Distinct stream from production and SHaRC training. Model construction
-    // never consumes the production estimator's random dimensions.
-    SampleGenerator sg = SampleGenerator(tid.xy, (gVXPGParams.frameIndex + 1u) * 0x85ebca6bu + gParams.seed * 0xc2b2ae35u);
-    Ray ray = gScene.camera.computeRayPinhole(tid.xy, gVXPGParams.frameDim);
-    if (gParams.useNRD == 0)
-    {
-        SampleGenerator cameraSG = SampleGenerator(tid.xy, gParams.sampleOffset + gParams.seed * 0x9e3779b9u);
-        const float2 p = (float2(tid.xy) + sampleNext2D(cameraSG)) / float2(gVXPGParams.frameDim);
-        const float2 ndc = p * float2(2.f, -2.f) + float2(-1.f, 1.f);
-        let camera = gScene.camera.data;
-        const float3 direction = normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW);
-        const float inverseCosine = 1.f / dot(normalize(camera.cameraW), direction);
-        ray = Ray(camera.posW, direction, camera.nearZ * inverseCosine, camera.farZ * inverseCosine);
-    }
+    ray = {};
+    hit = {};
+    gVXPGPrimaryPosition[pixel] = 0.f;
+    gVXPGPrimaryNormal[pixel] = 0.f;
+    if (gVXPGParams.visibilityEnabled != 0) gVXPGPrimaryHit[pixel] = 0u;
+    if (gVXPGState[RTPT_VXPG_STATE_GEOMETRY_OVERFLOW] != 0) return false;
+    SampleGenerator cameraSG = SampleGenerator(pixel, gParams.sampleOffset + gParams.seed * 0x9e3779b9u);
+    ray = rtptCameraRay(pixel, gVXPGParams.frameDim, gParams.useNRD != 0, cameraSG);
     SceneRayQuery<true> query;
     float hitT;
-    InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INJECT_PRIMARY],1u);
-    HitInfo hit = query.traceRay(ray, hitT);
-    ShadingData primary;
-    uint materialID;
-    if (!rtptVXPGShadeHit(hit, ray, primary, materialID)) return;
-    const IMaterialInstance primaryMI = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
-    gVXPGPrimaryPosition[tid.xy] = float4(primary.posW, 1.f);
-    gVXPGPrimaryNormal[tid.xy] = float4(primary.getOrientedFaceNormal(), primaryMI.getProperties(primary).roughness);
-    if(gVXPGParams.visibilityEnabled!=0)
+    rtptVXPGCount(RTPT_VXPG_STATE_INJECT_PRIMARY);
+    hit = query.traceRay(ray, hitT);
+    if (gVXPGParams.visibilityEnabled != 0)
     {
 #if HIT_INFO_USE_COMPRESSION
-        gVXPGPrimaryHit[tid.xy]=uint4(hit.pack(),0u,0u);
+        gVXPGPrimaryHit[pixel] = uint4(hit.pack(), 0u, 0u);
 #else
-        gVXPGPrimaryHit[tid.xy]=hit.pack();
+        gVXPGPrimaryHit[pixel] = hit.pack();
 #endif
     }
+    return true;
+}
+
+void rtptVXPGInjectSecondary(ShadingData primary, IMaterialInstance primaryMI, inout SampleGenerator sg)
+{
     BSDFSample bs = {};
     if (!primaryMI.sample(primary, sg, bs) || bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo))) return;
-    ray = Ray(primary.computeRayOrigin(), bs.wo);
-    InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INJECT_SECONDARY],1u);
-    hit = query.traceRay(ray, hitT);
+    const Ray ray = Ray(primary.computeRayOrigin(), bs.wo);
+    SceneRayQuery<true> query;
+    float hitT;
+    rtptVXPGCount(RTPT_VXPG_STATE_INJECT_SECONDARY);
+    const HitInfo hit = query.traceRay(ray, hitT);
     ShadingData sd;
+    uint materialID;
     if (!rtptVXPGShadeHit(hit, ray, sd, materialID)) return;
     const uint cell = rtptVXPGOwner(sd.posW);
     if (cell == RTPT_VXPG_INVALID || gVXPGBoundMin[cell].w == 0) return;
@@ -94,32 +90,28 @@ void main(uint3 tid : SV_DispatchThreadID)
     RTPTLightSample ls;
     if (gParams.useNEE != 0 && rtptSampleLight(sd, sg, ls))
     {
-        InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INJECT_SHADOW],1u);
+        rtptVXPGCount(RTPT_VXPG_STATE_INJECT_SHADOW);
         if (query.traceVisibilityRay(ls.visibilityRay)) local += mi.eval(sd, ls.dir, sg) * ls.LiOverPdf;
     }
-    if (!all(isfinite(local)))
-    {
-        InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
-        return;
-    }
-    InterlockedOr(gVXPGBoundMax[cell].w, 1u);
-    // Reference uses maxComponent of positive direct-light observations and
-    // their per-voxel average. This is proposal importance, not irradiance.
-    const float importance = max(local.x, max(local.y, local.z));
-    if (!(importance > 0.f)) return;
-    // Bounding model statistics does not clamp final transport radiance.
-    const uint64_t fixed = uint64_t(max(1.f, round(min(importance, 1.e6f) * 4096.f)));
-    uint64_t previousFlux;
-    InterlockedAdd(gVXPGFlux[cell], fixed, previousFlux);
-    if (previousFlux > uint64_t(0xffffffffffffffffull) - fixed)
-        InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],1u);
-    uint old;
-    InterlockedAdd(gVXPGCount[cell], 1u, old);
-    if (old==0xffffffffu) InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],1u);
-    if (old == 0)
-    {
-        gVXPGRepresentativePosition[cell] = float4(sd.posW, 1.f);
-        gVXPGRepresentativeNormal[cell] = float4(sd.getOrientedFaceNormal(), 0.f);
-    }
-    InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INJECTED], 1u);
+    rtptVXPGStoreObservation(sd, local);
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    if (any(tid.xy >= gVXPGParams.frameDim)) return;
+    Ray ray;
+    HitInfo hit;
+    if (!rtptVXPGProducePrimary(tid.xy, ray, hit)) return;
+    ShadingData primary;
+    uint materialID;
+    if (!rtptVXPGShadeHit(hit, ray, primary, materialID)) return;
+    const IMaterialInstance primaryMI = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
+    gVXPGPrimaryPosition[tid.xy] = float4(primary.posW, 1.f);
+    gVXPGPrimaryNormal[tid.xy] = float4(primary.getOrientedFaceNormal(), primaryMI.getProperties(primary).roughness);
+#if !RTPT_VXPG_SHARED_INJECTION
+    // Keep the original independent training stream and all secondary samples.
+    SampleGenerator sg = SampleGenerator(tid.xy, (gVXPGParams.frameIndex + 1u) * 0x85ebca6bu + gParams.seed * 0xc2b2ae35u);
+    rtptVXPGInjectSecondary(primary, primaryMI, sg);
+#endif
 }

@@ -10,25 +10,47 @@ VXPG 已接入普通 PT 和主图的 NRD diffuse/specular 路径，所有求交�
 
 CMD 顶部的 `RTPT_GUIDING_MODE` 选择 `BSDF`、`PG` 或 `VXPG`；`RTPT_VXPG_ENABLED=1/0` 控制 VXPG，窗口中对应 **RTPT → Guiding mode** 和 **VXPG → Enabled**。未选中的旧 PG 不采样、不训练，参数保留。VXPG 的 **Use guiding** 只停止采样；**Freeze updates** 停止模型构建；**Reset VXPG** 使模型失效并重建。冻结后改变相机、几何或光照会先回退 BSDF，解冻后恢复。
 
-两个版本都在第一跳加入 VXPG，只允许物理 bounce=0/1 使用它，bounce>=2 仅 BRDF：
+当前仅保留 **A：ShortBranch**；2026-10-22 按用户要求删除 B：MixturePath。Estimator 下拉框、Guide fraction (B)、CMD 的 `RTPT_VXPG_ESTIMATOR` 和 GPU 混合续接分支均已移除。旧图中的 `vxpgEstimator="ShortBranch"` 可兼容加载；其他值明确报错。旧 `vxpgGuideFraction` 仅警告并忽略，不再保存。
 
-- `RTPT_VXPG_ESTIMATOR=ShortBranch`：A。在每个实际展开且可引导的顶点，先独立完成 PG 短支路，再处理 BRDF 主路径。BRDF 命中 SHaRC 时立即终止自身后续，当前 PG 已完成。PG 不递归；真实首个命中不属于所选体素时作为空样本，不重抽、不改走 BRDF。
-- `RTPT_VXPG_PG_SHARC_ENABLED=0/1`：A 的 PG SHaRC 开关，窗口中为 **VXPG → PG SHaRC → Enabled**。关闭时 PG 计算真实直接光与自发光；开启且缓存资格/配对记录有效时返回完整缓存，否则仍计算真实局部项。缓存存在不会使 PG 被丢弃。局部项用 p/q 分配，后缀只在 H_G=1 的区域用 p/(p+H_G*q) 分配，BRDF 与 PG 共同使用同一命中事件的资格规则。
-- `RTPT_VXPG_ESTIMATOR=MixturePath`：B。先按 Guide fraction 选择 BRDF/PG，再追踪并按实际混合密度继续完整路径。PG 来源的当前边不查询 SHaRC，后续 BRDF 边仍可查询。A 的 PG 缓存设置在 B 中保留但不生效。
+- 只允许物理 bounce=0/1 使用 VXPG，bounce>=2 仅 BRDF。在每个实际展开且可引导的顶点，先独立完成 PG 短支路，再处理 BRDF 主路径。BRDF 命中 SHaRC 时终止自身后续；PG 不递归，真实首个命中不属于所选体素时作为空样本，不重抽。
+- `RTPT_VXPG_PG_SHARC_ENABLED=0/1` 对应 **VXPG → PG SHaRC → Enabled**。关闭时 PG 计算真实直接光与自发光；开启且缓存资格/配对记录有效时返回完整缓存，否则仍计算真实局部项。局部项用 p/q 分配，后缀只在 H_G=1 的区域用 p/(p+H_G*q) 分配。
+- 引导命中复用 candidate.pdf；BSDF 命中的 q 仍需反向求值，用于短分支/主路径分配及缓存资格。NEE 和命中光源的参考密度仍为材质 `evalPdf`，不查询 VXPG 的光源端点 q。
 
-NRD 两个分量各自使用自己的条件 PDF、贡献和首次 BRDF 距离。A 使用已有主 BRDF 射线；B 首表面选中 PG 时，额外从同一个表面发射独立的同分量 BRDF 距离射线，仅做一次最近有效求交。它不计算亮度、阴影或缓存，不继续反弹，不增加递归。普通 PT 没有该辅助射线。
+本次删除的 Release 构建与 320×180 VeachAjar 的 15 项运行检查通过，覆盖缓存/模块开关、全局/聚类分布、普通 PT 和旧 B 配置拒绝；实际 PG 缓存命中已观察到，所有检查帧 HDR 有限且 invalidSamples=0。默认关闭详细诊断的 1920×1080 主图另运行 8 帧，原始 HDR、合成、累积和 ToneMapper 输出全部有限，分布就绪。报告位于 `build/vxpg-remove-b-01/report.json` 和 `main-1080p.json`；临时 Python 脚本与调试产物已删除。本轮不提供新的性能或图像等价性结论。
 
-主图关闭下游 NRD 滤波时，仍保留 `enableNRD=True` 的分量信号路径用于直通合成，因此 B 的距离辅助也仍保留。要测没有该成本的普通 PT，使用 `enableNRD=False` 的测试图；不能把下游滤波开关的关闭当成切换到了普通 PT。
+NRD diffuse/specular 使用各自条件 PDF、贡献和已有主 BRDF 射线的首次命中距离。B 专用的辅助距离射线已删除。主图关闭下游 NRD 滤波时，仍保留 `enableNRD=True` 的分量信号路径用于直通合成；普通 PT 使用 `enableNRD=False`。
 
 A 的缓存 C/R 与 full 共用 hash、计数、调制和历史规则，使用不可变快照 Resolve。额外内存为 **120 B/entry**，默认 1M 项额外占用 120 MiB；该内存与 VXPG 模型预算分开报告。PG 缓存开关不改变训练目标，也不因切换而重新预热缓存。SHaRC 仍是近似缓存：插值/足迹、有限历史和更新路径长度都可能引入误差，MIS 不会消除这些近似。A 的 PG 缓存默认关闭，用于对照实验。
 
 `RTPT_VXPG_VISIBILITY_ENABLED=1/0` 对应 **Visibility Enabled**；关闭时停止可见性/聚类构建，使用全局体素分布。`RTPT_VXPG_DEBUG_ENABLED=1/0` 对应 **Debug Enabled**；关闭额外调试追踪/绘制，独立 `RTPT.vxpgDebug` 输出保持可用。Debug view 可查看体素、超像素、体素簇与可见性描述，均不接入 NRD。模型容量溢出、零质量、预算不足或冻结后失效时回退 BSDF，诊断快照和 `vxpgStats` 显示原因。
 
+`RTPT_VXPG_DIAGNOSTICS_ENABLED=1/0` 控制详细活动计数，对应属性 `vxpgDetailedDiagnostics` 和 **VXPG → Detailed diagnostics → Enabled**，默认 **0（关闭）**，与 Debug Enabled 独立。关闭时编译掉引导尝试、射线、缓存活动和构建观察等高频诊断原子；ready/generation、有效体素数、队列/溢出及无效数据检查仍保留。纯诊断切换保留模型、NRD 历史和最终累积，不改变采样 RNG 或射线预算；首次切换可能需要编译 shader 变体。
+
+当前簇内采样仅保留 **Full**：每层使用当前点与法线的几何重要性，BRDF 命中的反向 PDF 使用相同分支概率。Visibility 关闭或条件行无效时仍回退到原全局质量提议，bounce=1 也仍使用全局质量树。2026-10-23 按用户要求删除 O3 的 Mass-only / Hybrid（包括 2 层、3 层）实现、属性、Fast sampling UI 和 CMD/主图参数；[O3 阶段记录](VXPG_O3_RESULTS.md) 仅保留为历史测量，不代表当前可选功能。
+
+2026-10-23 按用户要求删除 O5.1 **Primary reuse**：移除 MainRender 首命中缓存读取、专用 hitT/完成标志纹理、属性、统计字段以及 CMD/UI 开关。MainRender 的普通 PT、NRD 和 VXPG 路径均直接执行主射线 RayQuery。此前 V 场景未获得净性能收益，[O5.1 阶段报告](VXPG_O5_1_RESULTS.md) 仅保留为历史测量。
+
+删除后的 Release RTPT/Mogwai 构建及 VeachAjar 14 组运行状态、142 项检查通过：包含 1080p 完整主图、普通 PT 3 SPP、NRD 直通/恢复、共享训练开/关/重开、冻结、SHaRC 关闭后的稀疏回退以及 BSDF 回退。321×181 下主渲染每帧追踪 58,101 条 primary，3 SPP 为 174,303 条；VXPG 全屏 primary 仍完整生产。验证输出均有限且 invalidSamples=0，未重新测量性能或画质等价性。记录在 `build/vxpg-remove-primary-reuse-20261023-001/runtime.json`，临时验证脚本已删除。
+
+O5.2 **Shared injection** 已接入 `RTPT_VXPG_SHARED_INJECTION_ENABLED=1/0`、属性 `vxpgSharedInjectionEnabled` 和 **VXPG → Shared injection → Enabled**，默认 **0**。开启后 VXPG 使用 SHaRC 原有训练路径的第二表面，默认每 **5×5 像素一条路径**；复用其 BSDF 续接、光源样本和遮挡求交。SHaRC 保留原 MIS 训练值，VXPG 使用自发光加 raw NEE 的正 maxRGB 重要性，二者不共用缓存载荷。全屏 primary position/normal/hit 仍完整生产并用于 VXPG 分布构建，Full 分布和采样/PDF 算法不变。
+
+SHaRC 关闭或冻结时，VXPG 以相同 stride 独立追踪到第二表面，不写 SHaRC；只关闭 SHaRC 查询仍共享更新。VXPG 冻结时停止注入而 SHaRC 继续训练。SHaRC 深度为 1 时，第二表面的额外 raw NEE 使用 RNG 副本，不延长或改写 SHaRC 后缀。共享开关、共享 stride/深度变化会使提议失效并重置图像历史；普通每帧训练不重置历史。该模式改变 VXPG 训练覆盖，不能视为逐位等价优化。V 场景对照和限制见 [O5.2 阶段报告](VXPG_O5_2_RESULTS.md)。
+
+O5.2 的 V 场景 1080p、9 对交错实测：Full/共享整帧 **25.781/26.049 ms**，均值慢 **1.04%**，未见稳定净收益；VXPGInject **0.631/0.289 ms**，但 MainRender **17.614/18.127 ms**。720p、8 秒、3 种子的 raw NMSE 增加 **0.28%**，最终 HDR 基本持平。159 项数值/运行检查通过；共享保持默认关闭。
+
+删除 O5.1 后，按用户要求只在 V 场景复测 O5.2 开/关：1080p 完整主图、9 对交错运行，每种模式 1,152 个 GPU 帧。关闭/开启共享的整帧为 **25.073/25.221 ms**（均值 +0.59%，配对 bootstrap 95% 区间 −1.35%～+2.03%），MainRender **17.112/17.671 ms**（+3.26%），VXPGInject **0.611/0.242 ms**（−60.40%）。未确认稳定整帧收益，默认继续关闭；206 项配置、状态和输出检查通过。本次未重新进行画质误差对照，也不把与旧测试时段的差值归因于删除 O5.1。完整数据在 `build/vxpg-full-after-removal-20261023-001/`，临时脚本已清理。
+
+读取 `vxpgStats` 时先检查 `diagnosticsAvailable`/`diagnosticsStatus` 及 `modelDiagnosticsAvailable`/`modelDiagnosticsStatus`。状态分别为 `disabled`、`unavailable` 或 `current_frame`/`current_update`；活动字段缺失表示未采集或当前无覆盖，**不表示射线数、接受数或缓存命中数为零**。渲染活动只覆盖最近一个有效主渲染帧，由 `diagnosticsFrameCount=1`、sample offset、SPP 和 generation 标识；模型活动只覆盖当前一次实际更新，由 `modelDiagnosticsFrameCount=1` 和更新 frame index 标识。Freeze updates 下，仍渲染时可以得到当前帧的渲染活动，但模型活动为 unavailable，不把冻结前的构建计数当作当前帧；解冻并实际更新后才重新提供。Read GPU statistics 和属性读取会主动读回，性能计时窗口内应避免调用。
+
 参考为 [VXPG 固定提交](https://github.com/SuikaSibyl/SIByLEngine2023/tree/8c1adad28c16e07592bc79122cb9d0c9738699bc)。本项目采用等价的 GPU radix sort 和按 Morton 次序组织的簇堆，使用明确条件化的模糊超像素和正反一致 PDF；并非原 Vulkan 实验代码的逐位移植。细小/远处病态盒子使用保守包围锥，锥外/盒外失败保留空质量。当前支持 RTPT 既有的反射型 StandardMaterial 三角形场景、alpha 纹理、实例变换；skinning/顶点缓存形变尚未验证，明确回退 BSDF，不修改共享框架。
 
 2026-10-22 按用户要求删除 RTPT/VXPG 专项测试：`tests/RTPT/` 下的验证脚本、基准脚本、依赖清单和两个专用场景（共 6 个文件），以及 FalcorTest 的 6 个 `RTPTVXPG*` C++/Slang 文件、对应 CMake 注册和运行目录中的测试 shader 副本。Falcor 通用测试、正式渲染代码、主入口、优化计划及历史性能报告保留。下述 10 项 GPU 测试和脚本运行结果属于删除前的历史证据，相关命令当前不可直接重跑；日常运行继续使用 `RTPR_START.cmd`。
 
-Release 构建、10 项 GPU 测试和主图组合回归通过。**当前没有性能优势**：RTX 5070 的 VeachAjar 1080p 完整图，旧 PG/A缓存关/A缓存开/B 分别约 15.58/41.14/41.40/36.71 ms；短时 raw HDR 质量也未优于旧 PG。默认 A 是固定双样本实验基线。协议、显存、缓存近似、自发光材质连续编辑的共享内存限制及全部证据见 [验收结果](VXPG_VALIDATION_RESULTS.md)。
+首次复刻的历史验收包括Release构建、10项GPU测试和主图组合回归；当时RTX 5070的VeachAjar 1080p完整图，旧PG/A缓存关/A缓存开/B约15.58/41.14/41.40/36.71 ms，短时raw HDR质量未优于旧PG。该组数字不与后续不同轮测量混用。历史协议、显存、缓存近似、自发光材质连续编辑的共享内存限制见 [验收结果](VXPG_VALIDATION_RESULTS.md)。
+
+2026-10-22完成O0–O2等价优化：默认关闭高频详细计数，复用候选PDF和同一端点q，提前拒绝无效引导命中，拆分PDF-only立体角计算，并在32 B节点内预计算查询几何。RTX 5070、VeachAjar、1080p完整主图、每模式9次运行均值，A缓存关 **43.24→29.96 ms（−30.71%）**、A缓存开 **43.19→30.18 ms（−30.13%）**、B **38.66→27.66 ms（−28.47%）**；720p下降约24%–28%。4秒配对raw HDR NMSE下降约24%–25%，最终NRD图像误差变化较小，不宣称确定改善。当前仍慢于同轮旧PG的约16.79 ms，主要差距仍在MainRender。
+
+本轮7项临时GPU测试在两种节点配置均通过，诊断开/关冻结原图逐位一致，主入口418条生命周期检查和清理后的Release构建通过。临时Python/GPU测试、注册、运行副本和临时采样偏移接口已删除，原始测量保留。节点独立消融小于5%门槛、核心子项按组合测量、1秒部分质量配对时间不合格以及冷重建稀疏计时排除等边界，详见 [O0–O2阶段报告](VXPG_O0_O2_RESULTS.md)。默认A/PG缓存关与完整管线保持原语义，未改变采样预算或引入O3后的新算法。
 
 ## 当前修改范围与 Material 恢复状态
 

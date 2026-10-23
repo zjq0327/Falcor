@@ -8,8 +8,6 @@ namespace RTPTVXPG
 {
 void Manager::validate(const Settings& s)
 {
-    FALCOR_CHECK(std::isfinite(s.guideFraction) && s.guideFraction >= 0.f && s.guideFraction < 1.f,
-        "VXPG guide fraction must be in [0,1), preserving BRDF support.");
     FALCOR_CHECK(s.gridResolution >= 16 && s.gridResolution <= 128 && (s.gridResolution & (s.gridResolution - 1)) == 0,
         "VXPG grid resolution must be a power of two in [16,128].");
     FALCOR_CHECK(s.maxVoxels >= 256 && s.maxVoxels <= 262144, "VXPG active voxel capacity must be in [256,262144].");
@@ -22,6 +20,20 @@ void Manager::validate(const Settings& s)
 void Manager::configure(const Settings& settings, uint2 frameDim)
 {
     validate(settings);
+    if (settings.sharedInjectionEnabled != mSettings.sharedInjectionEnabled)
+    {
+        invalidateDistribution("Training source changed; rebuild the VXPG proposal");
+        if (mpInject) mpInject->addDefine("RTPT_VXPG_SHARED_INJECTION", settings.sharedInjectionEnabled ? "1" : "0", true);
+    }
+    if (settings.detailedDiagnostics != mSettings.detailedDiagnostics)
+    {
+        // Change only instrumentation variants; published data and histories
+        // remain usable, including a frozen proposal and its debug view.
+        const char* enabled = settings.detailedDiagnostics ? "1" : "0";
+        for (const auto& pass : {mpInject, mpRowVisibility, mpTopLeaves})
+            if (pass) pass->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", enabled, true);
+        invalidateDiagnosticSnapshot();
+    }
     const bool structural = settings.gridResolution != mSettings.gridResolution || settings.maxVoxels != mSettings.maxVoxels ||
         settings.clusterCount != mSettings.clusterCount || settings.superpixelSize != mSettings.superpixelSize ||
         any(frameDim != mFrameDim);
@@ -75,6 +87,8 @@ uint64_t Manager::estimateModelBytes() const
 
 void Manager::invalidateDistribution(const std::string& reason)
 {
+    beginFrame();
+    invalidateDiagnosticSnapshot();
     ++mGeneration;
     mReady = mDistributionValid = false;
     mFallbackReason = reason;
@@ -97,6 +111,8 @@ void Manager::resetClusterPasses()
 
 void Manager::releaseModelResources()
 {
+    beginFrame();
+    invalidateDiagnosticSnapshot();
     mReady=mGeometryValid=mDistributionValid=false;
     mpClearGeometry=mpMakeJobs=mpFinalizeJobs=mpVoxelize=mpDebug=nullptr;
     mpClearFrame=mpInject=mpCompact=mpGlobalLeaves=mpGlobalLevel=mpPublish=mpClearDiagnostics=nullptr;
@@ -115,6 +131,8 @@ void Manager::releaseModelResources()
 
 void Manager::invalidate()
 {
+    beginFrame();
+    invalidateDiagnosticSnapshot();
     ++mGeneration;
     mReady = false;
     mGeometryValid = false;
@@ -153,8 +171,6 @@ void Manager::bind(const ShaderVar& root, uint32_t frameIndex, bool active) cons
         parameters["generation"] = mGeneration;
         parameters["enabled"] = active && mSettings.enabled ? 1u : 0u;
         parameters["useGuiding"] = mSettings.useGuiding ? 1u : 0u;
-        parameters["estimator"] = uint32_t(mSettings.estimator);
-        parameters["guideFraction"] = mSettings.guideFraction;
         parameters["pgUseCache"] = mSettings.pgUseCache ? 1u : 0u;
         parameters["visibilityEnabled"] = mSettings.visibilityEnabled ? 1u : 0u;
         parameters["debugEnabled"] = mSettings.debugEnabled ? 1u : 0u;
@@ -390,9 +406,12 @@ void Manager::buildGeometry(RenderContext* context, const ref<Texture>& debugOut
     }
 }
 
-void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, uint32_t seed, bool useNEE,
-    uint32_t sampleOffset, bool useNRD)
+void Manager::prepareLighting(RenderContext* context)
 {
+    beginFrame();
+    // Construction observations describe one actual update, never a frozen
+    // frame or an old update from before diagnostics were enabled.
+    invalidateDiagnosticSnapshot();
     if (!mGeometryValid || !mSettings.enabled) return;
     if (mSettings.freezeUpdates)
     {
@@ -464,6 +483,8 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
         defines.add(mpSampleGenerator->getDefines());
         defines.add("ENABLE_PG", "0");
         defines.add("ENABLE_NRD", "0");
+        defines.add("RTPT_VXPG_DETAILED_DIAGNOSTICS", mSettings.detailedDiagnostics ? "1" : "0");
+        defines.add("RTPT_VXPG_SHARED_INJECTION", mSettings.sharedInjectionEnabled ? "1" : "0");
         defines.add("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
         defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
@@ -492,6 +513,31 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
         context->uavBarrier(mpBoundMax.get());
         context->uavBarrier(mpInverse.get());
     }
+    if (mSettings.sharedInjectionEnabled)
+    {
+        context->uavBarrier(mpRepresentativePosition.get());
+        context->uavBarrier(mpRepresentativeNormal.get());
+    }
+    mLightingPrepared = true;
+}
+
+void Manager::barrierInjection(RenderContext* context) const
+{
+    for (const auto& buffer : {mpFlux, mpCount, mpState, mpBoundMax, mpRepresentativePosition, mpRepresentativeNormal})
+        if (buffer) context->uavBarrier(buffer.get());
+}
+
+void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, uint32_t seed, bool useNEE,
+    uint32_t sampleOffset, bool useNRD)
+{
+    if (!mLightingPrepared) return;
+    mLightingPrepared = false;
+    const uint32_t cells = mSettings.gridResolution * mSettings.gridResolution * mSettings.gridResolution;
+    auto execute = [&](const ref<ComputePass>& pass, uint3 size)
+    {
+        bind(pass->getRootVar(), mLightingFrameIndex, true);
+        pass->execute(context, size);
+    };
     {
         FALCOR_PROFILE(context, "VXPGInject");
         context->uavBarrier(mpPrimaryPosition.get());
@@ -547,6 +593,8 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
     mDistributionValid = true;
     mReady = true;
     mFallbackReason.clear();
+    mModelDiagnosticsAvailable = mSettings.detailedDiagnostics;
+    mModelDiagnosticsFrameIndex = mLightingFrameIndex;
     ++mLightingFrameIndex;
 }
 
@@ -596,6 +644,7 @@ void Manager::updateVisibility(RenderContext* context)
         desc.setShaderModel(ShaderModel::SM6_6);
         DefineList defines=scene?mpScene->getSceneDefines():DefineList();
         if(scene)defines.add(mpSampleGenerator->getDefines());
+        defines.add("RTPT_VXPG_DETAILED_DIAGNOSTICS", mSettings.detailedDiagnostics ? "1" : "0");
         return ComputePass::create(mpDevice,desc,defines,true);
     };
     if (!mpPrepareClusters)
@@ -728,6 +777,8 @@ void Manager::updateVisibility(RenderContext* context)
             context->uavBarrier(mpForest.get());
         }
         execute(mpPublishClusters, uint3(1));
+        // Publication converts the remaining AABB roots to query geometry.
+        context->uavBarrier(mpForest.get());
         context->uavBarrier(mpClusterState.get());
         context->uavBarrier(mpState.get());
     }

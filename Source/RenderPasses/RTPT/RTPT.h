@@ -37,7 +37,8 @@ private:
     bool usesPairedSharc() const;
     void clearSHARC(RenderContext* pRenderContext);
     void executeTraining(RenderContext* pRenderContext);
-    void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
+    void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex,
+        bool sharc, bool pg, bool vxpg = false);
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
@@ -50,12 +51,18 @@ private:
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
     RTPTVXPG::Settings mVXPGSettings;
     std::string mVXPGDiagnosticText;
+    bool mVXPGDiagnosticFrameAvailable = false;
+    uint32_t mVXPGDiagnosticFrameSampleOffset = 0;
+    uint32_t mVXPGDiagnosticFrameSamplesPerPixel = 0;
+    uint32_t mVXPGDiagnosticFrameGeneration = 0;
     RTPTVXPG::GuidingMode mGuidingMode = RTPTVXPG::GuidingMode::PG;
     bool mEnableVXPG = false;
     bool mEnablePG = false;
     bool mResetPG = true;
     bool mPGTrainingThisFrame = false;
     bool mSharedTrainingThisFrame = false;
+    bool mVXPGSharedTrainingThisFrame = false;
+    bool mVXPGSharedWithSHARCThisFrame = false;
     uint32_t mPGUpdateStride = 5;
     uint32_t mPGUpdateBounces = 8;
     uint32_t mPGFrameIndex = 0;

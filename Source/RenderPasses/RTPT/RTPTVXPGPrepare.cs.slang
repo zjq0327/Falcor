@@ -5,7 +5,11 @@ cbuffer VXPGTreeLevel { uint nodeOffset; uint nodeCount; uint leafCapacity; };
 [numthreads(32, 1, 1)]
 void clearDiagnostics(uint3 tid : SV_DispatchThreadID)
 {
-    if ((tid.x >= 6 && tid.x <= 11) || (tid.x >= 13 && tid.x < 32)) gVXPGState[tid.x] = 0;
+    // A frozen proposal still gets fresh render activity. Preserve its model
+    // structure (including gathered points at 26); construction activity is
+    // explicitly unavailable on frames with no construction dispatch.
+    if ((tid.x >= 6 && tid.x <= 25) || tid.x == RTPT_VXPG_STATE_SHARED_PATHS)
+        gVXPGState[tid.x] = 0;
 }
 
 [numthreads(256, 1, 1)]

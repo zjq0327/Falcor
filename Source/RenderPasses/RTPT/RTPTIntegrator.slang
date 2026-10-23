@@ -1,20 +1,9 @@
 #pragma once
+#include "RTPTCamera.slang"
 
 Ray rtptGenerateCameraRay(uint2 pixel, inout SampleGenerator sg)
 {
-#if ENABLE_NRD
-    // Radiance, first-hit guides and NRD reprojection share camera jitter.
-    return gScene.camera.computeRayPinhole(pixel, gParams.frameDim);
-#else
-    // Own subpixel jitter so accumulating a stationary camera remains valid.
-    // External camera jitter is deliberately ignored; this version is pinhole.
-    const float2 p = (float2(pixel) + sampleNext2D(sg)) / float2(gParams.frameDim);
-    const float2 ndc = p * float2(2.f, -2.f) + float2(-1.f, 1.f);
-    let camera = gScene.camera.data;
-    const float3 direction = normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW);
-    const float inverseCosine = 1.f / dot(normalize(camera.cameraW), direction);
-    return Ray(camera.posW, direction, camera.nearZ * inverseCosine, camera.farZ * inverseCosine);
-#endif
+    return rtptCameraRay(pixel, gParams.frameDim, ENABLE_NRD != 0, sg);
 }
 
 float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)

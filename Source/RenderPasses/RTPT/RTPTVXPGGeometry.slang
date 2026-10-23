@@ -74,6 +74,21 @@ struct RTPTVXPGSphericalBox
     float coneHeight;
 };
 
+float rtptVXPGBoundingConeHeight(float distance2, float radius2)
+{
+    const float sin2=min(1.f,radius2/max(1.e-30f,distance2));
+    return distance2<=radius2?2.f:sin2/(1.f+sqrt(max(0.f,1.f-sin2)));
+}
+
+bool rtptVXPGSphericalTriangleArea(float3 a, float3 b, float3 c, out float area)
+{
+    area = rtptVXPGTriangleSolidAngle(a, b, c);
+    const float3 ab = cross(a, b), ac = cross(a, c);
+    const float conditioning = length(cross(normalize(ab), normalize(ac)));
+    // Sampling and PDF-only evaluation must choose exactly the same fallback.
+    return !(!(area > 1.e-7f) || !(conditioning > 1.e-5f) || length(ab) < 1.e-4f || length(ac) < 1.e-4f || !isfinite(area));
+}
+
 RTPTVXPGSphericalBox rtptVXPGBoundingCone(float3 origin, float3 lo, float3 hi)
 {
     RTPTVXPGSphericalBox result={};
@@ -85,8 +100,7 @@ RTPTVXPGSphericalBox rtptVXPGBoundingCone(float3 origin, float3 lo, float3 hi)
     result.coneAxis=distance2>0.f?delta/sqrt(distance2):float3(0,0,1);
     // Stable 1-cos(theta), including sub-pixel distant boxes. Rejections outside
     // the box retain null probability, with this same cone density in reverse.
-    const float sin2=min(1.f,radius2/max(1.e-30f,distance2));
-    result.coneHeight=distance2<=radius2?2.f:sin2/(1.f+sqrt(max(0.f,1.f-sin2)));
+    result.coneHeight=rtptVXPGBoundingConeHeight(distance2,radius2);
     result.solidAngle=6.283185307179586f*result.coneHeight;
     return result;
 }
@@ -118,12 +132,10 @@ RTPTVXPGSphericalBox rtptVXPGSphericalBox(float3 origin, float3 lo, float3 hi)
         {
             const uint index = axis * 2 + triangle;
             const float3 a = corners[0], b = corners[triangle + 1], c = corners[triangle + 2];
-            const float area = rtptVXPGTriangleSolidAngle(a, b, c);
-            const float3 ab = cross(a, b), ac = cross(a, c);
-            const float conditioning = length(cross(normalize(ab), normalize(ac)));
+            float area;
             // Reject the entire box in this context. Dropping just one triangle
             // would require a directional support test in the reverse PDF.
-            if (!(area > 1.e-7f) || !(conditioning > 1.e-5f) || length(ab) < 1.e-4f || length(ac) < 1.e-4f || !isfinite(area))
+            if (!rtptVXPGSphericalTriangleArea(a, b, c, area))
             {
                 return rtptVXPGBoundingCone(origin,lo,hi);
             }
@@ -135,6 +147,41 @@ RTPTVXPGSphericalBox rtptVXPGSphericalBox(float3 origin, float3 lo, float3 hi)
         }
     }
     return result;
+}
+
+// Reverse evaluation needs the same solid angle/support as the sampler, but
+// does not need to materialize its 24 directions and six triangle records.
+float rtptVXPGBoxSolidAngle(float3 origin, float3 lo, float3 hi)
+{
+    if (!all(hi > lo) || !all(isfinite(origin)) || !all(isfinite(lo)) || !all(isfinite(hi))) return 0.f;
+    if (all(origin >= lo) && all(origin <= hi)) return 12.56637061435917f;
+    float solidAngle = 0.f;
+    for (uint axis = 0; axis < 3; ++axis)
+    {
+        if (origin[axis] >= lo[axis] && origin[axis] <= hi[axis]) continue;
+        const uint j = (axis + 1) % 3, k = (axis + 2) % 3;
+        float3 corners[4];
+        for (uint v = 0; v < 4; ++v)
+        {
+            float3 p;
+            p[axis] = origin[axis] < lo[axis] ? lo[axis] : hi[axis];
+            p[j] = (v == 1 || v == 2) ? hi[j] : lo[j];
+            p[k] = v >= 2 ? hi[k] : lo[k];
+            corners[v] = normalize(p - origin);
+        }
+        for (uint triangle = 0; triangle < 2; ++triangle)
+        {
+            float area;
+            if (!rtptVXPGSphericalTriangleArea(corners[0], corners[triangle + 1], corners[triangle + 2], area))
+            {
+                const float3 delta=0.5f*(lo+hi)-origin;
+                const float3 extent=0.5f*(hi-lo);
+                return 6.283185307179586f*rtptVXPGBoundingConeHeight(dot(delta,delta),dot(extent,extent)*1.00001f);
+            }
+            solidAngle += area;
+        }
+    }
+    return solidAngle;
 }
 
 bool rtptVXPGSampleBox(RTPTVXPGSphericalBox box, float3 u, out float3 direction)

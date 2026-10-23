@@ -37,8 +37,3 @@ RTPTVXPGMISWeights rtptVXPGWeights(float p, float q, bool guideUsesCache)
     result.guideSuffix = suffix.y;
     return result;
 }
-
-float rtptVXPGMixturePdf(float p, float q, float alpha)
-{
-    return (1.f - alpha) * p + alpha * q;
-}

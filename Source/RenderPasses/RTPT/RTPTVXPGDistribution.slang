@@ -6,9 +6,14 @@
 float rtptVXPGNodeImportance(RTPTVXPGNode node, float3 origin, float3 normal)
 {
     if (!(node.mass > 0.f)) return 0.f;
+#if RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY
+    const float3 delta = node.lo - origin;
+    const float radius = node.hi.x;
+#else
     const float3 delta = 0.5f * (node.lo + node.hi) - origin;
-    const float distance2 = dot(delta, delta);
     const float radius = 0.5f * length(node.hi - node.lo);
+#endif
+    const float distance2 = dot(delta, delta);
     const float distance = sqrt(max(1.e-20f, distance2));
     const float cosineBound = saturate(dot(normal, delta) / distance + radius / distance);
     const float cell2 = gVXPGParams.cellSize * gVXPGParams.cellSize;

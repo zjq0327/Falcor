@@ -19,7 +19,7 @@ bool rtptVXPGVisible(float3 a, float3 na, float3 b, float3 nb)
     const float length = sqrt(dot(segment, segment));
     if (!(length > 2.f*epsilon)) return false;
     SceneRayQuery<true> query;
-    InterlockedAdd(gVXPGClusterState[2], 1u);
+    rtptVXPGCountVisibility(2u);
     return query.traceVisibilityRay(Ray(origin, segment/length, 0.f, length-epsilon));
 }
 
@@ -66,7 +66,7 @@ void rowVisibility(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
     if (visible)
     {
         InterlockedOr(descriptor[lane/32],1u<<(lane%32));
-        InterlockedAdd(gVXPGClusterState[3],1u);
+        rtptVXPGCountVisibility(3u);
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane==0) gVXPGVisibility[compact]=uint4(descriptor[0],descriptor[1],descriptor[2],descriptor[3]);
@@ -320,7 +320,7 @@ float rtptVXPGPairContribution(uint row,uint cluster,uint sampleIndex,uint4 info
     const float contribution=max(f.x,max(f.y,f.z))/distance2;
     if(isfinite(contribution) && contribution>=0.f)
     {
-        if(contribution>0.f)InterlockedAdd(gVXPGState[25],1u);
+        if(contribution>0.f)rtptVXPGCount(25u);
         return contribution/32.f;
     }
     InterlockedAdd(gVXPGState[11],1u);

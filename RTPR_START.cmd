@@ -10,10 +10,11 @@ set "RTPT_TONEMAPPER_ENABLED=1"
 set "RTPT_GUIDING_MODE=VXPG"
 set "RTPT_PG_ENABLED=1"
 set "RTPT_VXPG_ENABLED=1"
-set "RTPT_VXPG_ESTIMATOR=ShortBranch"
 set "RTPT_VXPG_PG_SHARC_ENABLED=0"
 set "RTPT_VXPG_VISIBILITY_ENABLED=1"
 set "RTPT_VXPG_DEBUG_ENABLED=0"
+set "RTPT_VXPG_DIAGNOSTICS_ENABLED=0"
+set "RTPT_VXPG_SHARED_INJECTION_ENABLED=0"
 
 set "RTPT_EXE=build\windows-vs2022\bin\Release\Mogwai.exe"
 rem Main entry point: keep the complete integrated rendering pipeline here.

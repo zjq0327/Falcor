@@ -11,11 +11,13 @@ target_sources(RTPT PRIVATE
     RTPTPGTypes.slang
     RTPTPG.slang
     RTPTSampling.slang
+    RTPTCamera.slang
     RTPTVXPGMath.slang
     RTPTVXPGGeometry.slang
     RTPTVXPGTypes.slang
     RTPTVXPGGeometry.cs.slang
     RTPTVXPGInject.cs.slang
+    RTPTVXPGTraining.slang
     RTPTVXPGPrepare.cs.slang
     RTPTVXPGSampling.slang
     RTPTVXPGIntegrator.slang
