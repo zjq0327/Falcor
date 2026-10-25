@@ -1,42 +1,5 @@
 #pragma once
 
-// Clip a triangle against a closed box. A triangle clipped by six planes has
-// at most nine vertices. Twelve slots also retain conservative edge contacts.
-bool rtptVXPGClipTriangle(float3 a, float3 b, float3 c, float3 lo, float3 hi, out float3 boundMin, out float3 boundMax)
-{
-    float3 polygon[12];
-    float3 next[12];
-    polygon[0] = a; polygon[1] = b; polygon[2] = c;
-    uint count = 3;
-    for (uint plane = 0; plane < 6; ++plane)
-    {
-        const uint axis = plane / 2;
-        const bool lower = (plane & 1) == 0;
-        const float boundary = lower ? lo[axis] : hi[axis];
-        uint nextCount = 0;
-        for (uint i = 0; i < count; ++i)
-        {
-            const float3 p = polygon[i], q = polygon[(i + 1) % count];
-            const float dp = lower ? p[axis] - boundary : boundary - p[axis];
-            const float dq = lower ? q[axis] - boundary : boundary - q[axis];
-            if (dp >= 0.f && nextCount < 12) next[nextCount++] = p;
-            if ((dp >= 0.f) != (dq >= 0.f) && nextCount < 12)
-                next[nextCount++] = lerp(p, q, dp / (dp - dq));
-        }
-        count = nextCount;
-        for (uint j = 0; j < count; ++j) polygon[j] = next[j];
-        if (count == 0) break;
-    }
-    boundMin = hi;
-    boundMax = lo;
-    for (uint k = 0; k < count; ++k)
-    {
-        boundMin = min(boundMin, polygon[k]);
-        boundMax = max(boundMax, polygon[k]);
-    }
-    return count != 0;
-}
-
 float rtptVXPGTriangleSolidAngle(float3 a, float3 b, float3 c)
 {
     return 2.f * atan2(abs(dot(a, cross(b, c))), 1.f + dot(a, b) + dot(b, c) + dot(c, a));

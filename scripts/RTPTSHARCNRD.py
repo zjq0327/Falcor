@@ -16,9 +16,20 @@ def _choice(name, choices, default):
     return value
 
 
+def _vxpg_grid():
+    # VXPG has one spatial backend: persistent incremental sparse distance LOD.
+    return {
+        "vxpgLodSceneScale": float(os.environ.get("RTPT_VXPG_LOD_SCENE_SCALE", "8")),
+        "vxpgLodHashCapacity": int(os.environ.get("RTPT_VXPG_LOD_HASH_CAPACITY", "65536")),
+        "vxpgLodGeometryCapacity": int(os.environ.get("RTPT_VXPG_LOD_GEOMETRY_CAPACITY", "8192")),
+        "vxpgLodBudgetMB": int(os.environ.get("RTPT_VXPG_LOD_BUDGET_MB", "256")),
+    }
+
+
 def render_graph_RTPTSHARCNRD():
     graph = RenderGraph("RTPTSHARCNRD")
     graph.addPass(createPass("RTPT", {
+        **_vxpg_grid(),
         "enableNRD": True,
         "samplesPerPixel": 1,
         "maxBounces": 4,
@@ -28,28 +39,19 @@ def render_graph_RTPTSHARCNRD():
         "accumulate": False,
         "seed": 0,
         "enableSHARC": True,
-        "enablePG": True,
         "enableVXPG": True,
-        "guidingMode": _choice("RTPT_GUIDING_MODE", ("BSDF", "PG", "VXPG"), "VXPG"),
+        "guidingMode": _choice("RTPT_GUIDING_MODE", ("BSDF", "VXPG"), "VXPG"),
         "vxpgEnabled": _module_enabled("RTPT_VXPG_ENABLED", "1"),
         "vxpgPGUseCache": _module_enabled("RTPT_VXPG_PG_SHARC_ENABLED", "0"),
         "vxpgVisibilityEnabled": _module_enabled("RTPT_VXPG_VISIBILITY_ENABLED"),
         "vxpgDebugEnabled": _module_enabled("RTPT_VXPG_DEBUG_ENABLED", "0"),
         "vxpgDetailedDiagnostics": _module_enabled("RTPT_VXPG_DIAGNOSTICS_ENABLED", "0"),
         "vxpgSharedInjectionEnabled": _module_enabled("RTPT_VXPG_SHARED_INJECTION_ENABLED", "0"),
-        "pgEnabled": _module_enabled("RTPT_PG_ENABLED"),
-        "pgUseGuiding": True,
-        "pgFreeze": False,
-        "pgDetailedDiagnostics": _module_enabled("RTPT_PG_DIAGNOSTICS_ENABLED", "0"),
-        "pgGuideFraction": 0.5,
-        "pgCoarseLevels": 2,
-        "pgTreeBudgetMB": 64,
-        "pgRecordBudgetMB": 128,
-        "pgPublishInterval": 16,
-        "pgMaxRegions": 16384,
-        "pgMaxNodesPerRegion": 85,
-        "pgUpdateStride": 5,
-        "pgUpdateBounces": 8,
+        "vxpgDiscoveryStride": int(os.environ.get("RTPT_VXPG_DISCOVERY_STRIDE", "5")),
+        "vxpgSpatialStaleFrames": int(os.environ.get("RTPT_VXPG_SPATIAL_STALE_FRAMES", "512")),
+        "vxpgTreeRefreshFrames": int(os.environ.get("RTPT_VXPG_TREE_REFRESH_FRAMES", "16")),
+        "vxpgHistoryFrames": int(os.environ.get("RTPT_VXPG_HISTORY_FRAMES", "32")),
+        "vxpgHistoryStaleFrames": int(os.environ.get("RTPT_VXPG_HISTORY_STALE_FRAMES", "128")),
         "sharcEnabled": _module_enabled("RTPT_SHARC_ENABLED"),
         "sharcEntries": 1048576,
         "sharcUpdateStride": 5,

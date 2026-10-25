@@ -8,18 +8,34 @@ namespace RTPTVXPG
 {
 void Manager::validate(const Settings& s)
 {
-    FALCOR_CHECK(s.gridResolution >= 16 && s.gridResolution <= 128 && (s.gridResolution & (s.gridResolution - 1)) == 0,
-        "VXPG grid resolution must be a power of two in [16,128].");
+    FALCOR_CHECK(s.discoveryStride>=1 && s.discoveryStride<=32 && s.spatialStaleFrames>=1 && s.spatialStaleFrames<=16384,"Invalid incremental grid stride or lifetime.");
+    FALCOR_CHECK(s.treeRefreshFrames >= 1 && s.treeRefreshFrames <= 1024, "VXPG tree refresh interval must be in [1,1024].");
+    FALCOR_CHECK(s.historyFrames >= 1 && s.historyFrames <= 1024 && s.historyStaleFrames >= 1 && s.historyStaleFrames <= 4096,
+        "VXPG history frames must be in [1,1024] and lifetime in [1,4096].");
+    FALCOR_CHECK(std::isfinite(s.lodSceneScale) && s.lodSceneScale > 0.f, "Invalid VXPG LOD scale.");
+    FALCOR_CHECK(s.lodHashCapacity >= 256 && s.lodHashCapacity <= (1u << 22) && (s.lodHashCapacity & (s.lodHashCapacity - 1)) == 0, "Invalid VXPG hash capacity.");
+    FALCOR_CHECK(s.lodGeometryCapacity >= 256 && s.lodGeometryCapacity <= (1u << 21) && s.lodGeometryCapacity <= s.lodHashCapacity, "Invalid VXPG geometry capacity.");
+    FALCOR_CHECK(s.lodBudgetMiB >= 32 && s.lodBudgetMiB <= 2048, "Invalid VXPG budget.");
     FALCOR_CHECK(s.maxVoxels >= 256 && s.maxVoxels <= 262144, "VXPG active voxel capacity must be in [256,262144].");
     FALCOR_CHECK(s.clusterCount >= 1 && s.clusterCount <= 32, "VXPG cluster count must be in [1,32].");
     FALCOR_CHECK(s.superpixelSize >= 8 && s.superpixelSize <= 64, "VXPG superpixel size must be in [8,64].");
-    FALCOR_CHECK(s.budgetMiB >= 32 && s.budgetMiB <= 2048, "VXPG resource budget must be in [32,2048] MiB.");
-    FALCOR_CHECK(s.debugMode <= 3, "VXPG debug mode must be in [0,3].");
+    FALCOR_CHECK(s.debugMode <= 4, "VXPG debug mode must be in [0,4].");
 }
 
 void Manager::configure(const Settings& settings, uint2 frameDim)
 {
     validate(settings);
+    if(settings.spatialStaleFrames!=mSettings.spatialStaleFrames)invalidateDistribution("Spatial lifetime changed");
+    if (settings.historyFrames != mSettings.historyFrames ||
+        settings.historyStaleFrames != mSettings.historyStaleFrames || settings.enabled != mSettings.enabled ||
+        settings.sharedInjectionEnabled != mSettings.sharedInjectionEnabled)
+        resetLightingHistory();
+    if (settings.treeRefreshFrames != mSettings.treeRefreshFrames)
+        invalidateDistribution("Topology refresh interval changed");
+    const bool layoutChanged = settings.discoveryStride != mSettings.discoveryStride ||
+        settings.lodSceneScale != mSettings.lodSceneScale || settings.lodHashCapacity != mSettings.lodHashCapacity ||
+        settings.lodGeometryCapacity != mSettings.lodGeometryCapacity || settings.lodBudgetMiB != mSettings.lodBudgetMiB;
+    if (layoutChanged) { releaseModelResources(); invalidate(); }
     if (settings.sharedInjectionEnabled != mSettings.sharedInjectionEnabled)
     {
         invalidateDistribution("Training source changed; rebuild the VXPG proposal");
@@ -34,10 +50,14 @@ void Manager::configure(const Settings& settings, uint2 frameDim)
             if (pass) pass->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", enabled, true);
         invalidateDiagnosticSnapshot();
     }
-    const bool structural = settings.gridResolution != mSettings.gridResolution || settings.maxVoxels != mSettings.maxVoxels ||
+    const bool structural = settings.maxVoxels != mSettings.maxVoxels ||
         settings.clusterCount != mSettings.clusterCount || settings.superpixelSize != mSettings.superpixelSize ||
         any(frameDim != mFrameDim);
-    if (structural) invalidate();
+    if (structural)
+    {
+        releaseModelResources();
+        invalidate();
+    }
     else if (settings.visibilityEnabled != mSettings.visibilityEnabled) invalidateDistribution();
     if (any(frameDim != mFrameDim) || mScreenAllocationBytes == 0)
     {
@@ -67,7 +87,7 @@ void Manager::configure(const Settings& settings, uint2 frameDim)
     mSettings = settings;
     mFrameDim = frameDim;
     mEstimatedBytes = estimateModelBytes();
-    if (mEstimatedBytes > uint64_t(settings.budgetMiB) * 1024ull * 1024ull)
+    if (mEstimatedBytes > uint64_t(getBudgetMiB()) * 1024ull * 1024ull)
     {
         releaseModelResources();
         mFallbackReason = "Resource estimate exceeds VXPG budget";
@@ -76,28 +96,86 @@ void Manager::configure(const Settings& settings, uint2 frameDim)
 
 uint64_t Manager::estimateModelBytes() const
 {
-    const uint64_t cells = uint64_t(mSettings.gridResolution) * mSettings.gridResolution * mSettings.gridResolution;
+    const uint64_t cells = cellCapacity();
     const uint64_t superpixels = uint64_t((mFrameDim.x + mSettings.superpixelSize - 1) / mSettings.superpixelSize) *
         ((mFrameDim.y + mSettings.superpixelSize - 1) / mSettings.superpixelSize);
-    // 216 B/capacity covers next-power-of-two trees even for non-power capacities.
-    return cells * 80ull + uint64_t(mSettings.maxVoxels) * 216ull + superpixels * 304ull +
-        mScreenAllocationBytes + uint64_t(mFrameDim.x) * mFrameDim.y * 4ull +
-        uint64_t(mJobCapacity) * sizeof(uint2) + uint64_t(mTriangleCount) * 24ull + (2ull << 20);
+    // Conservative capacities for the persistent grid, local trees and screen data.
+    const uint64_t discoveryCount = uint64_t((mFrameDim.x + mSettings.discoveryStride - 1) / mSettings.discoveryStride) *
+        ((mFrameDim.y + mSettings.discoveryStride - 1) / mSettings.discoveryStride);
+    const uint64_t gridExtra = cells * 44ull + uint64_t(getHashCapacity()) * 8ull + discoveryCount * 60ull + 64ull;
+    const uint64_t localExtra = cells * 4ull + uint64_t(mSettings.maxVoxels) * 36ull + 344ull;
+    const uint64_t historySnapshots = cells * 32ull;
+    return historySnapshots + gridExtra + localExtra + cells * 96ull + 16ull +
+        uint64_t(mSettings.maxVoxels) * 216ull + superpixels * 304ull + mScreenAllocationBytes +
+        uint64_t(mFrameDim.x) * mFrameDim.y * 4ull + (2ull << 20);
+}
+
+void Manager::advanceGeneration(uint32_t& generation)
+{
+    if(generation==std::numeric_limits<uint32_t>::max())
+    {
+        // No queued consumer may retain the identity when it is reused.
+        mpDevice->wait();
+        generation=1;
+    }
+    else ++generation;
 }
 
 void Manager::invalidateDistribution(const std::string& reason)
 {
     beginFrame();
     invalidateDiagnosticSnapshot();
-    ++mGeneration;
+    advanceGeneration(mGeneration);
     mReady = mDistributionValid = false;
     mFallbackReason = reason;
 }
 
+void Manager::cameraChanged()
+{
+    // Screen points and top weights refresh before publication. Frozen data
+    // cannot refresh those view-dependent inputs and must fall back instead.
+    if (mSettings.freezeUpdates) invalidateDistribution();
+}
+
 void Manager::invalidateLighting()
 {
+    resetLightingHistory();
     invalidateDistribution("Lighting configuration needs rebuilding");
     mpInject = nullptr;
+}
+
+void Manager::resetLightingHistory()
+{
+    mResetHistory = true;
+    invalidateDistribution("Lighting history needs rebuilding");
+}
+
+std::array<uint32_t, 8> Manager::readHistoryCounters() const
+{
+    std::array<uint32_t, 8> result = {};
+    if (mpHistoryStats && !mResetHistory) mpHistoryStats->getBlob(result.data(), 0, sizeof(result));
+    return result;
+}
+
+std::array<uint32_t,8> Manager::readQueryCounters() const
+{
+    std::array<uint32_t,8> result={};
+    if(mSettings.detailedDiagnostics && mpQueryStats)mpQueryStats->getBlob(result.data(),0,sizeof(result));
+    return result;
+}
+
+std::array<uint32_t,16> Manager::readGridCounters() const
+{
+    std::array<uint32_t,16> result={};
+    if(mpGridState)mpGridState->getBlob(result.data(),0,sizeof(result));
+    return result;
+}
+
+std::array<uint32_t, 16> Manager::readTreeCounters() const
+{
+    std::array<uint32_t, 16> result = {};
+    if (mpTreeState && mDistributionValid) mpTreeState->getBlob(result.data(), 0, sizeof(result));
+    return result;
 }
 
 void Manager::resetClusterPasses()
@@ -114,43 +192,48 @@ void Manager::releaseModelResources()
     beginFrame();
     invalidateDiagnosticSnapshot();
     mReady=mGeometryValid=mDistributionValid=false;
-    mpClearGeometry=mpMakeJobs=mpFinalizeJobs=mpVoxelize=mpDebug=nullptr;
-    mpClearFrame=mpInject=mpCompact=mpGlobalLeaves=mpGlobalLevel=mpPublish=mpClearDiagnostics=nullptr;
+    mpDebug = nullptr;
+    mpClearFrame=mpInject=mpGlobalLeaves=mpGlobalLevel=mpPublish=mpClearDiagnostics=nullptr;
     resetClusterPasses();
-    mpBoundMin=mpBoundMax=mpState=mpInverse=mpJobs=mpDispatchArgs=nullptr;
-    mpTriangles=mpTriangleRanges=nullptr;
+    mpBoundMin = mpBoundMax = mpState = mpInverse = nullptr;
+    mpHash = mpCellKeys = mpWorkArgs = mpWorkDispatch = nullptr;
+    mpHistoryPrevious=mpNormalPrevious=nullptr;
+    mpGeometryWork=mpActiveWork=mpForestWork=nullptr;
     mpFlux=mpCount=mpCompactIndices=mpMass=mpGlobalTree=mpRepresentativePosition=mpRepresentativeNormal=nullptr;
+    mpHistory = mpHistoryStats = mpQueryStats = nullptr;
+    mpCellMass = mpTreeState = mpDirtyLeaves = mpDirtyNodes = mpLocalArgs = mpLocalDispatch = nullptr;
+    mpGridState=mpCellLifetime=mpFreeCells=mpRetiredCells=mpDiscovery=mpDiscoveryClaims=mpPendingHash=mpPendingSlots=nullptr;
+    mpGridClear=mpGridBegin=mpGridEvict=mpGridDiscover=mpGridInsert=mpGridReplay=mpGridRetire=nullptr;
+    mpBeginLocal = mpResolveLocal = mpSelectLocal = mpCompactLocal = mpLocalWork = mpLocalLeaves = mpLocalLevel = nullptr;
+    mResetHistory = true;
     mpRowPosition=mpRowNormal=mpVisibility=mpSeeds=mpCluster=mpClusterInfo=nullptr;
     mpForest=mpCompactToLeaf=mpSuperpixelPosition=mpSuperpixelNormal=mpTopTree=mpClusterState=mpClusterArgs=nullptr;
     mpSortA=mpSortB=mpHistogram=mpBinOffsets=nullptr;
     mpPrimaryPosition=mpPrimaryNormal=mpPrimaryHit=mpFuzzyIds=mpFuzzyWeights=nullptr;
     mpSuperpixelCount=mpSuperpixelRange=mpSuperpixelBlocks=mpSuperpixelPoints=nullptr;
-    mAllocatedResolution=mAllocatedCapacity=mAllocatedSuperpixelSize=mLeafCapacity=0;
+    mAllocatedCapacity = mAllocatedSuperpixelSize = mLeafCapacity = 0;
     mAllocatedFrameDim=uint2(0);
 }
 
 void Manager::invalidate()
 {
+    mResetHistory = true;
     beginFrame();
     invalidateDiagnosticSnapshot();
-    ++mGeneration;
+    advanceGeneration(mGeneration);
     mReady = false;
     mGeometryValid = false;
     mDistributionValid = false;
     mLightingFrameIndex = 0;
-    mpTriangles = mpTriangleRanges = nullptr;
-    mTriangleCount = 0;
     mFallbackReason = "Voxel proposal has not been built";
 }
 
 void Manager::setScene(const ref<Scene>& scene)
 {
     mpScene = scene;
-    mpClearGeometry = mpMakeJobs = mpFinalizeJobs = mpVoxelize = mpDebug = nullptr;
-    mpClearFrame = mpInject = mpCompact = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
+    mpDebug = nullptr;
+    mpClearFrame = mpInject = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
     resetClusterPasses();
-    mpTriangles = mpTriangleRanges = nullptr;
-    mTriangleCount = 0;
     invalidate();
 }
 
@@ -160,13 +243,25 @@ void Manager::bind(const ShaderVar& root, uint32_t frameIndex, bool active) cons
     if (parameters.isValid())
     {
         parameters["frameDim"] = mFrameDim;
-        parameters["resolution"] = mSettings.gridResolution;
-        parameters["cellCount"] = mSettings.gridResolution * mSettings.gridResolution * mSettings.gridResolution;
+        parameters["cellCount"] = cellCapacity();
+        parameters["hashCapacity"] = getHashCapacity();
+        parameters["sortMin"] = mpScene ? mpScene->getSceneBounds().minPoint : float3(0.f);
+        parameters["sortExtent"] = mpScene ? mpScene->getSceneBounds().extent() : float3(1.f);
         parameters["gridMin"] = mGridMin;
         parameters["cellSize"] = mCellSize;
+        parameters["lodCamera"] = mLodCamera;
+        parameters["lodSceneScale"] = mSettings.lodSceneScale;
+        parameters["geometryGeneration"] = mGeometryGeneration;
+        parameters["historyFrames"] = mSettings.historyFrames;
+        parameters["historyStaleFrames"] = mSettings.historyStaleFrames;
+        parameters["historyReset"] = mResetHistory ? 1u : 0u;
+        parameters["lodPreviousCamera"] = mPreviousLodCamera;
+        parameters["treeRefreshFrames"] = mSettings.treeRefreshFrames;
+        parameters["treeReset"] = mDistributionValid ? 0u : 1u;
+        parameters["globalLeafCapacity"] = mLeafCapacity;
+        parameters["discoveryStride"]=mSettings.discoveryStride;
+        parameters["spatialStaleFrames"]=mSettings.spatialStaleFrames;
         parameters["activeCapacity"] = mSettings.maxVoxels;
-        parameters["triangleCount"] = mTriangleCount;
-        parameters["jobCapacity"] = mJobCapacity;
         parameters["frameIndex"] = frameIndex;
         parameters["generation"] = mGeneration;
         parameters["enabled"] = active && mSettings.enabled ? 1u : 0u;
@@ -187,13 +282,26 @@ void Manager::bind(const ShaderVar& root, uint32_t frameIndex, bool active) cons
     buffer("gVXPGBoundMin", mpBoundMin);
     buffer("gVXPGBoundMax", mpBoundMax);
     buffer("gVXPGState", mpState);
+    buffer("gVXPGQueryStats",mpQueryStats);
     buffer("gVXPGInverse", mpInverse);
-    buffer("gVXPGTriangles", mpTriangles);
-    buffer("gVXPGTriangleRanges", mpTriangleRanges);
-    buffer("gVXPGJobs", mpJobs);
-    buffer("gVXPGDispatchArgs", mpDispatchArgs);
+    buffer("gVXPGWorkArgs",mpWorkArgs);
+    buffer("gVXPGHashSlots",mpHash);
+    buffer("gVXPGCellKeys",mpCellKeys);
     buffer("gVXPGFlux", mpFlux);
     buffer("gVXPGCount", mpCount);
+    buffer("gVXPGHistoryPrevious",mpHistoryPrevious);buffer("gVXPGNormalPrevious",mpNormalPrevious);
+
+    buffer("gVXPGHistory", mpHistory);
+    buffer("gVXPGHistoryStats", mpHistoryStats);
+    buffer("gVXPGCellMass", mpCellMass);
+    buffer("gVXPGTreeState", mpTreeState);
+    buffer("gVXPGDirtyLeaves", mpDirtyLeaves);
+    buffer("gVXPGDirtyNodes", mpDirtyNodes);
+    buffer("gVXPGLocalArgs", mpLocalArgs);
+    buffer("gVXPGGridState",mpGridState);buffer("gVXPGCellLifetime",mpCellLifetime);
+    buffer("gVXPGFreeCells",mpFreeCells);buffer("gVXPGRetiredCells",mpRetiredCells);
+    buffer("gVXPGDiscovery",mpDiscovery);buffer("gVXPGDiscoveryClaims",mpDiscoveryClaims);buffer("gVXPGPendingHash",mpPendingHash);buffer("gVXPGPendingSlots",mpPendingSlots);
+
     buffer("gVXPGCompact", mpCompactIndices);
     buffer("gVXPGMass", mpMass);
     buffer("gVXPGGlobalTree", mpGlobalTree);
@@ -205,6 +313,7 @@ void Manager::bind(const ShaderVar& root, uint32_t frameIndex, bool active) cons
     buffer("gVXPGSeeds", mpSeeds);
     buffer("gVXPGCluster", mpCluster);
     buffer("gVXPGClusterInfo", mpClusterInfo);
+
     buffer("gVXPGForest", mpForest);
     buffer("gVXPGCompactToLeaf", mpCompactToLeaf);
     buffer("gVXPGSuperpixelPosition", mpSuperpixelPosition);
@@ -238,8 +347,8 @@ std::array<uint32_t, 8> Manager::readClusterCounters() const
 uint64_t Manager::getPayloadBytes() const
 {
     uint64_t bytes=0;
-    for (const auto& buffer : {mpBoundMin,mpBoundMax,mpState,mpInverse,mpTriangles,mpTriangleRanges,mpJobs,mpDispatchArgs,
-        mpFlux,mpCount,mpCompactIndices,mpMass,mpGlobalTree,mpRepresentativePosition,mpRepresentativeNormal,
+    for (const auto& buffer : {mpWorkArgs,mpWorkDispatch,mpHash,mpCellKeys,mpBoundMin,mpBoundMax,mpState,mpInverse,
+        mpGridState,mpCellLifetime,mpFreeCells,mpRetiredCells,mpDiscovery,mpDiscoveryClaims,mpPendingHash,mpPendingSlots,mpFlux,mpCount,mpHistory,mpHistoryStats,mpQueryStats,mpHistoryPrevious,mpNormalPrevious,mpCellMass,mpTreeState,mpDirtyLeaves,mpDirtyNodes,mpLocalArgs,mpLocalDispatch,mpCompactIndices,mpMass,mpGlobalTree,mpRepresentativePosition,mpRepresentativeNormal,
         mpRowPosition,mpRowNormal,mpVisibility,mpSeeds,mpCluster,mpClusterInfo,mpForest,mpCompactToLeaf,
         mpSuperpixelPosition,mpSuperpixelNormal,mpTopTree,mpClusterState,mpClusterArgs,mpSortA,mpSortB,mpHistogram,mpBinOffsets,
         mpSuperpixelCount,mpSuperpixelRange,mpSuperpixelBlocks,mpSuperpixelPoints})
@@ -256,154 +365,141 @@ std::array<uint32_t, 32> Manager::readCounters() const
     return result;
 }
 
-void Manager::buildGeometry(RenderContext* context, const ref<Texture>& debugOutput)
+std::array<uint32_t,128> Manager::readLodCounts(uint32_t geometryCount,uint32_t activeCount) const
+{
+    std::array<uint32_t,128> counts={};
+    if(!mpCellKeys || !mpCompactIndices)return counts;
+    geometryCount=std::min(geometryCount,cellCapacity());activeCount=std::min(activeCount,mSettings.maxVoxels);
+    std::vector<int4> keys(geometryCount);std::vector<uint32_t> active(activeCount);
+    std::vector<uint4> bounds;
+    if(geometryCount)mpCellKeys->getBlob(keys.data(),0,keys.size()*sizeof(int4));
+    if(geometryCount)
+    {bounds.resize(geometryCount);mpBoundMin->getBlob(bounds.data(),0,bounds.size()*sizeof(uint4));}
+    if(activeCount)mpCompactIndices->getBlob(active.data(),0,active.size()*sizeof(uint32_t));
+    for(size_t i=0;i<keys.size();++i)
+        if((bounds.empty() || bounds[i].w!=0) && keys[i].w>0 && keys[i].w<64)++counts[keys[i].w];
+    for(auto cell:active)if(cell<keys.size() && keys[cell].w>0 && keys[cell].w<64)++counts[64+keys[cell].w];
+    return counts;
+}
+
+void Manager::appendObservationStatistics(Properties& props,uint32_t geometryCount,uint32_t activeCount) const
+{
+    if(!hasModelDiagnostics() || !mpCount || !mpCompactIndices || !mpMass)return;
+    const uint32_t cells = std::min(geometryCount, cellCapacity());
+    activeCount=std::min(activeCount,mSettings.maxVoxels);
+    if(!cells || !activeCount)return;
+    // Explicit statistics read only; never invoked by normal render dispatch.
+    std::vector<uint32_t> observations(cells),active(activeCount);
+    std::vector<float> mass(activeCount);
+    mpCount->getBlob(observations.data(),0,observations.size()*sizeof(uint32_t));
+    mpCompactIndices->getBlob(active.data(),0,active.size()*sizeof(uint32_t));
+    mpMass->getBlob(mass.data(),0,mass.size()*sizeof(float));
+    std::vector<int4> keys;
+    {keys.resize(cells);mpCellKeys->getBlob(keys.data(),0,keys.size()*sizeof(int4));}
+    for(uint32_t level=0;level<64u;++level)
+    {
+        std::vector<uint32_t> counts;uint64_t total=0;uint32_t single=0,low=0;
+        double totalMass=0.,lowMass=0.;
+        for(uint32_t i=0;i<activeCount;++i)
+        {
+            const uint32_t cell=active[i];if(cell>=cells || (level!=0 && keys[cell].w!=int(level)))continue;
+            const uint32_t n=observations[cell];counts.push_back(n);total+=n;
+            single+=n==1;low+=n<=4;totalMass+=mass[i];if(n<=4)lowMass+=mass[i];
+        }
+        if(counts.empty())continue;
+        std::sort(counts.begin(),counts.end());
+        const std::string prefix=level==0?"observation":"lod"+std::to_string(level)+"Observation";
+        props[prefix+"Count"]=total;
+        props[prefix+"PerActive"]=double(total)/counts.size();
+        props[prefix+"P10"]=counts[(counts.size()-1)/10];
+        props[prefix+"Median"]=.5*(double(counts[(counts.size()-1)/2])+counts[counts.size()/2]);
+        props[prefix+"SingleFraction"]=double(single)/counts.size();
+        props[prefix+"LowCountFraction"]=double(low)/counts.size();
+        props[prefix+"LowCountMassFraction"]=totalMass>0.?lowMass/totalMass:0.;
+    }
+}
+
+void Manager::buildIncrementalGeometry(RenderContext* context)
+{
+    const float3 camera=mpScene->getCamera()->getPosition();
+    if(any(camera!=mLodCamera))cameraChanged();
+    if(mSettings.freezeUpdates)return;
+    mLodCamera=camera;
+    mEstimatedBytes=estimateModelBytes();
+    if(mEstimatedBytes>uint64_t(getBudgetMiB())*1024ull*1024ull)
+    {mGeometryValid=mReady=false;mFallbackReason="Incremental grid exceeds VXPG budget";return;}
+    const auto* animation=mpScene->getAnimationController();
+    if(animation && (animation->hasSkinnedMeshes() || animation->hasAnimatedMeshCaches()))
+    {mGeometryValid=mReady=false;mFallbackReason="Skinned/vertex-cache geometry is not validated for VXPG";return;}
+    if(mGeometryValid)return;
+    FALCOR_PROFILE(context,"VXPGIncrementalGridReset");
+    const uint32_t cells=cellCapacity();
+    if(!mpBoundMin)
+    {
+        mpBoundMin=mpDevice->createStructuredBuffer(16,cells);mpBoundMax=mpDevice->createStructuredBuffer(16,cells);
+        mpInverse=mpDevice->createStructuredBuffer(4,cells);mpCellKeys=mpDevice->createStructuredBuffer(16,cells);
+        mpHash=mpDevice->createStructuredBuffer(4,getHashCapacity());mpState=mpDevice->createStructuredBuffer(4,32);
+        mpWorkArgs=mpDevice->createStructuredBuffer(4,256);
+        mpWorkDispatch=mpDevice->createStructuredBuffer(4,256,ResourceBindFlags::ShaderResource|ResourceBindFlags::UnorderedAccess|ResourceBindFlags::IndirectArg);
+        mpGridState=mpDevice->createStructuredBuffer(4,16);mpCellLifetime=mpDevice->createStructuredBuffer(16,cells);
+        mpFreeCells=mpDevice->createStructuredBuffer(4,cells);mpRetiredCells=mpDevice->createStructuredBuffer(4,cells);
+        const uint32_t requests=((mFrameDim.x+mSettings.discoveryStride-1)/mSettings.discoveryStride)*((mFrameDim.y+mSettings.discoveryStride-1)/mSettings.discoveryStride);
+        mpDiscovery=mpDevice->createStructuredBuffer(48,requests);mpDiscoveryClaims=mpDevice->createStructuredBuffer(4,requests);
+        mpPendingHash=mpDevice->createStructuredBuffer(4,getHashCapacity());mpPendingSlots=mpDevice->createStructuredBuffer(4,2*requests);
+        auto make=[&](const char* entry)
+        {
+            ProgramDesc desc;desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGIncremental.cs.slang").csEntry(entry);desc.setShaderModel(ShaderModel::SM6_6);
+            return ComputePass::create(mpDevice,desc,{},true);
+        };
+        mpGridClear=make("clearGrid");mpGridBegin=make("beginGrid");mpGridEvict=make("evictGrid");
+        mpGridDiscover=make("discover");mpGridInsert=make("insertGrid");mpGridReplay=make("replay");mpGridRetire=make("retire");
+    }
+    mGridMin = float3(-1.e-4f);
+    mCellSize = 2.f / mSettings.lodSceneScale;
+    mLodLevels = 63u;
+    for(const auto& b:{mpHash,mpState,mpBoundMin,mpBoundMax,mpInverse,mpCellKeys,mpCellLifetime,mpGridState})if(b)context->uavBarrier(b.get());
+    bind(mpGridClear->getRootVar(),mLightingFrameIndex,true);
+    mpGridClear->execute(context,uint3(std::max(cells,getHashCapacity()),1,1));
+    for(const auto& b:{mpHash,mpState,mpBoundMin,mpBoundMax,mpInverse,mpCellKeys,mpCellLifetime,mpGridState})if(b)context->uavBarrier(b.get());
+    mResetHistory=true;mDistributionValid=false;mGeometryValid=true;mReady=false;
+    advanceGeneration(mGeometryGeneration);++mGeometryRebuilds;
+}
+
+void Manager::prepareIncrementalGrid(RenderContext* context)
+{
+    FALCOR_PROFILE(context,"VXPGIncrementalMaintenance");
+    const uint32_t requests=((mFrameDim.x+mSettings.discoveryStride-1)/mSettings.discoveryStride)*((mFrameDim.y+mSettings.discoveryStride-1)/mSettings.discoveryStride);
+    for(const auto& b:{mpPendingHash,mpDiscovery,mpDiscoveryClaims,mpGridState,mpCellLifetime,mpRetiredCells,mpHash,mpBoundMin})if(b)context->uavBarrier(b.get());
+    bind(mpGridBegin->getRootVar(),mLightingFrameIndex,true);
+    mpGridBegin->execute(context,uint3(std::max(requests,getHashCapacity()),1,1));
+    context->uavBarrier(mpGridState.get());context->uavBarrier(mpPendingHash.get());context->uavBarrier(mpDiscovery.get());context->uavBarrier(mpDiscoveryClaims.get());
+    bind(mpGridEvict->getRootVar(),mLightingFrameIndex,true);
+    mpGridEvict->execute(context,uint3(cellCapacity(),1,1));
+    for(const auto& b:{mpHash,mpBoundMin,mpGridState,mpRetiredCells,mpHistory})if(b)context->uavBarrier(b.get());
+}
+
+void Manager::finishIncrementalGrid(RenderContext* context)
+{
+    FALCOR_PROFILE(context,"VXPGIncrementalInsert");
+    const uint32_t requests=((mFrameDim.x+mSettings.discoveryStride-1)/mSettings.discoveryStride)*((mFrameDim.y+mSettings.discoveryStride-1)/mSettings.discoveryStride);
+    auto barriers=[&]()
+    {
+        for(const auto& b:{mpHash,mpCellKeys,mpState,mpBoundMin,mpBoundMax,mpInverse,mpGridState,mpCellLifetime,
+            mpFreeCells,mpPendingHash,mpPendingSlots,mpDiscovery,mpDiscoveryClaims,mpCount,mpFlux,mpHistory,mpRepresentativePosition,mpRepresentativeNormal})
+            if(b)context->uavBarrier(b.get());
+    };
+    auto run=[&](const ref<ComputePass>& pass,uint32_t count)
+    {bind(pass->getRootVar(),mLightingFrameIndex,true);pass->execute(context,uint3(count,1,1));barriers();};
+    barriers();run(mpGridDiscover,2*requests);run(mpGridInsert,2*requests);run(mpGridReplay,requests);
+    bind(mpGeometryWork->getRootVar(),mLightingFrameIndex,true);
+    mpGeometryWork->execute(context,uint3(1));context->uavBarrier(mpWorkArgs.get());
+    context->copyResource(mpWorkDispatch.get(),mpWorkArgs.get());
+}
+
+void Manager::buildGeometry(RenderContext* context)
 {
     if (!mpScene || !mSettings.enabled) return;
-    if (mEstimatedBytes > uint64_t(mSettings.budgetMiB)*1024ull*1024ull)
-    {
-        mFallbackReason="Resource estimate exceeds VXPG budget";
-        return;
-    }
-    const auto* animation = mpScene->getAnimationController();
-    if (animation && (animation->hasSkinnedMeshes() || animation->hasAnimatedMeshCaches()))
-    {
-        mGeometryValid = mReady = false;
-        mFallbackReason = "Skinned/vertex-cache geometry is not validated for VXPG; using BSDF";
-        return;
-    }
-    const uint32_t cells = mSettings.gridResolution * mSettings.gridResolution * mSettings.gridResolution;
-    if (!mpTriangles)
-    {
-        uint64_t references=0;
-        for (uint32_t i = 0; i < mpScene->getGeometryInstanceCount(); ++i)
-        {
-            const auto& instance = mpScene->getGeometryInstance(i);
-            if (instance.getType() != GeometryType::TriangleMesh) continue;
-            const auto& mesh = mpScene->getMesh(MeshID(instance.geometryID));
-            references+=mesh.getTriangleCount();
-        }
-        if (references > (1ull<<26))
-        {
-            mFallbackReason="Triangle reference limit exceeded; using BSDF";
-            return;
-        }
-        mTriangleCount = uint32_t(references);
-        if (mTriangleCount==0)
-        {
-            mFallbackReason = "Scene contains no triangle geometry";
-            return;
-        }
-    }
-    const uint64_t planned = estimateModelBytes();
-    mEstimatedBytes = planned;
-    if (planned > uint64_t(mSettings.budgetMiB) * 1024ull * 1024ull)
-    {
-        releaseModelResources();
-        mFallbackReason = "Resource estimate exceeds VXPG budget";
-        mGeometryValid = mReady = false;
-        return;
-    }
-    if (!mpTriangles)
-    {
-        std::vector<uint2> triangles;
-        triangles.reserve(mTriangleCount);
-        for (uint32_t i=0;i<mpScene->getGeometryInstanceCount();++i)
-        {
-            const auto& instance=mpScene->getGeometryInstance(i);
-            if (instance.getType()!=GeometryType::TriangleMesh) continue;
-            const auto& mesh=mpScene->getMesh(MeshID(instance.geometryID));
-            for(uint32_t t=0;t<mesh.getTriangleCount();++t) triangles.emplace_back(i,t);
-        }
-        mpTriangles=mpDevice->createStructuredBuffer(sizeof(uint2),mTriangleCount,ResourceBindFlags::ShaderResource,
-            MemoryType::DeviceLocal,triangles.data());
-        mpTriangleRanges=mpDevice->createStructuredBuffer(sizeof(uint4),mTriangleCount);
-    }
-    if (!mpBoundMin || mAllocatedResolution != mSettings.gridResolution)
-    {
-        // Drop parameter-block references before changing resource generations.
-        mpClearGeometry = mpMakeJobs = mpFinalizeJobs = mpVoxelize = mpDebug = nullptr;
-        mpClearFrame = mpInject = mpCompact = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
-        resetClusterPasses();
-        mpForest = nullptr;
-        mpFlux = mpCount = mpCompactIndices = mpMass = mpGlobalTree = mpRepresentativePosition = mpRepresentativeNormal = nullptr;
-        mpBoundMin = mpDevice->createStructuredBuffer(sizeof(uint4), cells);
-        mpBoundMax = mpDevice->createStructuredBuffer(sizeof(uint4), cells);
-        mpInverse = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
-        const std::array<uint32_t, 32> zero = {};
-        mpState = mpDevice->createStructuredBuffer(sizeof(uint32_t), 32,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, zero.data());
-        mpJobs = mpDevice->createStructuredBuffer(sizeof(uint2), mJobCapacity);
-        mpDispatchArgs = mpDevice->createStructuredBuffer(sizeof(uint32_t), 3,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::IndirectArg);
-        mAllocatedResolution = mSettings.gridResolution;
-        mGeometryValid = false;
-    }
-    if (!mGeometryValid && mSettings.freezeUpdates)
-    {
-        mFallbackReason = "Frozen proposal is invalid; unfreeze to rebuild";
-        return;
-    }
-    auto makePass = [&](const char* entry)
-    {
-        ProgramDesc desc;
-        desc.addShaderModules(mpScene->getShaderModules());
-        desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGGeometry.cs.slang").csEntry(entry);
-        desc.addTypeConformances(mpScene->getTypeConformances());
-        desc.setShaderModel(ShaderModel::SM6_6);
-        return ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
-    };
-    auto execute = [&](const ref<ComputePass>& pass, uint3 size)
-    {
-        auto root = pass->getRootVar();
-        auto scene = root.findMember("gScene");
-        if (scene.isValid()) mpScene->bindShaderDataForRaytracing(context, scene);
-        bind(root, 0, true);
-        pass->execute(context, size);
-    };
-    if (!mGeometryValid)
-    {
-        FALCOR_PROFILE(context, "VXPGGeometry");
-        const auto& bounds = mpScene->getSceneBounds();
-        const float3 extent = bounds.extent();
-        const float side = std::max(1.e-3f, std::max(extent.x, std::max(extent.y, extent.z))) * 1.0001f;
-        mGridMin = bounds.center() - float3(0.5f * side);
-        mCellSize = side / float(mSettings.gridResolution);
-        if (!mpClearGeometry) mpClearGeometry = makePass("clearGeometry");
-        if (!mpMakeJobs) mpMakeJobs = makePass("makeGeometryJobs");
-        if (!mpFinalizeJobs) mpFinalizeJobs = makePass("finalizeGeometryJobs");
-        if (!mpVoxelize) mpVoxelize = makePass("voxelizeGeometry");
-        for (const auto& buffer : {mpState,mpBoundMin,mpBoundMax,mpJobs,mpTriangleRanges,mpDispatchArgs})
-            context->uavBarrier(buffer.get());
-        execute(mpClearGeometry, uint3(cells, 1, 1));
-        context->uavBarrier(mpState.get());
-        context->uavBarrier(mpBoundMin.get());
-        context->uavBarrier(mpBoundMax.get());
-        constexpr uint32_t triangleRow=65535u*64u;
-        execute(mpMakeJobs, uint3(std::min(mTriangleCount,triangleRow),(mTriangleCount+triangleRow-1)/triangleRow,1));
-        context->uavBarrier(mpState.get());
-        context->uavBarrier(mpJobs.get());
-        context->uavBarrier(mpTriangleRanges.get());
-        execute(mpFinalizeJobs, uint3(1));
-        context->uavBarrier(mpDispatchArgs.get());
-        auto root = mpVoxelize->getRootVar();
-        mpScene->bindShaderDataForRaytracing(context, root["gScene"]);
-        bind(root, 0, true);
-        mpVoxelize->executeIndirect(context, mpDispatchArgs.get());
-        context->uavBarrier(mpBoundMin.get());
-        context->uavBarrier(mpBoundMax.get());
-        context->uavBarrier(mpState.get());
-        mGeometryValid = true;
-        mFallbackReason = "Voxel bounds built; lighting distribution not built";
-    }
-    if (mSettings.debugEnabled && debugOutput)
-    {
-        if (!mpDebug) mpDebug = makePass("debugGeometry");
-        auto root = mpDebug->getRootVar();
-        mpScene->bindShaderDataForRaytracing(context, root["gScene"]);
-        bind(root, 0, true);
-        root["gVXPGDebug"] = debugOutput;
-        mpDebug->execute(context, uint3(mFrameDim, 1));
-    }
+    buildIncrementalGeometry(context);
 }
 
 void Manager::prepareLighting(RenderContext* context)
@@ -426,20 +522,29 @@ void Manager::prepareLighting(RenderContext* context)
                 mpClearDiagnostics = ComputePass::create(mpDevice, desc, {}, true);
             }
             context->uavBarrier(mpState.get());
+            context->uavBarrier(mpQueryStats.get());
             bind(mpClearDiagnostics->getRootVar(), mLightingFrameIndex, true);
             mpClearDiagnostics->execute(context, uint3(32,1,1));
+            context->uavBarrier(mpQueryStats.get());
             context->uavBarrier(mpState.get());
         }
         return;
     }
-    const uint32_t cells = mSettings.gridResolution * mSettings.gridResolution * mSettings.gridResolution;
+    const uint32_t cells = cellCapacity();
     if (!mpFlux || mAllocatedCapacity != mSettings.maxVoxels || any(mAllocatedFrameDim != mFrameDim))
     {
-        mpClearFrame = mpInject = mpCompact = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
+        mpClearFrame = mpInject = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
         resetClusterPasses();
         mpForest = nullptr;
         mpFlux = mpDevice->createStructuredBuffer(sizeof(uint64_t), cells);
         mpCount = mpDevice->createStructuredBuffer(sizeof(uint32_t), cells);
+        mpCellMass = mpTreeState = mpDirtyLeaves = mpDirtyNodes = mpLocalArgs = mpLocalDispatch = nullptr;
+        mDistributionValid = false;
+        mpQueryStats=mpDevice->createStructuredBuffer(4,8);
+        mpHistoryStats = mpDevice->createStructuredBuffer(4, 8);
+        context->clearUAV(mpHistoryStats->getUAV().get(),uint4(0));
+        mpHistory = nullptr;
+        mResetHistory = true;
         mpRepresentativePosition = mpDevice->createStructuredBuffer(sizeof(float4), cells);
         mpRepresentativeNormal = mpDevice->createStructuredBuffer(sizeof(float4), cells);
         mpCompactIndices = mpDevice->createStructuredBuffer(sizeof(uint32_t), mSettings.maxVoxels);
@@ -457,6 +562,35 @@ void Manager::prepareLighting(RenderContext* context)
         mAllocatedCapacity = mSettings.maxVoxels;
     }
     if (!mpSampleGenerator) mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_UNIFORM);
+    if (!mpHistory)
+    {
+        mpHistory = mpDevice->createStructuredBuffer(16, cells);
+        mResetHistory = true;
+    }
+    // A grid reset may already have reduced the occupied span to zero. Clear the
+    // complete history allocation before taking the previous-frame snapshot so
+    // newly reused cell IDs cannot inherit a different cell's stale history.
+    if (mpHistory && mResetHistory)
+        context->clearUAV(mpHistory->getUAV().get(), uint4(0));
+    if(!mpHistoryPrevious)
+    {
+        mpHistoryPrevious=mpDevice->createStructuredBuffer(16,cells);
+        mpNormalPrevious=mpDevice->createStructuredBuffer(16,cells);
+    }
+    if (!mpTreeState)
+    {
+        const uint32_t zero[16] = {};
+        mpTreeState = mpDevice->createStructuredBuffer(4, 16, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal, zero);
+        mpCellMass = mpDevice->createStructuredBuffer(4, cells);
+        mpDirtyLeaves = mpDevice->createStructuredBuffer(4, mSettings.maxVoxels);
+        mpDirtyNodes = mpDevice->createStructuredBuffer(4, 2*mLeafCapacity + 4*mSettings.maxVoxels + 64);
+        context->clearUAV(mpDirtyNodes->getUAV().get(), uint4(0));
+        mpLocalArgs = mpDevice->createStructuredBuffer(4, 3);
+        mpLocalDispatch = mpDevice->createStructuredBuffer(4, 3,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::IndirectArg);
+        mDistributionValid = false;
+    }
     if (!mpClearFrame)
     {
         auto makePrepare = [&](const char* entry)
@@ -467,10 +601,24 @@ void Manager::prepareLighting(RenderContext* context)
             return ComputePass::create(mpDevice, desc, {}, true);
         };
         mpClearFrame = makePrepare("clearFrame");
-        mpCompact = makePrepare("compact");
         mpGlobalLeaves = makePrepare("globalLeaves");
         mpGlobalLevel = makePrepare("globalLevel");
         mpPublish = makePrepare("publish");
+        auto makeLocal = [&](const char* entry)
+        {
+            ProgramDesc desc;
+            desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGLocal.cs.slang").csEntry(entry);
+            desc.setShaderModel(ShaderModel::SM6_6);
+            return ComputePass::create(mpDevice, desc, {}, true);
+        };
+        mpBeginLocal = makeLocal("beginLocal"); mpResolveLocal = makeLocal("resolveLocal");
+        mpSelectLocal = makeLocal("selectLocal"); mpCompactLocal = makeLocal("compactLocal");
+        mpLocalWork = makeLocal("localWork"); mpLocalLeaves = makeLocal("localLeaves"); mpLocalLevel = makeLocal("localLevel");
+        {
+            mpGeometryWork=makePrepare("geometryWork");
+            mpActiveWork=makePrepare("activeWork");
+            mpForestWork=makePrepare("forestWork");
+        }
     }
     if (!mpInject)
     {
@@ -481,7 +629,6 @@ void Manager::prepareLighting(RenderContext* context)
         desc.setShaderModel(ShaderModel::SM6_6);
         DefineList defines = mpScene->getSceneDefines();
         defines.add(mpSampleGenerator->getDefines());
-        defines.add("ENABLE_PG", "0");
         defines.add("ENABLE_NRD", "0");
         defines.add("RTPT_VXPG_DETAILED_DIAGNOSTICS", mSettings.detailedDiagnostics ? "1" : "0");
         defines.add("RTPT_VXPG_SHARED_INJECTION", mSettings.sharedInjectionEnabled ? "1" : "0");
@@ -490,7 +637,7 @@ void Manager::prepareLighting(RenderContext* context)
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
         mpInject = ComputePass::create(mpDevice, desc, defines, true);
     }
-    ++mGeneration;
+    advanceGeneration(mGeneration);
     auto execute = [&](const ref<ComputePass>& pass, uint3 size)
     {
         bind(pass->getRootVar(), mLightingFrameIndex, true);
@@ -498,6 +645,12 @@ void Manager::prepareLighting(RenderContext* context)
     };
     {
         FALCOR_PROFILE(context, "VXPGClear");
+        {
+            if (mGeneration == 1) context->clearUAV(mpDirtyNodes->getUAV().get(), uint4(0));
+            context->uavBarrier(mpTreeState.get());
+            execute(mpBeginLocal, uint3(1));
+            context->uavBarrier(mpTreeState.get());
+        }
         context->uavBarrier(mpState.get());
         context->uavBarrier(mpGlobalTree.get());
         context->uavBarrier(mpMass.get());
@@ -506,18 +659,38 @@ void Manager::prepareLighting(RenderContext* context)
         context->uavBarrier(mpFlux.get());
         context->uavBarrier(mpCount.get());
         context->uavBarrier(mpBoundMax.get());
-        execute(mpClearFrame, uint3(cells, 1, 1));
+        context->uavBarrier(mpHistoryStats.get());
+        context->uavBarrier(mpQueryStats.get());
+        if (mpHistory) context->uavBarrier(mpHistory.get());
+        {
+            context->uavBarrier(mpWorkArgs.get());
+            execute(mpGeometryWork,uint3(1));
+            context->uavBarrier(mpWorkArgs.get());
+            context->copyResource(mpWorkDispatch.get(),mpWorkArgs.get());
+            bind(mpClearFrame->getRootVar(),mLightingFrameIndex,true);
+            mpClearFrame->executeIndirect(context,mpWorkDispatch.get(),4*sizeof(uint32_t));
+        }
+        context->uavBarrier(mpQueryStats.get());
         context->uavBarrier(mpState.get());
         context->uavBarrier(mpFlux.get());
         context->uavBarrier(mpCount.get());
         context->uavBarrier(mpBoundMax.get());
         context->uavBarrier(mpInverse.get());
     }
+    prepareIncrementalGrid(context);
+    if(mpHistoryPrevious)
+    {
+        context->copyResource(mpHistoryPrevious.get(),mpHistory.get());
+        context->copyResource(mpNormalPrevious.get(),mpRepresentativeNormal.get());
+    }
     if (mSettings.sharedInjectionEnabled)
     {
         context->uavBarrier(mpRepresentativePosition.get());
         context->uavBarrier(mpRepresentativeNormal.get());
     }
+    if (mpHistory) context->uavBarrier(mpHistory.get());
+    context->uavBarrier(mpHistoryStats.get());
+    mResetHistory = false;
     mLightingPrepared = true;
 }
 
@@ -532,7 +705,7 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
 {
     if (!mLightingPrepared) return;
     mLightingPrepared = false;
-    const uint32_t cells = mSettings.gridResolution * mSettings.gridResolution * mSettings.gridResolution;
+    const uint32_t cells = cellCapacity();
     auto execute = [&](const ref<ComputePass>& pass, uint3 size)
     {
         bind(pass->getRootVar(), mLightingFrameIndex, true);
@@ -565,23 +738,75 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
         context->uavBarrier(mpPrimaryNormal.get());
         context->uavBarrier(mpPrimaryHit.get());
     }
+    finishIncrementalGrid(context);
     {
         FALCOR_PROFILE(context, "VXPGCompactAndTree");
-        execute(mpCompact, uint3(cells, 1, 1));
+        auto geometryPass = [&](const ref<ComputePass>& pass)
+        {
+            { bind(pass->getRootVar(), mLightingFrameIndex, true); pass->executeIndirect(context, mpWorkDispatch.get(), 4*sizeof(uint32_t)); }
+        };
+        {
+            context->uavBarrier(mpCellMass.get());
+            context->uavBarrier(mpDirtyLeaves.get());
+            geometryPass(mpResolveLocal);
+            context->uavBarrier(mpCellMass.get()); context->uavBarrier(mpTreeState.get()); context->uavBarrier(mpState.get());
+            execute(mpSelectLocal, uint3(1));
+            context->uavBarrier(mpTreeState.get()); context->uavBarrier(mpState.get());
+            geometryPass(mpCompactLocal);
+            context->uavBarrier(mpDirtyLeaves.get()); context->uavBarrier(mpTreeState.get());
+        }
         context->uavBarrier(mpMass.get());
         context->uavBarrier(mpCompactIndices.get());
         context->uavBarrier(mpInverse.get());
         context->uavBarrier(mpState.get());
+        if (mpHistory) context->uavBarrier(mpHistory.get());
+        context->uavBarrier(mpHistoryStats.get());
+        context->uavBarrier(mpQueryStats.get());
+        {
+            context->uavBarrier(mpWorkArgs.get());
+            execute(mpActiveWork,uint3(1));
+            context->uavBarrier(mpWorkArgs.get());
+            context->copyResource(mpWorkDispatch.get(),mpWorkArgs.get());
+        }
         mpGlobalLeaves->getRootVar()["VXPGTreeLevel"]["leafCapacity"] = mLeafCapacity;
-        execute(mpGlobalLeaves, uint3(mLeafCapacity, 1, 1));
+        {
+            bind(mpGlobalLeaves->getRootVar(),mLightingFrameIndex,true);
+            mpGlobalLeaves->executeIndirect(context,mpWorkDispatch.get(),12*sizeof(uint32_t));
+        }
         context->uavBarrier(mpGlobalTree.get());
-        for (uint32_t offset = mLeafCapacity / 2; offset > 0; offset /= 2)
+        for (uint32_t offset = mLeafCapacity / 2, level=1; offset > 0; offset /= 2,++level)
         {
             auto root = mpGlobalLevel->getRootVar();
-            root["VXPGTreeLevel"]["nodeOffset"] = offset;
+            root["VXPGTreeLevel"]["nodeOffset"] = level;
             root["VXPGTreeLevel"]["nodeCount"] = offset;
-            execute(mpGlobalLevel, uint3(offset, 1, 1));
+            {
+                bind(root,mLightingFrameIndex,true);
+                mpGlobalLevel->executeIndirect(context,mpWorkDispatch.get(),(32+(level-1)*3)*sizeof(uint32_t));
+            }
             context->uavBarrier(mpGlobalTree.get());
+        }
+    }
+    {
+        FALCOR_PROFILE(context, "VXPGLocalTreeUpdate");
+        context->uavBarrier(mpLocalArgs.get());
+        execute(mpLocalWork, uint3(1));
+        context->uavBarrier(mpLocalArgs.get());
+        context->copyResource(mpLocalDispatch.get(), mpLocalArgs.get());
+        auto localDispatch = [&](const ref<ComputePass>& pass)
+        {
+            bind(pass->getRootVar(), mLightingFrameIndex, true);
+            pass->executeIndirect(context, mpLocalDispatch.get());
+            context->uavBarrier(mpGlobalTree.get());
+            if (mpForest) context->uavBarrier(mpForest.get());
+            context->uavBarrier(mpDirtyNodes.get());
+            context->uavBarrier(mpTreeState.get());
+        };
+        if (mpForest) context->uavBarrier(mpForest.get());
+        localDispatch(mpLocalLeaves);
+        for (uint32_t level = 1; (mLeafCapacity >> level) > 0; ++level)
+        {
+            mpLocalLevel->getRootVar()["VXPGLocalLevel"]["localTreeLevel"] = level;
+            localDispatch(mpLocalLevel);
         }
     }
     if (mSettings.visibilityEnabled) updateVisibility(context);
@@ -589,12 +814,19 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
         context->uavBarrier(mpState.get());
         execute(mpPublish, uint3(1));
         context->uavBarrier(mpState.get());
+        if (mpTreeState) context->uavBarrier(mpTreeState.get());
+    }
+    {
+        bind(mpGridRetire->getRootVar(),mLightingFrameIndex,true);
+        mpGridRetire->execute(context,uint3(cellCapacity(),1,1));
+        context->uavBarrier(mpFreeCells.get());context->uavBarrier(mpGridState.get());context->uavBarrier(mpInverse.get());
     }
     mDistributionValid = true;
     mReady = true;
     mFallbackReason.clear();
     mModelDiagnosticsAvailable = mSettings.detailedDiagnostics;
     mModelDiagnosticsFrameIndex = mLightingFrameIndex;
+    mPreviousLodCamera=mLodCamera;
     ++mLightingFrameIndex;
 }
 
@@ -602,7 +834,7 @@ void Manager::updateVisibility(RenderContext* context)
 {
     const uint32_t rows = ((mFrameDim.x + mSettings.superpixelSize - 1) / mSettings.superpixelSize) *
         ((mFrameDim.y + mSettings.superpixelSize - 1) / mSettings.superpixelSize);
-    if (!mpForest || mAllocatedSuperpixelSize != mSettings.superpixelSize)
+    if (mSettings.visibilityEnabled && (!mpForest || mAllocatedSuperpixelSize != mSettings.superpixelSize))
     {
         resetClusterPasses();
         mpRowPosition = mpDevice->createStructuredBuffer(sizeof(float4), 128);
@@ -705,7 +937,7 @@ void Manager::updateVisibility(RenderContext* context)
         context->uavBarrier(mpClusterState.get());
         execute(mpSeedsPass, uint3(256, 1, 1));
         context->uavBarrier(mpSeeds.get());
-        execute(mpAssignClusters, uint3(mSettings.maxVoxels, 1, 1));
+        {rootFor(mpAssignClusters);mpAssignClusters->executeIndirect(context,mpWorkDispatch.get(),8*sizeof(uint32_t));}
         context->uavBarrier(mpCluster.get());
         context->uavBarrier(mpClusterInfo.get());
     }
@@ -724,7 +956,7 @@ void Manager::updateVisibility(RenderContext* context)
         auto root = rootFor(mpEncode);
         constants(root, 0);
         root["gVXPGSortOutput"] = sorted;
-        mpEncode->execute(context, uint3(mLeafCapacity, 1, 1));
+        mpEncode->executeIndirect(context,mpWorkDispatch.get(),16*sizeof(uint32_t));
         context->uavBarrier(sorted.get());
         for (uint32_t shift = 0; shift < 32; shift += 8)
         {
@@ -732,7 +964,7 @@ void Manager::updateVisibility(RenderContext* context)
             constants(root, shift);
             root["gVXPGSortInput"] = sorted;
             root["gVXPGHistogram"] = mpHistogram;
-            mpHistogramPass->execute(context, uint3(mLeafCapacity, 1, 1));
+            mpHistogramPass->executeIndirect(context,mpWorkDispatch.get(),16*sizeof(uint32_t));
             context->uavBarrier(mpHistogram.get());
             root = rootFor(mpPrefixPass);
             constants(root, shift);
@@ -747,7 +979,7 @@ void Manager::updateVisibility(RenderContext* context)
             root["gVXPGSortOutput"] = scratch;
             root["gVXPGHistogram"] = mpHistogram;
             root["gVXPGBinOffsets"] = mpBinOffsets;
-            mpScatter->execute(context, uint3(mLeafCapacity, 1, 1));
+            mpScatter->executeIndirect(context,mpWorkDispatch.get(),16*sizeof(uint32_t));
             context->uavBarrier(scratch.get());
             context->uavBarrier(sorted.get());
             context->uavBarrier(mpHistogram.get());
@@ -761,19 +993,26 @@ void Manager::updateVisibility(RenderContext* context)
         execute(mpAllocateForest, uint3(1));
         context->uavBarrier(mpClusterInfo.get());
         context->uavBarrier(mpClusterState.get());
-        execute(mpInitializeForest, uint3(4 * mSettings.maxVoxels + 64, 1, 1));
+        {
+            context->uavBarrier(mpWorkArgs.get());
+            execute(mpForestWork,uint3(1));
+            context->uavBarrier(mpWorkArgs.get());
+            context->copyResource(mpWorkDispatch.get(),mpWorkArgs.get());
+            rootFor(mpInitializeForest);
+            mpInitializeForest->executeIndirect(context,mpWorkDispatch.get(),20*sizeof(uint32_t));
+        }
         context->uavBarrier(mpForest.get());
         auto root = rootFor(mpForestLeaves);
         context->uavBarrier(mpCompactToLeaf.get());
         root["gVXPGSortInput"] = sorted;
-        mpForestLeaves->execute(context, uint3(mSettings.maxVoxels, 1, 1));
+        mpForestLeaves->executeIndirect(context,mpWorkDispatch.get(),8*sizeof(uint32_t));
         context->uavBarrier(mpForest.get());
         context->uavBarrier(mpCompactToLeaf.get());
         for (uint32_t level = 1; (mLeafCapacity >> level) > 0; ++level)
         {
             root = rootFor(mpForestLevel);
             root["VXPGClusterBuild"]["treeLevel"] = level;
-            mpForestLevel->execute(context, uint3(mLeafCapacity >> level, mSettings.clusterCount, 1));
+            mpForestLevel->executeIndirect(context,mpWorkDispatch.get(),(96+(level-1)*3)*sizeof(uint32_t));
             context->uavBarrier(mpForest.get());
         }
         execute(mpPublishClusters, uint3(1));
@@ -823,7 +1062,21 @@ void Manager::updateVisibility(RenderContext* context)
 
 void Manager::renderDebug(RenderContext* context, const ref<Texture>& output)
 {
-    if (!mSettings.debugEnabled || mSettings.debugMode == 0 || !mSettings.visibilityEnabled || !mDistributionValid || !mpDistributionDebug) return;
+    if(mSettings.debugEnabled && mGeometryValid && output &&
+        (mSettings.debugMode==0 || mSettings.debugMode==4 || !mSettings.visibilityEnabled))
+    {
+        if(!mpDebug)
+        {
+            ProgramDesc desc;desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGDebug.cs.slang").csEntry("debugGeometry");
+            desc.addTypeConformances(mpScene->getTypeConformances());desc.setShaderModel(ShaderModel::SM6_6);
+            mpDebug = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
+        }
+        auto root=mpDebug->getRootVar();bind(root,mLightingFrameIndex,true);
+        mpScene->bindShaderDataForRaytracing(context,root["gScene"]);root["gVXPGDebug"]=output;
+        mpDebug->execute(context,uint3(mFrameDim,1));return;
+    }
+    if (!mSettings.debugEnabled || mSettings.debugMode == 0 || mSettings.debugMode == 4 || !mSettings.visibilityEnabled || !mDistributionValid || !mpDistributionDebug) return;
     auto root = mpDistributionDebug->getRootVar();
     bind(root, mLightingFrameIndex, true);
     root["gVXPGDebug"] = output;

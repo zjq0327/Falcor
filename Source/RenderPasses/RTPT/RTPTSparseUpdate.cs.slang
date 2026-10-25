@@ -32,7 +32,6 @@ struct RTPTSparseSettings
     uint frameIndex;
     uint updateBounces;
     uint writeSHARC;
-    uint recordPG;
     uint writeVXPG;
 };
 ConstantBuffer<RTPTParams> gParams;
@@ -40,8 +39,6 @@ ConstantBuffer<RTPTSparseSettings> gSparseSettings;
 #if USE_ENV_LIGHT
 ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #endif
-#include "RTPTPGTypes.slang"
-#include "RTPTGrid.slang"
 #include "RTPTLighting.slang"
 #include "RTPTSharc.slang"
 
@@ -52,24 +49,23 @@ ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #include "RTPTVXPGTraining.slang"
 #endif
 
-void rtptPGStoreVertex(uint path, inout uint count, RTPTPGVertex vertex, inout bool valid)
+// Preserve the deterministic training-pixel phase for SHaRC and VXPG.
+uint rtptSparseHash32(uint value)
 {
-#if ENABLE_PG
-    if (count >= gPGSettings.verticesPerPath)
-    { valid = false; rtptPGCount(RTPT_PG_DIAG_RECORD_OVERFLOW); return; }
-    gPGVertices[path * gPGSettings.verticesPerPath + count] = vertex;
-    ++count;
-#endif
+    value = (value + 0x7ed55d16u) + (value << 12u);
+    value = (value ^ 0xc761c23cu) ^ (value >> 19u);
+    value = (value + 0x165667b1u) + (value << 5u);
+    value = (value + 0xd3a2646cu) ^ (value << 9u);
+    value = (value + 0xfd7046c5u) + (value << 3u);
+    return (value ^ 0xb55a4f09u) ^ (value >> 16u);
 }
 
-void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPixel, bool record)
+void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
 {
 #if ENABLE_SHARC
     SharcState sharcState;
     SharcInit(sharcState);
 #endif
-    uint count = 0u;
-    bool valid = true;
     float3 pathThroughput = 1.f;
     float3 previousPosition = 0.f;
     float3 previousNormal = 0.f;
@@ -94,21 +90,13 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
             if (previousUsedNEE && !previousDelta)
                 hitMIS = rtptPowerHeuristic(previousPdf, rtptEnvironmentLightPdf(ray.dir));
 #endif
-            if (!all(isfinite(environment))) { valid = false; break; }
+            if (!all(isfinite(environment))) break;
 #if ENABLE_SHARC
             if (gSparseSettings.writeSHARC != 0u) rtptSharcUpdateMiss(sharcState, environment * hitMIS);
 #endif
-            // A terminal pseudo-vertex preserves raw environment and arrival MIS separately.
-            if (record)
-            {
-                RTPTPGVertex terminal = {};
-                terminal.emission = environment;
-                terminal.hitMIS = hitMIS;
-                rtptPGStoreVertex(path, count, terminal, valid);
-            }
             break;
         }
-        if (hit.getType() != HitType::Triangle) { valid = false; break; }
+        if (hit.getType() != HitType::Triangle) break;
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
         const TriangleHit triangleHit = hit.getTriangleHit();
         const VertexData vertexData = gScene.getVertexData(triangleHit);
@@ -126,20 +114,8 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         if (previousUsedNEE && !previousDelta)
             hitMIS = rtptPowerHeuristic(previousPdf, rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd));
 #endif
-        if (!all(isfinite(emission))) { valid = false; break; }
-        RTPTPGVertex vertex = {};
-        vertex.sampleSurvival = 1.f;
-        vertex.emission = emission;
-        vertex.hitMIS = hitMIS;
-#if ENABLE_PG
-        if (record)
-            vertex.key = rtptGridKey(sd.posW, sd.getOrientedFaceNormal(), gPGSettings.cameraPosition,
-                gPGSettings.sceneScale, gPGSettings.coarseLevels);
-#endif
+        if (!all(isfinite(emission))) break;
         const uint lobes = mi.getLobeTypes(sd) & sd.mtl.getActiveLobes();
-        const bool trainable = (lobes & uint(LobeType::NonDeltaReflection)) != 0u &&
-            (lobes & ~uint(LobeType::NonDeltaReflection)) == 0u;
-        if (trainable) vertex.flags |= RTPT_PG_VERTEX_TRAINABLE;
         if (bounce == gSparseSettings.updateBounces)
         {
 #if RTPT_VXPG_SHARED_INJECTION
@@ -151,75 +127,65 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
                 bool rawValid = true;
                 if (gParams.useNEE != 0u)
                     rtptVXPGTrainingDirect(sd, mi, false, observationSG, raw, rawValid);
-                if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw);
+                if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel);
                 else InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
             }
 #endif
 #if ENABLE_SHARC
             if (gSparseSettings.writeSHARC != 0u) rtptSharcUpdateMiss(sharcState, emission * hitMIS);
 #endif
-            if (record) rtptPGStoreVertex(path, count, vertex, valid);
             break;
         }
+        float3 direct = 0.f;
         const bool useNEE = gParams.useNEE != 0u && (lobes & uint(LobeType::NonDeltaReflection)) != 0u;
 #if RTPT_VXPG_SHARED_INJECTION
         if (observeVXPG)
         {
             float3 raw = 0.f;
             bool rawValid = true;
-            vertex.direct = 0.f;
-            if (useNEE) vertex.direct = rtptVXPGTrainingDirect(sd, mi, true, sg, raw, rawValid);
+            if (useNEE) direct = rtptVXPGTrainingDirect(sd, mi, true, sg, raw, rawValid);
             else if (gParams.useNEE != 0u)
             {
                 SampleGenerator observationSG = sg;
                 rtptVXPGTrainingDirect(sd, mi, false, observationSG, raw, rawValid);
             }
-            if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw);
+            if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel);
             else InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
         }
         else
 #endif
-        vertex.direct = useNEE ? rtptEstimateDirect(sd, mi, sg) : float3(0.f);
-        if (!all(isfinite(vertex.direct))) { valid = false; break; }
+        direct = useNEE ? rtptEstimateDirect(sd, mi, sg) : float3(0.f);
+        if (!all(isfinite(direct))) break;
 #if ENABLE_SHARC
         if (gSparseSettings.writeSHARC != 0u)
         {
             const SharcHitData cacheHit = rtptMakeSharcHit(sd, properties, emission * hitMIS);
-            if (!rtptSharcUpdateHit(sharcState, cacheHit, vertex.direct, sampleNext1D(sg)))
-                rtptSharcUpdateMiss(sharcState, vertex.direct + emission * hitMIS);
+            if (!rtptSharcUpdateHit(sharcState, cacheHit, direct, sampleNext1D(sg)))
+                rtptSharcUpdateMiss(sharcState, direct + emission * hitMIS);
         }
 #endif
         BSDFSample bs = {};
         bool continued = mi.sample(sd, sg, bs);
         const bool delta = bs.isLobe(LobeType::Delta);
         if (continued && (!all(isfinite(bs.wo)) || !all(isfinite(bs.weight)) ||
-            (!delta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))))) { valid = false; break; }
+            (!delta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))))) break;
         continued = continued && !bs.isLobe(LobeType::Transmission) && any(bs.weight > 0.f);
         float3 transport = continued ? bs.weight : float3(0.f);
         if (continued)
         {
             pathThroughput *= bs.weight;
-            if (!all(isfinite(pathThroughput))) { valid = false; break; }
+            if (!all(isfinite(pathThroughput))) break;
             if (gParams.useRussianRoulette != 0u && bounce + 1u >= gParams.rrStartBounce)
             {
                 const float survival = min(0.95f, max(pathThroughput.x, max(pathThroughput.y, pathThroughput.z)));
                 if (!(survival > 0.f) || sampleNext1D(sg) >= survival) continued = false;
                 else
                 {
-                    vertex.sampleSurvival = survival;
                     transport /= survival;
                     pathThroughput /= survival;
                 }
             }
         }
-        if (continued)
-        {
-            vertex.flags |= RTPT_PG_VERTEX_OUTGOING;
-            vertex.direction = bs.wo;
-            vertex.samplePdf = bs.pdf;
-            vertex.transport = transport;
-        }
-        if (record) rtptPGStoreVertex(path, count, vertex, valid);
         if (!continued) break;
 #if ENABLE_SHARC
         if (gSparseSettings.writeSHARC != 0u) SharcSetThroughput(sharcState, transport);
@@ -231,23 +197,9 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         previousUsedNEE = useNEE;
         ray = Ray(sd.computeRayOrigin(), bs.wo);
 #else
-        valid = false;
         break;
 #endif
     }
-#if ENABLE_PG
-    if (record)
-    {
-        RTPTPGPathHeader header = {};
-        header.vertexCount = count;
-        header.flags = valid ? RTPT_PG_PATH_COMPLETE : RTPT_PG_PATH_INVALID;
-        header.ownerPixel = ownerPixel;
-        header.generation = gPGSettings.recordGeneration;
-        header.sceneGeneration = gPGSettings.sceneGeneration;
-        gPGPathHeaders[path] = header;
-        if (!valid) rtptPGCount(RTPT_PG_DIAG_INVALID);
-    }
-#endif
 }
 
 [numthreads(8, 8, 1)]
@@ -259,17 +211,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (any(tile >= tileDim)) return;
     const uint2 origin = tile * stride;
     const uint2 extent = min(uint2(stride), gSparseSettings.frameDim - origin);
-    const uint phase = rtptGridHash32(tile.x * 0x9e3779b9u ^ tile.y * 0x85ebca6bu ^ gParams.seed);
+    const uint phase = rtptSparseHash32(tile.x * 0x9e3779b9u ^ tile.y * 0x85ebca6bu ^ gParams.seed);
     const uint offset = (phase + gSparseSettings.frameIndex) % max(extent.x * extent.y, 1u);
     const uint2 pixel = origin + uint2(offset % max(extent.x, 1u), offset / max(extent.x, 1u));
-    const uint path = tile.y * tileDim.x + tile.x;
 #if RTPT_VXPG_SHARED_INJECTION
     if (gSparseSettings.writeVXPG != 0u) rtptVXPGCount(RTPT_VXPG_STATE_SHARED_PATHS);
-#endif
-#if ENABLE_PG
-    const bool record = gSparseSettings.recordPG != 0u && gPGSettings.trainingEnabled != 0u && path < gPGSettings.pathCapacity;
-#else
-    const bool record = false;
 #endif
     const uint sampleIndex = gParams.sampleOffset + gSparseSettings.frameIndex * 0x85ebca6bu + gParams.seed * 0x9e3779b9u;
     SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
@@ -279,5 +225,5 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const float3 direction = normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW);
     const float inverseCosine = 1.f / dot(normalize(camera.cameraW), direction);
     const Ray ray = Ray(camera.posW, direction, camera.nearZ * inverseCosine, camera.farZ * inverseCosine);
-    rtptSparseTrace(ray, sg, path, pixel.y * gSparseSettings.frameDim.x + pixel.x, record);
+    rtptSparseTrace(ray, sg, pixel);
 }

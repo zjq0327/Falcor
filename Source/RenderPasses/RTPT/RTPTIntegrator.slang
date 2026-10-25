@@ -14,7 +14,6 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
     float3 previousNormal = 0.f;
     float previousContinuationPdf = 0.f;
     bool previousDelta = true;
-    bool previousGuideSelected = false;
     bool previousUsedNEE = false;
 #if ENABLE_SHARC && SHARC_QUERY
     bool previousDiffuse = false;
@@ -69,7 +68,7 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
 #if ENABLE_SHARC && SHARC_QUERY
         if (bounce == 0) rtptCaptureSharcPrimary(sd, properties, sharcStats);
         float3 cachedRadiance;
-        if (rtptTrySharcQuery(sd, mi, properties, bounce, previousDelta, previousGuideSelected, previousDiffuse, previousRoughness,
+        if (rtptTrySharcQuery(sd, mi, properties, bounce, previousDelta, previousDiffuse, previousRoughness,
             length(sd.posW - previousPosition), sharcStats, cachedRadiance))
         {
             const float3 contribution = throughput * cachedRadiance;
@@ -98,21 +97,20 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
         }
 
         if (bounce == gParams.maxBounces) break;
-        const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
         if (previousUsedNEE)
         {
-            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
+            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sg);
             if (all(isfinite(contribution))) radiance += contribution;
         }
 
         BSDFSample bs = {};
-        if (!rtptSampleContinuation(sd, mi, sampling, sg, bs, previousGuideSelected)) break;
+        if (!mi.sample(sd, sg, bs)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         previousDelta = bs.isLobe(LobeType::Delta);
 #if ENABLE_SHARC && SHARC_QUERY
-        previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
+        previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
         previousRoughness = properties.roughness;
 #endif
         // A delta sample has a discrete probability; it does not compete in MIS.

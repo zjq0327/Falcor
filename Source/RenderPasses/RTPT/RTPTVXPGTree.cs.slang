@@ -1,6 +1,8 @@
 #include "RTPTVXPGDistribution.slang"
 
 cbuffer VXPGClusterBuild { uint sortShift; uint sortCapacity; uint sortGroups; uint treeLevel; };
+#define sortCapacity (gVXPGWorkArgs[1])
+#define sortGroups (gVXPGWorkArgs[2])
 RWStructuredBuffer<uint2> gVXPGSortInput;
 RWStructuredBuffer<uint2> gVXPGSortOutput;
 RWStructuredBuffer<uint> gVXPGHistogram;
@@ -17,11 +19,15 @@ uint rtptVXPGMorton(uint3 xyz)
 [numthreads(256,1,1)]
 void encodeVoxels(uint3 tid : SV_DispatchThreadID)
 {
+    if (rtptVXPGReuseTopology()) return;
     if (tid.x>=sortCapacity) return;
     uint2 code=uint2(RTPT_VXPG_INVALID);
     if (tid.x<min(gVXPGState[3],gVXPGParams.activeCapacity))
     {
-        code=uint2((gVXPGCluster[tid.x]<<21)|rtptVXPGMorton(rtptVXPGUnflatten(gVXPGCompact[tid.x])),tid.x);
+        const uint cell=gVXPGCompact[tid.x];
+        const float3 center=0.5f*(rtptVXPGWorldMin(cell)+rtptVXPGWorldMax(cell));
+        const uint3 xyz=uint3(clamp((center-gVXPGParams.sortMin)/max(gVXPGParams.sortExtent,float3(1.e-6f)),0.f,1.f)*127.f);
+        code=uint2((gVXPGCluster[tid.x]<<21)|rtptVXPGMorton(xyz),tid.x);
     }
     gVXPGSortOutput[tid.x]=code;
 }
@@ -31,6 +37,7 @@ groupshared uint keys[256];
 [numthreads(256,1,1)]
 void radixHistogram(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex, uint3 group : SV_GroupID)
 {
+    if (rtptVXPGReuseTopology()) return;
     histogram[lane]=0;
     GroupMemoryBarrierWithGroupSync();
     if (tid.x<sortCapacity)
@@ -42,6 +49,7 @@ void radixHistogram(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex, 
 [numthreads(256,1,1)]
 void radixPrefix(uint lane : SV_GroupIndex)
 {
+    if (rtptVXPGReuseTopology()) return;
     uint sum=0;
     for (uint group=0;group<sortGroups;++group)
     {
@@ -63,6 +71,7 @@ void radixPrefix(uint lane : SV_GroupIndex)
 [numthreads(256,1,1)]
 void radixScatter(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex, uint3 group : SV_GroupID)
 {
+    if (rtptVXPGReuseTopology()) return;
     const uint2 code=tid.x<sortCapacity?gVXPGSortInput[tid.x]:uint2(RTPT_VXPG_INVALID);
     const uint bin=(code.x>>sortShift)&255u;
     keys[lane]=bin;
@@ -78,6 +87,7 @@ void radixScatter(uint3 tid : SV_DispatchThreadID, uint lane : SV_GroupIndex, ui
 [numthreads(1,1,1)]
 void allocateForest(uint3 tid : SV_DispatchThreadID)
 {
+    if (rtptVXPGReuseTopology()) return;
     uint first=0, nodes=0, nonempty=0;
     for (uint c=0;c<32;++c)
     {
@@ -98,7 +108,8 @@ void allocateForest(uint3 tid : SV_DispatchThreadID)
 [numthreads(256,1,1)]
 void initializeForest(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x>=4*gVXPGParams.activeCapacity+64) return;
+    if (rtptVXPGReuseTopology()) return;
+    if (tid.x>=gVXPGClusterState[4]) return;
     RTPTVXPGNode node={};
     node.compact=RTPT_VXPG_INVALID;
     gVXPGForest[tid.x]=node;
@@ -107,6 +118,7 @@ void initializeForest(uint3 tid : SV_DispatchThreadID)
 [numthreads(256,1,1)]
 void forestLeaves(uint3 tid : SV_DispatchThreadID)
 {
+    if (rtptVXPGReuseTopology()) return;
     if (tid.x>=min(gVXPGState[3],gVXPGParams.activeCapacity)) return;
     const uint compact=gVXPGSortInput[tid.x].y;
     const uint cell=gVXPGCompact[compact], cluster=gVXPGCluster[compact];
@@ -131,6 +143,7 @@ RTPTVXPGNode rtptVXPGFinalizeNode(RTPTVXPGNode node)
 [numthreads(256,1,1)]
 void forestLevel(uint3 tid : SV_DispatchThreadID)
 {
+    if (rtptVXPGReuseTopology()) return;
     const uint c=tid.y;
     if (c>=gVXPGParams.clusterCount) return;
     const uint4 info=gVXPGClusterInfo[c];
@@ -166,7 +179,7 @@ void publishClusters(uint3 tid : SV_DispatchThreadID)
 #if RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY
         // Roots have no parent consumer; this also handles single-leaf and
         // empty clusters. The host barriers the forest before top-tree queries.
-        gVXPGForest[info.z+1]=rtptVXPGFinalizeNode(clusterRoot);
+        if (!rtptVXPGReuseTopology()) gVXPGForest[info.z+1]=rtptVXPGFinalizeNode(clusterRoot);
 #endif
     }
     const float root=gVXPGGlobalTree[1];

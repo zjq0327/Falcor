@@ -9,6 +9,8 @@ struct RTPTVXPGContext
     float3 origin;
     uint currentCell;
     uint generation;
+    uint geometryGeneration;
+    float sourceSize;
     uint leafCapacity;
     float totalMass;
     float3 normal;
@@ -22,6 +24,7 @@ struct RTPTVXPGCandidate
     uint targetCell;
     uint targetCompact;
     uint generation;
+    uint geometryGeneration;
 };
 
 bool rtptVXPGGetContext(float3 rayOrigin, float3 surfacePosition, uint bounce, out RTPTVXPGContext context)
@@ -32,7 +35,10 @@ bool rtptVXPGGetContext(float3 rayOrigin, float3 surfacePosition, uint bounce, o
     context.origin = rayOrigin;
     context.currentCell = rtptVXPGOwner(surfacePosition);
     context.generation = gVXPGParams.generation;
+    context.geometryGeneration = gVXPGParams.geometryGeneration;
+    context.sourceSize = rtptVXPGSurfaceSize(surfacePosition);
     context.leafCapacity = 1u << uint(firstbithigh(gVXPGParams.activeCapacity - 1u) + 1);
+    context.leafCapacity = gVXPGWorkArgs[0];
     context.totalMass = gVXPGGlobalTree[1];
     return context.totalMass > 0.f && isfinite(context.totalMass);
 }
@@ -73,13 +79,19 @@ float rtptVXPGVoxelProbability(RTPTVXPGContext context, uint compact)
     const uint4 info=gVXPGClusterInfo[c];
     float probability=gVXPGTopTree[context.topRow*64+32+c]/context.totalMass;
     uint node=gVXPGCompactToLeaf[compact];
+    uint traversed=0;
     while (node>1 && probability>0.f)
     {
+        ++traversed;
         const uint parent=node/2;
-        const float left=rtptVXPGLeftProbability(gVXPGForest[info.z+2*parent],gVXPGForest[info.z+2*parent+1],context.origin,context.normal);
+        const float left=rtptVXPGLeftProbability(gVXPGForest[info.z+2*parent],gVXPGForest[info.z+2*parent+1],context.origin,context.normal,context.sourceSize);
         probability*=((node&1u)==0)?left:1.f-left;
         node=parent;
     }
+#if RTPT_VXPG_DETAILED_DIAGNOSTICS
+    InterlockedAdd(gVXPGQueryStats[2],1u);InterlockedAdd(gVXPGQueryStats[3],traversed);
+    InterlockedMax(gVXPGQueryStats[6],traversed);
+#endif
     return probability;
 }
 
@@ -89,6 +101,7 @@ bool rtptVXPGSample(RTPTVXPGContext context, float4 u, out RTPTVXPGCandidate can
     candidate.targetCell = RTPT_VXPG_INVALID;
     candidate.targetCompact = RTPT_VXPG_INVALID;
     candidate.generation = context.generation;
+    candidate.geometryGeneration = context.geometryGeneration;
     uint node = 1;
     float value = min(u.x, 0.99999994f) * context.totalMass;
     float probability = 0.f;
@@ -110,14 +123,20 @@ bool rtptVXPGSample(RTPTVXPGContext context, float4 u, out RTPTVXPGCandidate can
         probability=mass/context.totalMass;
         float random=min(0.99999994f,value/mass);
         node=1;
+        uint traversed=0;
         while (node<info.w)
         {
-            const float left=rtptVXPGLeftProbability(gVXPGForest[info.z+2*node],gVXPGForest[info.z+2*node+1],context.origin,context.normal);
+            ++traversed;
+            const float left=rtptVXPGLeftProbability(gVXPGForest[info.z+2*node],gVXPGForest[info.z+2*node+1],context.origin,context.normal,context.sourceSize);
             if (random<left) { probability*=left; random/=left; node*=2; }
             else { probability*=1.f-left; random=(random-left)/(1.f-left); node=node*2+1; }
             random=min(random,0.99999994f);
         }
         compact=gVXPGForest[info.z+node].compact;
+#if RTPT_VXPG_DETAILED_DIAGNOSTICS
+        InterlockedAdd(gVXPGQueryStats[0],1u);InterlockedAdd(gVXPGQueryStats[1],traversed);
+        InterlockedMax(gVXPGQueryStats[5],traversed);
+#endif
     }
     else
     {
@@ -136,7 +155,11 @@ bool rtptVXPGSample(RTPTVXPGContext context, float4 u, out RTPTVXPGCandidate can
     candidate.targetCompact = compact;
     // Selecting the source voxel is a null event, without a retry or a change
     // to the normalized voxel distribution used by the reverse evaluator.
-    if (cell == context.currentCell) return false;
+    if (cell == context.currentCell)
+    {
+        rtptVXPGCount(RTPT_VXPG_STATE_SELF_REJECTED);
+        return false;
+    }
     const RTPTVXPGSphericalBox box = rtptVXPGSphericalBox(context.origin, rtptVXPGWorldMin(cell), rtptVXPGWorldMax(cell));
     if (!rtptVXPGSampleBox(box, u.yzw, candidate.direction)) return false;
     // The downward traversal already evaluated every conditional probability.
@@ -147,6 +170,9 @@ bool rtptVXPGSample(RTPTVXPGContext context, float4 u, out RTPTVXPGCandidate can
 
 float rtptVXPGHitPdf(RTPTVXPGContext context, float3 hitPosition)
 {
+    if(context.generation!=gVXPGParams.generation || context.geometryGeneration!=gVXPGParams.geometryGeneration ||
+        gVXPGState[RTPT_VXPG_STATE_READY]!=context.generation ||
+        (context.clustered && gVXPGClusterState[6]!=context.generation))return 0.f;
     const uint cell = rtptVXPGOwner(hitPosition);
     if (cell == RTPT_VXPG_INVALID || cell == context.currentCell) return 0.f;
     const uint compact = gVXPGInverse[cell];
@@ -165,11 +191,14 @@ bool rtptVXPGAccept(RTPTVXPGContext context, RTPTVXPGCandidate candidate, float3
     // support checks without reconstructing its already evaluated density.
     if (candidate.generation != context.generation || context.generation != gVXPGParams.generation ||
         gVXPGState[RTPT_VXPG_STATE_READY] != context.generation) return false;
+    if(candidate.geometryGeneration!=context.geometryGeneration || context.geometryGeneration!=gVXPGParams.geometryGeneration)return false;
     if (context.clustered && gVXPGClusterState[6] != context.generation) return false;
     if (!(candidate.pdf > 0.f) || !isfinite(candidate.pdf) || !all(isfinite(candidate.direction)) ||
         !all(isfinite(hitPosition))) return false;
-    const uint cell = rtptVXPGOwner(hitPosition);
-    if (cell == RTPT_VXPG_INVALID || cell == context.currentCell || cell != candidate.targetCell) return false;
+    const uint cell=candidate.targetCell;
+    int4 hitKey;
+    if(cell>=rtptVXPGGeometryCount() || cell==context.currentCell || !rtptVXPGTryOwnerKey(hitPosition,hitKey)) return false;
+    if(any(hitKey!=rtptVXPGCellIdentity(cell))) return false;
     const uint compact = gVXPGInverse[cell];
     if (compact != candidate.targetCompact || compact >= min(gVXPGState[RTPT_VXPG_STATE_ACTIVE], gVXPGParams.activeCapacity))
         return false;

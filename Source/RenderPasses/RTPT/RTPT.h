@@ -4,7 +4,6 @@
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
-#include "RTPTPG.h"
 #include "RTPTVXPG.h"
 
 using namespace Falcor;
@@ -24,8 +23,6 @@ public:
     void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
-    Properties getPGStatistics() const;
-    void resetPG() { mResetPG = true; mOptionsChanged = true; }
     Properties getVXPGStatistics() const;
     void resetVXPG() { mpVXPG->invalidate(); mOptionsChanged = true; }
 
@@ -38,16 +35,12 @@ private:
     void clearSHARC(RenderContext* pRenderContext);
     void executeTraining(RenderContext* pRenderContext);
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex,
-        bool sharc, bool pg, bool vxpg = false);
+        bool sharc, bool vxpg = false);
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
     ref<ComputePass> mpSHARCResolve;
     ref<ComputePass> mpSparseUpdate;
-    ref<ComputePass> mpPGPrepare;
-    ref<ComputePass> mpPGTrain;
-    std::unique_ptr<RTPTPG::Manager> mpPG;
-    RTPTPG::Settings mPGSettings;
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
     RTPTVXPG::Settings mVXPGSettings;
     std::string mVXPGDiagnosticText;
@@ -55,18 +48,10 @@ private:
     uint32_t mVXPGDiagnosticFrameSampleOffset = 0;
     uint32_t mVXPGDiagnosticFrameSamplesPerPixel = 0;
     uint32_t mVXPGDiagnosticFrameGeneration = 0;
-    RTPTVXPG::GuidingMode mGuidingMode = RTPTVXPG::GuidingMode::PG;
+    RTPTVXPG::GuidingMode mGuidingMode = RTPTVXPG::GuidingMode::BSDF;
     bool mEnableVXPG = false;
-    bool mEnablePG = false;
-    bool mResetPG = true;
-    bool mPGTrainingThisFrame = false;
-    bool mSharedTrainingThisFrame = false;
     bool mVXPGSharedTrainingThisFrame = false;
     bool mVXPGSharedWithSHARCThisFrame = false;
-    uint32_t mPGUpdateStride = 5;
-    uint32_t mPGUpdateBounces = 8;
-    uint32_t mPGFrameIndex = 0;
-    float3 mPGCameraPosition = float3(0.f);
     ref<Buffer> mpSHARCHashEntries;
     ref<Buffer> mpSHARCAccumulation;
     ref<Buffer> mpSHARCResolved;

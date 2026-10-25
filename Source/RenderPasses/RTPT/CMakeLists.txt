@@ -3,29 +3,26 @@ add_plugin(RTPT)
 target_sources(RTPT PRIVATE
     RTPT.cpp
     RTPT.h
-    RTPTPG.h
-    RTPTPG.cpp
     RTPTVXPG.h
     RTPTVXPG.cpp
-    RTPTGrid.slang
-    RTPTPGTypes.slang
-    RTPTPG.slang
-    RTPTSampling.slang
     RTPTCamera.slang
     RTPTVXPGMath.slang
     RTPTVXPGGeometry.slang
     RTPTVXPGTypes.slang
-    RTPTVXPGGeometry.cs.slang
+    RTPTVXPGHistory.slang
+    RTPTVXPGGrid.slang
+    RTPTVXPGDebug.cs.slang
     RTPTVXPGInject.cs.slang
     RTPTVXPGTraining.slang
+    RTPTVXPGLocal.cs.slang
+    RTPTVXPGObservation.slang
+    RTPTVXPGIncremental.cs.slang
     RTPTVXPGPrepare.cs.slang
     RTPTVXPGSampling.slang
     RTPTVXPGIntegrator.slang
     RTPTVXPGDistribution.slang
     RTPTVXPGVisibility.cs.slang
     RTPTVXPGTree.cs.slang
-    RTPTPGPrepare.cs.slang
-    RTPTPGTrain.cs.slang
     RTPTSparseUpdate.cs.slang
     RTPT.cs.slang
     RTPTIntegrator.slang

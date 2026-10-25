@@ -31,13 +31,12 @@ float2 rtptNRDPackNormal(float3 normal)
 
 /** Trace a component selected deterministically on the primary surface.
     The primary lobe-selection probability is one. Later vertices use the
-    mixed reflection estimator, including optional guiding, NEE and symmetric MIS.
+    BSDF reflection estimator, including NEE and symmetric MIS.
 */
 float3 rtptTraceNRDContinuation(
     ShadingData primarySD,
     IMaterialInstance primaryMI,
     uint primaryLobes,
-    RTPTSamplingContext primarySampling,
     inout SampleGenerator sg,
     out float firstHitDistance,
     inout RTPTSharcStats sharcStats
@@ -46,8 +45,7 @@ float3 rtptTraceNRDContinuation(
     firstHitDistance = kRTPTNRDMissDistance;
     primarySD.mtl.setActiveLobes(primaryLobes);
     BSDFSample bs = {};
-    bool previousGuideSelected = false;
-    if (!rtptSampleContinuation(primarySD, primaryMI, primarySampling, sg, bs, previousGuideSelected)) return float3(0.f);
+    if (!primaryMI.sample(primarySD, sg, bs)) return float3(0.f);
     if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) return float3(0.f);
 
     bool previousDelta = bs.isLobe(LobeType::Delta);
@@ -60,7 +58,7 @@ float3 rtptTraceNRDContinuation(
     float previousContinuationPdf = bs.pdf;
     bool previousUsedNEE = gParams.useNEE != 0 && !previousDelta;
 #if ENABLE_SHARC && SHARC_QUERY
-    bool previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
+    bool previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
     float previousRoughness = primaryMI.getProperties(primarySD).roughness;
 #endif
     Ray ray = Ray(primarySD.computeRayOrigin(), bs.wo);
@@ -103,7 +101,7 @@ float3 rtptTraceNRDContinuation(
 #if ENABLE_SHARC && SHARC_QUERY
         const BSDFProperties sharcProperties = mi.getProperties(sd);
         float3 cachedRadiance;
-        if (rtptTrySharcQuery(sd, mi, sharcProperties, bounce, previousDelta, previousGuideSelected, previousDiffuse, previousRoughness,
+        if (rtptTrySharcQuery(sd, mi, sharcProperties, bounce, previousDelta, previousDiffuse, previousRoughness,
             length(sd.posW - previousPosition), sharcStats, cachedRadiance))
         {
             const float3 contribution = throughput * cachedRadiance;
@@ -126,22 +124,21 @@ float3 rtptTraceNRDContinuation(
         }
 #endif
         if (bounce == gParams.maxBounces) break;
-        const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
 
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
         if (previousUsedNEE)
         {
-            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
+            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sg);
             if (all(isfinite(contribution))) radiance += contribution;
         }
 
         bs = {};
-        if (!rtptSampleContinuation(sd, mi, sampling, sg, bs, previousGuideSelected)) break;
+        if (!mi.sample(sd, sg, bs)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         previousDelta = bs.isLobe(LobeType::Delta);
 #if ENABLE_SHARC && SHARC_QUERY
-        previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
+        previousDiffuse = bs.isLobe(LobeType::DiffuseReflection);
         previousRoughness = sharcProperties.roughness;
 #endif
         if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
@@ -236,28 +233,24 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSh
         diffuseSD.mtl.setActiveLobes(uint(LobeType::DiffuseReflection));
         ShadingData specularSD = sd;
         specularSD.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
-        RTPTSamplingContext diffuseSampling = rtptBSDFSamplingContext();
-        RTPTSamplingContext specularSampling = rtptBSDFSamplingContext();
-        if (hasDiffuse) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
-        if (hasSpecular) specularSampling = rtptMakeSamplingContext(specularSD, mi);
 
         RTPTLightSample ls;
         if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLight(sd, sg, ls))
         {
             if (query.traceVisibilityRay(ls.visibilityRay))
             {
-                if (hasDiffuse) signals.diffuse = rtptEvaluateDirectComponent(diffuseSD, mi, ls, diffuseSampling, sg);
-                if (hasSpecular) signals.specular = rtptEvaluateDirectComponent(specularSD, mi, ls, specularSampling, sg);
+                if (hasDiffuse) signals.diffuse = rtptEvaluateDirectComponent(diffuseSD, mi, ls, sg);
+                if (hasSpecular) signals.specular = rtptEvaluateDirectComponent(specularSD, mi, ls, sg);
             }
         }
         if (hasDiffuse)
-            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg, signals.diffuseHitDistance, sharcStats);
+            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), sg, signals.diffuseHitDistance, sharcStats);
         if (hasSpecular)
-            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg, signals.specularHitDistance, sharcStats);
+            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), sg, signals.specularHitDistance, sharcStats);
         if (hasDeltaSpecular)
         {
             float unusedDistance;
-            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
+            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), sg, unusedDistance, sharcStats);
         }
         // NRD deliberately excludes surfaces outside its denoising range.
         // Preserve their energy through the unfiltered residual channel.

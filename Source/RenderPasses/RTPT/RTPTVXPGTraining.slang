@@ -22,7 +22,7 @@ float3 rtptVXPGTrainingDirect(ShadingData sd, IMaterialInstance mi, bool withMIS
     float misWeight = 1.f;
     if (withMIS && !ls.analytic)
     {
-        const float continuationPdf = rtptContinuationPdf(sd, mi, rtptBSDFSamplingContext(), ls.dir);
+        const float continuationPdf = mi.evalPdf(sd, ls.dir);
         if (!isfinite(continuationPdf)) { valid = false; return 0.f; }
         misWeight = rtptPowerHeuristic(ls.pdf, continuationPdf);
     }
@@ -40,34 +40,15 @@ float3 rtptVXPGTrainingDirect(ShadingData sd, IMaterialInstance mi, bool withMIS
     return visible && sharcNeedsVisibility ? contribution : float3(0.f);
 }
 
-void rtptVXPGStoreObservation(ShadingData sd, float3 local)
+#include "RTPTVXPGObservation.slang"
+void rtptVXPGStoreCellObservation(uint cell, ShadingData sd, float3 local)
 {
-    if (gVXPGState[RTPT_VXPG_STATE_GEOMETRY_OVERFLOW] != 0) return;
-    const uint cell = rtptVXPGOwner(sd.posW);
-    if (cell == RTPT_VXPG_INVALID || gVXPGBoundMin[cell].w == 0) return;
-    if (!all(isfinite(local)))
-    {
-        InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
-        return;
-    }
-    InterlockedOr(gVXPGBoundMax[cell].w, 1u);
-    // Reference uses maxComponent of positive direct-light observations and
-    // their per-voxel average. This is proposal importance, not irradiance.
-    const float importance = max(local.x, max(local.y, local.z));
-    if (!(importance > 0.f)) return;
-    // Bounding model statistics does not clamp final transport radiance.
-    const uint64_t fixed = uint64_t(max(1.f, round(min(importance, 1.e6f) * 4096.f)));
-    uint64_t previousFlux;
-    InterlockedAdd(gVXPGFlux[cell], fixed, previousFlux);
-    if (previousFlux > uint64_t(0xffffffffffffffffull) - fixed)
-        InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],1u);
-    uint old;
-    InterlockedAdd(gVXPGCount[cell], 1u, old);
-    if (old==0xffffffffu) InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],1u);
-    if (old == 0)
-    {
-        gVXPGRepresentativePosition[cell] = float4(sd.posW, 1.f);
-        gVXPGRepresentativeNormal[cell] = float4(sd.getOrientedFaceNormal(), 0.f);
-    }
-    rtptVXPGCount(RTPT_VXPG_STATE_INJECTED);
+    rtptVXPGStoreRawCellObservation(cell,sd.posW,sd.getOrientedFaceNormal(),local);
+}
+
+void rtptVXPGStoreObservation(ShadingData sd, float3 local, uint2 pixel)
+{
+    const uint cell=rtptVXPGOwner(sd.posW);
+    rtptVXPGRecordDiscovery(pixel,cell,sd.posW,sd.getOrientedFaceNormal(),local);
+    rtptVXPGStoreCellObservation(cell,sd,local);
 }

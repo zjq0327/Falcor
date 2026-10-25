@@ -19,7 +19,6 @@ ConstantBuffer<RTPTVXPGInjectParams> gParams;
 ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #endif
 // Reuse the RTPT light system with guiding disabled for this independent model.
-#include "RTPTSampling.slang"
 #include "RTPTLighting.slang"
 #include "RTPTVXPGTraining.slang"
 
@@ -68,7 +67,7 @@ bool rtptVXPGProducePrimary(uint2 pixel, out Ray ray, out HitInfo hit)
     return true;
 }
 
-void rtptVXPGInjectSecondary(ShadingData primary, IMaterialInstance primaryMI, inout SampleGenerator sg)
+void rtptVXPGInjectSecondary(ShadingData primary, IMaterialInstance primaryMI, inout SampleGenerator sg, uint2 pixel)
 {
     BSDFSample bs = {};
     if (!primaryMI.sample(primary, sg, bs) || bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo))) return;
@@ -81,7 +80,6 @@ void rtptVXPGInjectSecondary(ShadingData primary, IMaterialInstance primaryMI, i
     uint materialID;
     if (!rtptVXPGShadeHit(hit, ray, sd, materialID)) return;
     const uint cell = rtptVXPGOwner(sd.posW);
-    if (cell == RTPT_VXPG_INVALID || gVXPGBoundMin[cell].w == 0) return;
     const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
     const BSDFProperties properties = mi.getProperties(sd);
     float3 local = properties.emission;
@@ -93,7 +91,8 @@ void rtptVXPGInjectSecondary(ShadingData primary, IMaterialInstance primaryMI, i
         rtptVXPGCount(RTPT_VXPG_STATE_INJECT_SHADOW);
         if (query.traceVisibilityRay(ls.visibilityRay)) local += mi.eval(sd, ls.dir, sg) * ls.LiOverPdf;
     }
-    rtptVXPGStoreObservation(sd, local);
+    rtptVXPGRecordDiscovery(pixel,cell,sd.posW,sd.getOrientedFaceNormal(),local);
+    rtptVXPGStoreCellObservation(cell, sd, local);
 }
 
 [numthreads(8, 8, 1)]
@@ -112,6 +111,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 #if !RTPT_VXPG_SHARED_INJECTION
     // Keep the original independent training stream and all secondary samples.
     SampleGenerator sg = SampleGenerator(tid.xy, (gVXPGParams.frameIndex + 1u) * 0x85ebca6bu + gParams.seed * 0xc2b2ae35u);
-    rtptVXPGInjectSecondary(primary, primaryMI, sg);
+    rtptVXPGInjectSecondary(primary, primaryMI, sg, tid.xy);
 #endif
 }
