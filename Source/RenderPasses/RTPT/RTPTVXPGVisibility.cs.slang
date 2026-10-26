@@ -344,7 +344,7 @@ void topLevelLeaves(uint3 group : SV_GroupID,uint lane : SV_GroupIndex)
     const uint4 info=gVXPGClusterInfo[cluster];
     const uint2 range=gVXPGSuperpixelRange[row];
     const float4 source=gVXPGSuperpixelPosition[row];
-    const bool valid=cluster<gVXPGParams.clusterCount && info.y>0 && range.y>0 && source.w!=0.f;
+    const bool valid=gVXPGClusterState[6]==gVXPGParams.generation && cluster<gVXPGParams.clusterCount && info.y>0 && range.y>0 && source.w!=0.f;
     // One group evaluates the reference's 32 actual point pairs in parallel.
     float contribution=0.f;
     if(valid)contribution=rtptVXPGPairContribution(row,cluster,lane,info,range);

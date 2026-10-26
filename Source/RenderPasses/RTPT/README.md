@@ -1,5 +1,31 @@
 # RTPT、VXPG、SHaRC 与 NRD
 
+## RTPT/VXPG 专项测试已删除（2026-10-26）
+
+按用户要求删除 FalcorTest 中的 7 个 RTPT/VXPG 专项 C++/Slang 文件（原 17 项 GPU 测试），移除对应的 CMake 注册和 FalcorTest 对 RTPT 的专用构建依赖，并清理专项测试的运行目录着色器副本和对象文件。`tests/RTPT/` 的旧验证、基准脚本此前已移除；光照观察记录数量中仅供测试 fixture 使用的零值兼容分支也已清理。
+
+运行时 Debug、Detailed diagnostics、Morton/树快照及其 CMD/UI/脚本接口继续保留。Falcor 通用测试与共享测试框架保留。下文 GPU 回归数量、专项测试源码路径和命令均属于历史验收记录，当前不再提供这些测试；历史报告和测量数据仍保留，日常运行使用 `RTPR_START.cmd`。
+
+删除后验证：Release 的 RTPT / FalcorTest / Mogwai 构建通过；重建后的 FalcorTest 枚举中 RTPT/VXPG 用例为 0，215 个通用用例仍保留。主入口 1080p 完整管线及 321×181 的 Debug、详细诊断开关和树快照共 13 项运行检查通过，进程正常退出。本次临时验证脚本已清理；记录见 [删除后运行检查](../../../build/vxpg-remove-tests-20261026/smoke.json) 和 [清理清单](../../../build/vxpg-remove-tests-20261026/cleanup.json)。
+
+## LBVH 与 Bitonic 已删除（2026-10-25）
+
+按用户要求，删除 LBVH 建树、显式父子链接与采样分支、64 位拼接编码和 Bitonic 排序，以及专用 GPU 资源、调度、UI、CMD 参数、可序列化属性和实验测试。当前簇内路径固定为 **Cluster + 21 位 Morton 组合键、独立 32 位活动索引 → 稳定 Radix Sort → 叶子数补齐到二次幂的 Heap 二叉树**。Visibility 关闭时继续使用全局树；成员不变时的局部权重更新保留。
+
+旧属性 `vxpgLBVHEnabled`、`vxpgBitonicSortEnabled` 无论传入 true 或 false 都作为未知属性报错。主入口、场景、RayQuery 架构及其他模块的默认值和开关保留。
+
+保留本轮定位过程中发现的通用正确性修复：分支概率限制在 `[0,1]`，避免浮点除法使右分支概率为负；无效模型不发布簇分布。真实浮点数据的概率回归已迁移到基础 Heap GPU 测试，覆盖正反向概率和质量回退分支。
+
+删除依据和旧实验数据保留为历史记录：[LBVH 优化](VXPG_LBVH_OPTIMIZATION_RESULTS.md)、[Bitonic 实验](VXPG_BITONIC_RESULTS.md)、[Morton / LCP 定位](VXPG_MORTON_LCP_RESULTS.md)。其中实验开关和回放工具已移除，不代表当前可用功能。
+
+删除后验证：Release 的 RTPT / FalcorTest 构建通过，D3D12 debug layer 下 **16 项 GPU 回归全部通过**。VeachAjar 的主入口完整管线以 1920×1080 验证静止 128 帧 Stop、连续移动、网格复用、输出有限性、诊断快照、Visibility / VXPG / Guiding / SHaRC 的关闭与恢复、冻结恢复和手动重置；旧属性的 true / false 均被拒绝。运行目录的六个旧着色器副本已清理；共享框架的 Bitonic 工具不属于 VXPG，未改动。本次为删除后的正确性验证，没有重跑性能对比。详见[验证记录](../../../build/vxpg-remove-lbvh-bitonic-20261025/verification.json)与[GPU 测试](../../../build/vxpg-remove-lbvh-bitonic-20261025/gpu-tests.log)。
+
+## Morton 与树结构诊断
+
+在 **VXPG → Detailed diagnostics → Enabled** 下，点击 **Read Morton / tree snapshot** 可读取当前已发布模型的簇内 Morton 重复数量和真实叶深度。脚本可显式调用 `RTPT.vxpgTreeSnapshot()`；未启用诊断或模型无效时返回 `available=false`，仅显式请求才读回，不增加普通帧的 GPU 工作。CMD 保留 `RTPT_VXPG_DIAGNOSTICS_ENABLED`。
+
+快照格式版本为 2，标明 `treeType=Heap`、`sortBackend=Radix`，保留排序键、真实叶子、每簇重复组/深度、节点和采样上下文；删除旧的树/排序模式字段与显式链接数组。
+
 ## 当前 VXPG 固定基础实现（2026-10-24）
 
 VXPG 只保留一条空间路径：**世界空间稀疏哈希 → 按射线命中增量插入/过期回收 → 距离 Multi LOD → 持久光照重要性历史 → 带置信度和相邻层级初始化的局部树更新**。普通相机移动保留世界空间状态，屏幕相关分布继续每帧更新。
@@ -19,7 +45,7 @@ Sparse grid、Incremental spatial grid、Multi LOD、Camera reuse、Lighting his
 - `RTPT_VXPG_HISTORY_FRAMES` / `vxpgHistoryFrames`：默认 32；`RTPT_VXPG_HISTORY_STALE_FRAMES` / `vxpgHistoryStaleFrames`：默认 128。零光照是有效观测，缺测不等于零；冻结暂停老化。
 - `RTPT_VXPG_TREE_REFRESH_FRAMES` / `vxpgTreeRefreshFrames`：默认 16；成员不变时局部更新权重，初始、成员变化、周期刷新和无效数据时重建。
 
-其余可选模块继续保留独立 CMD 与运行时 Enabled：PG SHaRC、Shared injection、Visibility、Debug、Diagnostics，以及全局 SHaRC、NRD、FrameAccumulation、ToneMapper。
+其余可选模块继续保留独立 CMD 与运行时 Enabled：PG SHaRC、Visibility、Debug、Diagnostics，以及全局 SHaRC、NRD、FrameAccumulation、ToneMapper。2026-10-26 按用户要求，Shared injection 固定启用多次反弹共享；共享总开关、仅第二表面共享模式及独立第二表面注入均已删除。VXPG 总开关和冻结仍保留。
 
 固定基础实现阶段（删除六项可选优化之前）：Release 构建通过；D3D12 debug layer 下 19 项 GPU 回归通过，分进程完成 48 组主图运行检查，另检查 5 种调试视图。覆盖默认/1080p、128 帧 Stop、普通移动、其余模块开关三态、冻结恢复、空间容量拒绝、预算回退、手动重置、历史窗口 1 和奇数分辨率。连续大量切换配置的单进程检查在完成 41 组后发生内存分配失败；小容量配置和剩余项目在独立进程通过，未声称解决长期配置切换的进程内存积累。验证记录位于 `build/vxpg-required-20261024-001/verification-summary.json`。下方“六个可选开关的移动测试”及之后的章节保留旧阶段的历史协议、配置和测量数据；其中旧开关、旧空间后端和性能结论不代表当前实现。
 
@@ -185,7 +211,7 @@ RTX 5070 / 驱动 610.88 / D3D12 Release；1280×720，完整主入口管线。�
 
 **叶子增删。** 全局树使用固定叶槽与 free list；每个簇保留固定容量的森林区段，新叶优先分配到描述最相近且有空槽的簇，满簇可转入其他簇。这是有界 GPU 存储方案，不实现可变长簇内存搬迁。质量变化、旧叶删除和新叶插入分别记录脏地址，再分层重算共享祖先；删除记录保留旧森林地址，即使叶槽同帧重用也不会漏更新旧祖先。预计算几何节点合并包围球。`RTPT_VXPG_TREE_REFRESH_FRAMES` 默认 16，仍定期更新可见性代表点和聚类种子；未开启 Compact query tree 时，动态模式按新种子重新分配固定槽，不执行原 Morton 重排；开启后查询树独立紧凑排序。Adaptive cluster updates 则替代固定周期刷新。屏幕超像素、顶层估计和顶部树仍每帧构建。关闭 Visibility 时使用同一动态全局质量树。
 
-**增量发现与淘汰。** `RTPT_VXPG_DISCOVERY_STRIDE` 默认 5；主表面按每 5×5 像素一个轮换命中发现空间，第二表面复用已有 VXPG/SHaRC 训练命中，每个发现 tile 保留一个有界记录，不新增发现专用射线。已有 cell 的正常光照观测继续积累；缺失 cell 的记录在插入后回放一次。共享注入使用原子 tile claim，兼容其独立采样步长与相位。每帧只插入新 key，但发现哈希清理、过期扫描和质量解析仍有容量相关开销；不能把它理解为所有工作都与新格子数成正比。
+**增量发现与淘汰。** `RTPT_VXPG_DISCOVERY_STRIDE` 默认 5；主表面按每 5×5 像素一个轮换命中发现空间。光照训练固定按 SHaRC 实际 tile 布局，为每条路径、每个观察深度分别保留记录，兼容不同 stride、相位及奇数分辨率，浅层表面不会抢占深层记录。不新增发现专用射线。已有 cell 的正常光照观测立即积累；缺失 cell 按 key 去重、插入后回放每份观察一次，包括有效零光照；已立即写入的观察不会重复回放。记录池按配置的最坏深度预分配并计入预算，待插入槽位队列不超过哈希容量。每帧只插入新 key，但记录清理、发现、过期扫描和质量解析仍有容量相关开销。
 
 `RTPT_VXPG_SPATIAL_STALE_FRAMES` 默认 512，按实际模型更新次数计龄，与光照历史缺测期限 128 分开。淘汰使用哈希 tombstone 保留探测链；容量或探测预算不足时丢弃新插入并计数，已有记录和提议继续有效，未覆盖区域仍由 BSDF 支路承担。冷启动发现需要若干帧，容量不是无限增长。未开启 Observed support bounds 时，增量模式保存完整空间格子边界，不再保存三角形裁剪包围盒；这会扩大采样支持域，也可能增加空样本，必须与性能和画质一起评估。
 
@@ -348,11 +374,29 @@ A 的缓存 C/R 与 full 共用 hash、计数、调制和历史规则，使用�
 
 删除后的 Release RTPT/Mogwai 构建及 VeachAjar 14 组运行状态、142 项检查通过：包含 1080p 完整主图、普通 PT 3 SPP、NRD 直通/恢复、共享训练开/关/重开、冻结、SHaRC 关闭后的稀疏回退以及 BSDF 回退。321×181 下主渲染每帧追踪 58,101 条 primary，3 SPP 为 174,303 条；VXPG 全屏 primary 仍完整生产。验证输出均有限且 invalidSamples=0，未重新测量性能或画质等价性。记录在 `build/vxpg-remove-primary-reuse-20261023-001/runtime.json`，临时验证脚本已删除。
 
-O5.2 **Shared injection** 已接入 `RTPT_VXPG_SHARED_INJECTION_ENABLED=1/0`、属性 `vxpgSharedInjectionEnabled` 和 **VXPG → Shared injection → Enabled**，默认 **0**。开启后 VXPG 使用 SHaRC 原有训练路径的第二表面，默认每 **5×5 像素一条路径**；复用其 BSDF 续接、光源样本和遮挡求交。SHaRC 保留原 MIS 训练值，VXPG 使用自发光加 raw NEE 的正 maxRGB 重要性，二者不共用缓存载荷。全屏 primary position/normal/hit 仍完整生产并用于 VXPG 分布构建，Full 分布和采样/PDF 算法不变。
+**Shared injection 固定启用。** 2026-10-26 按用户要求删除共享总开关，以及关闭共享时的独立第二表面注入实现。CMD 不再读取 `RTPT_VXPG_SHARED_INJECTION_ENABLED`，UI 仅显示共享状态；旧属性 `vxpgSharedInjectionEnabled` 和 `vxpgSharedInjectionAllBouncesEnabled` 无论传入 true 或 false 均作为未知属性报错。VXPG 训练时，从第二表面（bounce=1）至训练路径实际到达的最后一个表面，每个深度都提供局部观察。共享路径默认每 **5×5 像素一条**、SHaRC Update bounces=8；步长与深度仍可调，不补足因未命中或俄罗斯轮盘终止的深度，不改变 SHaRC 路径数量和反弹预算。保留 VXPG 总开关和冻结；不再提供仅第二表面共享模式。
 
-SHaRC 关闭或冻结时，VXPG 以相同 stride 独立追踪到第二表面，不写 SHaRC；只关闭 SHaRC 查询仍共享更新。VXPG 冻结时停止注入而 SHaRC 继续训练。SHaRC 深度为 1 时，第二表面的额外 raw NEE 使用 RNG 副本，不延长或改写 SHaRC 后缀。共享开关、共享 stride/深度变化会使提议失效并重置图像历史；普通每帧训练不重置历史。该模式改变 VXPG 训练覆盖，不能视为逐位等价优化。V 场景对照和限制见 [O5.2 阶段报告](VXPG_O5_2_RESULTS.md)。
+各深度复用 SHaRC 的 BSDF 续接、光源样本、材质求值和遮挡求交。SHaRC 保留原 MIS 训练值，VXPG 使用自发光加 raw NEE 的 maxRGB 重要性，不乘相机路径 throughput，不将 SHaRC 后缀辐射写入 VXPG；二者不共用缓存载荷。全屏 primary position/normal/hit 仍完整生产，Full 分布和采样/PDF 算法不变。1080p、stride=5、8 个观察深度的 48 字节记录池约 30.375 MiB；当前主入口配置仍在 **256 MiB** 预算内，保持原预算。更密步长或更深路径须重新核对预算；超预算会明确报告并回退 BSDF。空间池或哈希饱和沿用已有拒绝统计，不按深度裁剪记录池。
 
-O5.2 的 V 场景 1080p、9 对交错实测：Full/共享整帧 **25.781/26.049 ms**，均值慢 **1.04%**，未见稳定净收益；VXPGInject **0.631/0.289 ms**，但 MainRender **17.614/18.127 ms**。720p、8 秒、3 种子的 raw NMSE 增加 **0.28%**，最终 HDR 基本持平。159 项数值/运行检查通过；共享保持默认关闭。
+SHaRC 关闭或冻结时，VXPG 以同一配置的 stride 和完整反弹深度独立训练，不写 SHaRC、不推进其更新帧索引；不再存在专门追踪到第二表面就结束的稀疏回退。只关闭 SHaRC 查询仍共享其全部更新。VXPG 冻结时停止注入而 SHaRC 继续训练。SHaRC 任意终止表面的额外 raw NEE 使用 RNG 副本，不延长或改写 SHaRC 后缀。共享 stride/深度或训练来源变化会清理 VXPG 光照历史并重置 NRD 与最终累积；普通每帧训练不重置历史。固定共享沿用此前默认开启时的训练算法；主表面数据由 `RTPTVXPGPrimary.cs.slang` 完整采集，已删除旧独立注入着色器及其光源绑定。详细诊断可读取 `sharedObservationsBounce1...32` 和 `sharedRecordedObservations`；它们统计本次更新实际留下的观察，非配置深度，也不等于最终成功建格数量。将训练深度显式设为 1 仍是合法的最小预算，不代表恢复已删除的共享模式。
+
+**2026-10-26 固定共享、删除关闭分支后验证。** Release 的 RTPT / FalcorTest / Mogwai 构建通过，17 项 D3D12 debug-layer GPU 回归和 95 项主入口运行检查通过，最终进程正常退出。主入口 1080p 下反弹 1–8 均有实际观察，全屏主表面数据保留，估算 227.50 MiB 仍在原 256 MiB 预算内；完整管线和 128/Stop 配置保留，达到上限后训练继续。321×181 下验证 SHaRC 关闭/冻结/查询关闭及恢复、VXPG 冻结/关闭及恢复、BSDF 着色器变体、4/8 深度调整。两项旧共享属性 true/false 均被拒绝，继承环境中的旧 CMD 变量设为 0 也无法选择已删除路径。临时脚本及旧独立注入的运行目录着色器副本已清理；首次检查脚本的退出接口错误修正后完整重跑。详见 [本轮运行验证](../../../build/vxpg-fixed-shared-training-20261026/validation.json) 和 [GPU 测试](../../../build/vxpg-fixed-shared-training-20261026/gpu-tests.log)。本轮未重新测量性能或画质。
+
+**2026-10-26 删除仅第二表面共享模式后的历史验证（当时仍保留共享总开关）。** Release 的 RTPT / FalcorTest / Mogwai 构建通过，17 项 D3D12 debug-layer GPU 回归和 89 项主入口运行检查通过。验证默认 1080p 下反弹 1–8 均有实际观察、256 MiB 预算内提议有效、完整全局管线与 128/Stop 设置保留且达到上限后训练继续；321×181 下检查当时的共享总开关关闭/重开、SHaRC 关闭/冻结/恢复、只关闭缓存查询以及 4/8 深度调整。SHaRC 停更时深层观察仍存在且其更新帧索引不推进；旧属性 true/false 均被拒绝，旧序列化和统计子开关字段已移除。详见 [阶段运行验证](../../../build/vxpg-fixed-shared-bounces-20261026/validation.json) 和 [GPU 测试](../../../build/vxpg-fixed-shared-bounces-20261026/gpu-tests.log)。下方性能/画质为删除前阶段的历史数据，该阶段验证针对模式删除及停更时的多深度独立训练。
+
+详细诊断的旧字段 `injectionSecondaryRays` 在多反弹共享下统计所有被观察深度的续接求交尝试；这些求交复用 SHaRC 原路径，不能把此计数解释为多反弹模块额外发射的射线数。
+
+**2026-10-25 多次反弹共享历史验证（包含现已删除的模式）。** Release RTPT / FalcorTest / Mogwai 构建通过，17 项 D3D12 debug-layer GPU 测试通过；其中新增回归覆盖不同发现步长、奇数尺寸、多深度新格子、同格多份观察、有效零光照、回放不重复计数及当时的仅第二表面回退。主入口配置的 69 项运行检查通过，确认当时默认开启共享与深度子开关、反弹 1–8 均有实际观察、全屏 primary 保留、128 Stop 保持和切换重置、SHaRC 关闭/冻结及只关查询、VXPG 关闭/冻结和恢复。321×181、seed=19、64 帧对照的 `RTPT.sharcCacheRadiance` 输出在独立、仅第二表面及全部反弹模式下逐像素一致。验证记录见 [validation.json](../../../build/vxpg-shared-all-bounces-20261025/validation.json)。初次状态验证使用 320 MiB 临时预算；最终入口恢复原 256 MiB，以下历史性能及画质批次均使用该预算。
+
+RTX 5070 / 驱动 610.88 / D3D12 Release / 静态 VeachAjar / 1920×1080，直接读取 `RTPR_START.cmd` 的脚本、场景和模块配置，主图完整开启，PG SHaRC 关闭、详细诊断与 debug layer 关闭。三个种子 0/19/37，平衡正反序，每个窗口重新初始化并预热 128 帧，再保留 128 个 GPU profiler 记录；18 个窗口共 2304 个有效计时帧。最终图仍为 128/Stop，RTPT、SHaRC、NRD 和 VXPG 更新继续执行。独立 / 仅第二表面 / 全部反弹的整帧 GPU 均值为 **25.025 / 24.773 / 24.857 ms**；全部反弹相对仅第二表面约 **+0.34%**，相对独立约 **−0.67%**。三个种子的配对 t 区间均包含零，不据此宣称稳定加速。全部反弹的 SparseTrace 为 0.370 ms，观察记录清理及发现插入也增加开销；主渲染约 17.69 ms，仍占主要成本。VXPG 资源载荷从 196.65 增至 **223.22 MiB**，保守预算估算 **227.50 MiB**，不包含另列的 SHaRC 配对缓存和其他管线资源。详见 [性能汇总](../../../build/vxpg-shared-all-bounces-20261025/performance-summary.json) 与 [完整计时](../../../build/vxpg-shared-all-bounces-20261025/performance.json)。
+
+长批次反复替换图和编译时出现一次 `slang.dll / 0xc0000005` 原生异常；保留当时已完成记录，单独保存第三种子的中断窗口，并在新进程中完整重测该种子的正反序组。最终汇总使用完整平衡的 18 个窗口；分批续测正常退出，没有修改 Slang 或共享框架。
+
+画质使用同一 1080p 完整主图、三个种子，分别保存冷启动 128 帧最终图；随后重置累积，在每配置约 8 秒的渲染窗口内记录预热后的最终 128/Stop 图和全部窗口帧的原始信号均值。原始信号仅在画质阶段增加测量用 AccumulatePass，不计入上述性能图；窗口末允许完成一整帧，图像读回在窗口外，各模式平均渲染窗口约 8.013–8.017 秒、每窗口 306–320 帧。参考为 SHaRC/VXPG 关闭、16 bounces、两个独立种子各 2048 帧的 BSDF 原始信号均值；比较配置仍保持主入口 maxBounces=4，并包含 SHaRC/NRD 的近似误差。两个参考的差异 NMSE=0.03327，估计合并参考噪声底约 0.00832，绝对误差不能解释为本次共享模式单独造成。
+
+独立 / 仅第二表面 / 全部反弹的三种子平均原始信号 NMSE 为 **0.041830 / 0.041416 / 0.041770**，预热后最终 HDR NMSE 为 **0.162553 / 0.162572 / 0.162703**。全部反弹相对仅第二表面的配对变化为：原始信号 **+0.86%**、冷启动最终图 **+0.076%**、预热后最终图 **+0.081%**；误差增加表示变差。分别对两个参考计算也没有得到画质改善结论。该阶段 V 场景表现为训练覆盖增加、资源开销增加，性能和画质没有测出收益；当时保留两个独立开关用于对照，共享总开关、深度子开关及仅第二表面共享模式现均已删除，测量数据仍作为历史记录保留。详见 [画质汇总](../../../build/vxpg-shared-all-bounces-20261025/quality-summary.json)、[逐窗口数据](../../../build/vxpg-shared-all-bounces-20261025/quality.json) 和 [seed 0 冷启动/预热后显示对照](../../../build/vxpg-shared-all-bounces-20261025/comparison-seed0.png)。
+
+O5.2 的历史 V 场景 1080p、9 对交错实测：Full/共享整帧 **25.781/26.049 ms**，均值慢 **1.04%**，未见稳定净收益；VXPGInject **0.631/0.289 ms**，但 MainRender **17.614/18.127 ms**。720p、8 秒、3 种子的 raw NMSE 增加 **0.28%**，最终 HDR 基本持平。159 项数值/运行检查通过；当时仅第二表面共享保持默认关闭，不能把这组历史结果当作当前多次反弹模式的性能结论。
 
 删除 O5.1 后，按用户要求只在 V 场景复测 O5.2 开/关：1080p 完整主图、9 对交错运行，每种模式 1,152 个 GPU 帧。关闭/开启共享的整帧为 **25.073/25.221 ms**（均值 +0.59%，配对 bootstrap 95% 区间 −1.35%～+2.03%），MainRender **17.112/17.671 ms**（+3.26%），VXPGInject **0.611/0.242 ms**（−60.40%）。未确认稳定整帧收益，默认继续关闭；206 项配置、状态和输出检查通过。本次未重新进行画质误差对照，也不把与旧测试时段的差值归因于删除 O5.1。完整数据在 `build/vxpg-full-after-removal-20261023-001/`，临时脚本已清理。
 

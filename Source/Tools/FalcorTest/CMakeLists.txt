@@ -1,16 +1,7 @@
 add_falcor_executable(FalcorTest)
-# O7 regression shaders include the RTPT shader library from the runtime tree.
-add_dependencies(FalcorTest RTPT)
 
 target_sources(FalcorTest PRIVATE
     FalcorTest.cpp
-    Tests/RTPT/VXPGSparseGrid.cpp
-    Tests/RTPT/VXPGDistanceLOD.cpp
-    Tests/RTPT/VXPGTemporal.cpp
-    Tests/RTPT/VXPGTemporal.cs.slang
-    Tests/RTPT/VXPGDistanceLOD.cs.slang
-    Tests/RTPT/VXPGSparseSampling.cs.slang
-
     Tests/Core/AftermathTests.cpp
     Tests/Core/AftermathTests.cs.slang
     Tests/Core/AssetResolverTests.cpp

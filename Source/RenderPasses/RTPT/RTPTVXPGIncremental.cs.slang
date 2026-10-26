@@ -1,10 +1,11 @@
 #include "RTPTVXPGObservation.slang"
 
-uint discoveryCount(){const uint2 d=rtptVXPGDiscoveryDim();return d.x*d.y;}
+uint primaryDiscoveryCount(){const uint2 d=rtptVXPGDiscoveryDim();return d.x*d.y;}
+uint discoveryCount(){return rtptVXPGDiscoveryRecordCount();}
 float4 tokenPosition(uint token)
 {
-    const uint request=token-1, index=request/2;
-    return (request&1u)!=0?gVXPGDiscovery[index].position:gVXPGPrimaryPosition[rtptVXPGDiscoveryPixel(index)];
+    const uint request=token-1, primaryCount=primaryDiscoveryCount();
+    return request<primaryCount ? gVXPGPrimaryPosition[rtptVXPGDiscoveryPixel(request)] : gVXPGDiscovery[request-primaryCount].position;
 }
 int4 tokenIdentity(uint token)
 {
@@ -32,7 +33,7 @@ void beginGrid(uint3 tid:SV_DispatchThreadID)
 {
     const uint i=tid.x;
     if(i<gVXPGParams.hashCapacity)gVXPGPendingHash[i]=0;
-    if(i<discoveryCount()){RTPTVXPGDiscovery empty={};gVXPGDiscovery[i]=empty;gVXPGDiscoveryClaims[i]=0;}
+    if(i<discoveryCount()){RTPTVXPGDiscovery empty={};gVXPGDiscovery[i]=empty;}
     if(i==0)gVXPGGridState[1]=gVXPGGridState[2]=0;
 }
 [numthreads(256,1,1)]
@@ -56,7 +57,7 @@ void evictGrid(uint3 tid:SV_DispatchThreadID)
 void discover(uint3 tid:SV_DispatchThreadID)
 {
     const uint request=tid.x;
-    if(request>=2*discoveryCount())return;
+    if(request>=primaryDiscoveryCount()+discoveryCount())return;
     const uint token=request+1;
     const float4 position=tokenPosition(token);
     int4 key;

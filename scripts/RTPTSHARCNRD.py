@@ -46,7 +46,6 @@ def render_graph_RTPTSHARCNRD():
         "vxpgVisibilityEnabled": _module_enabled("RTPT_VXPG_VISIBILITY_ENABLED"),
         "vxpgDebugEnabled": _module_enabled("RTPT_VXPG_DEBUG_ENABLED", "0"),
         "vxpgDetailedDiagnostics": _module_enabled("RTPT_VXPG_DIAGNOSTICS_ENABLED", "0"),
-        "vxpgSharedInjectionEnabled": _module_enabled("RTPT_VXPG_SHARED_INJECTION_ENABLED", "0"),
         "vxpgDiscoveryStride": int(os.environ.get("RTPT_VXPG_DISCOVERY_STRIDE", "5")),
         "vxpgSpatialStaleFrames": int(os.environ.get("RTPT_VXPG_SPATIAL_STALE_FRAMES", "512")),
         "vxpgTreeRefreshFrames": int(os.environ.get("RTPT_VXPG_TREE_REFRESH_FRAMES", "16")),

@@ -2,7 +2,6 @@
 #include "Falcor.h"
 #include "Utils/Properties.h"
 #include "Utils/Sampling/SampleGenerator.h"
-#include "Rendering/Lights/EnvMapSampler.h"
 #include <array>
 
 namespace RTPTVXPG
@@ -18,7 +17,6 @@ struct Settings
     bool visibilityEnabled = true;
     bool debugEnabled = false;
     bool detailedDiagnostics = false;
-    bool sharedInjectionEnabled = false;
     uint32_t historyFrames = 32;
     uint32_t historyStaleFrames = 128;
     uint32_t discoveryStride = 5;
@@ -40,7 +38,7 @@ class Manager
 public:
     explicit Manager(Falcor::ref<Falcor::Device> device) : mpDevice(device) {}
     static void validate(const Settings& settings);
-    void configure(const Settings& settings, Falcor::uint2 frameDim);
+    void configure(const Settings& settings, Falcor::uint2 frameDim, uint32_t sharedStride, uint32_t sharedBounces);
     void invalidate();
     void invalidateDistribution(const std::string& reason = "View-dependent proposal needs rebuilding");
     void cameraChanged();
@@ -54,11 +52,12 @@ public:
     void buildGeometry(Falcor::RenderContext* context);
     // Prepare/clear observation buffers before sparse SHaRC/VXPG training.
     void prepareLighting(Falcor::RenderContext* context);
-    bool canInjectShared() const { return mLightingPrepared && mSettings.sharedInjectionEnabled; }
+    bool canInjectShared() const { return mLightingPrepared; }
     uint32_t getLightingFrameIndex() const { return mLightingFrameIndex; }
+    uint64_t getDiscoveryRecordCount() const;
+    std::array<uint32_t,32> readSharedObservationCounts() const;
     void barrierInjection(Falcor::RenderContext* context) const;
-    void updateLighting(Falcor::RenderContext* context, Falcor::EnvMapSampler* envSampler, uint32_t seed, bool useNEE,
-        uint32_t sampleOffset, bool useNRD);
+    void updateLighting(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
     // Must be called even when guiding/model updates are disabled or frozen.
     void beginFrame() { mLightingPrepared = false; }
     void bind(const Falcor::ShaderVar& root, uint32_t frameIndex, bool active) const;
@@ -66,6 +65,9 @@ public:
     std::array<uint32_t, 128> readLodCounts(uint32_t geometryCount, uint32_t activeCount) const;
     void appendObservationStatistics(Falcor::Properties& props, uint32_t geometryCount, uint32_t activeCount) const;
     std::array<uint32_t, 8> readClusterCounters() const;
+    // Explicit, gated readback for same-model structural diagnostics/replay.
+    // Never called from the render loop or ordinary statistics collection.
+    Falcor::Properties readTreeSnapshot(const Settings& requested) const;
     void invalidateDiagnosticSnapshot() { mModelDiagnosticsAvailable = false; }
     bool hasModelDiagnostics() const { return mSettings.detailedDiagnostics && mModelDiagnosticsAvailable; }
     uint32_t getModelDiagnosticsFrameIndex() const { return mModelDiagnosticsFrameIndex; }
@@ -87,6 +89,8 @@ public:
 private:
     void advanceGeneration(uint32_t& generation);
     uint64_t estimateModelBytes() const;
+    uint64_t primaryDiscoveryCount() const;
+    uint64_t discoveryRequestCount() const { return primaryDiscoveryCount() + getDiscoveryRecordCount(); }
     void resetClusterPasses();
     void releaseModelResources();
     void updateVisibility(Falcor::RenderContext* context);
@@ -97,6 +101,8 @@ private:
     Falcor::ref<Falcor::Device> mpDevice;
     Settings mSettings;
     Falcor::uint2 mFrameDim = Falcor::uint2(0);
+    uint32_t mSharedTrainingStride = 5;
+    uint32_t mSharedTrainingBounces = 8;
     uint32_t mGeneration = 1;
     uint32_t mGeometryGeneration = 1;
     uint32_t mGeometryRebuilds = 0;
@@ -117,7 +123,7 @@ private:
     Falcor::ref<Falcor::Buffer> mpWorkArgs, mpWorkDispatch;
     Falcor::ref<Falcor::ComputePass> mpGeometryWork, mpActiveWork, mpForestWork;
     Falcor::ref<Falcor::ComputePass> mpDebug;
-    Falcor::ref<Falcor::ComputePass> mpClearFrame, mpInject, mpGlobalLeaves, mpGlobalLevel, mpPublish;
+    Falcor::ref<Falcor::ComputePass> mpClearFrame, mpPrimary, mpGlobalLeaves, mpGlobalLevel, mpPublish;
     Falcor::ref<Falcor::ComputePass> mpClearDiagnostics;
     Falcor::ref<Falcor::SampleGenerator> mpSampleGenerator;
     Falcor::ref<Falcor::Buffer> mpFlux, mpCount, mpCompactIndices, mpMass, mpGlobalTree, mpRepresentativePosition, mpRepresentativeNormal;
@@ -126,7 +132,7 @@ private:
     Falcor::float3 mPreviousLodCamera = Falcor::float3(0.f);
     Falcor::ref<Falcor::Buffer> mpCellMass, mpTreeState, mpDirtyLeaves, mpDirtyNodes, mpLocalArgs, mpLocalDispatch;
     Falcor::ref<Falcor::ComputePass> mpBeginLocal, mpResolveLocal, mpSelectLocal, mpCompactLocal, mpLocalWork, mpLocalLeaves, mpLocalLevel;
-    Falcor::ref<Falcor::Buffer> mpGridState, mpCellLifetime, mpFreeCells, mpRetiredCells, mpDiscovery, mpDiscoveryClaims, mpPendingHash, mpPendingSlots;
+    Falcor::ref<Falcor::Buffer> mpGridState, mpCellLifetime, mpFreeCells, mpRetiredCells, mpDiscovery, mpPendingHash, mpPendingSlots;
     Falcor::ref<Falcor::ComputePass> mpGridClear, mpGridBegin, mpGridEvict, mpGridDiscover, mpGridInsert, mpGridReplay, mpGridRetire;
     Falcor::ref<Falcor::Texture> mpPrimaryPosition, mpPrimaryNormal, mpPrimaryHit;
     Falcor::ref<Falcor::Buffer> mpRowPosition, mpRowNormal, mpVisibility, mpSeeds, mpCluster, mpClusterInfo;

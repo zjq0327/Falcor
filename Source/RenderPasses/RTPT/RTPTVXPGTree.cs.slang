@@ -174,16 +174,18 @@ void publishClusters(uint3 tid : SV_DispatchThreadID)
     for (uint c=0;c<gVXPGParams.clusterCount;++c)
     {
         const uint4 info=gVXPGClusterInfo[c];
-        const RTPTVXPGNode clusterRoot=gVXPGForest[info.z+1];
+        if (info.y==0) continue;
+        const uint rootAddress=info.z+1;
+        const RTPTVXPGNode clusterRoot=gVXPGForest[rootAddress];
         sum+=clusterRoot.mass;
 #if RTPT_VXPG_PRECOMPUTED_NODE_GEOMETRY
-        // Roots have no parent consumer; this also handles single-leaf and
-        // empty clusters. The host barriers the forest before top-tree queries.
-        if (!rtptVXPGReuseTopology()) gVXPGForest[info.z+1]=rtptVXPGFinalizeNode(clusterRoot);
+        // Roots have no parent consumer; this also handles single-leaf
+        // clusters. The host barriers the forest before top-tree queries.
+        if (!rtptVXPGReuseTopology()) gVXPGForest[rootAddress]=rtptVXPGFinalizeNode(clusterRoot);
 #endif
     }
     const float root=gVXPGGlobalTree[1];
-    const bool valid=gVXPGClusterState[1]>0 && isfinite(sum) && root>0.f && abs(sum-root)<=max(1.e-4f,root*1.e-4f);
+    const bool valid=gVXPGState[11]==0 && gVXPGClusterState[1]>0 && isfinite(sum) && root>0.f && abs(sum-root)<=max(1.e-4f,root*1.e-4f);
     gVXPGClusterState[6]=valid?gVXPGParams.generation:0;
     if (!valid && root>0.f) InterlockedAdd(gVXPGState[11],1u);
 }

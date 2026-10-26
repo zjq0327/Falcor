@@ -43,6 +43,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
     {
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("vxpgStats", [](const RTPT& self) { return self.getVXPGStatistics().toPython(); });
+        pass.def("vxpgTreeSnapshot", [](const RTPT& self) { return self.getVXPGTreeSnapshot().toPython(); });
         pass.def("resetVXPG", &RTPT::resetVXPG);
     });
 }
@@ -52,6 +53,19 @@ RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
     mpVXPG = std::make_unique<RTPTVXPG::Manager>(mpDevice);
     setProperties(props);
     mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_UNIFORM);
+}
+
+Properties RTPT::getVXPGTreeSnapshot() const
+{
+    if (!mEnableVXPG || mGuidingMode != RTPTVXPG::GuidingMode::VXPG || !mVXPGSettings.enabled)
+    {
+        Properties result;
+        result["version"] = 2u;
+        result["available"] = false;
+        result["status"] = "VXPG is not enabled and selected";
+        return result;
+    }
+    return mpVXPG->readTreeSnapshot(mVXPGSettings);
 }
 
 void RTPT::setProperties(const Properties& props)
@@ -113,7 +127,6 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "vxpgVisibilityEnabled") vxpg.visibilityEnabled = value;
         else if (key == "vxpgDebugEnabled") vxpg.debugEnabled = value;
         else if (key == "vxpgDetailedDiagnostics") vxpg.detailedDiagnostics = value;
-        else if (key == "vxpgSharedInjectionEnabled") vxpg.sharedInjectionEnabled = value;
         else if (key == "vxpgDiscoveryStride") vxpg.discoveryStride = value;
         else if (key == "vxpgSpatialStaleFrames") vxpg.spatialStaleFrames = value;
         else if (key == "vxpgTreeRefreshFrames") vxpg.treeRefreshFrames = value;
@@ -164,9 +177,9 @@ void RTPT::setProperties(const Properties& props)
     const bool vxpgStructureChanged = vxpgLayoutChanged || enableVXPG != mEnableVXPG ||
         vxpg.maxVoxels != mVXPGSettings.maxVoxels || vxpg.clusterCount != mVXPGSettings.clusterCount ||
         vxpg.superpixelSize != mVXPGSettings.superpixelSize;
-    const bool vxpgTrainingChanged = vxpg.sharedInjectionEnabled != mVXPGSettings.sharedInjectionEnabled ||
-        useNEE != mUseNEE || seed != mSeed ||
-        (vxpg.sharedInjectionEnabled && (sharcUpdateStride != mSHARCUpdateStride || sharcUpdateBounces != mSHARCUpdateBounces));
+    const bool vxpgTrainingChanged = useNEE != mUseNEE || seed != mSeed ||
+        sharcUpdateStride != mSHARCUpdateStride || sharcUpdateBounces != mSHARCUpdateBounces ||
+        (enableSHARC && sharcEnabled && !sharcFreeze) != (mEnableSHARC && mSHARCEnabled && !mSHARCFreeze);
     if (vxpgTrainingChanged)
     {
         mpVXPG->resetLightingHistory();
@@ -283,7 +296,6 @@ Properties RTPT::getProperties() const
     props["vxpgVisibilityEnabled"] = mVXPGSettings.visibilityEnabled;
     props["vxpgDebugEnabled"] = mVXPGSettings.debugEnabled;
     props["vxpgDetailedDiagnostics"] = mVXPGSettings.detailedDiagnostics;
-    props["vxpgSharedInjectionEnabled"] = mVXPGSettings.sharedInjectionEnabled;
     props["vxpgDiscoveryStride"] = mVXPGSettings.discoveryStride;
     props["vxpgSpatialStaleFrames"] = mVXPGSettings.spatialStaleFrames;
     props["vxpgTreeRefreshFrames"] = mVXPGSettings.treeRefreshFrames;
@@ -387,13 +399,25 @@ Properties RTPT::getVXPGStatistics() const
         }
         props["lodLevelsUsed"]=used;
     }
-    props["sharedInjectionEnabled"] = mVXPGSettings.sharedInjectionEnabled;
     props["sharedInjectionActive"] = mVXPGSharedTrainingThisFrame;
     props["sharedWithSHARC"] = mVXPGSharedWithSHARCThisFrame;
     props["sharedInjectionStride"] = mSHARCUpdateStride;
+    props["sharedInjectionMaxBounce"] = mVXPGSharedTrainingThisFrame ? mSHARCUpdateBounces : 0u;
+    props["discoveryRecordCapacity"] = mpVXPG->getDiscoveryRecordCount();
     const bool diagnosticsAvailable = selectedEnabled && mVXPGSettings.detailedDiagnostics && mVXPGDiagnosticFrameAvailable &&
         mVXPGDiagnosticFrameGeneration == mpVXPG->getGeneration();
     const bool modelDiagnosticsAvailable = diagnosticsAvailable && mpVXPG->hasModelDiagnostics();
+    if(modelDiagnosticsAvailable && mVXPGSharedTrainingThisFrame)
+    {
+        const auto counts=mpVXPG->readSharedObservationCounts();
+        uint32_t total=0;
+        for(uint32_t bounce=0;bounce<32;++bounce)
+        {
+            if(bounce<mSHARCUpdateBounces)props["sharedObservationsBounce"+std::to_string(bounce+1)]=counts[bounce];
+            total+=counts[bounce];
+        }
+        props["sharedRecordedObservations"]=total;
+    }
     props["detailedDiagnostics"] = mVXPGSettings.detailedDiagnostics;
     props["diagnosticsAvailable"] = diagnosticsAvailable;
     props["diagnosticsStatus"] = !mVXPGSettings.detailedDiagnostics ? "disabled" : diagnosticsAvailable ? "current_frame" : "unavailable";
@@ -539,7 +563,6 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 void RTPT::prepareProgram(RenderContext* pRenderContext)
 {
     const bool compileVXPG = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG;
-    const bool compileSharedVXPG = compileVXPG && mVXPGSettings.sharedInjectionEnabled;
     // Request the mesh light collection before querying useEmissiveLights().
     if (mpScene->getRenderSettings().useEmissiveLights)
         mpScene->getILightCollection(pRenderContext);
@@ -564,7 +587,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     }
     else mpEnvMapSampler = nullptr;
 
-    if (!mpComputePass || ((mEnableSHARC || compileSharedVXPG) && !mpSparseUpdate) ||
+    if (!mpComputePass || ((mEnableSHARC || compileVXPG) && !mpSparseUpdate) ||
         (mEnableSHARC && !mpSHARCResolve))
     {
         ProgramDesc desc;
@@ -603,7 +626,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         }
         if (!mpComputePass)
             mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
-        if ((mEnableSHARC || compileSharedVXPG) && !mpSparseUpdate)
+        if ((mEnableSHARC || compileVXPG) && !mpSparseUpdate)
         {
             ProgramDesc updateDesc;
             updateDesc.addShaderModules(mpScene->getShaderModules());
@@ -615,7 +638,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             updateDefines.add("ENABLE_NRD", "0");
             updateDefines.add("SHARC_UPDATE", "1");
             updateDefines.add("SHARC_QUERY", "0");
-            updateDefines.add("RTPT_VXPG_SHARED_INJECTION", compileSharedVXPG ? "1" : "0");
             mpSparseUpdate = ComputePass::create(mpDevice, updateDesc, updateDefines, true);
         }
         if (mEnableSHARC && !mpSHARCResolve)
@@ -725,7 +747,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     sparse["updateBounces"] = bounces;
     sparse["writeSHARC"] = sharc ? 1u : 0u;
     sparse["writeVXPG"] = vxpg ? 1u : 0u;
-    if (mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.sharedInjectionEnabled)
+    if (mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG)
         mpVXPG->bind(var, mpVXPG->getLightingFrameIndex(), vxpg);
     const uint2 updateDim = (mFrameDim + stride - 1u) / stride;
     mpSparseUpdate->execute(pRenderContext, uint3(updateDim, 1));
@@ -786,7 +808,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
     if (sharc)
         dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, mSHARCFrameIndex, true, vxpg);
     else if (vxpg)
-        dispatchSparse(pRenderContext, mSHARCUpdateStride, 1u, mpVXPG->getLightingFrameIndex(), false, true);
+        dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, mpVXPG->getLightingFrameIndex(), false, true);
     if (sharc)
     {
         FALCOR_PROFILE(pRenderContext, "SHARCResolve");
@@ -912,7 +934,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
     if (mEnableVXPG)
     {
-        mpVXPG->configure(mVXPGSettings, mFrameDim);
+        mpVXPG->configure(mVXPGSettings, mFrameDim, mSHARCUpdateStride, mSHARCUpdateBounces);
         auto debug = renderData.getTexture("vxpgDebug");
         pRenderContext->clearTexture(debug.get());
         if (mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled)
@@ -928,7 +950,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
     if (mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled)
     {
-        mpVXPG->updateLighting(pRenderContext, mpEnvMapSampler.get(), mSeed, mUseNEE, mSampleOffset, mEnableNRD);
+        mpVXPG->updateLighting(pRenderContext, mSeed, mSampleOffset, mEnableNRD);
         mpVXPG->renderDebug(pRenderContext, renderData.getTexture("vxpgDebug"));
     }
     if ((mEnableNRD || mEnableSHARC || mEnableVXPG) && mResetNRDHistory)
@@ -1076,12 +1098,12 @@ void RTPT::renderUI(Gui::Widgets& widget)
             auto injection = vx.group("Shared injection");
             if (injection)
             {
-                flag = mVXPGSettings.sharedInjectionEnabled;
-                if (injection.checkbox("Enabled", flag)) props["vxpgSharedInjectionEnabled"] = flag;
-                injection.text("Uses SHaRC Update stride (default 5x5), second surface only.");
+                injection.text("Always enabled while VXPG training is active.");
+                injection.text("Uses SHaRC Update stride (default 5x5), starting at the second surface.");
+                injection.text("Always observes every reached bounce through SHaRC Update bounces.");
                 injection.text(mVXPGSharedWithSHARCThisFrame ? "Sharing the active SHaRC training paths." :
-                    mVXPGSharedTrainingThisFrame ? "VXPG-only sparse paths; SHaRC updates are disabled/frozen." : "Shared injection inactive.");
-                injection.tooltip("Keeps full-screen primary data. Shares raw direct-light observations before MIS, preserving SHaRC RNG and depth. Changes VXPG coverage; resets its proposal, NRD and final accumulation.", true);
+                    mVXPGSharedTrainingThisFrame ? "VXPG-only multi-bounce paths; SHaRC updates are disabled/frozen." : "Shared injection inactive.");
+                injection.tooltip("Keeps full-screen primary data. Shares raw direct-light observations at every reached continuation vertex, including the terminal vertex. Uses the configured SHaRC stride/depth even when SHaRC updates are disabled or frozen, without writing SHaRC. Resets VXPG lighting history, NRD and final accumulation when the training source changes.", true);
             }
             auto cache = vx.group("PG SHaRC");
             if (cache)
@@ -1126,6 +1148,23 @@ void RTPT::renderUI(Gui::Widgets& widget)
                 if (diagnostics.checkbox("Enabled", flag)) props["vxpgDetailedDiagnostics"] = flag;
                 diagnostics.text("Activity counters cover one rendered frame; model counters require an update.");
                 diagnostics.tooltip("Compile out activity atomics when disabled. Error and algorithm state remain enabled. Does not reset the model or image history.", true);
+                if (diagnostics.button("Read Morton / tree snapshot"))
+                {
+                    const auto snapshot = getVXPGTreeSnapshot();
+                    if (snapshot.get<bool>("available", false))
+                    {
+                        const auto totals = snapshot.get<Properties>("totals");
+                        mVXPGTreeDiagnosticText = "Snapshot generation " + std::to_string(snapshot.get<uint32_t>("generation")) +
+                            ": active " + std::to_string(snapshot.get<uint32_t>("activeCount")) +
+                            ", leaves in duplicate Morton groups " + std::to_string(totals.get<uint32_t>("duplicateLeaves")) +
+                            ", excess duplicate keys " + std::to_string(totals.get<uint32_t>("duplicateExcess")) +
+                            "\nLeaf depth mean/p95/max: " + std::to_string(totals.get<double>("meanDepth")) + "/" +
+                            std::to_string(totals.get<uint32_t>("p95Depth")) + "/" + std::to_string(totals.get<uint32_t>("maxDepth"));
+                    }
+                    else mVXPGTreeDiagnosticText = "Tree snapshot unavailable: " + snapshot.get<std::string>("status", "unknown");
+                }
+                diagnostics.tooltip("Requires Enabled and a published clustered proposal. Reads the current model only on request; this can pause rendering. Duplicate Morton groups are counted within each Cluster.", true);
+                if (!mVXPGTreeDiagnosticText.empty()) diagnostics.text(mVXPGTreeDiagnosticText);
             }
             uint32_t debugMode = mVXPGSettings.debugMode;
             const Gui::DropdownList debugModes = {{0, "Voxel bounds"}, {1, "Superpixel ID"}, {2, "Voxel cluster ID"}, {3, "Visibility descriptor"}, {4,"Distance LOD"}};

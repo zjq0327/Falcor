@@ -5,6 +5,7 @@ target_sources(RTPT PRIVATE
     RTPT.h
     RTPTVXPG.h
     RTPTVXPG.cpp
+    RTPTVXPGDiagnostics.cpp
     RTPTCamera.slang
     RTPTVXPGMath.slang
     RTPTVXPGGeometry.slang
@@ -12,7 +13,7 @@ target_sources(RTPT PRIVATE
     RTPTVXPGHistory.slang
     RTPTVXPGGrid.slang
     RTPTVXPGDebug.cs.slang
-    RTPTVXPGInject.cs.slang
+    RTPTVXPGPrimary.cs.slang
     RTPTVXPGTraining.slang
     RTPTVXPGLocal.cs.slang
     RTPTVXPGObservation.slang

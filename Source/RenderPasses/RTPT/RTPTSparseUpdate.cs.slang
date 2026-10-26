@@ -42,10 +42,7 @@ ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #include "RTPTLighting.slang"
 #include "RTPTSharc.slang"
 
-#ifndef RTPT_VXPG_SHARED_INJECTION
-#define RTPT_VXPG_SHARED_INJECTION 0
-#endif
-#if RTPT_VXPG_SHARED_INJECTION
+#if ENABLE_VXPG
 #include "RTPTVXPGTraining.slang"
 #endif
 
@@ -75,8 +72,8 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
     SceneRayQuery<true> query;
     for (uint bounce = 0u; bounce <= gSparseSettings.updateBounces; ++bounce)
     {
-#if RTPT_VXPG_SHARED_INJECTION
-        const bool observeVXPG = gSparseSettings.writeVXPG != 0u && bounce == 1u;
+#if ENABLE_VXPG
+        const bool observeVXPG = gSparseSettings.writeVXPG != 0u && rtptVXPGObservesSharedBounce(bounce);
         if (observeVXPG) rtptVXPGCount(RTPT_VXPG_STATE_INJECT_SECONDARY);
 #endif
         float hitT;
@@ -118,7 +115,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
         const uint lobes = mi.getLobeTypes(sd) & sd.mtl.getActiveLobes();
         if (bounce == gSparseSettings.updateBounces)
         {
-#if RTPT_VXPG_SHARED_INJECTION
+#if ENABLE_VXPG
             if (observeVXPG)
             {
                 // Do not extend SHaRC's path or change its terminal-vertex value.
@@ -127,7 +124,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
                 bool rawValid = true;
                 if (gParams.useNEE != 0u)
                     rtptVXPGTrainingDirect(sd, mi, false, observationSG, raw, rawValid);
-                if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel);
+                if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel, bounce);
                 else InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
             }
 #endif
@@ -138,7 +135,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
         }
         float3 direct = 0.f;
         const bool useNEE = gParams.useNEE != 0u && (lobes & uint(LobeType::NonDeltaReflection)) != 0u;
-#if RTPT_VXPG_SHARED_INJECTION
+#if ENABLE_VXPG
         if (observeVXPG)
         {
             float3 raw = 0.f;
@@ -149,7 +146,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
                 SampleGenerator observationSG = sg;
                 rtptVXPGTrainingDirect(sd, mi, false, observationSG, raw, rawValid);
             }
-            if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel);
+            if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel, bounce);
             else InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
         }
         else
@@ -214,7 +211,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const uint phase = rtptSparseHash32(tile.x * 0x9e3779b9u ^ tile.y * 0x85ebca6bu ^ gParams.seed);
     const uint offset = (phase + gSparseSettings.frameIndex) % max(extent.x * extent.y, 1u);
     const uint2 pixel = origin + uint2(offset % max(extent.x, 1u), offset / max(extent.x, 1u));
-#if RTPT_VXPG_SHARED_INJECTION
+#if ENABLE_VXPG
     if (gSparseSettings.writeVXPG != 0u) rtptVXPGCount(RTPT_VXPG_STATE_SHARED_PATHS);
 #endif
     const uint sampleIndex = gParams.sampleOffset + gSparseSettings.frameIndex * 0x85ebca6bu + gParams.seed * 0x9e3779b9u;

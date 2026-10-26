@@ -87,6 +87,9 @@ struct RTPTVXPGParams
     float3 lodPreviousCamera;
     uint discoveryStride;
     uint spatialStaleFrames;
+    uint discoveryRecordCount;
+    uint sharedInjectionStride;
+    uint sharedInjectionBounces;
 };
 ConstantBuffer<RTPTVXPGParams> gVXPGParams;
 RWStructuredBuffer<uint4> gVXPGBoundMin;
@@ -121,7 +124,6 @@ RWStructuredBuffer<uint> gVXPGFreeCells;
 RWStructuredBuffer<uint> gVXPGRetiredCells;
 struct RTPTVXPGDiscovery { float4 position; float4 normal; float4 light; };
 RWStructuredBuffer<RTPTVXPGDiscovery> gVXPGDiscovery;
-RWStructuredBuffer<uint> gVXPGDiscoveryClaims;
 RWStructuredBuffer<uint> gVXPGPendingHash;
 RWStructuredBuffer<uint> gVXPGPendingSlots;
 bool rtptVXPGReuseTopology()

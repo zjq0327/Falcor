@@ -22,13 +22,14 @@ void Manager::validate(const Settings& s)
     FALCOR_CHECK(s.debugMode <= 4, "VXPG debug mode must be in [0,4].");
 }
 
-void Manager::configure(const Settings& settings, uint2 frameDim)
+void Manager::configure(const Settings& settings, uint2 frameDim, uint32_t sharedStride, uint32_t sharedBounces)
 {
     validate(settings);
+    FALCOR_CHECK(sharedStride>=1 && sharedStride<=32 && sharedBounces>=1 && sharedBounces<=32,"Invalid shared training layout.");
     if(settings.spatialStaleFrames!=mSettings.spatialStaleFrames)invalidateDistribution("Spatial lifetime changed");
     if (settings.historyFrames != mSettings.historyFrames ||
         settings.historyStaleFrames != mSettings.historyStaleFrames || settings.enabled != mSettings.enabled ||
-        settings.sharedInjectionEnabled != mSettings.sharedInjectionEnabled)
+        sharedStride!=mSharedTrainingStride || sharedBounces!=mSharedTrainingBounces)
         resetLightingHistory();
     if (settings.treeRefreshFrames != mSettings.treeRefreshFrames)
         invalidateDistribution("Topology refresh interval changed");
@@ -36,17 +37,12 @@ void Manager::configure(const Settings& settings, uint2 frameDim)
         settings.lodSceneScale != mSettings.lodSceneScale || settings.lodHashCapacity != mSettings.lodHashCapacity ||
         settings.lodGeometryCapacity != mSettings.lodGeometryCapacity || settings.lodBudgetMiB != mSettings.lodBudgetMiB;
     if (layoutChanged) { releaseModelResources(); invalidate(); }
-    if (settings.sharedInjectionEnabled != mSettings.sharedInjectionEnabled)
-    {
-        invalidateDistribution("Training source changed; rebuild the VXPG proposal");
-        if (mpInject) mpInject->addDefine("RTPT_VXPG_SHARED_INJECTION", settings.sharedInjectionEnabled ? "1" : "0", true);
-    }
     if (settings.detailedDiagnostics != mSettings.detailedDiagnostics)
     {
         // Change only instrumentation variants; published data and histories
         // remain usable, including a frozen proposal and its debug view.
         const char* enabled = settings.detailedDiagnostics ? "1" : "0";
-        for (const auto& pass : {mpInject, mpRowVisibility, mpTopLeaves})
+        for (const auto& pass : {mpPrimary, mpRowVisibility, mpTopLeaves})
             if (pass) pass->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", enabled, true);
         invalidateDiagnosticSnapshot();
     }
@@ -86,6 +82,8 @@ void Manager::configure(const Settings& settings, uint2 frameDim)
     }
     mSettings = settings;
     mFrameDim = frameDim;
+    mSharedTrainingStride = sharedStride;
+    mSharedTrainingBounces = sharedBounces;
     mEstimatedBytes = estimateModelBytes();
     if (mEstimatedBytes > uint64_t(getBudgetMiB()) * 1024ull * 1024ull)
     {
@@ -94,15 +92,39 @@ void Manager::configure(const Settings& settings, uint2 frameDim)
     }
 }
 
+uint64_t Manager::primaryDiscoveryCount() const
+{
+    const uint32_t stride=mSettings.discoveryStride;
+    return uint64_t((mFrameDim.x+stride-1)/stride)*((mFrameDim.y+stride-1)/stride);
+}
+
+uint64_t Manager::getDiscoveryRecordCount() const
+{
+    const uint32_t stride=mSharedTrainingStride;
+    return uint64_t((mFrameDim.x+stride-1)/stride)*((mFrameDim.y+stride-1)/stride)*mSharedTrainingBounces;
+}
+
+std::array<uint32_t,32> Manager::readSharedObservationCounts() const
+{
+    std::array<uint32_t,32> counts={};
+    if(!mpDiscovery || !hasModelDiagnostics())return counts;
+    // Explicit statistics readback only; never part of frame scheduling.
+    const uint32_t depth=mSharedTrainingBounces;
+    std::vector<float4> records(size_t(getDiscoveryRecordCount())*3);
+    mpDiscovery->getBlob(records.data(),0,records.size()*sizeof(float4));
+    for(size_t i=0;i<records.size()/3;++i)if(records[i*3].w!=0.f)++counts[i%depth];
+    return counts;
+}
+
 uint64_t Manager::estimateModelBytes() const
 {
     const uint64_t cells = cellCapacity();
     const uint64_t superpixels = uint64_t((mFrameDim.x + mSettings.superpixelSize - 1) / mSettings.superpixelSize) *
         ((mFrameDim.y + mSettings.superpixelSize - 1) / mSettings.superpixelSize);
     // Conservative capacities for the persistent grid, local trees and screen data.
-    const uint64_t discoveryCount = uint64_t((mFrameDim.x + mSettings.discoveryStride - 1) / mSettings.discoveryStride) *
-        ((mFrameDim.y + mSettings.discoveryStride - 1) / mSettings.discoveryStride);
-    const uint64_t gridExtra = cells * 44ull + uint64_t(getHashCapacity()) * 8ull + discoveryCount * 60ull + 64ull;
+    const uint64_t pendingCount=std::min<uint64_t>(discoveryRequestCount(),getHashCapacity());
+    const uint64_t gridExtra = cells * 44ull + uint64_t(getHashCapacity()) * 8ull +
+        getDiscoveryRecordCount()*48ull + pendingCount*4ull + 64ull;
     const uint64_t localExtra = cells * 4ull + uint64_t(mSettings.maxVoxels) * 36ull + 344ull;
     const uint64_t historySnapshots = cells * 32ull;
     return historySnapshots + gridExtra + localExtra + cells * 96ull + 16ull +
@@ -141,7 +163,7 @@ void Manager::invalidateLighting()
 {
     resetLightingHistory();
     invalidateDistribution("Lighting configuration needs rebuilding");
-    mpInject = nullptr;
+    mpPrimary = nullptr;
 }
 
 void Manager::resetLightingHistory()
@@ -193,7 +215,7 @@ void Manager::releaseModelResources()
     invalidateDiagnosticSnapshot();
     mReady=mGeometryValid=mDistributionValid=false;
     mpDebug = nullptr;
-    mpClearFrame=mpInject=mpGlobalLeaves=mpGlobalLevel=mpPublish=mpClearDiagnostics=nullptr;
+    mpClearFrame=mpPrimary=mpGlobalLeaves=mpGlobalLevel=mpPublish=mpClearDiagnostics=nullptr;
     resetClusterPasses();
     mpBoundMin = mpBoundMax = mpState = mpInverse = nullptr;
     mpHash = mpCellKeys = mpWorkArgs = mpWorkDispatch = nullptr;
@@ -202,7 +224,7 @@ void Manager::releaseModelResources()
     mpFlux=mpCount=mpCompactIndices=mpMass=mpGlobalTree=mpRepresentativePosition=mpRepresentativeNormal=nullptr;
     mpHistory = mpHistoryStats = mpQueryStats = nullptr;
     mpCellMass = mpTreeState = mpDirtyLeaves = mpDirtyNodes = mpLocalArgs = mpLocalDispatch = nullptr;
-    mpGridState=mpCellLifetime=mpFreeCells=mpRetiredCells=mpDiscovery=mpDiscoveryClaims=mpPendingHash=mpPendingSlots=nullptr;
+    mpGridState=mpCellLifetime=mpFreeCells=mpRetiredCells=mpDiscovery=mpPendingHash=mpPendingSlots=nullptr;
     mpGridClear=mpGridBegin=mpGridEvict=mpGridDiscover=mpGridInsert=mpGridReplay=mpGridRetire=nullptr;
     mpBeginLocal = mpResolveLocal = mpSelectLocal = mpCompactLocal = mpLocalWork = mpLocalLeaves = mpLocalLevel = nullptr;
     mResetHistory = true;
@@ -232,7 +254,7 @@ void Manager::setScene(const ref<Scene>& scene)
 {
     mpScene = scene;
     mpDebug = nullptr;
-    mpClearFrame = mpInject = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
+    mpClearFrame = mpPrimary = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
     resetClusterPasses();
     invalidate();
 }
@@ -261,6 +283,9 @@ void Manager::bind(const ShaderVar& root, uint32_t frameIndex, bool active) cons
         parameters["globalLeafCapacity"] = mLeafCapacity;
         parameters["discoveryStride"]=mSettings.discoveryStride;
         parameters["spatialStaleFrames"]=mSettings.spatialStaleFrames;
+        parameters["discoveryRecordCount"]=uint32_t(getDiscoveryRecordCount());
+        parameters["sharedInjectionStride"]=mSharedTrainingStride;
+        parameters["sharedInjectionBounces"]=mSharedTrainingBounces;
         parameters["activeCapacity"] = mSettings.maxVoxels;
         parameters["frameIndex"] = frameIndex;
         parameters["generation"] = mGeneration;
@@ -300,7 +325,7 @@ void Manager::bind(const ShaderVar& root, uint32_t frameIndex, bool active) cons
     buffer("gVXPGLocalArgs", mpLocalArgs);
     buffer("gVXPGGridState",mpGridState);buffer("gVXPGCellLifetime",mpCellLifetime);
     buffer("gVXPGFreeCells",mpFreeCells);buffer("gVXPGRetiredCells",mpRetiredCells);
-    buffer("gVXPGDiscovery",mpDiscovery);buffer("gVXPGDiscoveryClaims",mpDiscoveryClaims);buffer("gVXPGPendingHash",mpPendingHash);buffer("gVXPGPendingSlots",mpPendingSlots);
+    buffer("gVXPGDiscovery",mpDiscovery);buffer("gVXPGPendingHash",mpPendingHash);buffer("gVXPGPendingSlots",mpPendingSlots);
 
     buffer("gVXPGCompact", mpCompactIndices);
     buffer("gVXPGMass", mpMass);
@@ -348,7 +373,7 @@ uint64_t Manager::getPayloadBytes() const
 {
     uint64_t bytes=0;
     for (const auto& buffer : {mpWorkArgs,mpWorkDispatch,mpHash,mpCellKeys,mpBoundMin,mpBoundMax,mpState,mpInverse,
-        mpGridState,mpCellLifetime,mpFreeCells,mpRetiredCells,mpDiscovery,mpDiscoveryClaims,mpPendingHash,mpPendingSlots,mpFlux,mpCount,mpHistory,mpHistoryStats,mpQueryStats,mpHistoryPrevious,mpNormalPrevious,mpCellMass,mpTreeState,mpDirtyLeaves,mpDirtyNodes,mpLocalArgs,mpLocalDispatch,mpCompactIndices,mpMass,mpGlobalTree,mpRepresentativePosition,mpRepresentativeNormal,
+        mpGridState,mpCellLifetime,mpFreeCells,mpRetiredCells,mpDiscovery,mpPendingHash,mpPendingSlots,mpFlux,mpCount,mpHistory,mpHistoryStats,mpQueryStats,mpHistoryPrevious,mpNormalPrevious,mpCellMass,mpTreeState,mpDirtyLeaves,mpDirtyNodes,mpLocalArgs,mpLocalDispatch,mpCompactIndices,mpMass,mpGlobalTree,mpRepresentativePosition,mpRepresentativeNormal,
         mpRowPosition,mpRowNormal,mpVisibility,mpSeeds,mpCluster,mpClusterInfo,mpForest,mpCompactToLeaf,
         mpSuperpixelPosition,mpSuperpixelNormal,mpTopTree,mpClusterState,mpClusterArgs,mpSortA,mpSortB,mpHistogram,mpBinOffsets,
         mpSuperpixelCount,mpSuperpixelRange,mpSuperpixelBlocks,mpSuperpixelPoints})
@@ -443,9 +468,7 @@ void Manager::buildIncrementalGeometry(RenderContext* context)
         mpWorkDispatch=mpDevice->createStructuredBuffer(4,256,ResourceBindFlags::ShaderResource|ResourceBindFlags::UnorderedAccess|ResourceBindFlags::IndirectArg);
         mpGridState=mpDevice->createStructuredBuffer(4,16);mpCellLifetime=mpDevice->createStructuredBuffer(16,cells);
         mpFreeCells=mpDevice->createStructuredBuffer(4,cells);mpRetiredCells=mpDevice->createStructuredBuffer(4,cells);
-        const uint32_t requests=((mFrameDim.x+mSettings.discoveryStride-1)/mSettings.discoveryStride)*((mFrameDim.y+mSettings.discoveryStride-1)/mSettings.discoveryStride);
-        mpDiscovery=mpDevice->createStructuredBuffer(48,requests);mpDiscoveryClaims=mpDevice->createStructuredBuffer(4,requests);
-        mpPendingHash=mpDevice->createStructuredBuffer(4,getHashCapacity());mpPendingSlots=mpDevice->createStructuredBuffer(4,2*requests);
+        mpPendingHash=mpDevice->createStructuredBuffer(4,getHashCapacity());
         auto make=[&](const char* entry)
         {
             ProgramDesc desc;desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGIncremental.cs.slang").csEntry(entry);desc.setShaderModel(ShaderModel::SM6_6);
@@ -468,11 +491,16 @@ void Manager::buildIncrementalGeometry(RenderContext* context)
 void Manager::prepareIncrementalGrid(RenderContext* context)
 {
     FALCOR_PROFILE(context,"VXPGIncrementalMaintenance");
-    const uint32_t requests=((mFrameDim.x+mSettings.discoveryStride-1)/mSettings.discoveryStride)*((mFrameDim.y+mSettings.discoveryStride-1)/mSettings.discoveryStride);
-    for(const auto& b:{mpPendingHash,mpDiscovery,mpDiscoveryClaims,mpGridState,mpCellLifetime,mpRetiredCells,mpHash,mpBoundMin})if(b)context->uavBarrier(b.get());
+    // Resize only observation scratch when training depth/stride changes. Keep
+    // the persistent spatial map, including while its proposal is frozen.
+    const uint32_t records=uint32_t(getDiscoveryRecordCount());
+    const uint32_t pending=uint32_t(std::min<uint64_t>(discoveryRequestCount(),getHashCapacity()));
+    if(!mpDiscovery || mpDiscovery->getElementCount()!=records)mpDiscovery=mpDevice->createStructuredBuffer(48,records);
+    if(!mpPendingSlots || mpPendingSlots->getElementCount()!=pending)mpPendingSlots=mpDevice->createStructuredBuffer(4,pending);
+    for(const auto& b:{mpPendingHash,mpDiscovery,mpGridState,mpCellLifetime,mpRetiredCells,mpHash,mpBoundMin})if(b)context->uavBarrier(b.get());
     bind(mpGridBegin->getRootVar(),mLightingFrameIndex,true);
-    mpGridBegin->execute(context,uint3(std::max(requests,getHashCapacity()),1,1));
-    context->uavBarrier(mpGridState.get());context->uavBarrier(mpPendingHash.get());context->uavBarrier(mpDiscovery.get());context->uavBarrier(mpDiscoveryClaims.get());
+    mpGridBegin->execute(context,uint3(std::max(records,getHashCapacity()),1,1));
+    context->uavBarrier(mpGridState.get());context->uavBarrier(mpPendingHash.get());context->uavBarrier(mpDiscovery.get());
     bind(mpGridEvict->getRootVar(),mLightingFrameIndex,true);
     mpGridEvict->execute(context,uint3(cellCapacity(),1,1));
     for(const auto& b:{mpHash,mpBoundMin,mpGridState,mpRetiredCells,mpHistory})if(b)context->uavBarrier(b.get());
@@ -481,16 +509,18 @@ void Manager::prepareIncrementalGrid(RenderContext* context)
 void Manager::finishIncrementalGrid(RenderContext* context)
 {
     FALCOR_PROFILE(context,"VXPGIncrementalInsert");
-    const uint32_t requests=((mFrameDim.x+mSettings.discoveryStride-1)/mSettings.discoveryStride)*((mFrameDim.y+mSettings.discoveryStride-1)/mSettings.discoveryStride);
+    const uint32_t requests=uint32_t(discoveryRequestCount());
     auto barriers=[&]()
     {
         for(const auto& b:{mpHash,mpCellKeys,mpState,mpBoundMin,mpBoundMax,mpInverse,mpGridState,mpCellLifetime,
-            mpFreeCells,mpPendingHash,mpPendingSlots,mpDiscovery,mpDiscoveryClaims,mpCount,mpFlux,mpHistory,mpRepresentativePosition,mpRepresentativeNormal})
+            mpFreeCells,mpPendingHash,mpPendingSlots,mpDiscovery,mpCount,mpFlux,mpHistory,mpRepresentativePosition,mpRepresentativeNormal})
             if(b)context->uavBarrier(b.get());
     };
     auto run=[&](const ref<ComputePass>& pass,uint32_t count)
     {bind(pass->getRootVar(),mLightingFrameIndex,true);pass->execute(context,uint3(count,1,1));barriers();};
-    barriers();run(mpGridDiscover,2*requests);run(mpGridInsert,2*requests);run(mpGridReplay,requests);
+    barriers();run(mpGridDiscover,requests);
+    run(mpGridInsert,uint32_t(std::min<uint64_t>(requests,getHashCapacity())));
+    run(mpGridReplay,uint32_t(getDiscoveryRecordCount()));
     bind(mpGeometryWork->getRootVar(),mLightingFrameIndex,true);
     mpGeometryWork->execute(context,uint3(1));context->uavBarrier(mpWorkArgs.get());
     context->copyResource(mpWorkDispatch.get(),mpWorkArgs.get());
@@ -533,7 +563,7 @@ void Manager::prepareLighting(RenderContext* context)
     const uint32_t cells = cellCapacity();
     if (!mpFlux || mAllocatedCapacity != mSettings.maxVoxels || any(mAllocatedFrameDim != mFrameDim))
     {
-        mpClearFrame = mpInject = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
+        mpClearFrame = mpPrimary = mpGlobalLeaves = mpGlobalLevel = mpPublish = nullptr;
         resetClusterPasses();
         mpForest = nullptr;
         mpFlux = mpDevice->createStructuredBuffer(sizeof(uint64_t), cells);
@@ -620,22 +650,17 @@ void Manager::prepareLighting(RenderContext* context)
             mpForestWork=makePrepare("forestWork");
         }
     }
-    if (!mpInject)
+    if (!mpPrimary)
     {
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
-        desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGInject.cs.slang").csEntry("main");
+        desc.addShaderLibrary("RenderPasses/RTPT/RTPTVXPGPrimary.cs.slang").csEntry("main");
         desc.addTypeConformances(mpScene->getTypeConformances());
         desc.setShaderModel(ShaderModel::SM6_6);
         DefineList defines = mpScene->getSceneDefines();
         defines.add(mpSampleGenerator->getDefines());
-        defines.add("ENABLE_NRD", "0");
         defines.add("RTPT_VXPG_DETAILED_DIAGNOSTICS", mSettings.detailedDiagnostics ? "1" : "0");
-        defines.add("RTPT_VXPG_SHARED_INJECTION", mSettings.sharedInjectionEnabled ? "1" : "0");
-        defines.add("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
-        defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
-        defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
-        mpInject = ComputePass::create(mpDevice, desc, defines, true);
+        mpPrimary = ComputePass::create(mpDevice, desc, defines, true);
     }
     advanceGeneration(mGeneration);
     auto execute = [&](const ref<ComputePass>& pass, uint3 size)
@@ -683,11 +708,8 @@ void Manager::prepareLighting(RenderContext* context)
         context->copyResource(mpHistoryPrevious.get(),mpHistory.get());
         context->copyResource(mpNormalPrevious.get(),mpRepresentativeNormal.get());
     }
-    if (mSettings.sharedInjectionEnabled)
-    {
-        context->uavBarrier(mpRepresentativePosition.get());
-        context->uavBarrier(mpRepresentativeNormal.get());
-    }
+    context->uavBarrier(mpRepresentativePosition.get());
+    context->uavBarrier(mpRepresentativeNormal.get());
     if (mpHistory) context->uavBarrier(mpHistory.get());
     context->uavBarrier(mpHistoryStats.get());
     mResetHistory = false;
@@ -700,8 +722,7 @@ void Manager::barrierInjection(RenderContext* context) const
         if (buffer) context->uavBarrier(buffer.get());
 }
 
-void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, uint32_t seed, bool useNEE,
-    uint32_t sampleOffset, bool useNRD)
+void Manager::updateLighting(RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD)
 {
     if (!mLightingPrepared) return;
     mLightingPrepared = false;
@@ -712,22 +733,20 @@ void Manager::updateLighting(RenderContext* context, EnvMapSampler* envSampler, 
         pass->execute(context, size);
     };
     {
-        FALCOR_PROFILE(context, "VXPGInject");
+        FALCOR_PROFILE(context, "VXPGPrimary");
         context->uavBarrier(mpPrimaryPosition.get());
         context->uavBarrier(mpPrimaryNormal.get());
         context->uavBarrier(mpPrimaryHit.get());
         context->uavBarrier(mpRepresentativePosition.get());
         context->uavBarrier(mpRepresentativeNormal.get());
-        auto root = mpInject->getRootVar();
+        auto root = mpPrimary->getRootVar();
         bind(root, mLightingFrameIndex, true);
         mpScene->bindShaderDataForRaytracing(context, root["gScene"]);
         mpSampleGenerator->bindShaderData(root);
-        if (envSampler && mpScene->useEnvLight()) envSampler->bindShaderData(root["gEnvMapSampler"]);
         root["gParams"]["seed"] = seed;
-        root["gParams"]["useNEE"] = useNEE ? 1u : 0u;
         root["gParams"]["sampleOffset"] = sampleOffset;
         root["gParams"]["useNRD"] = useNRD ? 1u : 0u;
-        mpInject->execute(context, uint3(mFrameDim, 1));
+        mpPrimary->execute(context, uint3(mFrameDim, 1));
         context->uavBarrier(mpFlux.get());
         context->uavBarrier(mpCount.get());
         context->uavBarrier(mpState.get());

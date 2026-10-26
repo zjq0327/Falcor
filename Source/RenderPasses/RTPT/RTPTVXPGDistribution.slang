@@ -29,9 +29,12 @@ float rtptVXPGLeftProbability(RTPTVXPGNode left, RTPTVXPGNode right, float3 orig
     const float l = rtptVXPGNodeImportance(left, origin, normal,sourceSize);
     const float r = rtptVXPGNodeImportance(right, origin, normal,sourceSize);
     const float sum = l + r;
-    if (sum > 0.f && isfinite(sum)) return l / sum;
+    // Fast floating-point division can exceed one by an ULP when the other
+    // child is tiny. Keep the common forward/reverse branch probability in
+    // its mathematical range, including the complement used for the right.
+    if (sum > 0.f && isfinite(sum)) return saturate(l / sum);
     const float mass = left.mass + right.mass;
-    return mass > 0.f ? left.mass / mass : 0.5f;
+    return mass > 0.f ? saturate(left.mass / mass) : 0.5f;
 }
 float rtptVXPGClusterDistance(uint4 a, uint4 b, float intensityA, float intensityB)
 {

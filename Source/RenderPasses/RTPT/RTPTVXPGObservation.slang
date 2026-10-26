@@ -1,10 +1,6 @@
 #pragma once
 #include "RTPTVXPGTypes.slang"
 
-#ifndef RTPT_VXPG_SHARED_INJECTION
-#define RTPT_VXPG_SHARED_INJECTION 0
-#endif
-
 void rtptVXPGStoreRawCellObservation(uint cell, float3 position, float3 normal, float3 local)
 {
     if (gVXPGState[RTPT_VXPG_STATE_GEOMETRY_OVERFLOW] != 0) return;
@@ -42,6 +38,14 @@ uint2 rtptVXPGDiscoveryDim()
 {
     return (gVXPGParams.frameDim+gVXPGParams.discoveryStride-1)/gVXPGParams.discoveryStride;
 }
+uint rtptVXPGDiscoveryRecordCount()
+{
+    return gVXPGParams.discoveryRecordCount;
+}
+bool rtptVXPGObservesSharedBounce(uint bounce)
+{
+    return bounce>=1u && bounce<=gVXPGParams.sharedInjectionBounces;
+}
 uint2 rtptVXPGDiscoveryPixel(uint index)
 {
     const uint stride=gVXPGParams.discoveryStride;
@@ -51,19 +55,17 @@ uint2 rtptVXPGDiscoveryPixel(uint index)
     const uint offset=(rtptVXPGHash(index)+gVXPGParams.frameIndex)%(extent.x*extent.y);
     return origin+uint2(offset%extent.x,offset/extent.x);
 }
-void rtptVXPGRecordDiscovery(uint2 pixel,uint cell,float3 position,float3 normal,float3 light)
+void rtptVXPGRecordDiscovery(uint2 pixel,uint cell,float3 position,float3 normal,float3 light,uint bounce)
 {
-
-    const uint2 tile=pixel/gVXPGParams.discoveryStride;
-    const uint index=tile.x+tile.y*rtptVXPGDiscoveryDim().x;
-#if RTPT_VXPG_SHARED_INJECTION
-    // The shared producer has its own tile stride and phase. Claim one record
-    // per discovery tile instead of requiring two unrelated phases to match.
-    uint previous;InterlockedCompareExchange(gVXPGDiscoveryClaims[index],0u,1u,previous);
-    if(previous!=0)return;
-#else
-    if(any(pixel!=rtptVXPGDiscoveryPixel(index)))return;
-#endif
+    if(!rtptVXPGObservesSharedBounce(bounce))return;
+    const uint depth=gVXPGParams.sharedInjectionBounces;
+    // One writer per sparse path and depth, independent of primary discovery
+    // stride/phase. A shallow hit cannot hide a deeper, not-yet-created cell.
+    const uint stride=max(gVXPGParams.sharedInjectionStride,1u);
+    const uint2 dim=(gVXPGParams.frameDim+stride-1u)/stride;
+    const uint2 tile=pixel/stride;
+    const uint index=(tile.x+tile.y*dim.x)*depth+bounce-1u;
+    if(index>=rtptVXPGDiscoveryRecordCount())return;
     RTPTVXPGDiscovery record={};
     record.position=float4(position,1.f);record.normal=float4(normal,0.f);
     record.light=float4(light,cell==RTPT_VXPG_INVALID?1.f:0.f);

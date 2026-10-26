@@ -46,9 +46,9 @@ void rtptVXPGStoreCellObservation(uint cell, ShadingData sd, float3 local)
     rtptVXPGStoreRawCellObservation(cell,sd.posW,sd.getOrientedFaceNormal(),local);
 }
 
-void rtptVXPGStoreObservation(ShadingData sd, float3 local, uint2 pixel)
+void rtptVXPGStoreObservation(ShadingData sd, float3 local, uint2 pixel, uint bounce)
 {
     const uint cell=rtptVXPGOwner(sd.posW);
-    rtptVXPGRecordDiscovery(pixel,cell,sd.posW,sd.getOrientedFaceNormal(),local);
+    rtptVXPGRecordDiscovery(pixel,cell,sd.posW,sd.getOrientedFaceNormal(),local,bounce);
     rtptVXPGStoreCellObservation(cell,sd,local);
 }

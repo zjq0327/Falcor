@@ -24,6 +24,7 @@ public:
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getVXPGStatistics() const;
+    Properties getVXPGTreeSnapshot() const;
     void resetVXPG() { mpVXPG->invalidate(); mOptionsChanged = true; }
 
 private:
@@ -44,6 +45,7 @@ private:
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
     RTPTVXPG::Settings mVXPGSettings;
     std::string mVXPGDiagnosticText;
+    std::string mVXPGTreeDiagnosticText;
     bool mVXPGDiagnosticFrameAvailable = false;
     uint32_t mVXPGDiagnosticFrameSampleOffset = 0;
     uint32_t mVXPGDiagnosticFrameSamplesPerPixel = 0;
