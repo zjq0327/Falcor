@@ -1,5 +1,5 @@
 #pragma once
-#include "RTPTVXPGTypes.slang"
+#include "RTPTVXPGGrid.slang"
 
 float3 rtptVXPGTrainingEmission(ShadingData sd, BSDFProperties properties, uint materialID)
 {

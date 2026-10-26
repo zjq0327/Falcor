@@ -1,5 +1,4 @@
 #pragma once
-#include "RTPTVXPGGrid.slang"
 #include "RTPTVXPGHistory.slang"
 
 
@@ -42,18 +41,6 @@ static const uint RTPT_VXPG_STATE_OWNER_QUERIES = 29;
 static const uint RTPT_VXPG_STATE_OWNER_PROBES = 30;
 static const uint RTPT_VXPG_STATE_FULL_BRANCH_STEPS = 31;
 
-float4 rtptVXPGNormalizeFuzzyWeights(float4 weights)
-{
-    const float sum=dot(weights,float4(1.f));
-    return sum>0.f?weights/sum:float4(0.f);
-}
-uint rtptVXPGNearestFuzzyRow(uint4 ids,float4 normalizedWeights)
-{
-    uint nearest=0;
-    for(uint k=1;k<4;++k)if(normalizedWeights[k]>normalizedWeights[nearest])nearest=k;
-    return normalizedWeights[nearest]>0.f?ids[nearest]:RTPT_VXPG_INVALID;
-}
-
 struct RTPTVXPGParams
 {
     uint2 frameDim;
@@ -66,7 +53,6 @@ struct RTPTVXPGParams
     uint enabled;
     uint useGuiding;
     uint pgUseCache;
-    uint visibilityEnabled;
     uint debugEnabled;
     uint debugMode;
     uint superpixelSize;
@@ -126,11 +112,6 @@ struct RTPTVXPGDiscovery { float4 position; float4 normal; float4 light; };
 RWStructuredBuffer<RTPTVXPGDiscovery> gVXPGDiscovery;
 RWStructuredBuffer<uint> gVXPGPendingHash;
 RWStructuredBuffer<uint> gVXPGPendingSlots;
-bool rtptVXPGReuseTopology()
-{
-
-    return gVXPGTreeState[0] == 0;
-}
 RWStructuredBuffer<float4> gVXPGRepresentativePosition;
 RWStructuredBuffer<float4> gVXPGRepresentativeNormal;
 RWStructuredBuffer<uint> gVXPGHashSlots;
@@ -171,105 +152,3 @@ RWStructuredBuffer<uint> gVXPGSuperpixelPoints;
 // 0: valid superpixels, 1: nonempty clusters, 2: visibility rays,
 // 3: visible pairs, 4: forest node allocation, 5: top rows, 6: publication.
 RWStructuredBuffer<uint> gVXPGClusterState;
-
-// Activity observations only. Algorithm state, capacity/overflow checks and
-// invalid-data counters must keep their unconditional writes.
-void rtptVXPGCount(uint index, uint amount = 1u)
-{
-#if RTPT_VXPG_DETAILED_DIAGNOSTICS
-    InterlockedAdd(gVXPGState[index], amount);
-#endif
-}
-
-void rtptVXPGCountVisibility(uint index, uint amount = 1u)
-{
-#if RTPT_VXPG_DETAILED_DIAGNOSTICS
-    InterlockedAdd(gVXPGClusterState[index], amount);
-#endif
-}
-
-uint rtptVXPGHash(uint x)
-{
-    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16);
-}
-float rtptVXPGUniform(uint x) { return float(rtptVXPGHash(x) >> 8) * (1.f / 16777216.f); }
-
-bool rtptVXPGTryOwnerKey(float3 position, out int4 key)
-{
-    return rtptVXPGDistanceKey(position, gVXPGParams.lodCamera, gVXPGParams.lodSceneScale, key);
-}
-
-uint rtptVXPGKeyHash(int4 key)
-{
-    return rtptVXPGHash(asuint(key.x) ^ rtptVXPGHash(asuint(key.y) ^
-        rtptVXPGHash(asuint(key.z) ^ rtptVXPGHash(uint(key.w)))));
-}
-
-int3 rtptVXPGCellKey(uint cell)
-{
-    return gVXPGCellKeys[cell].xyz;
-}
-int4 rtptVXPGCellIdentity(uint cell)
-{
-    return gVXPGCellKeys[cell];
-}
-float rtptVXPGCellSize(uint cell)
-{
-    return rtptVXPGLevelSize(uint(rtptVXPGCellIdentity(cell).w), gVXPGParams.lodSceneScale);
-}
-float rtptVXPGSurfaceSize(float3 position)
-{
-    return rtptVXPGLevelSize(rtptVXPGDistanceLevel(position, gVXPGParams.lodCamera), gVXPGParams.lodSceneScale);
-}
-uint rtptVXPGGeometryCount()
-{
-    return min(gVXPGState[RTPT_VXPG_STATE_OCCUPIED],gVXPGParams.cellCount);
-}
-uint rtptVXPGFindKey(int4 key)
-{
-    const uint first = rtptVXPGKeyHash(key);
-    rtptVXPGCount(RTPT_VXPG_STATE_OWNER_QUERIES);
-    for (uint probe=0;probe<128;++probe)
-    {
-        rtptVXPGCount(RTPT_VXPG_STATE_OWNER_PROBES);
-#if RTPT_VXPG_DETAILED_DIAGNOSTICS
-        InterlockedMax(gVXPGState[RTPT_VXPG_STATE_OWNER_MAX_PROBES],probe+1u);
-#endif
-        const uint slot=(first+probe)&(gVXPGParams.hashCapacity-1);
-        const uint entry=gVXPGHashSlots[slot];
-        if (entry==0) return RTPT_VXPG_INVALID;
-        const uint cell=entry-1;
-        if (cell>=rtptVXPGGeometryCount())continue;
-        if (gVXPGBoundMin[cell].w!=0 && all(gVXPGCellKeys[cell]==key)) return cell;
-    }
-    return RTPT_VXPG_INVALID;
-}
-uint rtptVXPGOwner(float3 position)
-{
-    int4 key;
-    if(gVXPGState[RTPT_VXPG_STATE_GEOMETRY_OVERFLOW]!=0 || !rtptVXPGTryOwnerKey(position,key))return RTPT_VXPG_INVALID;
-    return rtptVXPGFindKey(key);
-}
-float3 rtptVXPGWorldMin(uint cell)
-{
-    return gVXPGParams.gridMin + (float3(rtptVXPGCellKey(cell))+asfloat(gVXPGBoundMin[cell].xyz)) * rtptVXPGCellSize(cell);
-}
-float3 rtptVXPGWorldMax(uint cell)
-{
-    return gVXPGParams.gridMin + (float3(rtptVXPGCellKey(cell))+asfloat(gVXPGBoundMax[cell].xyz)) * rtptVXPGCellSize(cell);
-}
-
-// This is also exercised by the GPU membership regression, without scene rays.
-uint rtptVXPGClusterMember(uint4 info, float random)
-{
-    if (info.y == 0) return RTPT_VXPG_INVALID;
-    const uint rank = min(uint(saturate(random) * info.y), info.y - 1);
-    const uint compact = gVXPGForest[info.z + info.w + rank].compact;
-    if (compact < gVXPGParams.activeCapacity)
-    {
-        const uint cell = gVXPGCompact[compact];
-        if (cell < rtptVXPGGeometryCount() && gVXPGMass[compact] > 0.f) return compact;
-    }
-    InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
-    return RTPT_VXPG_INVALID;
-}

@@ -1,4 +1,4 @@
-#include "RTPTVXPGPrepare.cs.slang"
+#include "RTPTVXPGHistoryResolve.slang"
 #include "RTPTVXPGDistribution.slang"
 
 cbuffer VXPGLocalLevel { uint localTreeLevel; };
@@ -85,13 +85,10 @@ void localLeaves(uint3 tid : SV_DispatchThreadID)
     const uint compact = gVXPGDirtyLeaves[tid.x];
     gVXPGGlobalTree[rtptVXPGGlobalBase() + compact] = gVXPGMass[compact];
     InterlockedAdd(gVXPGTreeState[5], 1u);
-    if (gVXPGParams.visibilityEnabled != 0)
-    {
-        const uint4 info = gVXPGClusterInfo[gVXPGCluster[compact]];
-        const uint address=info.z+gVXPGCompactToLeaf[compact];
-        gVXPGForest[address].mass = gVXPGMass[compact];
-        InterlockedAdd(gVXPGTreeState[6], 1u);
-    }
+    const uint4 info = gVXPGClusterInfo[gVXPGCluster[compact]];
+    const uint address=info.z+gVXPGCompactToLeaf[compact];
+    gVXPGForest[address].mass = gVXPGMass[compact];
+    InterlockedAdd(gVXPGTreeState[6], 1u);
 }
 
 [numthreads(256,1,1)]
@@ -110,17 +107,14 @@ void localLevel(uint3 tid : SV_DispatchThreadID)
             InterlockedAdd(gVXPGTreeState[5], 1u);
         }
     }
-    if (gVXPGParams.visibilityEnabled != 0)
+    const uint4 info = gVXPGClusterInfo[gVXPGCluster[compact]];
+    const uint local = gVXPGCompactToLeaf[compact] >> localTreeLevel;
+    if (local == 0) return;
+    const uint address = info.z + local;
+    InterlockedExchange(gVXPGDirtyNodes[2*gVXPGParams.globalLeafCapacity + address], gVXPGParams.generation, previous);
+    if (previous != gVXPGParams.generation)
     {
-        const uint4 info = gVXPGClusterInfo[gVXPGCluster[compact]];
-        const uint local = gVXPGCompactToLeaf[compact] >> localTreeLevel;
-        if (local == 0) return;
-        const uint address = info.z + local;
-        InterlockedExchange(gVXPGDirtyNodes[2*gVXPGParams.globalLeafCapacity + address], gVXPGParams.generation, previous);
-        if (previous != gVXPGParams.generation)
-        {
-            gVXPGForest[address].mass = gVXPGForest[info.z+2*local].mass + gVXPGForest[info.z+2*local+1].mass;
-            InterlockedAdd(gVXPGTreeState[6], 1u);
-        }
+        gVXPGForest[address].mass = gVXPGForest[info.z+2*local].mass + gVXPGForest[info.z+2*local+1].mass;
+        InterlockedAdd(gVXPGTreeState[6], 1u);
     }
 }

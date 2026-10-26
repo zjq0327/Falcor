@@ -72,7 +72,7 @@ RWTexture2D<float4> gNRDMotionW;
 #include "RTPTNRD.slang"
 #endif
 #if ENABLE_VXPG
-#include "RTPTVXPGIntegrator.slang"
+#include "VXPG/RTPTVXPGIntegrator.slang"
 #endif
 
 [numthreads(8, 8, 1)]

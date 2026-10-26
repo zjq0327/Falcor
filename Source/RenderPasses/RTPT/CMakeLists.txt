@@ -3,27 +3,31 @@ add_plugin(RTPT)
 target_sources(RTPT PRIVATE
     RTPT.cpp
     RTPT.h
-    RTPTVXPG.h
-    RTPTVXPG.cpp
-    RTPTVXPGDiagnostics.cpp
+    VXPG/RTPTVXPG.h
+    VXPG/RTPTVXPG.cpp
+    VXPG/RTPTVXPGResources.cpp
+    VXPG/RTPTVXPGSettings.cpp
+    VXPG/RTPTVXPGDiagnostics.cpp
     RTPTCamera.slang
-    RTPTVXPGMath.slang
-    RTPTVXPGGeometry.slang
-    RTPTVXPGTypes.slang
-    RTPTVXPGHistory.slang
-    RTPTVXPGGrid.slang
-    RTPTVXPGDebug.cs.slang
-    RTPTVXPGPrimary.cs.slang
-    RTPTVXPGTraining.slang
-    RTPTVXPGLocal.cs.slang
-    RTPTVXPGObservation.slang
-    RTPTVXPGIncremental.cs.slang
-    RTPTVXPGPrepare.cs.slang
-    RTPTVXPGSampling.slang
-    RTPTVXPGIntegrator.slang
-    RTPTVXPGDistribution.slang
-    RTPTVXPGVisibility.cs.slang
-    RTPTVXPGTree.cs.slang
+    VXPG/RTPTVXPGMath.slang
+    VXPG/RTPTVXPGGeometry.slang
+    VXPG/RTPTVXPGTypes.slang
+    VXPG/RTPTVXPGDiagnostics.slang
+    VXPG/RTPTVXPGHistory.slang
+    VXPG/RTPTVXPGHistoryResolve.slang
+    VXPG/RTPTVXPGGrid.slang
+    VXPG/RTPTVXPGDebug.cs.slang
+    VXPG/RTPTVXPGPrimary.cs.slang
+    VXPG/RTPTVXPGTraining.slang
+    VXPG/RTPTVXPGLocal.cs.slang
+    VXPG/RTPTVXPGObservation.slang
+    VXPG/RTPTVXPGIncremental.cs.slang
+    VXPG/RTPTVXPGPrepare.cs.slang
+    VXPG/RTPTVXPGSampling.slang
+    VXPG/RTPTVXPGIntegrator.slang
+    VXPG/RTPTVXPGDistribution.slang
+    VXPG/RTPTVXPGVisibility.cs.slang
+    VXPG/RTPTVXPGTree.cs.slang
     RTPTSparseUpdate.cs.slang
     RTPT.cs.slang
     RTPTIntegrator.slang

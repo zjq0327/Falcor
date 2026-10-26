@@ -1,5 +1,5 @@
 #pragma once
-#include "RTPTVXPGTypes.slang"
+#include "RTPTVXPGGrid.slang"
 
 void rtptVXPGStoreRawCellObservation(uint cell, float3 position, float3 normal, float3 local)
 {

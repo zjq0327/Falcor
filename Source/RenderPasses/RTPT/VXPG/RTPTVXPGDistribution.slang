@@ -1,5 +1,5 @@
 #pragma once
-#include "RTPTVXPGTypes.slang"
+#include "RTPTVXPGGrid.slang"
 
 // Geometry-only bound used identically during traversal and reverse evaluation.
 // The positive floor is proposal regularization, never a radiance clamp.
@@ -41,4 +41,38 @@ float rtptVXPGClusterDistance(uint4 a, uint4 b, float intensityA, float intensit
     const uint4 bits = countbits(a ^ b);
     // Fixed reference path uses position weight 0 and intensity weight 1.
     return float(bits.x + bits.y + bits.z + bits.w) + abs(intensityA - intensityB);
+}
+
+// Topology reuse and screen-row association share the same proposal contract.
+float4 rtptVXPGNormalizeFuzzyWeights(float4 weights)
+{
+    const float sum=dot(weights,float4(1.f));
+    return sum>0.f?weights/sum:float4(0.f);
+}
+
+uint rtptVXPGNearestFuzzyRow(uint4 ids,float4 normalizedWeights)
+{
+    uint nearest=0;
+    for(uint k=1;k<4;++k)if(normalizedWeights[k]>normalizedWeights[nearest])nearest=k;
+    return normalizedWeights[nearest]>0.f?ids[nearest]:RTPT_VXPG_INVALID;
+}
+
+bool rtptVXPGReuseTopology()
+{
+
+    return gVXPGTreeState[0] == 0;
+}
+
+uint rtptVXPGClusterMember(uint4 info, float random)
+{
+    if (info.y == 0) return RTPT_VXPG_INVALID;
+    const uint rank = min(uint(saturate(random) * info.y), info.y - 1);
+    const uint compact = gVXPGForest[info.z + info.w + rank].compact;
+    if (compact < gVXPGParams.activeCapacity)
+    {
+        const uint cell = gVXPGCompact[compact];
+        if (cell < rtptVXPGGeometryCount() && gVXPGMass[compact] > 0.f) return compact;
+    }
+    InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
+    return RTPT_VXPG_INVALID;
 }

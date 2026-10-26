@@ -4,7 +4,6 @@ import Utils.Sampling.SampleGenerator;
 #include "RTPTVXPGDistribution.slang"
 
 RWStructuredBuffer<uint> gVXPGClusterArgs;
-RWTexture2D<float4> gVXPGDebug;
 
 // Both endpoints are actual surface samples. Normal orientation and endpoint
 // offsets are independent of the proposal boxes; alpha testing uses SceneRayQuery.
@@ -23,6 +22,7 @@ bool rtptVXPGVisible(float3 a, float3 na, float3 b, float3 nb)
     return query.traceVisibilityRay(Ray(origin, segment/length, 0.f, length-epsilon));
 }
 
+// World-space clustering: skipped while the published topology can be reused.
 [numthreads(128,1,1)]
 void representativeRows(uint3 tid : SV_DispatchThreadID)
 {
@@ -169,6 +169,7 @@ void assignClusters(uint3 tid : SV_DispatchThreadID)
     InterlockedAdd(gVXPGClusterInfo[best].y,1u);
 }
 
+// View-dependent distribution: refreshed every update, including ordinary camera motion.
 [numthreads(64,1,1)]
 void superpixelCenters(uint3 tid : SV_DispatchThreadID)
 {
@@ -375,40 +376,4 @@ void topLevelParents(uint3 tid : SV_DispatchThreadID)
     const uint base=row*64;
     for (uint i=31;i>0;--i) gVXPGTopTree[base+i]=gVXPGTopTree[base+2*i]+gVXPGTopTree[base+2*i+1];
     if (gVXPGTopTree[base+1]>0.f) InterlockedAdd(gVXPGClusterState[5],1u);
-}
-
-[numthreads(8,8,1)]
-void debugDistribution(uint3 tid : SV_DispatchThreadID)
-{
-    if (any(tid.xy>=gVXPGParams.frameDim)) return;
-    const float4 p=gVXPGPrimaryPosition[tid.xy];
-    float3 color=0.f;
-    uint id=RTPT_VXPG_INVALID;
-    if (p.w!=0.f)
-    {
-        const uint cell=rtptVXPGOwner(p.xyz);
-        if (gVXPGParams.debugMode==1)
-        {
-            const float4 weights=gVXPGFuzzyWeights[tid.xy];
-            uint dominant=0;
-            for(uint k=1;k<4;++k)if(weights[k]>weights[dominant])dominant=k;
-            id=gVXPGFuzzyIds[tid.xy][dominant];
-        }
-        else if (cell!=RTPT_VXPG_INVALID)
-        {
-            const uint compact=gVXPGInverse[cell];
-            if (compact!=RTPT_VXPG_INVALID && compact<gVXPGParams.activeCapacity)
-            {
-                id=gVXPGCluster[compact];
-                if (gVXPGParams.debugMode==3)
-                {
-                    const uint4 v=countbits(gVXPGVisibility[compact]);
-                    color=float3(float(v.x+v.y+v.z+v.w)/128.f);
-                }
-            }
-        }
-        if (gVXPGParams.debugMode!=3 && id!=RTPT_VXPG_INVALID)
-            color=frac(float3(0.61803399f,0.41421356f,0.73205081f)*float(id+1));
-    }
-    gVXPGDebug[tid.xy]=float4(color,1.f);
 }

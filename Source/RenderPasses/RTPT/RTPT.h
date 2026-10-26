@@ -4,7 +4,7 @@
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
-#include "RTPTVXPG.h"
+#include "VXPG/RTPTVXPG.h"
 
 using namespace Falcor;
 
@@ -28,8 +28,10 @@ public:
     void resetVXPG() { mpVXPG->invalidate(); mOptionsChanged = true; }
 
 private:
+    RTPTVXPG::RuntimeContext getVXPGContext() const;
     void reset();
     void validateScene() const;
+    bool updateSceneState(); ///< Apply scene changes and report whether render history must reset.
     void prepareProgram(RenderContext* pRenderContext);
     void bindSHARC(const ShaderVar& rootVar, bool resolve = false);
     bool usesPairedSharc() const;
@@ -44,8 +46,7 @@ private:
     ref<ComputePass> mpSparseUpdate;
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
     RTPTVXPG::Settings mVXPGSettings;
-    std::string mVXPGDiagnosticText;
-    std::string mVXPGTreeDiagnosticText;
+    RTPTVXPG::UIState mVXPGUI;
     bool mVXPGDiagnosticFrameAvailable = false;
     uint32_t mVXPGDiagnosticFrameSampleOffset = 0;
     uint32_t mVXPGDiagnosticFrameSamplesPerPixel = 0;

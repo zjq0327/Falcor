@@ -48,7 +48,9 @@ bool rtptVXPGGetSurfaceContext(float3 rayOrigin, float3 surfacePosition, float3 
 {
     if (!rtptVXPGGetContext(rayOrigin,surfacePosition,bounce,context)) return false;
     context.normal=normal;
-    if (bounce!=0 || gVXPGParams.visibilityEnabled==0 || gVXPGClusterState[6]!=context.generation) return true;
+    // Visibility is always enabled. Later bounces and unavailable screen rows
+    // retain the global proposal used by the enabled estimator.
+    if (bounce!=0 || gVXPGClusterState[6]!=context.generation) return true;
     const uint4 ids=gVXPGFuzzyIds[pixel];
     const float4 weights=gVXPGFuzzyWeights[pixel];
     // This latent choice is shared by primary NEE and every NRD component.

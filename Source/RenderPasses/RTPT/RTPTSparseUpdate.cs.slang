@@ -43,7 +43,7 @@ ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #include "RTPTSharc.slang"
 
 #if ENABLE_VXPG
-#include "RTPTVXPGTraining.slang"
+#include "VXPG/RTPTVXPGTraining.slang"
 #endif
 
 // Preserve the deterministic training-pixel phase for SHaRC and VXPG.

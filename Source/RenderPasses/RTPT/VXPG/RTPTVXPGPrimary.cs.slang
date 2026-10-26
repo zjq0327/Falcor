@@ -5,8 +5,8 @@ import Scene.RaytracingInline;
 import Utils.Sampling.SampleGenerator;
 import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
-#include "RTPTVXPGTypes.slang"
-#include "RTPTCamera.slang"
+#include "RTPTVXPGGrid.slang"
+#include "../RTPTCamera.slang"
 
 struct RTPTVXPGPrimaryParams { uint seed; uint sampleOffset; uint useNRD; };
 ConstantBuffer<RTPTVXPGPrimaryParams> gParams;
@@ -33,7 +33,7 @@ bool rtptVXPGProducePrimary(uint2 pixel, out Ray ray, out HitInfo hit)
     hit = {};
     gVXPGPrimaryPosition[pixel] = 0.f;
     gVXPGPrimaryNormal[pixel] = 0.f;
-    if (gVXPGParams.visibilityEnabled != 0) gVXPGPrimaryHit[pixel] = 0u;
+    gVXPGPrimaryHit[pixel] = 0u;
     if (gVXPGState[RTPT_VXPG_STATE_GEOMETRY_OVERFLOW] != 0) return false;
     SampleGenerator cameraSG = SampleGenerator(pixel, gParams.sampleOffset + gParams.seed * 0x9e3779b9u);
     ray = rtptCameraRay(pixel, gVXPGParams.frameDim, gParams.useNRD != 0, cameraSG);
@@ -41,14 +41,11 @@ bool rtptVXPGProducePrimary(uint2 pixel, out Ray ray, out HitInfo hit)
     float hitT;
     rtptVXPGCount(RTPT_VXPG_STATE_INJECT_PRIMARY);
     hit = query.traceRay(ray, hitT);
-    if (gVXPGParams.visibilityEnabled != 0)
-    {
 #if HIT_INFO_USE_COMPRESSION
-        gVXPGPrimaryHit[pixel] = uint4(hit.pack(), 0u, 0u);
+    gVXPGPrimaryHit[pixel] = uint4(hit.pack(), 0u, 0u);
 #else
-        gVXPGPrimaryHit[pixel] = hit.pack();
+    gVXPGPrimaryHit[pixel] = hit.pack();
 #endif
-    }
     return true;
 }
 
