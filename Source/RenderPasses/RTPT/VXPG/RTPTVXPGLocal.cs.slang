@@ -5,18 +5,18 @@ cbuffer VXPGLocalLevel { uint localTreeLevel; };
 
 uint rtptVXPGGlobalBase()
 {
-    return gVXPGWorkArgs[0];
+    return gVXPGWorkArgs[RTPT_VXPG_WORK_LEAF_BASE];
 }
 
 [numthreads(1,1,1)]
 void beginLocal(uint3 tid : SV_DispatchThreadID)
 {
-    uint reason = gVXPGParams.treeReset != 0 ? 1u : 0u;
-    if (gVXPGTreeState[7] + 1u >= gVXPGParams.treeRefreshFrames) reason |= 2u;
-    if (gVXPGTreeState[8] == 0) reason |= 8u;
-    gVXPGTreeState[0] = reason != 0 ? 1u : 0u;
-    gVXPGTreeState[10] = reason;
-    gVXPGTreeState[2] = gVXPGTreeState[5] = gVXPGTreeState[6] = gVXPGTreeState[9] = 0;
+    uint reason = gVXPGParams.treeReset != 0 ? RTPT_VXPG_REBUILD_RESET : 0u;
+    if (gVXPGTreeState[RTPT_VXPG_TREE_TOPOLOGY_AGE] + 1u >= gVXPGParams.treeRefreshFrames) reason |= RTPT_VXPG_REBUILD_PERIODIC;
+    if (gVXPGTreeState[RTPT_VXPG_TREE_TOPOLOGY_VALID] == 0) reason |= RTPT_VXPG_REBUILD_INVALID;
+    gVXPGTreeState[RTPT_VXPG_TREE_FULL_BUILD] = reason != 0 ? 1u : 0u;
+    gVXPGTreeState[RTPT_VXPG_TREE_REBUILD_REASON] = reason;
+    gVXPGTreeState[RTPT_VXPG_TREE_DIRTY_LEAVES] = gVXPGTreeState[RTPT_VXPG_TREE_GLOBAL_NODES] = gVXPGTreeState[RTPT_VXPG_TREE_FOREST_NODES] = gVXPGTreeState[RTPT_VXPG_TREE_MEMBERSHIP_CHANGES] = 0;
 }
 
 [numthreads(256,1,1)]
@@ -27,15 +27,15 @@ void resolveLocal(uint3 tid : SV_DispatchThreadID)
     const float mass = rtptVXPGResolveMass(cell);
     gVXPGCellMass[cell] = mass;
     const bool wasActive = gVXPGInverse[cell] != RTPT_VXPG_INVALID;
-    if (wasActive != (mass > 0.f)) InterlockedAdd(gVXPGTreeState[9], 1u);
+    if (wasActive != (mass > 0.f)) InterlockedAdd(gVXPGTreeState[RTPT_VXPG_TREE_MEMBERSHIP_CHANGES], 1u);
 }
 
 [numthreads(1,1,1)]
 void selectLocal(uint3 tid : SV_DispatchThreadID)
 {
-    if (gVXPGTreeState[9] != 0) { gVXPGTreeState[0] = 1; gVXPGTreeState[10] |= 4u; }
-    if (gVXPGState[4] != 0 || gVXPGState[11] != 0) { gVXPGTreeState[0] = 1; gVXPGTreeState[10] |= 8u; }
-    gVXPGState[3] = rtptVXPGReuseTopology() ? gVXPGTreeState[1] : 0u;
+    if (gVXPGTreeState[RTPT_VXPG_TREE_MEMBERSHIP_CHANGES] != 0) { gVXPGTreeState[RTPT_VXPG_TREE_FULL_BUILD] = 1; gVXPGTreeState[RTPT_VXPG_TREE_REBUILD_REASON] |= RTPT_VXPG_REBUILD_MEMBERSHIP; }
+    if (gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW] != 0 || gVXPGState[RTPT_VXPG_STATE_INVALID] != 0) { gVXPGTreeState[RTPT_VXPG_TREE_FULL_BUILD] = 1; gVXPGTreeState[RTPT_VXPG_TREE_REBUILD_REASON] |= RTPT_VXPG_REBUILD_INVALID; }
+    gVXPGState[RTPT_VXPG_STATE_ACTIVE] = rtptVXPGReuseTopology() ? gVXPGTreeState[RTPT_VXPG_TREE_PREVIOUS_ACTIVE] : 0u;
 }
 
 [numthreads(256,1,1)]
@@ -49,8 +49,8 @@ void compactLocal(uint3 tid : SV_DispatchThreadID)
         gVXPGInverse[cell] = RTPT_VXPG_INVALID;
         if (!(mass > 0.f)) return;
         uint index;
-        InterlockedAdd(gVXPGState[3], 1u, index);
-        if (index >= gVXPGParams.activeCapacity) { InterlockedOr(gVXPGState[4], 1u); return; }
+        InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_ACTIVE], 1u, index);
+        if (index >= gVXPGParams.activeCapacity) { InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW], RTPT_VXPG_OVERFLOW_ACTIVE_CAPACITY); return; }
         gVXPGCompact[index] = cell;
         gVXPGInverse[cell] = index;
         gVXPGMass[index] = mass;
@@ -58,14 +58,14 @@ void compactLocal(uint3 tid : SV_DispatchThreadID)
     else if (mass > 0.f)
     {
         const uint index = gVXPGInverse[cell];
-        if (index >= gVXPGTreeState[1] || index >= gVXPGParams.activeCapacity)
-        { InterlockedAdd(gVXPGState[11], 1u); return; }
+        if (index >= gVXPGTreeState[RTPT_VXPG_TREE_PREVIOUS_ACTIVE] || index >= gVXPGParams.activeCapacity)
+        { InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u); return; }
         // Exact change detection: no energy is dropped by a dirty threshold.
         if (mass != gVXPGMass[index])
         {
             gVXPGMass[index] = mass;
             uint dirty;
-            InterlockedAdd(gVXPGTreeState[2], 1u, dirty);
+            InterlockedAdd(gVXPGTreeState[RTPT_VXPG_TREE_DIRTY_LEAVES], 1u, dirty);
             gVXPGDirtyLeaves[dirty] = index;
         }
     }
@@ -74,27 +74,27 @@ void compactLocal(uint3 tid : SV_DispatchThreadID)
 [numthreads(1,1,1)]
 void localWork(uint3 tid : SV_DispatchThreadID)
 {
-    gVXPGLocalArgs[0] = max(1u, (gVXPGTreeState[2] + 255u) / 256u);
-    gVXPGLocalArgs[1] = gVXPGLocalArgs[2] = 1;
+    gVXPGLocalArgs[RTPT_VXPG_DISPATCH_X] = max(1u, (gVXPGTreeState[RTPT_VXPG_TREE_DIRTY_LEAVES] + 255u) / 256u);
+    gVXPGLocalArgs[RTPT_VXPG_DISPATCH_Y] = gVXPGLocalArgs[RTPT_VXPG_DISPATCH_Z] = 1;
 }
 
 [numthreads(256,1,1)]
 void localLeaves(uint3 tid : SV_DispatchThreadID)
 {
-    if (!rtptVXPGReuseTopology() || tid.x >= gVXPGTreeState[2]) return;
+    if (!rtptVXPGReuseTopology() || tid.x >= gVXPGTreeState[RTPT_VXPG_TREE_DIRTY_LEAVES]) return;
     const uint compact = gVXPGDirtyLeaves[tid.x];
     gVXPGGlobalTree[rtptVXPGGlobalBase() + compact] = gVXPGMass[compact];
-    InterlockedAdd(gVXPGTreeState[5], 1u);
+    InterlockedAdd(gVXPGTreeState[RTPT_VXPG_TREE_GLOBAL_NODES], 1u);
     const uint4 info = gVXPGClusterInfo[gVXPGCluster[compact]];
     const uint address=info.z+gVXPGCompactToLeaf[compact];
     gVXPGForest[address].mass = gVXPGMass[compact];
-    InterlockedAdd(gVXPGTreeState[6], 1u);
+    InterlockedAdd(gVXPGTreeState[RTPT_VXPG_TREE_FOREST_NODES], 1u);
 }
 
 [numthreads(256,1,1)]
 void localLevel(uint3 tid : SV_DispatchThreadID)
 {
-    if (!rtptVXPGReuseTopology() || tid.x >= gVXPGTreeState[2]) return;
+    if (!rtptVXPGReuseTopology() || tid.x >= gVXPGTreeState[RTPT_VXPG_TREE_DIRTY_LEAVES]) return;
     const uint compact = gVXPGDirtyLeaves[tid.x];
     const uint node = (rtptVXPGGlobalBase() + compact) >> localTreeLevel;
     uint previous;
@@ -104,7 +104,7 @@ void localLevel(uint3 tid : SV_DispatchThreadID)
         if (previous != gVXPGParams.generation)
         {
             gVXPGGlobalTree[node] = gVXPGGlobalTree[2*node] + gVXPGGlobalTree[2*node+1];
-            InterlockedAdd(gVXPGTreeState[5], 1u);
+            InterlockedAdd(gVXPGTreeState[RTPT_VXPG_TREE_GLOBAL_NODES], 1u);
         }
     }
     const uint4 info = gVXPGClusterInfo[gVXPGCluster[compact]];
@@ -115,6 +115,6 @@ void localLevel(uint3 tid : SV_DispatchThreadID)
     if (previous != gVXPGParams.generation)
     {
         gVXPGForest[address].mass = gVXPGForest[info.z+2*local].mass + gVXPGForest[info.z+2*local+1].mass;
-        InterlockedAdd(gVXPGTreeState[6], 1u);
+        InterlockedAdd(gVXPGTreeState[RTPT_VXPG_TREE_FOREST_NODES], 1u);
     }
 }

@@ -1,8 +1,8 @@
 #include "RTPTVXPGDistribution.slang"
 
 cbuffer VXPGClusterBuild { uint sortShift; uint sortCapacity; uint sortGroups; uint treeLevel; };
-#define sortCapacity (gVXPGWorkArgs[1])
-#define sortGroups (gVXPGWorkArgs[2])
+#define sortCapacity (gVXPGWorkArgs[RTPT_VXPG_WORK_SORT_CAPACITY])
+#define sortGroups (gVXPGWorkArgs[RTPT_VXPG_WORK_SORT_GROUPS])
 RWStructuredBuffer<uint2> gVXPGSortInput;
 RWStructuredBuffer<uint2> gVXPGSortOutput;
 RWStructuredBuffer<uint> gVXPGHistogram;
@@ -22,7 +22,7 @@ void encodeVoxels(uint3 tid : SV_DispatchThreadID)
     if (rtptVXPGReuseTopology()) return;
     if (tid.x>=sortCapacity) return;
     uint2 code=uint2(RTPT_VXPG_INVALID);
-    if (tid.x<min(gVXPGState[3],gVXPGParams.activeCapacity))
+    if (tid.x<min(gVXPGState[RTPT_VXPG_STATE_ACTIVE],gVXPGParams.activeCapacity))
     {
         const uint cell=gVXPGCompact[tid.x];
         const float3 center=0.5f*(rtptVXPGWorldMin(cell)+rtptVXPGWorldMax(cell));
@@ -100,16 +100,16 @@ void allocateForest(uint3 tid : SV_DispatchThreadID)
         nodes+=2*leaves;
     }
     // Sum(nextPow2(n)) < 2*N plus empty cluster roots.
-    gVXPGClusterState[1]=nonempty;
-    gVXPGClusterState[4]=nodes;
-    if (nodes>4*gVXPGParams.activeCapacity+64) InterlockedAdd(gVXPGState[11],1u);
+    gVXPGClusterState[RTPT_VXPG_CLUSTER_NONEMPTY]=nonempty;
+    gVXPGClusterState[RTPT_VXPG_CLUSTER_FOREST_NODES]=nodes;
+    if (nodes>4*gVXPGParams.activeCapacity+64) InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID],1u);
 }
 
 [numthreads(256,1,1)]
 void initializeForest(uint3 tid : SV_DispatchThreadID)
 {
     if (rtptVXPGReuseTopology()) return;
-    if (tid.x>=gVXPGClusterState[4]) return;
+    if (tid.x>=gVXPGClusterState[RTPT_VXPG_CLUSTER_FOREST_NODES]) return;
     RTPTVXPGNode node={};
     node.compact=RTPT_VXPG_INVALID;
     gVXPGForest[tid.x]=node;
@@ -119,7 +119,7 @@ void initializeForest(uint3 tid : SV_DispatchThreadID)
 void forestLeaves(uint3 tid : SV_DispatchThreadID)
 {
     if (rtptVXPGReuseTopology()) return;
-    if (tid.x>=min(gVXPGState[3],gVXPGParams.activeCapacity)) return;
+    if (tid.x>=min(gVXPGState[RTPT_VXPG_STATE_ACTIVE],gVXPGParams.activeCapacity)) return;
     const uint compact=gVXPGSortInput[tid.x].y;
     const uint cell=gVXPGCompact[compact], cluster=gVXPGCluster[compact];
     const uint4 info=gVXPGClusterInfo[cluster];
@@ -185,7 +185,7 @@ void publishClusters(uint3 tid : SV_DispatchThreadID)
 #endif
     }
     const float root=gVXPGGlobalTree[1];
-    const bool valid=gVXPGState[11]==0 && gVXPGClusterState[1]>0 && isfinite(sum) && root>0.f && abs(sum-root)<=max(1.e-4f,root*1.e-4f);
-    gVXPGClusterState[6]=valid?gVXPGParams.generation:0;
-    if (!valid && root>0.f) InterlockedAdd(gVXPGState[11],1u);
+    const bool valid=gVXPGState[RTPT_VXPG_STATE_INVALID]==0 && gVXPGClusterState[RTPT_VXPG_CLUSTER_NONEMPTY]>0 && isfinite(sum) && root>0.f && abs(sum-root)<=max(1.e-4f,root*1.e-4f);
+    gVXPGClusterState[RTPT_VXPG_CLUSTER_READY]=valid?gVXPGParams.generation:0;
+    if (!valid && root>0.f) InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID],1u);
 }

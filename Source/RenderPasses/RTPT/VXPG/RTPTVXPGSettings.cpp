@@ -265,21 +265,7 @@ Properties Manager::renderSettingsUI(Gui::Widgets& vx, const Settings& settings,
             true
         );
         if (diagnostics.button("Read Morton / tree snapshot"))
-        {
-            const auto snapshot = getTreeSnapshot(settings, runtime);
-            if (snapshot.get<bool>("available", false))
-            {
-                const auto totals = snapshot.get<Properties>("totals");
-                ui.treeText = "Snapshot generation " + std::to_string(snapshot.get<uint32_t>("generation")) + ": active " +
-                              std::to_string(snapshot.get<uint32_t>("activeCount")) + ", leaves in duplicate Morton groups " +
-                              std::to_string(totals.get<uint32_t>("duplicateLeaves")) + ", excess duplicate keys " +
-                              std::to_string(totals.get<uint32_t>("duplicateExcess")) +
-                              "\nLeaf depth mean/p95/max: " + std::to_string(totals.get<double>("meanDepth")) + "/" +
-                              std::to_string(totals.get<uint32_t>("p95Depth")) + "/" + std::to_string(totals.get<uint32_t>("maxDepth"));
-            }
-            else
-                ui.treeText = "Tree snapshot unavailable: " + snapshot.get<std::string>("status", "unknown");
-        }
+            ui.treeText = getTreeSnapshotText(settings, runtime);
         diagnostics.tooltip(
             "Requires Enabled and a published clustered proposal. Reads the current model only on request; this can pause rendering. "
             "Duplicate Morton groups are counted within each Cluster.",
@@ -290,7 +276,8 @@ Properties Manager::renderSettingsUI(Gui::Widgets& vx, const Settings& settings,
     }
     uint32_t debugMode = settings.debugMode;
     const Gui::DropdownList debugModes = {
-        {0, "Voxel bounds"}, {1, "Superpixel ID"}, {2, "Voxel cluster ID"}, {3, "Visibility descriptor"}, {4, "Distance LOD"}};
+        {0, "Voxel bounds"}, {1, "Superpixel ID"}, {2, "Voxel cluster ID"}, {3, "Visibility descriptor"}, {4, "Distance LOD"}
+    };
     if (vx.dropdown("Debug view", debugModes, debugMode))
         props["vxpgDebugMode"] = debugMode;
     return props;

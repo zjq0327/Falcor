@@ -586,7 +586,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     sparse["writeSHARC"] = sharc ? 1u : 0u;
     sparse["writeVXPG"] = vxpg ? 1u : 0u;
     if (mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG)
-        mpVXPG->bind(var, mpVXPG->getLightingFrameIndex(), vxpg);
+        mpVXPG->bindTraining(var, vxpg);
     const uint2 updateDim = (mFrameDim + stride - 1u) / stride;
     mpSparseUpdate->execute(pRenderContext, uint3(updateDim, 1));
     if (vxpg) mpVXPG->barrierInjection(pRenderContext);
@@ -603,7 +603,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     }
 }
 
-void RTPT::executeTraining(RenderContext* pRenderContext)
+void RTPT::executeTraining(RenderContext* pRenderContext, const RTPTVXPG::TrainingInputs& vxpgTraining)
 {
     // Query resources remain UAVs. Order the preceding frame's reads before
     // clearing, sparse writes or reusing a previous paired resolve destination.
@@ -640,13 +640,13 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
         if (mResetSHARCCache) clearSHARC(pRenderContext);
     }
     const bool sharc = mEnableSHARC && mSHARCEnabled && !mSHARCFreeze;
-    const bool vxpg = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mpVXPG->isTrainingPrepared();
+    const bool vxpg = vxpgTraining.writeObservations;
     mVXPGSharedTrainingThisFrame = vxpg;
     mVXPGSharedWithSHARCThisFrame = vxpg && sharc;
     if (sharc)
         dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, mSHARCFrameIndex, true, vxpg);
     else if (vxpg)
-        dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, mpVXPG->getLightingFrameIndex(), false, true);
+        dispatchSparse(pRenderContext, mSHARCUpdateStride, mSHARCUpdateBounces, vxpgTraining.frameIndex, false, true);
     if (sharc)
     {
         FALCOR_PROFILE(pRenderContext, "SHARCResolve");
@@ -672,7 +672,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    mpVXPG->beginFrame();
+    auto vxpgUpdate = mpVXPG->beginUpdate();
     mVXPGSharedTrainingThisFrame = mVXPGSharedWithSHARCThisFrame = false;
     auto color = renderData.getTexture("color");
     auto noisyColor = renderData.getTexture("noisyColor");
@@ -728,27 +728,16 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         pRenderContext->copyResource(color.get(), mpAccumulation.get());
         return;
     }
+    RTPTVXPG::TrainingInputs vxpgTraining;
     if (mEnableVXPG)
-    {
-        mpVXPG->configure(mVXPGSettings, mFrameDim, mSHARCUpdateStride, mSHARCUpdateBounces);
-        auto debug = renderData.getTexture("vxpgDebug");
-        pRenderContext->clearTexture(debug.get());
-        if (mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled)
-        {
-            mpVXPG->buildGeometry(pRenderContext);
-            mpVXPG->prepareLighting(pRenderContext);
-        }
-    }
-    if (mEnableSHARC || mpVXPG->isTrainingPrepared())
+        vxpgTraining = vxpgUpdate.prepare(pRenderContext, mVXPGSettings, mFrameDim, mSHARCUpdateStride, mSHARCUpdateBounces,
+            mGuidingMode, renderData.getTexture("vxpgDebug"));
+    if (mEnableSHARC || vxpgTraining.writeObservations)
     {
         if (mEnableSHARC && mResetSHARCCache) mResetNRDHistory = true;
-        executeTraining(pRenderContext);
+        executeTraining(pRenderContext, vxpgTraining);
     }
-    if (mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled)
-    {
-        mpVXPG->updateLighting(pRenderContext, mSeed, mSampleOffset, mEnableNRD);
-        mpVXPG->renderDebug(pRenderContext, renderData.getTexture("vxpgDebug"));
-    }
+    vxpgUpdate.finish(pRenderContext, mSeed, mSampleOffset, mEnableNRD);
     if ((mEnableNRD || mEnableSHARC || mEnableVXPG) && mResetNRDHistory)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
@@ -782,14 +771,14 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         var["gSharcStats"] = renderData.getTexture("sharcStats");
     }
     if (mEnableVXPG)
-        mpVXPG->bind(var, mSampleOffset, mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled && mpVXPG->isReady());
+        mpVXPG->bindRendering(var, mSampleOffset, mGuidingMode == RTPTVXPG::GuidingMode::VXPG && mVXPGSettings.enabled && mpVXPG->hasSubmittedModel());
     pRenderContext->uavBarrier(mpAccumulation.get());
     {
         FALCOR_PROFILE(pRenderContext, "MainRender");
         mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
     }
     mVXPGDiagnosticFrameAvailable = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG &&
-        mVXPGSettings.enabled && mVXPGSettings.detailedDiagnostics && mpVXPG->isReady();
+        mVXPGSettings.enabled && mVXPGSettings.detailedDiagnostics && mpVXPG->hasSubmittedModel();
     if (mVXPGDiagnosticFrameAvailable)
     {
         mVXPGDiagnosticFrameSampleOffset = mSampleOffset;

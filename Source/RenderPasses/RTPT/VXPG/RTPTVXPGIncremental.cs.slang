@@ -19,8 +19,8 @@ void clearGrid(uint3 tid:SV_DispatchThreadID)
     {
         gVXPGHashSlots[i]=0;
     }
-    if(i<32)gVXPGState[i]=0;
-    if(i<16)gVXPGGridState[i]=0;
+    if(i<RTPT_VXPG_STATE_WORDS)gVXPGState[i]=0;
+    if(i<RTPT_VXPG_GRID_WORDS)gVXPGGridState[i]=0;
     if(i<gVXPGParams.cellCount)
     {
         gVXPGBoundMin[i]=gVXPGBoundMax[i]=0;
@@ -34,7 +34,7 @@ void beginGrid(uint3 tid:SV_DispatchThreadID)
     const uint i=tid.x;
     if(i<gVXPGParams.hashCapacity)gVXPGPendingHash[i]=0;
     if(i<discoveryCount()){RTPTVXPGDiscovery empty={};gVXPGDiscovery[i]=empty;}
-    if(i==0)gVXPGGridState[1]=gVXPGGridState[2]=0;
+    if(i==0)gVXPGGridState[RTPT_VXPG_GRID_PENDING]=gVXPGGridState[RTPT_VXPG_GRID_RETIRED]=0;
 }
 [numthreads(256,1,1)]
 void evictGrid(uint3 tid:SV_DispatchThreadID)
@@ -48,10 +48,10 @@ void evictGrid(uint3 tid:SV_DispatchThreadID)
     gVXPGHashSlots[life.z]=RTPT_VXPG_INVALID;
     gVXPGBoundMin[cell].w=0;
     gVXPGHistory[cell]={};
-    uint index;InterlockedAdd(gVXPGGridState[2],1u,index);
+    uint index;InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_RETIRED],1u,index);
     gVXPGRetiredCells[index]=cell;
-    InterlockedAdd(gVXPGGridState[4],1u);
-    InterlockedAdd(gVXPGGridState[6],0xffffffffu);
+    InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_EVICTED],1u);
+    InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_LIVE],0xffffffffu);
 }
 [numthreads(256,1,1)]
 void discover(uint3 tid:SV_DispatchThreadID)
@@ -72,27 +72,27 @@ void discover(uint3 tid:SV_DispatchThreadID)
         uint prior;InterlockedCompareExchange(gVXPGPendingHash[slot],0u,token,prior);
         if(prior==0)
         {
-            uint index;InterlockedAdd(gVXPGGridState[1],1u,index);
+            uint index;InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_PENDING],1u,index);
             gVXPGPendingSlots[index]=slot;return;
         }
         if(all(tokenIdentity(prior)==key))return;
     }
-    InterlockedAdd(gVXPGGridState[8],1u);
+    InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_DISCOVERY_REJECTS],1u);
 }
 uint allocateCell()
 {
-    uint available=gVXPGGridState[0];
+    uint available=gVXPGGridState[RTPT_VXPG_GRID_FREE];
     while(available!=0)
     {
-        uint prior;InterlockedCompareExchange(gVXPGGridState[0],available,available-1,prior);
+        uint prior;InterlockedCompareExchange(gVXPGGridState[RTPT_VXPG_GRID_FREE],available,available-1,prior);
         if(prior==available)
-        {InterlockedAdd(gVXPGGridState[7],1u);return gVXPGFreeCells[available-1];}
+        {InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_REUSED],1u);return gVXPGFreeCells[available-1];}
         available=prior;
     }
-    uint count=gVXPGState[2];
+    uint count=gVXPGState[RTPT_VXPG_STATE_OCCUPIED];
     while(count<gVXPGParams.cellCount)
     {
-        uint prior;InterlockedCompareExchange(gVXPGState[2],count,count+1,prior);
+        uint prior;InterlockedCompareExchange(gVXPGState[RTPT_VXPG_STATE_OCCUPIED],count,count+1,prior);
         if(prior==count)return count;
         count=prior;
     }
@@ -102,7 +102,7 @@ uint allocateCell()
 void insertGrid(uint3 tid:SV_DispatchThreadID)
 {
     const uint index=tid.x;
-    if(index>=gVXPGGridState[1])return;
+    if(index>=gVXPGGridState[RTPT_VXPG_GRID_PENDING])return;
     const uint token=gVXPGPendingHash[gVXPGPendingSlots[index]];
     const int4 key=tokenIdentity(token);
     const uint first=rtptVXPGKeyHash(key);
@@ -118,12 +118,12 @@ void insertGrid(uint3 tid:SV_DispatchThreadID)
             if(prior==RTPT_VXPG_INVALID){slot=s;break;}
         }
     }
-    if(slot==RTPT_VXPG_INVALID){InterlockedAdd(gVXPGGridState[5],1u);return;}
+    if(slot==RTPT_VXPG_INVALID){InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_CAPACITY_REJECTS],1u);return;}
     const uint cell=allocateCell();
     if(cell==RTPT_VXPG_INVALID)
     {
         gVXPGHashSlots[slot]=RTPT_VXPG_INVALID;
-        InterlockedAdd(gVXPGGridState[5],1u);return;
+        InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_CAPACITY_REJECTS],1u);return;
     }
     gVXPGCellKeys[cell]=key;
     gVXPGBoundMin[cell]=uint4(asuint(float3(0.f)),1u);
@@ -134,7 +134,7 @@ void insertGrid(uint3 tid:SV_DispatchThreadID)
     gVXPGHistory[cell]={};
     gVXPGCellLifetime[cell]=uint4(gVXPGParams.frameIndex,gVXPGCellLifetime[cell].y+1,slot,0);
     gVXPGHashSlots[slot]=cell+1;
-    InterlockedAdd(gVXPGGridState[3],1u);InterlockedAdd(gVXPGGridState[6],1u);
+    InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_INSERTED],1u);InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_LIVE],1u);
 }
 [numthreads(256,1,1)]
 void replay(uint3 tid:SV_DispatchThreadID)
@@ -150,10 +150,10 @@ void replay(uint3 tid:SV_DispatchThreadID)
 [numthreads(256,1,1)]
 void retire(uint3 tid:SV_DispatchThreadID)
 {
-    if(tid.x>=gVXPGGridState[2])return;
+    if(tid.x>=gVXPGGridState[RTPT_VXPG_GRID_RETIRED])return;
     const uint cell=gVXPGRetiredCells[tid.x];
     // All render data for this ID has been removed before the slot is freed.
     gVXPGInverse[cell]=RTPT_VXPG_INVALID;
-    uint index;InterlockedAdd(gVXPGGridState[0],1u,index);
+    uint index;InterlockedAdd(gVXPGGridState[RTPT_VXPG_GRID_FREE],1u,index);
     gVXPGFreeCells[index]=cell;
 }

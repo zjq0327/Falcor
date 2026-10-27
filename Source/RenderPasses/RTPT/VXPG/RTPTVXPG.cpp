@@ -5,6 +5,50 @@
 using namespace Falcor;
 namespace RTPTVXPG
 {
+Manager::FrameUpdate::FrameUpdate(Manager& manager) : mManager(manager)
+{
+    mManager.clearTrainingPreparation();
+}
+
+Manager::FrameUpdate::~FrameUpdate()
+{
+    // Cancel an unfinished preparation on early return/exception; never publish
+    // from a destructor. Normal finish() has already consumed the preparation.
+    mManager.clearTrainingPreparation();
+}
+
+TrainingInputs Manager::FrameUpdate::prepare(
+    RenderContext* context,
+    const Settings& settings,
+    uint2 frameDim,
+    uint32_t sharedStride,
+    uint32_t sharedBounces,
+    GuidingMode mode,
+    const ref<Texture>& debugOutput
+)
+{
+    mManager.configure(settings, frameDim, sharedStride, sharedBounces);
+    mpDebugOutput = debugOutput;
+    context->clearTexture(mpDebugOutput.get());
+    mSelected = mode == GuidingMode::VXPG && settings.enabled;
+    if (mSelected)
+    {
+        mManager.buildGeometry(context);
+        mManager.prepareLighting(context);
+    }
+    return {mManager.mLightingPrepared, mManager.mLightingFrameIndex};
+}
+
+void Manager::FrameUpdate::finish(RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD)
+{
+    if (!mSelected)
+        return;
+    mManager.updateLighting(context, seed, sampleOffset, useNRD);
+    // Frozen models still support debug rendering even without a new update.
+    mManager.renderDebug(context, mpDebugOutput);
+    mSelected = false;
+}
+
 void Manager::configure(const Settings& settings, uint2 frameDim, uint32_t sharedStride, uint32_t sharedBounces)
 {
     validate(settings);
@@ -42,18 +86,6 @@ void Manager::configure(const Settings& settings, uint2 frameDim, uint32_t share
     }
 }
 
-uint64_t Manager::primaryDiscoveryCount() const
-{
-    const uint32_t stride = mSettings.discoveryStride;
-    return uint64_t((mFrameDim.x + stride - 1) / stride) * ((mFrameDim.y + stride - 1) / stride);
-}
-
-uint64_t Manager::getDiscoveryRecordCount() const
-{
-    const uint32_t stride = mSharedTrainingStride;
-    return uint64_t((mFrameDim.x + stride - 1) / stride) * ((mFrameDim.y + stride - 1) / stride) * mSharedTrainingBounces;
-}
-
 void Manager::advanceGeneration(uint32_t& generation)
 {
     if (generation == std::numeric_limits<uint32_t>::max())
@@ -70,11 +102,11 @@ void Manager::invalidate(Invalidation scope, const std::string& reason)
 {
     // Retire an identity only once. Further requests may still discard history,
     // the grid or allocations while the proposal is already invalid.
-    if (mReady || mDistributionValid || mLightingPrepared)
+    if (mModelSubmitted || mDistributionValid || mLightingPrepared)
         advanceGeneration(mGeneration);
-    beginFrame();
+    clearTrainingPreparation();
     invalidateDiagnosticSnapshot();
-    mReady = mDistributionValid = false;
+    mModelSubmitted = mDistributionValid = false;
     if (scope >= Invalidation::LightingHistory)
         mResetHistory = true;
     if (scope >= Invalidation::Grid)
@@ -113,9 +145,7 @@ void Manager::lightingChanged()
 void Manager::setScene(const ref<Scene>& scene)
 {
     mpScene = scene;
-    mView.pDebug = nullptr;
-    mLighting.pClearFrame = mView.pPrimary = mProposal.pGlobalLeaves = mProposal.pGlobalLevel = mProposal.pPublish = nullptr;
-    resetClusterPasses();
+    resetScenePasses();
     invalidate();
 }
 
@@ -173,7 +203,7 @@ void Manager::buildIncrementalGeometry(RenderContext* context)
     mResetHistory = true;
     mDistributionValid = false;
     mGeometryValid = true;
-    mReady = false;
+    mModelSubmitted = false;
     advanceGeneration(mGeometryGeneration);
     ++mGeometryRebuilds;
 }
@@ -249,7 +279,7 @@ void Manager::buildGeometry(RenderContext* context)
 
 void Manager::prepareLighting(RenderContext* context)
 {
-    beginFrame();
+    clearTrainingPreparation();
     // Construction observations describe one actual update, never a frozen
     // frame or an old update from before diagnostics were enabled.
     invalidateDiagnosticSnapshot();
@@ -265,13 +295,13 @@ void Manager::prepareLighting(RenderContext* context)
                 mProposal.pClearDiagnostics = createPass("RTPTVXPGPrepare.cs.slang", "clearDiagnostics");
             context->uavBarrier(mProposal.pState.get());
             context->uavBarrier(mProposal.pQueryStats.get());
-            dispatchUpdate(context, mProposal.pClearDiagnostics, uint3(32, 1, 1));
+            dispatchUpdate(context, mProposal.pClearDiagnostics, uint3(RTPT_VXPG_STATE_WORDS, 1, 1));
             context->uavBarrier(mProposal.pQueryStats.get());
             context->uavBarrier(mProposal.pState.get());
         }
         return;
     }
-    ensureLightingResources(context);
+    ensureTrainingResources(context);
     advanceGeneration(mGeneration);
     {
         FALCOR_PROFILE(context, "VXPGClear");
@@ -299,7 +329,7 @@ void Manager::prepareLighting(RenderContext* context)
             dispatchUpdate(context, mProposal.pGeometryWork, uint3(1));
             context->uavBarrier(mProposal.pWorkArgs.get());
             context->copyResource(mProposal.pWorkDispatch.get(), mProposal.pWorkArgs.get());
-            dispatchIndirectUpdate(context, mLighting.pClearFrame, mProposal.pWorkDispatch, 4 * sizeof(uint32_t));
+            dispatchIndirectUpdate(context, mLighting.pClearFrame, mProposal.pWorkDispatch, RTPT_VXPG_WORK_GEOMETRY * sizeof(uint32_t));
         }
         context->uavBarrier(mProposal.pQueryStats.get());
         context->uavBarrier(mProposal.pState.get());
@@ -336,12 +366,13 @@ void Manager::barrierInjection(RenderContext* context) const
             context->uavBarrier(buffer.get());
 }
 
-// Bind only common inputs here. Entry constants, sampler data and all GPU
-// synchronization remain explicit at the stage call sites.
-void Manager::bindUpdatePass(RenderContext* context, const ref<ComputePass>& pass) const
+// Internal build/debug kernels retain the training-frame clock and activation.
+// Entry constants, sampler data and all synchronization stay at the call sites.
+void Manager::bindBuildPass(RenderContext* context, const ref<ComputePass>& pass) const
 {
     auto root = pass->getRootVar();
-    bind(root, mLightingFrameIndex, true);
+    bindParameters(root, mLightingFrameIndex, true);
+    bindResources(root);
     auto scene = root.findMember("gScene");
     if (scene.isValid())
         mpScene->bindShaderDataForRaytracing(context, scene);
@@ -349,7 +380,7 @@ void Manager::bindUpdatePass(RenderContext* context, const ref<ComputePass>& pas
 
 void Manager::dispatchUpdate(RenderContext* context, const ref<ComputePass>& pass, uint3 size)
 {
-    bindUpdatePass(context, pass);
+    bindBuildPass(context, pass);
     pass->execute(context, size);
 }
 
@@ -360,7 +391,7 @@ void Manager::dispatchIndirectUpdate(
     uint64_t byteOffset
 )
 {
-    bindUpdatePass(context, pass);
+    bindBuildPass(context, pass);
     pass->executeIndirect(context, arguments.get(), byteOffset);
 }
 
@@ -411,14 +442,14 @@ void Manager::resolveHistoryAndBuildGlobalTree(RenderContext* context)
     {
         context->uavBarrier(mProposal.pCellMass.get());
         context->uavBarrier(mProposal.pDirtyLeaves.get());
-        dispatchIndirectUpdate(context, mProposal.pResolveLocal, mProposal.pWorkDispatch, 4 * sizeof(uint32_t));
+        dispatchIndirectUpdate(context, mProposal.pResolveLocal, mProposal.pWorkDispatch, RTPT_VXPG_WORK_GEOMETRY * sizeof(uint32_t));
         context->uavBarrier(mProposal.pCellMass.get());
         context->uavBarrier(mProposal.pTreeState.get());
         context->uavBarrier(mProposal.pState.get());
         dispatchUpdate(context, mProposal.pSelectLocal, uint3(1));
         context->uavBarrier(mProposal.pTreeState.get());
         context->uavBarrier(mProposal.pState.get());
-        dispatchIndirectUpdate(context, mProposal.pCompactLocal, mProposal.pWorkDispatch, 4 * sizeof(uint32_t));
+        dispatchIndirectUpdate(context, mProposal.pCompactLocal, mProposal.pWorkDispatch, RTPT_VXPG_WORK_GEOMETRY * sizeof(uint32_t));
         context->uavBarrier(mProposal.pDirtyLeaves.get());
         context->uavBarrier(mProposal.pTreeState.get());
     }
@@ -437,14 +468,19 @@ void Manager::resolveHistoryAndBuildGlobalTree(RenderContext* context)
         context->copyResource(mProposal.pWorkDispatch.get(), mProposal.pWorkArgs.get());
     }
     mProposal.pGlobalLeaves->getRootVar()["VXPGTreeLevel"]["leafCapacity"] = mProposal.leafCapacity;
-    dispatchIndirectUpdate(context, mProposal.pGlobalLeaves, mProposal.pWorkDispatch, 12 * sizeof(uint32_t));
+    dispatchIndirectUpdate(context, mProposal.pGlobalLeaves, mProposal.pWorkDispatch, RTPT_VXPG_WORK_GLOBAL_LEAVES * sizeof(uint32_t));
     context->uavBarrier(mProposal.pGlobalTree.get());
     for (uint32_t offset = mProposal.leafCapacity / 2, level = 1; offset > 0; offset /= 2, ++level)
     {
         auto root = mProposal.pGlobalLevel->getRootVar();
         root["VXPGTreeLevel"]["nodeOffset"] = level;
         root["VXPGTreeLevel"]["nodeCount"] = offset;
-        dispatchIndirectUpdate(context, mProposal.pGlobalLevel, mProposal.pWorkDispatch, (32 + (level - 1) * 3) * sizeof(uint32_t));
+        dispatchIndirectUpdate(
+            context,
+            mProposal.pGlobalLevel,
+            mProposal.pWorkDispatch,
+            (RTPT_VXPG_WORK_GLOBAL_LEVELS + (level - 1) * RTPT_VXPG_DISPATCH_WORDS) * sizeof(uint32_t)
+        );
         context->uavBarrier(mProposal.pGlobalTree.get());
     }
 }
@@ -491,7 +527,7 @@ void Manager::publishAndRetire(RenderContext* context)
         context->uavBarrier(mProposal.pInverse.get());
     }
     mDistributionValid = true;
-    mReady = true;
+    mModelSubmitted = true;
     mFallbackReason.clear();
     mModelDiagnosticsAvailable = mSettings.detailedDiagnostics;
     mModelDiagnosticsFrameIndex = mLightingFrameIndex;
@@ -501,9 +537,9 @@ void Manager::publishAndRetire(RenderContext* context)
 
 void Manager::updateVisibility(RenderContext* context)
 {
-    const uint32_t rows = ((mFrameDim.x + mSettings.superpixelSize - 1) / mSettings.superpixelSize) *
-                          ((mFrameDim.y + mSettings.superpixelSize - 1) / mSettings.superpixelSize);
-    ensureVisibilityResources(rows);
+    const auto dimensions = getResourceDimensions();
+    const uint32_t rows = uint32_t(dimensions.superpixelRows);
+    ensureVisibilityResources(dimensions);
     updateVisibilityClusters(context);
     const auto sorted = sortClusterVoxels(context);
     buildClusterForest(context, sorted);
@@ -534,7 +570,7 @@ void Manager::updateVisibilityClusters(RenderContext* context)
     context->uavBarrier(mProposal.pClusterState.get());
     dispatchUpdate(context, mProposal.pSeedsPass, uint3(256, 1, 1));
     context->uavBarrier(mProposal.pSeeds.get());
-    dispatchIndirectUpdate(context, mProposal.pAssignClusters, mProposal.pWorkDispatch, 8 * sizeof(uint32_t));
+    dispatchIndirectUpdate(context, mProposal.pAssignClusters, mProposal.pWorkDispatch, RTPT_VXPG_WORK_ACTIVE * sizeof(uint32_t));
     context->uavBarrier(mProposal.pCluster.get());
     context->uavBarrier(mProposal.pClusterInfo.get());
 }
@@ -555,7 +591,7 @@ ref<Buffer> Manager::sortClusterVoxels(RenderContext* context)
     auto root = mProposal.pEncode->getRootVar();
     constants(root, 0);
     root["gVXPGSortOutput"] = sorted;
-    dispatchIndirectUpdate(context, mProposal.pEncode, mProposal.pWorkDispatch, 16 * sizeof(uint32_t));
+    dispatchIndirectUpdate(context, mProposal.pEncode, mProposal.pWorkDispatch, RTPT_VXPG_WORK_SORT * sizeof(uint32_t));
     context->uavBarrier(sorted.get());
     for (uint32_t shift = 0; shift < 32; shift += 8)
     {
@@ -563,7 +599,7 @@ ref<Buffer> Manager::sortClusterVoxels(RenderContext* context)
         constants(root, shift);
         root["gVXPGSortInput"] = sorted;
         root["gVXPGHistogram"] = mProposal.pHistogram;
-        dispatchIndirectUpdate(context, mProposal.pHistogramPass, mProposal.pWorkDispatch, 16 * sizeof(uint32_t));
+        dispatchIndirectUpdate(context, mProposal.pHistogramPass, mProposal.pWorkDispatch, RTPT_VXPG_WORK_SORT * sizeof(uint32_t));
         context->uavBarrier(mProposal.pHistogram.get());
         root = mProposal.pPrefixPass->getRootVar();
         constants(root, shift);
@@ -578,7 +614,7 @@ ref<Buffer> Manager::sortClusterVoxels(RenderContext* context)
         root["gVXPGSortOutput"] = scratch;
         root["gVXPGHistogram"] = mProposal.pHistogram;
         root["gVXPGBinOffsets"] = mProposal.pBinOffsets;
-        dispatchIndirectUpdate(context, mProposal.pScatter, mProposal.pWorkDispatch, 16 * sizeof(uint32_t));
+        dispatchIndirectUpdate(context, mProposal.pScatter, mProposal.pWorkDispatch, RTPT_VXPG_WORK_SORT * sizeof(uint32_t));
         context->uavBarrier(scratch.get());
         context->uavBarrier(sorted.get());
         context->uavBarrier(mProposal.pHistogram.get());
@@ -600,20 +636,27 @@ void Manager::buildClusterForest(RenderContext* context, const ref<Buffer>& sort
         dispatchUpdate(context, mProposal.pForestWork, uint3(1));
         context->uavBarrier(mProposal.pWorkArgs.get());
         context->copyResource(mProposal.pWorkDispatch.get(), mProposal.pWorkArgs.get());
-        dispatchIndirectUpdate(context, mProposal.pInitializeForest, mProposal.pWorkDispatch, 20 * sizeof(uint32_t));
+        dispatchIndirectUpdate(
+            context, mProposal.pInitializeForest, mProposal.pWorkDispatch, RTPT_VXPG_WORK_FOREST_NODES * sizeof(uint32_t)
+        );
     }
     context->uavBarrier(mProposal.pForest.get());
     auto root = mProposal.pForestLeaves->getRootVar();
     context->uavBarrier(mProposal.pCompactToLeaf.get());
     root["gVXPGSortInput"] = sorted;
-    dispatchIndirectUpdate(context, mProposal.pForestLeaves, mProposal.pWorkDispatch, 8 * sizeof(uint32_t));
+    dispatchIndirectUpdate(context, mProposal.pForestLeaves, mProposal.pWorkDispatch, RTPT_VXPG_WORK_ACTIVE * sizeof(uint32_t));
     context->uavBarrier(mProposal.pForest.get());
     context->uavBarrier(mProposal.pCompactToLeaf.get());
     for (uint32_t level = 1; (mProposal.leafCapacity >> level) > 0; ++level)
     {
         root = mProposal.pForestLevel->getRootVar();
         root["VXPGClusterBuild"]["treeLevel"] = level;
-        dispatchIndirectUpdate(context, mProposal.pForestLevel, mProposal.pWorkDispatch, (96 + (level - 1) * 3) * sizeof(uint32_t));
+        dispatchIndirectUpdate(
+            context,
+            mProposal.pForestLevel,
+            mProposal.pWorkDispatch,
+            (RTPT_VXPG_WORK_FOREST_LEVELS + (level - 1) * RTPT_VXPG_DISPATCH_WORDS) * sizeof(uint32_t)
+        );
         context->uavBarrier(mProposal.pForest.get());
     }
     dispatchUpdate(context, mProposal.pPublishClusters, uint3(1));

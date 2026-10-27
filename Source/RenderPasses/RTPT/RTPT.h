@@ -36,7 +36,7 @@ private:
     void bindSHARC(const ShaderVar& rootVar, bool resolve = false);
     bool usesPairedSharc() const;
     void clearSHARC(RenderContext* pRenderContext);
-    void executeTraining(RenderContext* pRenderContext);
+    void executeTraining(RenderContext* pRenderContext, const RTPTVXPG::TrainingInputs& vxpgTraining);
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex,
         bool sharc, bool vxpg = false);
 

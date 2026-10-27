@@ -60,7 +60,7 @@ uint rtptVXPGNearestFuzzyRow(uint4 ids,float4 normalizedWeights)
 bool rtptVXPGReuseTopology()
 {
 
-    return gVXPGTreeState[0] == 0;
+    return gVXPGTreeState[RTPT_VXPG_TREE_FULL_BUILD] == 0;
 }
 
 uint rtptVXPGClusterMember(uint4 info, float random)

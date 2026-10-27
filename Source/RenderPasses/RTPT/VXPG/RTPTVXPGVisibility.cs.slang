@@ -18,7 +18,7 @@ bool rtptVXPGVisible(float3 a, float3 na, float3 b, float3 nb)
     const float length = sqrt(dot(segment, segment));
     if (!(length > 2.f*epsilon)) return false;
     SceneRayQuery<true> query;
-    rtptVXPGCountVisibility(2u);
+    rtptVXPGCountVisibility(RTPT_VXPG_CLUSTER_VISIBILITY_RAYS);
     return query.traceVisibilityRay(Ray(origin, segment/length, 0.f, length-epsilon));
 }
 
@@ -43,18 +43,18 @@ void prepareClusterArgs(uint3 tid : SV_DispatchThreadID)
     if (rtptVXPGReuseTopology())
     {
         // Preserve topology/allocation; reset only current-frame activity.
-        if (tid.x == 0 || tid.x == 2 || tid.x == 3 || tid.x == 5 || tid.x == 6) gVXPGClusterState[tid.x] = 0;
-        if (tid.x < 3) gVXPGClusterArgs[tid.x] = 1;
+        if (tid.x == RTPT_VXPG_CLUSTER_VALID_SUPERPIXELS || tid.x == RTPT_VXPG_CLUSTER_VISIBILITY_RAYS || tid.x == RTPT_VXPG_CLUSTER_VISIBLE_PAIRS || tid.x == RTPT_VXPG_CLUSTER_TOP_ROWS || tid.x == RTPT_VXPG_CLUSTER_READY) gVXPGClusterState[tid.x] = 0;
+        if (tid.x < RTPT_VXPG_DISPATCH_WORDS) gVXPGClusterArgs[tid.x] = 1;
         return;
     }
-    if (tid.x<8) gVXPGClusterState[tid.x]=0;
+    if (tid.x<RTPT_VXPG_CLUSTER_WORDS) gVXPGClusterState[tid.x]=0;
     if (tid.x<32) gVXPGClusterInfo[tid.x]=0;
     if (tid.x==0)
     {
-        const uint count=min(gVXPGState[3],gVXPGParams.activeCapacity);
-        gVXPGClusterArgs[0]=max(1u,min(1024u,count));
-        gVXPGClusterArgs[1]=max(1u,(count+1023)/1024);
-        gVXPGClusterArgs[2]=1;
+        const uint count=min(gVXPGState[RTPT_VXPG_STATE_ACTIVE],gVXPGParams.activeCapacity);
+        gVXPGClusterArgs[RTPT_VXPG_DISPATCH_X]=max(1u,min(1024u,count));
+        gVXPGClusterArgs[RTPT_VXPG_DISPATCH_Y]=max(1u,(count+1023)/1024);
+        gVXPGClusterArgs[RTPT_VXPG_DISPATCH_Z]=1;
     }
 }
 
@@ -64,7 +64,7 @@ void rowVisibility(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
 {
     if (rtptVXPGReuseTopology()) return;
     const uint compact=group.x+group.y*1024;
-    if (compact>=min(gVXPGState[3],gVXPGParams.activeCapacity)) return;
+    if (compact>=min(gVXPGState[RTPT_VXPG_STATE_ACTIVE],gVXPGParams.activeCapacity)) return;
     if (lane<4) descriptor[lane]=0;
     GroupMemoryBarrierWithGroupSync();
     const uint cell=gVXPGCompact[compact];
@@ -75,7 +75,7 @@ void rowVisibility(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
     if (visible)
     {
         InterlockedOr(descriptor[lane/32],1u<<(lane%32));
-        rtptVXPGCountVisibility(3u);
+        rtptVXPGCountVisibility(RTPT_VXPG_CLUSTER_VISIBLE_PAIRS);
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane==0) gVXPGVisibility[compact]=uint4(descriptor[0],descriptor[1],descriptor[2],descriptor[3]);
@@ -93,7 +93,7 @@ groupshared uint selectedSeed;
 void seedClusters(uint lane : SV_GroupIndex)
 {
     if (rtptVXPGReuseTopology()) return;
-    const uint count=min(gVXPGState[3],gVXPGParams.activeCapacity);
+    const uint count=min(gVXPGState[RTPT_VXPG_STATE_ACTIVE],gVXPGParams.activeCapacity);
     if (count==0) return;
     for (uint j=0;j<4;++j)
     {
@@ -155,7 +155,7 @@ void assignClusters(uint3 tid : SV_DispatchThreadID)
 {
     if (rtptVXPGReuseTopology()) return;
     const uint i=tid.x;
-    if (i>=min(gVXPGState[3],gVXPGParams.activeCapacity)) return;
+    if (i>=min(gVXPGState[RTPT_VXPG_STATE_ACTIVE],gVXPGParams.activeCapacity)) return;
     uint best=0;
     float minimum=3.402823e38f;
     const uint4 descriptor=gVXPGVisibility[i];
@@ -191,7 +191,7 @@ void superpixelCenters(uint3 tid : SV_DispatchThreadID)
     }
     gVXPGSuperpixelPosition[row]=position;
     gVXPGSuperpixelNormal[row]=position.w!=0.f?gVXPGPrimaryNormal[pixel]:float4(0.f);
-    if (position.w!=0.f) InterlockedAdd(gVXPGClusterState[0],1u);
+    if (position.w!=0.f) InterlockedAdd(gVXPGClusterState[RTPT_VXPG_CLUSTER_VALID_SUPERPIXELS],1u);
 }
 
 [numthreads(8,8,1)]
@@ -270,8 +270,8 @@ void prefixSuperpixelBlocks(uint3 tid : SV_DispatchThreadID)
         gVXPGSuperpixelBlocks[block]=prefix;
         prefix+=count;
     }
-    if(prefix>gVXPGParams.frameDim.x*gVXPGParams.frameDim.y)InterlockedOr(gVXPGState[4],8u);
-    gVXPGState[26]=prefix;
+    if(prefix>gVXPGParams.frameDim.x*gVXPGParams.frameDim.y)InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],RTPT_VXPG_OVERFLOW_SCREEN_PREFIX);
+    gVXPGState[RTPT_VXPG_STATE_GATHERED_POINTS]=prefix;
 }
 [numthreads(256,1,1)]
 void finalizeSuperpixelRanges(uint3 tid : SV_DispatchThreadID)
@@ -293,7 +293,7 @@ void scatterSuperpixelPoints(uint3 tid : SV_DispatchThreadID)
     InterlockedAdd(gVXPGSuperpixelCount[row],1u,slot);
     const uint2 range=gVXPGSuperpixelRange[row];
     if(slot>=range.y || range.x+slot>=gVXPGParams.frameDim.x*gVXPGParams.frameDim.y)
-    {InterlockedOr(gVXPGState[4],16u);return;}
+    {InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],RTPT_VXPG_OVERFLOW_SCREEN_SCATTER);return;}
     gVXPGSuperpixelPoints[range.x+slot]=pixel.x+pixel.y*gVXPGParams.frameDim.x;
 }
 
@@ -328,10 +328,10 @@ float rtptVXPGPairContribution(uint row,uint cluster,uint sampleIndex,uint4 info
     const float contribution=max(f.x,max(f.y,f.z))/distance2;
     if(isfinite(contribution) && contribution>=0.f)
     {
-        if(contribution>0.f)rtptVXPGCount(25u);
+        if(contribution>0.f)rtptVXPGCount(RTPT_VXPG_STATE_POSITIVE_PAIRS);
         return contribution/32.f;
     }
-    InterlockedAdd(gVXPGState[11],1u);
+    InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID],1u);
 #endif
     return 0.f;
 }
@@ -345,7 +345,7 @@ void topLevelLeaves(uint3 group : SV_GroupID,uint lane : SV_GroupIndex)
     const uint4 info=gVXPGClusterInfo[cluster];
     const uint2 range=gVXPGSuperpixelRange[row];
     const float4 source=gVXPGSuperpixelPosition[row];
-    const bool valid=gVXPGClusterState[6]==gVXPGParams.generation && cluster<gVXPGParams.clusterCount && info.y>0 && range.y>0 && source.w!=0.f;
+    const bool valid=gVXPGClusterState[RTPT_VXPG_CLUSTER_READY]==gVXPGParams.generation && cluster<gVXPGParams.clusterCount && info.y>0 && range.y>0 && source.w!=0.f;
     // One group evaluates the reference's 32 actual point pairs in parallel.
     float contribution=0.f;
     if(valid)contribution=rtptVXPGPairContribution(row,cluster,lane,info,range);
@@ -375,5 +375,5 @@ void topLevelParents(uint3 tid : SV_DispatchThreadID)
     if (row>=gVXPGParams.superpixelDim.x*gVXPGParams.superpixelDim.y) return;
     const uint base=row*64;
     for (uint i=31;i>0;--i) gVXPGTopTree[base+i]=gVXPGTopTree[base+2*i]+gVXPGTopTree[base+2*i+1];
-    if (gVXPGTopTree[base+1]>0.f) InterlockedAdd(gVXPGClusterState[5],1u);
+    if (gVXPGTopTree[base+1]>0.f) InterlockedAdd(gVXPGClusterState[RTPT_VXPG_CLUSTER_TOP_ROWS],1u);
 }

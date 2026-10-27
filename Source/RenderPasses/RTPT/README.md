@@ -51,23 +51,66 @@ LBVH、Bitonic 及已删除的六项优化均未恢复。无效提议继续回�
 VXPG 专用实现集中在 [VXPG](VXPG) 目录，仍只有一个 `RTPTVXPG::Manager`。
 内部资源按网格、光照历史、采样树、屏幕数据分组；这些是代码职责，不新增功能开关。
 
+资源尺寸通过 `ResourceDimensions` 统一派生，创建缓冲与预算估算共用体素、哈希、树、屏幕和观测容量。
+各组提供 `release()`、`bind()` 和 `getPayloadBytes()`；Manager 只协调四组绑定并汇总实际分配字节数。
+每组用一份 `forEachResource()` 清单维护资源名与成员的对应关系，绑定和显存统计共用清单。
+间接调度副本及排序临时缓冲也参与统计，但不增加公共绑定；各阶段继续显式绑定自己的临时资源。
+统计保留缓冲 `getSize()` 与纹理 `getTextureSizeInBytes()` 的口径，空资源贡献零，不进行 GPU 读回。
+完整释放时一起清理 GPU 对象与已分配尺寸；View 保留当前分辨率的驱动分配估算缓存。
+预算仍使用含驱动对齐和安全余量的原有保守估算，与实际分配字节数分别管理。
+`ensureTrainingResources()` 按组协调光照、提议树和主表面纹理的创建，历史清零与局部树初始化各有独立入口。
+`ensureVisibilityResources()` 协调簇树与屏幕资源；两处仍使用原有联动重建条件。
+Pass 创建与缓冲创建分开，`resetTrainingPasses()`、`resetClusterPasses()`、`resetScenePasses()` 明确各类依赖。
+重建范围继续由 `compareSettings()` 和 `invalidate()` 决定，预算公式、分辨率变化后的重建范围及冻结恢复规则保持原样。
+
 - [RTPTVXPG.cpp](VXPG/RTPTVXPG.cpp)：生命周期、失效处理、GPU 更新阶段和发布顺序。
 - [RTPTVXPGResources.cpp](VXPG/RTPTVXPGResources.cpp)：资源创建/初始化、释放、预算与着色器绑定。
 - [RTPTVXPGSettings.cpp](VXPG/RTPTVXPGSettings.cpp)：属性解析/导出、校验、变化分类与参数 UI。
-- [RTPTVXPGDiagnostics.cpp](VXPG/RTPTVXPGDiagnostics.cpp)：计数器读回、统计属性、结构快照和诊断显示。
+- [RTPTVXPGDiagnosticData.h](VXPG/RTPTVXPGDiagnosticData.h)：诊断使用的 CPU 快照与解释结果，不持有 GPU 资源。
+- [RTPTVXPGReadback.cpp](VXPG/RTPTVXPGReadback.cpp)：显式读回入口、可用性检查与快照采集。
+- [RTPTVXPGDiagnostics.cpp](VXPG/RTPTVXPGDiagnostics.cpp)：纯 CPU 的观测统计、LOD 计数及树结构/屏幕上下文分析。
+- [RTPTVXPGDiagnosticsFormat.cpp](VXPG/RTPTVXPGDiagnosticsFormat.cpp)：将快照转换为 Python 属性、树 JSON 和 UI 文本。
+- [RTPTVXPGDiagnosticsUI.cpp](VXPG/RTPTVXPGDiagnosticsUI.cpp)：Python API 与诊断按钮适配，缓存并显示最近一次读取的文本。
+- [RTPTVXPGLayout.slangh](VXPG/RTPTVXPGLayout.slangh)：CPU 与 Shader 共用的状态槽位、计数器、错误位、间接调度偏移和缓冲字数。
+- [RTPTVXPGResources.slang](VXPG/RTPTVXPGResources.slang)：公共 GPU 资源声明及训练、构建、查询阶段的读写约定。
 - [RTPT.cpp](RTPT.cpp)：主渲染、共享训练、SHaRC/NRD/累积联动，以及 Python 接口转发。
 
 UI 生成参数补丁，与脚本共同经过 `RTPT::setProperties()` 的候选参数校验和统一应用。
 `compareSettings()` 分类 VXPG 参数的影响；RTPT 决定跨模块刷新，Manager 按最强影响统一处理模型内部失效。
 `RuntimeContext` 只传递选中模式、训练状态和诊断帧信息，诊断层不依赖整个 RTPT 类。
+诊断读回保留 Python 统计与 UI 按钮各自原有的读取范围；普通帧和未点击的 UI 不采集 GPU 快照。
+树快照先读取并验证结构，再读取屏幕上下文，结构无效时提前返回。格式化层只消费 CPU 数据，
+不触发额外读回；树摘要直接使用解释后的数据，不再先生成完整 JSON 再解析为 UI 文本。
 
 Pass 统一通过 `createPass()` 创建，显式声明是否需要场景、采样器及当前诊断配置。
 直接/间接调度统一绑定 VXPG 参数及 Shader 实际需要的场景数据；入口专用参数、采样器绑定、
 GPU barrier 和间接参数缓冲复制仍写在各阶段内部，保持执行依赖可见。
 
+CPU 绑定分为三个入口：`bindTraining()` 为共享训练绑定观测写入目标，帧索引由 Manager 提供；
+`bindRendering()` 为主渲染绑定已发布提议，明确接收 `sampleOffset`；内部 `bindBuildPass()` 服务构建及调试计算入口。
+训练和构建继续使用 `mLightingFrameIndex`，主渲染继续使用采样偏移，均映射到原 GPU 参数字段。
+三者复用私有的 `bindParameters()` 和 `bindResources()`，保持唯一的参数/资源映射以及原有反射筛选行为。
+公共资源保留原先的 RW 类型和声明顺序；查询阶段写入诊断计数和非法数据计数，不更新观测、历史或拓扑。
+非法数据计数不受 Detailed diagnostics 开关控制，保留原有无条件记录行为。
+
+每帧由 `beginUpdate()` 创建不可复制的 `FrameUpdate`，在无场景或基础 PT 累积上限等提前返回之前清理训练许可。
+`FrameUpdate::prepare()` 封装配置、调试输出清零、建格与观测准备，并返回 `TrainingInputs` 中的写入许可和训练帧索引。
+RTPT 使用这份本帧结果调度共享或独立训练；`bindTraining()` 和训练后的 barrier 保持在原有位置。
+`FrameUpdate::finish()` 完成更新、发布与调试绘制；冻结时仍能绘制已有模型。作用域结束只清理训练许可，不隐式提交 GPU 工作。
+`configure()`、`buildGeometry()`、`prepareLighting()`、`updateLighting()` 和 `renderDebug()` 均为 Manager 私有实现。
+
+`hasSubmittedModel()` / `mModelSubmitted` 只表示 CPU 已提交模型发布命令，不代表 GPU 已完成或模型有效。
+Shader 继续检查 GPU READY 与当前代次，失败时走既有 BSDF 回退。显式诊断中的 `ready`、`gpuReady` 等字段含义保持不变；
+区分这两类状态不会在普通帧新增 CPU 读回或等待。
+
+`RTPTVXPGLayout.slangh` 是六组状态/统计缓冲及三组间接调度参数的共同定义来源。
+CPU 资源分配、读回与调度，以及 Shader 读写和清零，都使用这里的命名常量。
+偏移单位为 32 位字，CPU 调用间接调度时仍转换为字节；保留原有槽位数值、保留槽位、
+缓冲容量和清零范围。参数及结构化记录的字段、顺序和步长保持不变。
+
 Shader 的职责：
 
-- `Types.slang`：参数、数据布局和资源声明；`Diagnostics.slang`：可编译关闭的活动计数。
+- `Types.slang`：参数和结构化记录，并包含共享布局头；`Resources.slang`：公共资源声明；`Diagnostics.slang`：可编译关闭的活动计数。
 - `Grid.slang` / `Incremental.cs.slang`：距离 LOD、空间查询与增量网格维护。
 - `Training.slang` / `Observation.slang`：共享训练与观测记录；`History.slang` / `HistoryResolve.slang`：历史公式与 GPU 解析。
 - `Prepare.cs.slang` / `Local.cs.slang` / `Tree.cs.slang` / `Distribution.slang`：全局树、局部更新、簇树和公共概率规则。
@@ -76,6 +119,8 @@ Shader 的职责：
 
 以上 Shader 名称均带 `RTPTVXPG` 前缀。计算入口不互相包含；公共历史解析通过
 `HistoryResolve.slang` 共享。正向采样与反向 PDF 共用概率计算，保留概率边界修复。
+训练入口显式依赖 `Observation.slang`，查询入口经 `Sampling.slang` 依赖公共资源声明；
+`History.slang` 的历史解析公式由构建侧 `HistoryResolve.slang` 引入，训练和查询不再间接包含它。
 
 ## 每帧顺序与不变量
 
@@ -142,4 +187,57 @@ RTPT/VXPG 专项测试已按用户要求删除，本次重构不恢复它们。�
 五种调试视图、SHaRC 关闭/冻结时的独立训练、相机复用、冻结恢复、VXPG 总开关及参数调整和重置。
 采样概率、MIS、聚类、排序、建树和共享训练算法保持原样；临时验证脚本及依赖已清理。
 见 [固定 Visibility 验证](../../../build/vxpg-fixed-visibility-20261026/verification-summary.json)。
+
+GPU 布局定义统一后，Release 的 RTPT/Mogwai 构建通过；重构前 46 项运行检查及重构后 51 项检查全部通过。
+验证使用主入口配置、VeachAjar 和 D3D12 debug layer，覆盖 1080p 的 128 帧 Stop、奇数分辨率诊断、
+Heap/Radix 快照、调试视图、共享训练、相机复用、冻结恢复、VXPG 开关及参数调整和手动重置。
+106 个命名布局常量展开后，40 个现有代码文件的代码 token 一致（忽略注释、格式及整数后缀），
+原有 28 个命名常量数值全部保留；属性、诊断/快照字段和 GPU 分配字节数与基线一致。
+图像不是逐像素一致：重构前后 HDR 平均绝对差约 0.000802，同版本重复运行约 0.000812，
+均为 1080p、128 帧 RGBA 读回；差异处于相近量级，本验证不作逐像素一致或性能提升保证。
+见 [GPU 布局重构验证](../../../build/vxpg-gpu-layout-20261026/verification-summary.json)。
+
+资源生命周期重构后，Release 的 RTPT/Mogwai 构建通过，重构前 91 项及重构后 95 项运行检查全部通过。
+21 个状态的资源估算、实际分配字节数、容量、模型代次和网格重建次数与基线一致。
+覆盖 1080p 的 128 帧 Stop、奇数分辨率、非二次幂容量、训练布局调整、冻结调整分辨率、
+开关恢复、场景重载与诊断恢复；本配置 227 MiB 时预算回退并释放资源，228 MiB 时恢复。
+59 处资源分配配置、47 个 Pass 配置及 106 个完整释放的 GPU 成员保持一致；Shader 未修改。
+验证使用主入口配置和 D3D12 debug layer，通过无窗口脚本执行；临时脚本和依赖在交付前清理。
+见 [资源生命周期重构验证](../../../build/vxpg-resources-20261026/verification-summary.json)。
+
+训练、构建与渲染接口拆分后，Release 的 RTPT/Mogwai 构建通过；重构前 82 项及重构后 86 项运行检查全部通过。
+18 个状态的模型代次、发布状态、训练状态、容量及资源分配量等 11 个字段与基线一致，属性与快照字段保持不变。
+53 个公共资源声明的类型与顺序、10 个参数/记录结构保持原样；30 个 Shader 文件的算法代码及 CPU 调度、同步顺序不变。
+覆盖主入口 1080p 的 128 帧 Stop、奇数分辨率、冻结查询与诊断切换、五种调试视图、
+SHaRC 关闭/冻结时的独立训练、训练步幅/深度调整、VXPG 开关恢复、PG SHaRC 和手动重置。
+验证使用 VeachAjar 和 D3D12 debug layer，通过无窗口脚本执行；本阶段未做逐像素对比或性能基准。
+临时脚本和依赖在交付前清理。见 [接口拆分验证](../../../build/vxpg-interfaces-20261026/verification-summary.json)。
+
+四组资源的绑定与实际显存统计归组后，Release 的 RTPT/Mogwai 构建通过；重构前 84 项及重构后 88 项运行检查全部通过。
+53 项公共绑定、59 个缓冲/纹理的统计范围保持一致；每组的绑定与统计共用一份资源清单，31 个 Shader 文件未修改。
+18 个状态的实际分配量、预算估算、容量、模型代次及训练状态等 13 个字段与基线一致，属性与快照字段保持不变。
+覆盖完整管线的 1080p/128 帧 Stop、奇数分辨率、容量和训练布局调整、SHaRC 独立训练、五种调试视图、
+冻结调整分辨率、开关恢复、手动重置与场景重载；227 MiB 时回退并释放全部资源，228 MiB 时恢复。
+验证使用 VeachAjar 和 D3D12 debug layer，通过无窗口脚本执行；未做逐像素对比或性能基准，临时脚本和依赖已清理。
+见 [资源分组绑定与统计验证](../../../build/vxpg-resource-groups-20261026/verification-summary.json)。
+
+每帧更新接口收拢后，Release 的 RTPT/Mogwai 构建通过；基线 98 项检查及重构后完整运行的 102 项检查通过。
+22 个模型状态的发布代次、GPU READY、资源分配量、训练状态和 SHaRC 帧索引等 12 个字段与基线一致。
+覆盖无场景、1080p/128 帧最终累积、同帧冻结与相机移动、冻结诊断及五种调试视图、
+SHaRC 关闭/冻结时独立训练、VXPG/引导开关、预算回退恢复、手动重置和场景卸载重载。
+基础 PT 累积提前返回在独立纯 PT 图中验证；训练、更新及 Shader 校验不新增每帧读回，31 个 Shader 文件未修改。
+基线最后一个纯 PT 清屏断言修正为框架既有 RGBA `(0, 0, 0, 1)` 后，单独重跑四项纯 PT 检查，
+与已通过的主管线结果合并；原始记录及验证脚本修正原因均保留在摘要中。重构后使用修正脚本完整跑通。
+验证使用 VeachAjar、D3D12 debug layer 和无窗口脚本，未做跨版本逐像素对比或性能基准，临时脚本和依赖已清理。
+见 [每帧接口与状态语义验证](../../../build/vxpg-frame-interface-20261026/verification-summary.json)。
+
+诊断读回与展示分离后，Release 的 RTPT/Mogwai 构建通过；基线 97 项和重构后 102 项运行检查通过。
+16 个状态的统计字段集合、15 项模型/容量/诊断元数据及树快照状态和根字段与基线一致。
+CPU 对照程序将相同输入送入重构前实现和新实现，191 项检查通过，覆盖统计属性、UI 文本、
+观测统计、树快照 JSON、重复 Morton/树深统计及无效结构/上下文分支；格式化结果逐字符串核对。
+验证使用主入口配置、VeachAjar、D3D12 debug layer，覆盖 1080p/128 帧 Stop、奇数分辨率、
+冻结与诊断切换、独立训练、引导/VXPG 开关、手动重置、预算回退恢复和场景卸载。
+GPU 算法、资源布局和调度未修改，普通帧不增加读回。未做逐像素对比或性能基准；临时脚本、
+CPU 对照程序和依赖在交付前清理。见 [诊断分层验证](../../../build/vxpg-diagnostics-20261026/verification-summary.json)。
+
 历史实验、已删除功能与旧测试数量见 [历史记录](README_HISTORY.md)，不代表当前可用功能。

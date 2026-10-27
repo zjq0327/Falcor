@@ -1,4 +1,5 @@
 #pragma once
+#include "RTPTVXPGHistory.slang"
 #include "RTPTVXPGGrid.slang"
 
 // Resolve observations into persistent importance; shared by update kernels.
@@ -17,13 +18,13 @@ RTPTVXPGHistory rtptVXPGAdjacentHistory(uint cell,RTPTVXPGHistory previous,uint 
     const RTPTVXPGHistory donor=gVXPGHistoryPrevious[source];
     if(donor.valid!=1u || donor.weight<4.f || donor.age>=gVXPGParams.historyStaleFrames)return previous;
     const float3 a=gVXPGNormalPrevious[source].xyz,b=gVXPGRepresentativeNormal[cell].xyz;
-    if(dot(a,b)<.8f){InterlockedAdd(gVXPGHistoryStats[5],1u);return previous;}
+    if(dot(a,b)<.8f){InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_NORMAL_REJECTS],1u);return previous;}
     const float retention=1.f-rcp(float(max(1u,gVXPGParams.historyFrames)));
     previous.mean=donor.mean;
     previous.weight=min(2.f,donor.weight*pow(retention,float(donor.age+1u)));
     previous.age=0;previous.valid=3u;
-    InterlockedAdd(gVXPGHistoryStats[4],1u);
-    InterlockedAdd(gVXPGHistoryStats[6],1u);
+    InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_BORROWED],1u);
+    InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_BORROWED_TOTAL],1u);
     return previous;
 }
 
@@ -39,10 +40,10 @@ float rtptVXPGResolveMass(uint cell)
         const RTPTVXPGHistory history = rtptVXPGResolveHistory(previous, mean, count,
             gVXPGParams.historyFrames, gVXPGParams.historyStaleFrames);
         gVXPGHistory[cell] = history;
-        if (history.valid != 0) InterlockedAdd(gVXPGHistoryStats[0], 1u);
-        if (history.valid != 0 && count == 0) InterlockedAdd(gVXPGHistoryStats[1], 1u);
-        if (previous.valid != 0 && history.valid == 0) InterlockedAdd(gVXPGHistoryStats[2], 1u);
-        if (count > 0) InterlockedAdd(gVXPGHistoryStats[3], 1u);
+        if (history.valid != 0) InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_VALID], 1u);
+        if (history.valid != 0 && count == 0) InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_CARRIED], 1u);
+        if (previous.valid != 0 && history.valid == 0) InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_EXPIRED], 1u);
+        if (count > 0) InterlockedAdd(gVXPGHistoryStats[RTPT_VXPG_HISTORY_UPDATED], 1u);
         if (history.valid == 0) return 0.f;
         mean = history.mean;
         {
@@ -66,7 +67,7 @@ float rtptVXPGResolveMass(uint cell)
     // Reference premultiplies the mean observation by the largest box-face
     // area, estimating voxel power rather than selecting by irradiance alone.
     const float mass=mean*area;
-    if (!isfinite(mass)) { InterlockedAdd(gVXPGState[11],1u); return 0.f; }
+    if (!isfinite(mass)) { InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID],1u); return 0.f; }
     if (!(mass>0.f)) return 0.f;
     return mass;
 }

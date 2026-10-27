@@ -21,10 +21,10 @@ void rtptVXPGStoreRawCellObservation(uint cell, float3 position, float3 normal, 
     uint64_t previousFlux;
     InterlockedAdd(gVXPGFlux[cell], fixed, previousFlux);
     if (previousFlux > uint64_t(0xffffffffffffffffull) - fixed)
-        InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],2u);
+        InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],RTPT_VXPG_OVERFLOW_FLUX);
     uint old;
     InterlockedAdd(gVXPGCount[cell], 1u, old);
-    if (old==0xffffffffu) InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],4u);
+    if (old==0xffffffffu) InterlockedOr(gVXPGState[RTPT_VXPG_STATE_DISTRIBUTION_OVERFLOW],RTPT_VXPG_OVERFLOW_OBSERVATION_COUNT);
     if (old == 0)
     {
         gVXPGRepresentativePosition[cell] = float4(position, 1.f);

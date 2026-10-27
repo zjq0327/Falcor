@@ -1,5 +1,7 @@
 #pragma once
-#include "RTPTVXPGGrid.slang"
+#include "RTPTVXPGObservation.slang"
+
+// Shared-path training entry: observation writes only; model publication is a build step.
 
 float3 rtptVXPGTrainingEmission(ShadingData sd, BSDFProperties properties, uint materialID)
 {
@@ -40,7 +42,6 @@ float3 rtptVXPGTrainingDirect(ShadingData sd, IMaterialInstance mi, bool withMIS
     return visible && sharcNeedsVisibility ? contribution : float3(0.f);
 }
 
-#include "RTPTVXPGObservation.slang"
 void rtptVXPGStoreCellObservation(uint cell, ShadingData sd, float3 local)
 {
     rtptVXPGStoreRawCellObservation(cell,sd.posW,sd.getOrientedFaceNormal(),local);

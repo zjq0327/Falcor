@@ -1,15 +1,8 @@
 #pragma once
+#include "RTPTVXPGTypes.slang"
 
 // Importance history, not cached transport radiance. Weight decays lazily
 // between positive observations; missing observations do not mean zero light.
-struct RTPTVXPGHistory
-{
-    float mean;
-    float weight;
-    uint age;
-    uint valid;
-};
-
 RTPTVXPGHistory rtptVXPGResolveHistory(RTPTVXPGHistory previous, float mean, uint count, uint window, uint lifetime)
 {
     if (count == 0)

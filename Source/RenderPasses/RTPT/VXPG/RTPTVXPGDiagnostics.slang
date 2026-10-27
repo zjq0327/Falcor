@@ -1,5 +1,5 @@
 #pragma once
-#include "RTPTVXPGTypes.slang"
+#include "RTPTVXPGResources.slang"
 
 // Activity observations only. Algorithm state, capacity/overflow checks and
 // invalid-data counters must keep their unconditional writes.

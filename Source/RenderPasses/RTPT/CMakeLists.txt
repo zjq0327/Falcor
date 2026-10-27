@@ -8,10 +8,16 @@ target_sources(RTPT PRIVATE
     VXPG/RTPTVXPGResources.cpp
     VXPG/RTPTVXPGSettings.cpp
     VXPG/RTPTVXPGDiagnostics.cpp
+    VXPG/RTPTVXPGDiagnosticData.h
+    VXPG/RTPTVXPGReadback.cpp
+    VXPG/RTPTVXPGDiagnosticsFormat.cpp
+    VXPG/RTPTVXPGDiagnosticsUI.cpp
     RTPTCamera.slang
     VXPG/RTPTVXPGMath.slang
     VXPG/RTPTVXPGGeometry.slang
     VXPG/RTPTVXPGTypes.slang
+    VXPG/RTPTVXPGResources.slang
+    VXPG/RTPTVXPGLayout.slangh
     VXPG/RTPTVXPGDiagnostics.slang
     VXPG/RTPTVXPGHistory.slang
     VXPG/RTPTVXPGHistoryResolve.slang

@@ -1,11 +1,21 @@
 #pragma once
 #include "Falcor.h"
+#include "RTPTVXPGLayout.slangh"
 #include "Utils/Properties.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include <array>
 
 namespace RTPTVXPG
 {
+namespace Diagnostics
+{
+struct Metadata;
+struct ObservationStatistics;
+struct StatisticsSnapshot;
+struct TreeSnapshot;
+enum class StatisticsRequest;
+} // namespace Diagnostics
+
 enum class GuidingMode : uint32_t
 {
     BSDF,
@@ -87,51 +97,95 @@ struct UIState
     std::string treeText;
 };
 
+/** Per-frame sparse-training inputs, valid only between prepare() and finish().
+    These describe CPU preparation, not GPU proposal validity. */
+struct TrainingInputs
+{
+    bool writeObservations = false;
+    uint32_t frameIndex = 0;
+};
+
 /** Owns the sparse grid, importance history and GPU-published proposal.
-    RTPT schedules shared training between prepareLighting() and updateLighting(). */
+    RTPT schedules shared training between FrameUpdate::prepare() and finish(). */
 class Manager
 {
 public:
+    /** One frame's update scope. Construct before early returns; prepare only
+        when VXPG graph resources are available. No GPU work runs on destruction. */
+    class FrameUpdate
+    {
+    public:
+        FrameUpdate(const FrameUpdate&) = delete;
+        FrameUpdate& operator=(const FrameUpdate&) = delete;
+        ~FrameUpdate();
+        TrainingInputs prepare(
+            Falcor::RenderContext* context,
+            const Settings& settings,
+            Falcor::uint2 frameDim,
+            uint32_t sharedStride,
+            uint32_t sharedBounces,
+            GuidingMode mode,
+            const Falcor::ref<Falcor::Texture>& debugOutput
+        );
+        void finish(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
+
+    private:
+        friend class Manager;
+        explicit FrameUpdate(Manager& manager);
+        Manager& mManager;
+        bool mSelected = false;
+        Falcor::ref<Falcor::Texture> mpDebugOutput;
+    };
+
     explicit Manager(Falcor::ref<Falcor::Device> device) : mpDevice(device) {}
+    FrameUpdate beginUpdate() { return FrameUpdate(*this); }
     static void validate(const Settings& settings);
     Falcor::Properties renderSettingsUI(Falcor::Gui::Widgets& widget, const Settings& settings, const RuntimeContext& runtime, UIState& ui)
         const;
     void renderDiagnosticsUI(Falcor::Gui::Widgets& widget, const Settings& settings, const RuntimeContext& runtime, UIState& ui) const;
     Falcor::Properties getStatistics(const Settings& settings, const RuntimeContext& runtime) const;
     Falcor::Properties getTreeSnapshot(const Settings& settings, const RuntimeContext& runtime) const;
-    void configure(const Settings& settings, Falcor::uint2 frameDim, uint32_t sharedStride, uint32_t sharedBounces);
     void invalidate(Invalidation scope = Invalidation::Grid, const std::string& reason = {});
     void cameraChanged(bool projectionChanged, bool freezeUpdates);
     void lightingChanged();
     void setScene(const Falcor::ref<Falcor::Scene>& scene);
-    void buildGeometry(Falcor::RenderContext* context);
-    // Prepare/clear observation buffers before sparse SHaRC/VXPG training.
-    void prepareLighting(Falcor::RenderContext* context);
-    bool isTrainingPrepared() const { return mLightingPrepared; }
-    uint32_t getLightingFrameIndex() const { return mLightingFrameIndex; }
     void barrierInjection(Falcor::RenderContext* context) const;
-    void updateLighting(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
-    // Must be called even when guiding/model updates are disabled or frozen.
-    void beginFrame() { mLightingPrepared = false; }
-    void bind(const Falcor::ShaderVar& root, uint32_t frameIndex, bool active) const;
+    // Sparse shared paths write observations using the model's training frame index.
+    void bindTraining(const Falcor::ShaderVar& root, bool writeObservations) const;
+    // Bind the submitted proposal; Shader consumers validate GPU READY/generation.
+    void bindRendering(const Falcor::ShaderVar& root, uint32_t sampleOffset, bool useSubmittedModel) const;
     void invalidateDiagnosticSnapshot() { mModelDiagnosticsAvailable = false; }
-    void renderDebug(Falcor::RenderContext* context, const Falcor::ref<Falcor::Texture>& output);
     uint32_t getGeneration() const { return mGeneration; }
-    bool isReady() const { return mReady; }
+    // CPU publication commands were submitted; this does not confirm GPU completion
+    // or validity. Shader consumers still check GPU READY against the generation.
+    bool hasSubmittedModel() const { return mModelSubmitted; }
 
 private:
+    void clearTrainingPreparation() { mLightingPrepared = false; }
+    void configure(const Settings& settings, Falcor::uint2 frameDim, uint32_t sharedStride, uint32_t sharedBounces);
+    void buildGeometry(Falcor::RenderContext* context);
+    void prepareLighting(Falcor::RenderContext* context);
+    void updateLighting(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
+    void renderDebug(Falcor::RenderContext* context, const Falcor::ref<Falcor::Texture>& output);
     // Internal diagnostics and resource metadata; all readbacks remain explicit.
-    std::array<uint32_t, 8> readHistoryCounters() const;
-    std::array<uint32_t, 8> readQueryCounters() const;
-    std::array<uint32_t, 16> readTreeCounters() const;
-    std::array<uint32_t, 16> readGridCounters() const;
+    std::array<uint32_t, RTPT_VXPG_HISTORY_WORDS> readHistoryCounters() const;
+    std::array<uint32_t, RTPT_VXPG_QUERY_WORDS> readQueryCounters() const;
+    std::array<uint32_t, RTPT_VXPG_TREE_WORDS> readTreeCounters() const;
+    std::array<uint32_t, RTPT_VXPG_GRID_WORDS> readGridCounters() const;
     uint64_t getDiscoveryRecordCount() const;
     std::array<uint32_t, 32> readSharedObservationCounts() const;
-    std::array<uint32_t, 32> readCounters() const;
+    std::array<uint32_t, RTPT_VXPG_STATE_WORDS> readCounters() const;
     std::array<uint32_t, 128> readLodCounts(uint32_t geometryCount, uint32_t activeCount) const;
-    void appendObservationStatistics(Falcor::Properties& props, uint32_t geometryCount, uint32_t activeCount) const;
-    std::array<uint32_t, 8> readClusterCounters() const;
-    Falcor::Properties readTreeSnapshot(const Settings& requested) const;
+    std::array<Diagnostics::ObservationStatistics, 64> readObservationStatistics(uint32_t geometryCount, uint32_t activeCount) const;
+    std::array<uint32_t, RTPT_VXPG_CLUSTER_WORDS> readClusterCounters() const;
+    Diagnostics::Metadata captureDiagnosticMetadata(const Settings& requested, const RuntimeContext& runtime) const;
+    Diagnostics::StatisticsSnapshot readStatisticsSnapshot(
+        const Settings& requested,
+        const RuntimeContext& runtime,
+        Diagnostics::StatisticsRequest request
+    ) const;
+    Diagnostics::TreeSnapshot readTreeSnapshot(const Settings& requested, const RuntimeContext& runtime) const;
+    std::string getTreeSnapshotText(const Settings& settings, const RuntimeContext& runtime) const;
     bool hasModelDiagnostics() const { return mSettings.detailedDiagnostics && mModelDiagnosticsAvailable; }
     uint32_t getModelDiagnosticsFrameIndex() const { return mModelDiagnosticsFrameIndex; }
     uint64_t getEstimatedBytes() const { return mEstimatedBytes; }
@@ -147,10 +201,41 @@ private:
     const std::string& getFallbackReason() const { return mFallbackReason; }
 
     void updateScreenAllocation(Falcor::uint2 frameDim);
+    // Requested dimensions, derived without allocating or changing model validity.
+    struct ResourceDimensions
+    {
+        uint32_t cells;
+        uint32_t hashSlots;
+        uint32_t activeVoxels;
+        uint32_t leafCapacity;
+        uint32_t forestNodes;
+        uint32_t dirtyNodes;
+        Falcor::uint2 frameDim;
+        Falcor::uint2 superpixelDim;
+        uint64_t pixels;
+        uint64_t superpixelRows;
+        uint64_t discoveryRecords;
+        uint64_t pendingSlots;
+    };
+    ResourceDimensions getResourceDimensions() const;
+    Falcor::uint2 superpixelDimensions() const;
     void ensureGridResources();
     void ensureObservationResources();
-    void ensureLightingResources(Falcor::RenderContext* context);
-    void ensureVisibilityResources(uint32_t rows);
+    void ensureTrainingResources(Falcor::RenderContext* context);
+    void ensureVisibilityResources(const ResourceDimensions& dimensions);
+    void createGridBuffers(const ResourceDimensions& dimensions);
+    void createProposalGridBuffers(const ResourceDimensions& dimensions);
+    void createGridPasses();
+    void createLightingBuffers(Falcor::RenderContext* context, const ResourceDimensions& dimensions);
+    void createProposalBuffers(const ResourceDimensions& dimensions);
+    void createPrimaryTextures(const ResourceDimensions& dimensions);
+    void ensureLightingHistory(Falcor::RenderContext* context, const ResourceDimensions& dimensions);
+    void ensureLocalTreeResources(Falcor::RenderContext* context, const ResourceDimensions& dimensions);
+    void ensureTrainingPasses();
+    void createClusterBuffers(const ResourceDimensions& dimensions);
+    void createScreenBuffers(const ResourceDimensions& dimensions);
+    void createClusterPasses();
+    void createScreenPasses();
     enum class PassScene
     {
         None,
@@ -168,7 +253,9 @@ private:
         PassScene scene = PassScene::None,
         PassCounters counters = PassCounters::None
     ) const;
-    void bindUpdatePass(Falcor::RenderContext* context, const Falcor::ref<Falcor::ComputePass>& pass) const;
+    void bindParameters(const Falcor::ShaderVar& root, uint32_t frameIndex, bool active) const;
+    void bindResources(const Falcor::ShaderVar& root) const;
+    void bindBuildPass(Falcor::RenderContext* context, const Falcor::ref<Falcor::ComputePass>& pass) const;
     void dispatchUpdate(Falcor::RenderContext* context, const Falcor::ref<Falcor::ComputePass>& pass, Falcor::uint3 size);
     void dispatchIndirectUpdate(
         Falcor::RenderContext* context,
@@ -185,6 +272,8 @@ private:
     uint64_t primaryDiscoveryCount() const;
     uint64_t discoveryRequestCount() const { return primaryDiscoveryCount() + getDiscoveryRecordCount(); }
     void resetClusterPasses();
+    void resetTrainingPasses();
+    void resetScenePasses();
     void releaseModelResources();
     void updateVisibility(Falcor::RenderContext* context);
     void updateVisibilityClusters(Falcor::RenderContext* context);
@@ -208,7 +297,7 @@ private:
     uint64_t mEstimatedBytes = 0;
     bool mLightingPrepared = false;
     bool mResetHistory = true;
-    bool mReady = false;
+    bool mModelSubmitted = false;
     bool mGeometryValid = false;
     bool mDistributionValid = false;
     bool mModelDiagnosticsAvailable = false;
@@ -218,6 +307,11 @@ private:
     Falcor::float3 mPreviousLodCamera = Falcor::float3(0.f);
     struct GridResources
     {
+        void release() { *this = {}; }
+        void bind(const Falcor::ShaderVar& root) const;
+        uint64_t getPayloadBytes() const;
+        template<typename Visitor>
+        void forEachResource(Visitor&& visit) const;
         Falcor::ref<Falcor::Buffer> pBoundMin;
         Falcor::ref<Falcor::Buffer> pBoundMax;
         Falcor::ref<Falcor::Buffer> pHash;
@@ -239,6 +333,11 @@ private:
     } mGrid;
     struct LightingResources
     {
+        void release() { *this = {}; }
+        void bind(const Falcor::ShaderVar& root) const;
+        uint64_t getPayloadBytes() const;
+        template<typename Visitor>
+        void forEachResource(Visitor&& visit) const;
         Falcor::ref<Falcor::ComputePass> pClearFrame;
         Falcor::ref<Falcor::Buffer> pFlux;
         Falcor::ref<Falcor::Buffer> pCount;
@@ -251,6 +350,11 @@ private:
     } mLighting;
     struct ProposalResources
     {
+        void release() { *this = {}; }
+        void bind(const Falcor::ShaderVar& root) const;
+        uint64_t getPayloadBytes() const;
+        template<typename Visitor>
+        void forEachResource(Visitor&& visit) const;
         Falcor::ref<Falcor::Buffer> pState;
         Falcor::ref<Falcor::Buffer> pInverse;
         Falcor::ref<Falcor::Buffer> pWorkArgs;
@@ -310,6 +414,11 @@ private:
     } mProposal;
     struct ViewResources
     {
+        void release(); // Retains the driver allocation estimate for the current frame size.
+        void bind(const Falcor::ShaderVar& root) const;
+        uint64_t getPayloadBytes() const;
+        template<typename Visitor>
+        void forEachResource(Visitor&& visit) const;
         Falcor::ref<Falcor::ComputePass> pDebug;
         Falcor::ref<Falcor::ComputePass> pPrimary;
         Falcor::ref<Falcor::Texture> pPrimaryPosition;

@@ -116,7 +116,7 @@ float3 rtptVXPGShortBranch(ShadingData source, IMaterialInstance sourceMI, Shadi
     RTPTVXPGContext guide, uint bounce, float invRho, inout SampleGenerator sg, inout RTPTSharcStats stats)
 {
     rtptVXPGCount(RTPT_VXPG_STATE_ATTEMPTS);
-    rtptVXPGCount(14u + bounce);
+    rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_ATTEMPTS + bounce);
     RTPTVXPGCandidate candidate;
     const float4 u = float4(sampleNext2D(sg), sampleNext2D(sg));
     if (!rtptVXPGSample(guide, u, candidate))
@@ -247,7 +247,7 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
             if (gVXPGParams.pgUseCache != 0 && q > 0.f && rtptSharcPairEligible(next, nextMI, nextProperties,
                 bounce+1, delta, true, true, diffuse, properties.roughness, segment))
             {
-                rtptVXPGCount(13);
+                rtptVXPGCount(RTPT_VXPG_STATE_PG_CACHE_CHECKS);
                 guideCacheAtBRDF = rtptSharcReadPair(cacheHit, cachedLocal, cachedSuffix);
             }
             if (rtptSharcPairEligible(next, nextMI, nextProperties, bounce+1, delta, false, false, diffuse, properties.roughness, segment))

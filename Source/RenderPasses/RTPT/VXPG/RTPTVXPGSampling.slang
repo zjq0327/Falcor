@@ -1,9 +1,10 @@
 #pragma once
-#include "RTPTVXPGTypes.slang"
+#include "RTPTVXPGResources.slang"
 #include "RTPTVXPGMath.slang"
 #include "RTPTVXPGGeometry.slang"
 #include "RTPTVXPGDistribution.slang"
 
+// Query entry: use a published generation; diagnostic and invalid-data counters may be written.
 struct RTPTVXPGContext
 {
     float3 origin;
@@ -38,7 +39,7 @@ bool rtptVXPGGetContext(float3 rayOrigin, float3 surfacePosition, uint bounce, o
     context.geometryGeneration = gVXPGParams.geometryGeneration;
     context.sourceSize = rtptVXPGSurfaceSize(surfacePosition);
     context.leafCapacity = 1u << uint(firstbithigh(gVXPGParams.activeCapacity - 1u) + 1);
-    context.leafCapacity = gVXPGWorkArgs[0];
+    context.leafCapacity = gVXPGWorkArgs[RTPT_VXPG_WORK_LEAF_BASE];
     context.totalMass = gVXPGGlobalTree[1];
     return context.totalMass > 0.f && isfinite(context.totalMass);
 }
@@ -50,7 +51,7 @@ bool rtptVXPGGetSurfaceContext(float3 rayOrigin, float3 surfacePosition, float3 
     context.normal=normal;
     // Visibility is always enabled. Later bounces and unavailable screen rows
     // retain the global proposal used by the enabled estimator.
-    if (bounce!=0 || gVXPGClusterState[6]!=context.generation) return true;
+    if (bounce!=0 || gVXPGClusterState[RTPT_VXPG_CLUSTER_READY]!=context.generation) return true;
     const uint4 ids=gVXPGFuzzyIds[pixel];
     const float4 weights=gVXPGFuzzyWeights[pixel];
     // This latent choice is shared by primary NEE and every NRD component.
@@ -91,8 +92,8 @@ float rtptVXPGVoxelProbability(RTPTVXPGContext context, uint compact)
         node=parent;
     }
 #if RTPT_VXPG_DETAILED_DIAGNOSTICS
-    InterlockedAdd(gVXPGQueryStats[2],1u);InterlockedAdd(gVXPGQueryStats[3],traversed);
-    InterlockedMax(gVXPGQueryStats[6],traversed);
+    InterlockedAdd(gVXPGQueryStats[RTPT_VXPG_QUERY_REVERSE_COUNT],1u);InterlockedAdd(gVXPGQueryStats[RTPT_VXPG_QUERY_REVERSE_STEPS],traversed);
+    InterlockedMax(gVXPGQueryStats[RTPT_VXPG_QUERY_REVERSE_MAX_DEPTH],traversed);
 #endif
     return probability;
 }
@@ -136,8 +137,8 @@ bool rtptVXPGSample(RTPTVXPGContext context, float4 u, out RTPTVXPGCandidate can
         }
         compact=gVXPGForest[info.z+node].compact;
 #if RTPT_VXPG_DETAILED_DIAGNOSTICS
-        InterlockedAdd(gVXPGQueryStats[0],1u);InterlockedAdd(gVXPGQueryStats[1],traversed);
-        InterlockedMax(gVXPGQueryStats[5],traversed);
+        InterlockedAdd(gVXPGQueryStats[RTPT_VXPG_QUERY_FORWARD_COUNT],1u);InterlockedAdd(gVXPGQueryStats[RTPT_VXPG_QUERY_FORWARD_STEPS],traversed);
+        InterlockedMax(gVXPGQueryStats[RTPT_VXPG_QUERY_FORWARD_MAX_DEPTH],traversed);
 #endif
     }
     else
@@ -174,7 +175,7 @@ float rtptVXPGHitPdf(RTPTVXPGContext context, float3 hitPosition)
 {
     if(context.generation!=gVXPGParams.generation || context.geometryGeneration!=gVXPGParams.geometryGeneration ||
         gVXPGState[RTPT_VXPG_STATE_READY]!=context.generation ||
-        (context.clustered && gVXPGClusterState[6]!=context.generation))return 0.f;
+        (context.clustered && gVXPGClusterState[RTPT_VXPG_CLUSTER_READY]!=context.generation))return 0.f;
     const uint cell = rtptVXPGOwner(hitPosition);
     if (cell == RTPT_VXPG_INVALID || cell == context.currentCell) return 0.f;
     const uint compact = gVXPGInverse[cell];
@@ -194,7 +195,7 @@ bool rtptVXPGAccept(RTPTVXPGContext context, RTPTVXPGCandidate candidate, float3
     if (candidate.generation != context.generation || context.generation != gVXPGParams.generation ||
         gVXPGState[RTPT_VXPG_STATE_READY] != context.generation) return false;
     if(candidate.geometryGeneration!=context.geometryGeneration || context.geometryGeneration!=gVXPGParams.geometryGeneration)return false;
-    if (context.clustered && gVXPGClusterState[6] != context.generation) return false;
+    if (context.clustered && gVXPGClusterState[RTPT_VXPG_CLUSTER_READY] != context.generation) return false;
     if (!(candidate.pdf > 0.f) || !isfinite(candidate.pdf) || !all(isfinite(candidate.direction)) ||
         !all(isfinite(hitPosition))) return false;
     const uint cell=candidate.targetCell;
