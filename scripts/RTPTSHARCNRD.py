@@ -31,6 +31,7 @@ def render_graph_RTPTSHARCNRD():
     graph.addPass(createPass("RTPT", {
         **_vxpg_grid(),
         "enableNRD": True,
+        "nrdSplitEnabled": _module_enabled("RTPT_NRD_SPLIT_ENABLED", "1"),
         "samplesPerPixel": 1,
         "maxBounces": 4,
         "useNEE": True,

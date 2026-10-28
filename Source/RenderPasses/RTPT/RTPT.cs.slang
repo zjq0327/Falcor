@@ -1,4 +1,7 @@
 /** Single-pass Monte Carlo path tracer using inline ray queries. */
+#ifndef RTPT_NRD_SPLIT_STAGE
+#define RTPT_NRD_SPLIT_STAGE 0
+#endif
 #include "Scene/SceneDefines.slangh"
 #include "Utils/Math/MathConstants.slangh"
 
@@ -74,6 +77,9 @@ RWTexture2D<float4> gNRDMotionW;
 #if ENABLE_VXPG
 #include "VXPG/RTPTVXPGIntegrator.slang"
 #endif
+#if ENABLE_NRD && ENABLE_VXPG && RTPT_NRD_SPLIT_STAGE != 0
+#include "RTPTNRDSplit.slang"
+#endif
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -83,6 +89,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     float3 frameAverage = 0.f;
     RTPTSharcStats sharcStats = {};
+#if ENABLE_NRD && ENABLE_VXPG && RTPT_NRD_SPLIT_STAGE == 2
+    const RTPTNRDSplitRecord record = gNRDSplitRecords[rtptNRDSplitIndex(pixel)];
+    // Stage A owns the unchanged BSDF fallback, including its final outputs.
+    if (record.pending == 0u) return;
+    sharcStats = record.stats;
+    const uint sampleIndex = gParams.sampleOffset + gParams.seed * 0x9e3779b9u;
+    const float3 sampleRadiance = rtptVXPGTraceNRDSplitB(record, pixel, sampleIndex, sharcStats);
+    frameAverage += (sampleRadiance - frameAverage) / float(1);
+#else
     for (uint s = 0; s < gParams.samplesPerPixel; ++s)
     {
         // Offset the absolute sample index by an odd seed stride. Unlike XOR,
@@ -96,8 +111,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         // reflection component. The host enforces 1 spp without PT accumulation.
         float3 sampleRadiance;
 #if ENABLE_VXPG
+#if RTPT_NRD_SPLIT_STAGE == 1
+        if (rtptVXPGRenderingActive())
+        {
+            gNRDSplitRecords[rtptNRDSplitIndex(pixel)] = rtptVXPGTraceNRDSplitA(primaryRay, pixel, sampleIndex, sharcStats);
+            return;
+        }
+        // The ordinary fallback writes final outputs in A; B skips this pixel.
+        RTPTNRDSplitRecord emptyRecord = {};
+        gNRDSplitRecords[rtptNRDSplitIndex(pixel)] = emptyRecord;
+#else
         if (rtptVXPGRenderingActive()) sampleRadiance = rtptVXPGTraceNRD(primaryRay, pixel, sampleIndex, sharcStats);
         else
+#endif
 #endif
         sampleRadiance = rtptTraceNRD(primaryRay, pixel, sampleIndex, sg, sharcStats);
 #else
@@ -110,6 +136,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
     }
+#endif
 #if ENABLE_SHARC
     rtptWriteSharcDebug(pixel, sharcStats);
 #endif

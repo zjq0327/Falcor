@@ -5,6 +5,8 @@ pushd "%~dp0" || exit /b 1
 rem Module switches: 1 = enabled, 0 = disabled. These are local to this launch.
 set "RTPT_SHARC_ENABLED=1"
 set "RTPT_NRD_ENABLED=1"
+rem Experimental two-Pass VXPG NRD continuations; 0 keeps the original single Pass.
+set "RTPT_NRD_SPLIT_ENABLED=1"
 set "RTPT_ACCUMULATION_ENABLED=1"
 set "RTPT_TONEMAPPER_ENABLED=1"
 set "RTPT_LIGHT_GRID_ENABLED=1"

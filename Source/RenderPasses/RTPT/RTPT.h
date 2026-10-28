@@ -27,6 +27,7 @@ public:
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getVXPGStatistics() const;
     Properties getLocalLightStatistics() const;
+    Properties getNRDSplitStatistics() const;
     Properties captureLocalLightInspection();
     // Explicit synchronization for completed-frame RTPT benchmarks. Never
     // called by the normal render loop or by diagnostic refreshes.
@@ -40,6 +41,8 @@ private:
     void validateScene() const;
     bool updateSceneState(); ///< Apply scene changes and report whether render history must reset.
     void prepareProgram(RenderContext* pRenderContext);
+    void invalidateRenderPrograms();
+    void releaseNRDSplitRecords();
     void bindSHARC(const ShaderVar& rootVar, bool resolve = false);
     bool usesPairedSharc() const;
     void clearSHARC(RenderContext* pRenderContext);
@@ -49,6 +52,11 @@ private:
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
+    ref<ComputePass> mpNRDSplitDiffuse, mpNRDSplitSpecular;
+    ref<Buffer> mpNRDSplitRecords;
+    uint2 mNRDSplitFrameDim = uint2(0);
+    bool mNRDSplitActiveThisFrame = false;
+    bool mNRDSplitResourceFallback = false;
     ref<ComputePass> mpSHARCResolve;
     ref<ComputePass> mpSparseUpdate;
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
@@ -86,6 +94,7 @@ private:
     bool mAccumulate = true;
     uint32_t mMaxAccumulationFrames = 0; // 0 means unlimited.
     bool mEnableNRD = false;
+    bool mNRDSplitEnabled = false;
     bool mResetNRDHistory = true;
     bool mEnableSHARC = false;
     bool mSHARCEnabled = true;
