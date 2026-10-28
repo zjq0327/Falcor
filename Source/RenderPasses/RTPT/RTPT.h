@@ -5,6 +5,8 @@
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include "VXPG/RTPTVXPG.h"
+#include "PrimarySurface/RTPTPrimarySurface.h"
+#include "LocalLights/RTPTLocalLights.h"
 
 using namespace Falcor;
 
@@ -24,6 +26,11 @@ public:
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getVXPGStatistics() const;
+    Properties getLocalLightStatistics() const;
+    Properties captureLocalLightInspection();
+    // Explicit synchronization for completed-frame RTPT benchmarks. Never
+    // called by the normal render loop or by diagnostic refreshes.
+    void waitForGpu() { mpDevice->getRenderContext()->submit(true); }
     Properties getVXPGTreeSnapshot() const;
     void resetVXPG() { mpVXPG->invalidate(); mOptionsChanged = true; }
 
@@ -45,6 +52,9 @@ private:
     ref<ComputePass> mpSHARCResolve;
     ref<ComputePass> mpSparseUpdate;
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;
+    std::unique_ptr<RTPTPrimarySurface::Manager> mpPrimarySurface;
+    std::unique_ptr<RTPTLocalLights::Manager> mpLocalLights;
+    RTPTLocalLights::Settings mLocalLightSettings;
     RTPTVXPG::Settings mVXPGSettings;
     RTPTVXPG::UIState mVXPGUI;
     bool mVXPGDiagnosticFrameAvailable = false;

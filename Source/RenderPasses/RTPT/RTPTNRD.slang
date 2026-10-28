@@ -37,6 +37,8 @@ float3 rtptTraceNRDContinuation(
     ShadingData primarySD,
     IMaterialInstance primaryMI,
     uint primaryLobes,
+    uint2 pixel,
+    uint sampleIndex,
     inout SampleGenerator sg,
     out float firstHitDistance,
     inout RTPTSharcStats sharcStats
@@ -129,7 +131,9 @@ float3 rtptTraceNRDContinuation(
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
         if (previousUsedNEE)
         {
-            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sg);
+            const RTPTLightingContext lightContext = rtptSurfaceLightContext(
+                sd, pixel, sampleIndex, bounce, RTPT_LIGHT_QUERY_SECONDARY);
+            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, lightContext, sg);
             if (all(isfinite(contribution))) radiance += contribution;
         }
 
@@ -175,7 +179,7 @@ void rtptWriteNRDSignals(uint2 pixel, RTPTNRDSignals signals)
     gNRDMotionW[pixel] = float4(signals.motionW, 0.f);
 }
 
-float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
+float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
 {
     RTPTNRDSignals signals = {};
     signals.diffuseReflectance = 1.f;
@@ -235,22 +239,35 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSh
         specularSD.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
 
         RTPTLightSample ls;
-        if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLight(sd, sg, ls))
+        const RTPTLightingContext lightContext = rtptSurfaceLightContext(
+            sd, pixel, sampleIndex, 0u, RTPT_LIGHT_QUERY_MAIN_PRIMARY);
+        if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular))
         {
-            if (query.traceVisibilityRay(ls.visibilityRay))
+            const bool sampled = rtptSampleLight(sd, lightContext, sg, ls);
+            bool visible = false;
+            float3 rawDiffuse = 0.f, rawSpecular = 0.f;
+            if (sampled)
             {
-                if (hasDiffuse) signals.diffuse = rtptEvaluateDirectComponent(diffuseSD, mi, ls, sg);
-                if (hasSpecular) signals.specular = rtptEvaluateDirectComponent(specularSD, mi, ls, sg);
+                visible = query.traceVisibilityRay(ls.visibilityRay);
+                if (visible)
+                {
+                    if (hasDiffuse) signals.diffuse = rtptEvaluateDirectComponent(diffuseSD, mi, ls, sg, rawDiffuse);
+                    if (hasSpecular) signals.specular = rtptEvaluateDirectComponent(specularSD, mi, ls, sg, rawSpecular);
+                }
             }
+            // The primary light/visibility event is shared by both NRD
+            // components. Record it once after their existing evaluations.
+            const float3 raw = rawDiffuse + rawSpecular;
+            if (all(isfinite(raw))) rtptLocalRecordFeedback(lightContext, ls, raw, visible, sampled);
         }
         if (hasDiffuse)
-            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), sg, signals.diffuseHitDistance, sharcStats);
+            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), pixel, sampleIndex, sg, signals.diffuseHitDistance, sharcStats);
         if (hasSpecular)
-            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), sg, signals.specularHitDistance, sharcStats);
+            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), pixel, sampleIndex, sg, signals.specularHitDistance, sharcStats);
         if (hasDeltaSpecular)
         {
             float unusedDistance;
-            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), sg, unusedDistance, sharcStats);
+            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), pixel, sampleIndex, sg, unusedDistance, sharcStats);
         }
         // NRD deliberately excludes surfaces outside its denoising range.
         // Preserve their energy through the unfiltered residual channel.

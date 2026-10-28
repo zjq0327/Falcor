@@ -57,7 +57,7 @@ uint rtptSparseHash32(uint value)
     return (value ^ 0xb55a4f09u) ^ (value >> 16u);
 }
 
-void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
+void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel, uint sampleIndex)
 {
 #if ENABLE_SHARC
     SharcState sharcState;
@@ -113,6 +113,8 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
 #endif
         if (!all(isfinite(emission))) break;
         const uint lobes = mi.getLobeTypes(sd) & sd.mtl.getActiveLobes();
+        const RTPTLightingContext lightContext = rtptSurfaceLightContext(
+            sd, pixel, sampleIndex, bounce, RTPT_LIGHT_QUERY_TRAINING);
         if (bounce == gSparseSettings.updateBounces)
         {
 #if ENABLE_VXPG
@@ -123,7 +125,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
                 float3 raw = 0.f;
                 bool rawValid = true;
                 if (gParams.useNEE != 0u)
-                    rtptVXPGTrainingDirect(sd, mi, false, observationSG, raw, rawValid);
+                    rtptVXPGTrainingDirect(sd, mi, lightContext, false, observationSG, raw, rawValid);
                 if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel, bounce);
                 else InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
             }
@@ -140,18 +142,18 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint2 pixel)
         {
             float3 raw = 0.f;
             bool rawValid = true;
-            if (useNEE) direct = rtptVXPGTrainingDirect(sd, mi, true, sg, raw, rawValid);
+            if (useNEE) direct = rtptVXPGTrainingDirect(sd, mi, lightContext, true, sg, raw, rawValid);
             else if (gParams.useNEE != 0u)
             {
                 SampleGenerator observationSG = sg;
-                rtptVXPGTrainingDirect(sd, mi, false, observationSG, raw, rawValid);
+                rtptVXPGTrainingDirect(sd, mi, lightContext, false, observationSG, raw, rawValid);
             }
             if (rawValid) rtptVXPGStoreObservation(sd, rtptVXPGTrainingEmission(sd, properties, materialID) + raw, pixel, bounce);
             else InterlockedAdd(gVXPGState[RTPT_VXPG_STATE_INVALID], 1u);
         }
         else
 #endif
-        direct = useNEE ? rtptEstimateDirect(sd, mi, sg) : float3(0.f);
+        direct = useNEE ? rtptEstimateDirect(sd, mi, lightContext, sg) : float3(0.f);
         if (!all(isfinite(direct))) break;
 #if ENABLE_SHARC
         if (gSparseSettings.writeSHARC != 0u)
@@ -222,5 +224,5 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const float3 direction = normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW);
     const float inverseCosine = 1.f / dot(normalize(camera.cameraW), direction);
     const Ray ray = Ray(camera.posW, direction, camera.nearZ * inverseCosine, camera.farZ * inverseCosine);
-    rtptSparseTrace(ray, sg, pixel);
+    rtptSparseTrace(ray, sg, pixel, sampleIndex);
 }

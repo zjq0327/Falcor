@@ -18,6 +18,213 @@ FrameAccumulation 管理，默认 Enabled、128 帧、Stop、autoReset；0 表�
 NRD 关闭时传递当前帧信号；SHaRC 的 `sharcEnabled` 控制更新和查询，`sharcUseCache`
 只控制查询。影响信号的切换会重置 NRD 历史及最终累积。
 
+## 局部光源采样与显示
+
+主入口接入独立的 LocalLights 模块。`RTPT_LIGHT_GRID_ENABLED`、
+`RTPT_LIGHT_TILE_ENABLED`、`RTPT_LIGHT_TILE_ADAPTIVE_ENABLED` 默认 1；
+`RTPT_LIGHT_GRID_CDF_ENABLED`、`RTPT_LIGHT_GRID_PERSISTENT_ENABLED` 默认 1，
+分别控制格内 CDF 查找与跨帧格子复用。
+Light Grid 固定使用全量分布，`RTPT_LIGHT_GRID_RESOLUTION=16` 控制最大轴格数；
+窗口中 `Light Grid → Maximum grid axis` 可调。旧稀疏 Grid、后端切换、
+Global 混合比例、哈希容量、每格灯数上限、影响半径和未使用格寿命均已删除。
+`RTPT_LOCAL_LIGHT_DEBUG_ENABLED`、`RTPT_LOCAL_LIGHT_OVERLAY_ENABLED` 默认 0。
+窗口中 `RTPT → Local light sampling` 提供对应 Enabled、参数和 Inspector；
+`Light Grid → CDF sampling → Enabled` 与 `Light Grid → Persistent cache → Enabled`
+可以独立切换，两者都依赖 Light Grid 总开关。
+`LocalLightOverlay` Pass 有独立 Enabled 与透明度。原有 VXPG、SHaRC、NRD、累积和后处理控制保留。
+
+直接查看 `RTPT.localLightDebug` 可绕过 NRD 与最终累积；查看 `LocalLightOverlay.output`
+可在 ToneMapper 后叠加诊断。默认输出仍是 `ToneMapper.dst`。诊断模式包括 Grid 候选数量、
+Grid Cell、Tile 边界、真实 LightKey、真实采样来源、遮挡结果、历史有效性和年龄。
+原有模式 0–7 保留；模式 8 为 Grid cache state（橙色为本帧重建、绿色为复用、灰色为不可用，
+洋红色为类别无效），模式 9 为 Grid cache build age。建表年龄按 256 帧归一化显示；
+不表示到期倒计时，静态格子可长期复用。
+选定 Inspector X/Y 后点 Capture selected pixel，可读取该帧实际选灯的 PMF/PDF、
+Grid/Tile、候选权重及版本；不会重新采样或额外追踪阴影射线。未测试可见性的合法空事件
+与真正遮挡分别显示。采样来源蓝/绿/橙对应 Global/Grid/Tile；可见性绿/红/黄对应
+可见/遮挡/未测试。切换显示、选点或读取快照不会重置渲染历史。
+
+`PrimarySurface/` 统一生成当前帧位置、面法线/粗糙度与 HitInfo，使用与主渲染一致的
+相机和绝对 sample index。VXPG 在原有更新位置复制到自己的模型快照，冻结时保持该快照；
+LocalLights 继续使用当前视图，因此不依赖 VXPG 或 SHaRC 是否启用。
+
+`LocalLights/` 管理世界空间 Light Grid、32/16/8 像素 Tile、重投影历史与探测反馈。
+唯一的 **Full-CDF** 在场景几何包围盒上一次构建完整三维规则网格。每格包含当前
+Falcor LightCollection 全部活跃发光三角形，以及 Scene 全部启用的解析灯（包含 Directional / Distant）；
+Grid 外的有限查询位置钳制到边界格。位置、包围盒和功率仅影响重要性权重，不用于硬剔除。
+零估计、极暗和远灯仍分配正概率；没有每格灯数、catalog 扫描上限或影响半径裁剪。
+天光继续由原 EnvMapSampler 单独采样。
+
+每个非空类别以 `2^24` 个整数区间表示概率，每灯至少一个区间，剩余区间按重要性分配。
+CDF 二分查找、线性查找和 PMF 求值读取同一份量化分布，PMF 是实际整数区间宽度除以 `2^24`。
+CDF 关闭时存储区间宽度并线性扫描，完整性不变。
+Tile/Grid 分支选择与 Grid 区间选择使用独立随机数，
+防止 24-bit 分支重映射跳过最小区间。索引顺序复用共享 catalog，不为每格复制 Light ID 与 float 原始权重。
+每格每灯只需 4 字节，另有每格 48 字节元数据和每灯 32 字节热描述符。
+
+正常主表面在有有效 Tile 时使用 `75% Tile + 25% Full Grid`，无 Tile 时使用 `100% Full Grid`；
+次反弹、训练和 Probe 使用 `100% Full Grid`，**正常 Global 份额为 0**。
+这里的 Global 指独立的全灯抽样分支；完整的源灯目录继续用于建表和着色。
+因此主表面的类别内最小选灯 PMF 至少为 `1/(4*2^24)`；无 Tile 时至少为 `1/2^24`。
+最终 NEE PDF 还包含类别概率与灯面几何密度。所有分支对同一 LightKey 的概率相加后用于除权。
+完整 Grid 不可用、类别与 catalog 不匹配或资源准备失败时，整个查询回退 Global，避免只剩截断的 Tile。
+主动关闭 Grid 时使用 100% Global；Tile 保留配置，但需有效 Grid 才参与采样。重新开启 Grid 后恢复原 Tile 配置。
+
+预算不足时逐步减少网格分辨率，保留所有灯；最小一格与 Tile/历史仍无法容纳时回退 Global。
+每类别超过 `2^24` 盏灯也回退，避免承诺无法表示的最小概率。全量 CDF 的显存随格数乘灯数增长，
+降低分辨率会减弱空间重要性的精度，不会减少灯的支持域。
+只启用 Full Grid 而 Tile/Debug 均关闭时，Grid 自身不要求生成 PrimarySurface；其他模块仍可独立要求主表面。
+Persistent 关闭后每帧重建；开启时静态世界格子直接复用，相机移动不重建。
+光源集合、能量、变换、发光几何和采样配置变化会重建并重置相关历史和最终累积。
+准备阶段完成更新后，训练、Probe 和主渲染读取同一帧冻结的概率模型。
+
+每帧在准备阶段重投影历史，并用独立随机流的稀疏 Probe 探索局部光源，然后发布只读采样分布。
+之后执行共享训练和主渲染；主渲染反馈写入另一组资源，下一帧使用。
+NRD 的 diffuse/specular 共用一次选灯和阴影测试，反馈只合并记录一次。
+为保持现有 SHaRC 缓存目标一致，实际采样 PDF 与旧全局 MIS 参考 PDF 分开存储；
+NEE 和命中发光面的互补 MIS 使用同一参考分布，实际估计仍按真正的混合采样 PDF 除权。
+天光仍沿用原 EnvMapSampler，本次功能针对局部光源。
+
+历史采用有界反馈的加权替换与同光源均值更新，用于学习提议分布，不是完整的 ReSTIR reservoir
+估计器。模型预算约束 Grid、Tile 和历史；PrimarySurface 与可单独增删的 Debug 纹理另计，
+`localLightStats.resourceBytes` 统计 LocalLights 实际总分配，`primarySurfaceBytes` 单独报告主表面。
+
+Python 提供只读 `RTPT.localLightStats` 和显式 `RTPT.captureLocalLightInspection()`；
+后者只按请求读取 2032 字节快照，常规帧不做 CPU 读回。快照保留旧布局前 122 个 uint4，
+额外记录所选格子的缓存代次和建表年龄，以及每类别前 16 个候选的
+`float4(integerBins, cdfLo, cdfHi, gridPmf)`；CDF 关闭时区间为 -1，不能当作有效 CDF。
+实际事件灯即使不在前 16 项中，也单独提供同一组 Grid 数值。Grid PMF 只描述 Grid 分支，
+最终估计仍使用所有选灯分支相加后的类别内混合 PMF。
+
+开启 Debug 时，GPU 遍历所有格子/所有灯，核对正区间、类别归一化与发布代次；
+`fullGridSupportAudit` 返回检查格数、无效格数、区间错误数、检查条目数。
+`queryBranchCounts0..3` 分别返回主表面/次反弹/训练/Probe 的 Global、Grid、Tile 实际选择次数。
+这些审计和原子计数只在 Debug 开启时执行，正常采样不增加 CPU 读回。
+`gridResourceBytes` 单列 Grid 实际分配，`fullGridDimensions` 与 `fullGridBudgetReduced` 报告预算降级。
+
+显式快照同时读取本帧 GPU 建格、复用和查询计数。
+`gridCellReuseRatio` 为 reused/(built+reused)，是格子级复用率，不是射线查询命中率。
+Debug 开启时另统计实际选灯路径的 Grid 查询与缺格次数，`gridQueryMissRatio` 仅描述缺格，
+不等于全部 Global 回退比例；Inspector 的 PMF 求值不增加这些查询计数。
+纯 PT 内建累积达到上限时诊断仍可
+刷新，保持已累积颜色，不再训练提议或推进反馈历史。实现不修改共享 Material/BSDF，也不引入 DXR RT Pipeline。
+
+### LocalLights 专项测试已删除（2026-10-27）
+
+LocalLights 的专项 GPU 测试、测试着色器、验证与基准脚本、专用场景及 FalcorTest 注册已移除。
+以下保留删除前的验证和测量记录；对应的专项测试与采集命令不再提供，历史报告和图像继续保留。
+正式渲染实现、运行时 Debug/Inspector 与主入口不受影响，日常运行继续使用 `RTPR_START.cmd`。
+删除后 FalcorTest Release 重建通过；D3D12 用例枚举中 RTPT/VXPG 专项为 0，215 个通用用例保留。
+
+### 仅保留新 Grid 的历史验证（2026-10-27）
+
+旧后端及其专用资源/测试已删除，主入口、UI 与序列化不再包含后端选择或 Global 比例。
+Release RTPT/FalcorTest 构建、1 项生产整数 CDF GPU 测试、294 条真实渲染图运行检查通过。
+覆盖主管线、无 PrimarySurface 的纯 Grid、冷首帧灯光停用/恢复、发光类别移除/恢复、
+CDF/线性、Persistent、Tile/Adaptive、Debug 切换，以及预算降分辨率和整模型回退/恢复。
+
+VeachAjar、256×144、seed=1：删除前后纯 PT 的 16/64/128 帧 HDR 图像逐像素一致。
+完整管线 128 帧 HDR 均值差 −0.096%，相对 RMSE 0.993%；含时序缓存的结果不要求逐像素一致，
+单 seed 对照不构成无偏证明。1920×1080 完整管线在热身 160 帧、3×32 帧下，
+GPU 整图时间中位数为 27.85 → 27.87 ms（93 个有效样本，约 +0.07%），未观察到明显性能变化。
+Grid 逻辑缓冲统计由 28,876 → 28,832 字节，仅少了旧路径的占位缓冲，不代表进程驻留显存有明显变化。
+
+见 [本次验证汇总](../../../build/new-grid-only-validation/summary.json)。
+
+### Full-CDF 改造历史验证（2026-10-27，删除旧后端之前）
+
+Release 构建通过，RTX 5070 / D3D12 debug layer 上 8 项 GPU 测试与 917 条运行断言通过。
+覆盖 76 盏解析灯（含极远暗灯、零强度、Directional、Distant）、每格全部区间的正概率审计、
+四类查询来源、首帧/目录变化、相机复用、CDF/线性与 Persistent/Tile/Adaptive 开关，
+以及预算降分辨率、整模型 Global 回退和恢复。正常查询的 Global 次数为 0；
+次反弹、共享训练与 Probe 的 Tile 次数为 0。旧的每格灯数/catalog/半径限制设为极小值后，
+Full 模式仍保留全部灯。源码与运行目录的 17 份局部灯光 Shader 已逐一核对一致。
+
+1920×1080 完整管线，热身 160 帧、3 轮 × 32 帧，Profiler GPU 整图时间中位数：
+VeachAjar 旧 Grid+Tile 为 33.47 ms，Full Grid+Tile 为 27.85 ms（下降 16.8%）；
+32 点灯场景为 42.16 → 39.57 ms（下降 6.1%）。Global 基线分别为 30.83 / 36.19 ms，
+因此 Full 模式的收益随场景变化；多灯场景仍慢于 Global。单独完成批次的墙钟时间另存，
+不将 GPU 时间解释为应用 FPS。Full 与旧后端分别编译，避免通用热路径携带两套实现的额外开销。
+
+多灯 1080p 的 Grid 缓冲为 6.313 → 0.091 MiB，LocalLights 全部分配为
+36.124 → 29.903 MiB（下降约 17.2%）；仍由 VXPG 使用的 PrimarySurface 为 101.25 MiB。
+这些统计累加模块缓冲/纹理的分配量，整进程驻留显存还包含其他模块与驱动资源。
+只启用 Full Grid 的纯 PT 对照已确认 `primarySurfaceBytes=0`、模型有效且输出有限。
+
+正式画质矩阵为两种场景、纯 PT/完整管线、三 seed（1/7/19）、16/64/128 帧；
+另有两种场景各两份独立 2048 spp Global PT4 参考。保留 46 个无损图像归档与 67 个采集案例。
+128 帧时，纯 PT 新旧 HDR 方差在约 ±1% 内，平均亮度差约 0.15–0.17%；
+完整管线 HDR 方差分别下降约 10.0% / 4.7%，平均亮度差约 +0.59% / −0.32%。
+三 seed 仅为粗略估计，有限噪声 PT4 参考不作为完整管线真值，也不构成严格无偏证明。
+
+长批次反复重载场景后曾发生 E_OUTOFMEMORY；失败批次排除，受影响的矩阵按每模式/seed
+独立进程重跑并全部完成。`RTPR_START.cmd` 已实际启动，窗口确认 `ToneMapper.dst`、
+FrameAccumulation Enabled / Auto Reset / Max Frames=128 / Stop / 128 帧完成，并显示 Full-CDF 模式。
+嵌套 ImGui 树未能通过自动输入展开，因此窗口中的逐个复选框点击未声明通过；
+开关的关闭/恢复由真实渲染图 `set_properties` 回归验证。默认模块值未在窗口中更改。
+
+见 [完整汇总](../../../build/full-cdf-grid-validation/summary.json)、
+[画质、误差和实际图像](../../../build/full-cdf-grid-validation/report/summary.json)、
+[1080p 阶段耗时](../../../build/full-cdf-grid-validation/report-1080/summary.json)、
+[主入口累积状态](../../../build/full-cdf-grid-validation/ui/main-entry-accumulation.png)。
+
+以下是旧稀疏 Grid 的历史验证，不代表 Full-CDF 的性能。
+
+此前 LocalLights 初版的 Release 构建、763 帧/145 项功能检查，以及主入口配置的 1080p、139 帧/22 项检查通过。
+以下初版记录不覆盖新增的 CDF 与持久 Grid；新增路径的验证见本节后续记录。
+覆盖全局基线、Grid/Tile/Adaptive/Debug/Overlay 独立切换、预算与容量回退、相机/分辨率/seed、
+无场景、纯 PT 持帧及完整管线 128 帧 Stop；停止最终累积后采样模型和 SHaRC 仍继续更新。
+已实际运行 `RTPR_START.cmd` 并检查窗口，默认输出为 `ToneMapper.dst`。
+两个 seed、256 spp 的多灯纯 PT 对照中，引导/全局平均亮度差为解析灯 +0.069%、面光源 −0.028%，
+处于 seed 波动范围；这不是严格无偏性的数值证明或性能基准，也不保证 VeachAjar 单灯场景加速。
+本机 1080p 的分配统计为 LocalLights 约 34.1 MiB、PrimarySurface 约 101.3 MiB，VXPG 仍保留独立快照。
+临时验证脚本与场景已清理。见 [完整验证报告](../../../build/local-lights-validation/local-lights-verification-summary.json)、
+[实际四视图](../../../build/local-lights-validation/local-light-veach-views.png) 和
+[主入口窗口](../../../build/local-lights-validation/main-entry-window.png)。
+
+下述历史画质/耗时数据由现已删除的专项采集工具生成。many 测试场景为原 VeachAjar 加
+32 个非均匀点光源，保留原发光面，与旧 96 灯合成基准不同。采集时保留主图连线；
+纯 PT 对照关闭 VXPG/SHaRC/NRD，完整管线保留这些模块并使用最终累积 128 帧 Stop。
+无损 NPZ 图像与 JSON 报告继续保留；GPU 时间来自 Profiler 时间戳，墙钟批次在两端等待 GPU 完成。
+Global PT4 双参考仅用于纯 PT 误差及参考噪声底估计，完整管线只比较多 seed 噪声和可视结果。
+
+2026-10-27 的 CDF / 持久 Grid 版本已通过 Release 的 RTPT、Mogwai、FalcorTest 构建。
+RTX 5070 / D3D12 debug layer 上 7 项生产 Shader helper GPU 测试及 1153 条运行断言通过。
+运行断言涵盖 CDF 区间和实际混合 PMF、哈希碰撞/退役/重插、同 Tile 跨多个 Cell、
+Grid 缺失或溢出时的 Tile 回退、光照失效，以及 Grid 实际开启时 CDF / Persistent 四组合。
+Grid / Tile 关闭时，CDF / Persistent 四组合的纯 PT 图像逐像素一致。
+阶段 A / B 的 31 / 122 条检查单独保留为历史记录，不重复计入上述 1153 条。
+原始报告、硬件证据与校验值见 [当前自动验证汇总](../../../build/local-light-cdf-validation/summary.json)。
+
+同版本正式画质矩阵已完成：256×144、三 seed、16 / 64 / 128 帧，纯 PT 六种模式及完整管线四种模式，
+两种场景共 42 个采集进程、64 个无损图像归档，另含各场景两份独立 2048 spp 纯 PT 参考。
+本组场景中 CDF 与线性 Grid 的画质基本相同；持久 CDF 在多灯纯 PT 的 GPU 图耗时为 0.305 ms，
+线性 Grid + Adaptive Tile 为 0.317 ms，Global 为 0.170 ms。
+完整管线多灯的持久 CDF / 线性 / Global 则为 1.827 / 1.810 / 1.532 ms。
+这些是开启 Profiler 的 GPU 图时间，不是应用 FPS；独立完成批次墙钟也保留在报告中。
+128 帧多灯纯 PT 的持久 CDF HDR 方差约为 Global 的 0.977，完整管线约为 0.893，
+显示空间的差异更小；三 seed 仅提供粗略估计，本次结果不支持明显的整体加速或收敛收益。
+误差曲线采用有限噪声参考，不作严格无偏证明；近似同 GPU 预算图使用帧数乘稳态耗时，
+排除冷启动和编译，不能解释为实际冷启动等墙钟时间测试。
+见 [画质/阶段耗时/复用诊断与实际图像](../../../build/local-light-cdf-comparison/report/summary.json)。
+
+默认 1920×1080 的完整管线另完成 8 组稳态计时（热身 160 帧，3 轮，计时 seed=1）。
+VeachAjar 的 Global / 线性 Grid+Tile / CDF 每帧重建 / 持久 CDF 为
+29.49 / 31.59 / 32.13 / 32.30 ms；32 点灯场景为 34.85 / 39.97 / 40.24 / 40.73 ms。
+这里都是完整 RenderGraph 的 GPU 时间中位数，1080p 没有另采画质矩阵。
+多灯持久化将 LocalLightPrepare 从 0.235 降至 0.206 ms，但整图没有因此加速，
+MainRender 的完整路径工作仍占主要耗时。当前数据不支持优先增加复杂的并行建表或候选池；
+后续优化应先隔离主渲染查询与请求维护的成本，不能将 MainRender 全部归为选灯开销。
+见 [1080p 完整计时](../../../build/local-light-cdf-comparison-1080/report/summary.json) 与
+[紧凑耗时图](../../../build/local-light-cdf-comparison-1080/report/timing-overview.png)。
+
+已实际通过 `RTPR_START.cmd` 打开窗口验证：默认 VeachAjar、`ToneMapper.dst`、NRD Enabled、
+FrameAccumulation Enabled / Auto Reset / Max Frames=128 / Stop / 128 帧完成均保留。
+CDF 与 Persistent 默认启用，分别关闭和重新开启后画面重新累积；Grid、Tile、Adaptive 开关保留。
+新增 Grid cache state 和 Grid cache build age 两个视图均已在窗口中实际显示。
+结束时恢复 CDF / Persistent / Grid / Tile / Adaptive 启用、Debug 关闭、`ToneMapper.dst` 正常输出。
+见 [窗口验证记录及截图索引](../../../build/local-light-cdf-validation/main-entry-ui.json)。
+
 ## VXPG 固定行为与控制
 
 VXPG 固定使用世界空间稀疏哈希、增量建格、距离 Multi LOD、普通相机移动复用、
@@ -124,13 +331,14 @@ Shader 的职责：
 
 ## 每帧顺序与不变量
 
-1. 准备资源、清本帧观测、标记过期网格，并保存上一帧历史/法线。
-2. RTPT 调度固定的 Shared injection；已有 cell 直接累积，缺失 cell 记录待回放观测。
-3. 生成当前帧主表面 position/normal/hit。此阶段不是单独的光照注入路径。
-4. 网格 discover → insert → replay，只回放原先未写入的观测。
-5. 解析历史及置信度，判断成员变化，建立或更新全局树。
-6. 局部权重更新，固定更新 Visibility 的 Radix + Heap 簇树和当前帧屏幕分布。
-7. 发布完整提议，再回收旧 cell ID；主渲染查询已发布模型。
+1. 准备 VXPG 资源、清本帧观测、标记过期网格，并保存上一帧历史/法线。
+2. PrimarySurface 生成当前视图；独立的 LocalLights 完成 Grid/Tile/Probe 更新并发布选灯分布。
+3. RTPT 调度固定的 Shared injection；已有 cell 直接累积，缺失 cell 记录待回放观测。
+4. VXPG 将共享主表面复制到自己的 position/normal/hit 快照。此阶段不是单独的光照注入路径。
+5. 网格 discover → insert → replay，只回放原先未写入的观测。
+6. 解析历史及置信度，判断成员变化，建立或更新全局树。
+7. 局部权重更新，固定更新 Visibility 的 Radix + Heap 簇树和当前帧屏幕分布。
+8. 发布完整提议，再回收旧 cell ID；主渲染查询已发布模型。
 
 Visibility 的编排入口只串联四个阶段：`updateVisibilityClusters()` → `sortClusterVoxels()` →
 `buildClusterForest()` → `updateScreenDistribution()`。排序阶段返回最终缓冲，建树阶段显式接收它；

@@ -3,6 +3,7 @@
 #include "RTPTVXPGLayout.slangh"
 #include "Utils/Properties.h"
 #include "Utils/Sampling/SampleGenerator.h"
+#include "../PrimarySurface/RTPTPrimarySurface.h"
 #include <array>
 
 namespace RTPTVXPG
@@ -127,7 +128,7 @@ public:
             GuidingMode mode,
             const Falcor::ref<Falcor::Texture>& debugOutput
         );
-        void finish(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
+        void finish(Falcor::RenderContext* context, const RTPTPrimarySurface::View& primary);
 
     private:
         friend class Manager;
@@ -165,7 +166,7 @@ private:
     void configure(const Settings& settings, Falcor::uint2 frameDim, uint32_t sharedStride, uint32_t sharedBounces);
     void buildGeometry(Falcor::RenderContext* context);
     void prepareLighting(Falcor::RenderContext* context);
-    void updateLighting(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
+    void updateLighting(Falcor::RenderContext* context, const RTPTPrimarySurface::View& primary);
     void renderDebug(Falcor::RenderContext* context, const Falcor::ref<Falcor::Texture>& output);
     // Internal diagnostics and resource metadata; all readbacks remain explicit.
     std::array<uint32_t, RTPT_VXPG_HISTORY_WORDS> readHistoryCounters() const;
@@ -263,7 +264,7 @@ private:
         const Falcor::ref<Falcor::Buffer>& arguments,
         uint64_t byteOffset = 0
     );
-    void updatePrimaryData(Falcor::RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD);
+    void updatePrimaryData(Falcor::RenderContext* context, const RTPTPrimarySurface::View& primary);
     void resolveHistoryAndBuildGlobalTree(Falcor::RenderContext* context);
     void updateLocalTrees(Falcor::RenderContext* context);
     void publishAndRetire(Falcor::RenderContext* context);

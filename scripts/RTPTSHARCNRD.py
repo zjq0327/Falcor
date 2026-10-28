@@ -34,6 +34,13 @@ def render_graph_RTPTSHARCNRD():
         "samplesPerPixel": 1,
         "maxBounces": 4,
         "useNEE": True,
+        "localLightGridEnabled": _module_enabled("RTPT_LIGHT_GRID_ENABLED", "1"),
+        "localLightGridResolution": int(os.environ.get("RTPT_LIGHT_GRID_RESOLUTION", "16")),
+        "localLightGridCdfEnabled": _module_enabled("RTPT_LIGHT_GRID_CDF_ENABLED", "1"),
+        "localLightGridPersistentEnabled": _module_enabled("RTPT_LIGHT_GRID_PERSISTENT_ENABLED", "1"),
+        "localLightTileEnabled": _module_enabled("RTPT_LIGHT_TILE_ENABLED", "1"),
+        "localLightAdaptiveEnabled": _module_enabled("RTPT_LIGHT_TILE_ADAPTIVE_ENABLED", "1"),
+        "localLightDebugEnabled": _module_enabled("RTPT_LOCAL_LIGHT_DEBUG_ENABLED", "0"),
         "useRussianRoulette": True,
         "rrStartBounce": 3,
         "accumulate": False,
@@ -95,6 +102,10 @@ def render_graph_RTPTSHARCNRD():
         "autoExposure": False,
         "exposureCompensation": 0.0,
     }), "ToneMapperReference")
+    graph.addPass(createPass("RTPTLocalLightOverlay", {
+        "enabled": _module_enabled("RTPT_LOCAL_LIGHT_OVERLAY_ENABLED", "0"),
+        "opacity": 1.0,
+    }), "LocalLightOverlay")
 
     graph.addEdge("RTPT.nrdDiffuseRadianceHitDist", "NRD.diffuseRadianceHitDist")
     graph.addEdge("RTPT.nrdSpecularRadianceHitDist", "NRD.specularRadianceHitDist")
@@ -110,6 +121,8 @@ def render_graph_RTPTSHARCNRD():
     graph.addEdge("ModulateIllumination.output", "FrameAccumulation.input")
     graph.addEdge("FrameAccumulation.output", "ToneMapper.src")
     graph.addEdge("RTPT.noisyColor", "ToneMapperReference.src")
+    graph.addEdge("ToneMapper.dst", "LocalLightOverlay.color")
+    graph.addEdge("RTPT.localLightDebug", "LocalLightOverlay.debug")
 
     graph.markOutput("ToneMapper.dst")
     # Debug textures bypass NRD; only radiance signals are connected to the denoiser.
@@ -122,6 +135,8 @@ def render_graph_RTPTSHARCNRD():
     graph.markOutput("RTPT.sharcCacheRadiance")
     graph.markOutput("RTPT.sharcStats")
     graph.markOutput("RTPT.vxpgDebug")
+    graph.markOutput("RTPT.localLightDebug")
+    graph.markOutput("LocalLightOverlay.output")
     return graph
 
 

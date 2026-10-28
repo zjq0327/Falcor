@@ -39,11 +39,11 @@ TrainingInputs Manager::FrameUpdate::prepare(
     return {mManager.mLightingPrepared, mManager.mLightingFrameIndex};
 }
 
-void Manager::FrameUpdate::finish(RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD)
+void Manager::FrameUpdate::finish(RenderContext* context, const RTPTPrimarySurface::View& primary)
 {
     if (!mSelected)
         return;
-    mManager.updateLighting(context, seed, sampleOffset, useNRD);
+    mManager.updateLighting(context, primary);
     // Frozen models still support debug rendering even without a new update.
     mManager.renderDebug(context, mpDebugOutput);
     mSelected = false;
@@ -395,14 +395,14 @@ void Manager::dispatchIndirectUpdate(
     pass->executeIndirect(context, arguments.get(), byteOffset);
 }
 
-void Manager::updateLighting(RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD)
+void Manager::updateLighting(RenderContext* context, const RTPTPrimarySurface::View& primary)
 {
     if (!mLightingPrepared)
         return;
     mLightingPrepared = false;
 
     // Shared training has already written observations between prepare/update.
-    updatePrimaryData(context, seed, sampleOffset, useNRD);
+    updatePrimaryData(context, primary);
     finishIncrementalGrid(context);
     resolveHistoryAndBuildGlobalTree(context);
     updateLocalTrees(context);
@@ -411,19 +411,19 @@ void Manager::updateLighting(RenderContext* context, uint32_t seed, uint32_t sam
     publishAndRetire(context);
 }
 
-void Manager::updatePrimaryData(RenderContext* context, uint32_t seed, uint32_t sampleOffset, bool useNRD)
+void Manager::updatePrimaryData(RenderContext* context, const RTPTPrimarySurface::View& primary)
 {
-    FALCOR_PROFILE(context, "VXPGPrimary");
+    FALCOR_CHECK(primary.isValid() && all(primary.frameDim == mFrameDim), "VXPG requires the current RTPT primary surface view.");
+    FALCOR_PROFILE(context, "VXPGPrimarySnapshot");
     context->uavBarrier(mView.pPrimaryPosition.get());
     context->uavBarrier(mView.pPrimaryNormal.get());
     context->uavBarrier(mView.pPrimaryHit.get());
     context->uavBarrier(mLighting.pRepresentativePosition.get());
     context->uavBarrier(mLighting.pRepresentativeNormal.get());
     auto root = mView.pPrimary->getRootVar();
-    mpSampleGenerator->bindShaderData(root);
-    root["gParams"]["seed"] = seed;
-    root["gParams"]["sampleOffset"] = sampleOffset;
-    root["gParams"]["useNRD"] = useNRD ? 1u : 0u;
+    root["gPrimarySourcePosition"] = primary.position;
+    root["gPrimarySourceNormalRoughness"] = primary.normalRoughness;
+    root["gPrimarySourceHit"] = primary.hit;
     dispatchUpdate(context, mView.pPrimary, uint3(mFrameDim, 1));
     context->uavBarrier(mLighting.pFlux.get());
     context->uavBarrier(mLighting.pCount.get());

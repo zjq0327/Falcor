@@ -6,7 +6,7 @@ Ray rtptGenerateCameraRay(uint2 pixel, inout SampleGenerator sg)
     return rtptCameraRay(pixel, gParams.frameDim, ENABLE_NRD != 0, sg);
 }
 
-float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
+float3 rtptTracePath(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
 {
     float3 radiance = 0.f;
     float3 throughput = 1.f;
@@ -101,7 +101,9 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
         if (previousUsedNEE)
         {
-            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sg);
+            const RTPTLightingContext lightContext = rtptSurfaceLightContext(sd, pixel, sampleIndex, bounce,
+                bounce == 0 ? RTPT_LIGHT_QUERY_MAIN_PRIMARY : RTPT_LIGHT_QUERY_SECONDARY);
+            const float3 contribution = throughput * rtptEstimateDirect(sd, mi, lightContext, sg);
             if (all(isfinite(contribution))) radiance += contribution;
         }
 

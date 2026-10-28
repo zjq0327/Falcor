@@ -99,14 +99,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         if (rtptVXPGRenderingActive()) sampleRadiance = rtptVXPGTraceNRD(primaryRay, pixel, sampleIndex, sharcStats);
         else
 #endif
-        sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg, sharcStats);
+        sampleRadiance = rtptTraceNRD(primaryRay, pixel, sampleIndex, sg, sharcStats);
 #else
         float3 sampleRadiance;
 #if ENABLE_VXPG
         if (rtptVXPGRenderingActive()) sampleRadiance = rtptVXPGTracePath(primaryRay, pixel, sampleIndex, sharcStats);
         else
 #endif
-        sampleRadiance = rtptTracePath(primaryRay, sg, sharcStats);
+        sampleRadiance = rtptTracePath(primaryRay, pixel, sampleIndex, sg, sharcStats);
 #endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
     }

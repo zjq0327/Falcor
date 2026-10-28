@@ -557,7 +557,7 @@ void Manager::ensureTrainingPasses()
         mProposal.pForestWork = createPass("RTPTVXPGPrepare.cs.slang", "forestWork");
     }
     if (!mView.pPrimary)
-        mView.pPrimary = createPass("RTPTVXPGPrimary.cs.slang", "main", PassScene::SceneAndSampler, PassCounters::Configured);
+        mView.pPrimary = createPass("RTPTVXPGPrimary.cs.slang", "main", PassScene::None, PassCounters::Configured);
 }
 
 void Manager::ensureTrainingResources(RenderContext* context)

@@ -1,4 +1,5 @@
 #include "RTPT.h"
+#include "LocalLights/Debug/RTPTLocalLightOverlay.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Scene/Material/StandardMaterial.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
@@ -39,10 +40,14 @@ const Gui::DropdownList kSHARCCapacities = {
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, RTPT>();
+    registry.registerClass<RenderPass, RTPTLocalLightOverlay>();
     ScriptBindings::registerBinding([](pybind11::module& m)
     {
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("vxpgStats", [](const RTPT& self) { return self.getVXPGStatistics().toPython(); });
+        pass.def_property_readonly("localLightStats", [](const RTPT& self) { return self.getLocalLightStatistics().toPython(); });
+        pass.def("captureLocalLightInspection", [](RTPT& self) { return self.captureLocalLightInspection().toPython(); });
+        pass.def("waitForGpu", &RTPT::waitForGpu);
         pass.def("vxpgTreeSnapshot", [](const RTPT& self) { return self.getVXPGTreeSnapshot().toPython(); });
         pass.def("resetVXPG", &RTPT::resetVXPG);
     });
@@ -50,6 +55,8 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 
 RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
+    mpPrimarySurface = std::make_unique<RTPTPrimarySurface::Manager>(mpDevice);
+    mpLocalLights = std::make_unique<RTPTLocalLights::Manager>(mpDevice);
     mpVXPG = std::make_unique<RTPTVXPG::Manager>(mpDevice);
     setProperties(props);
     mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_UNIFORM);
@@ -79,6 +86,19 @@ Properties RTPT::getVXPGStatistics() const
     return mpVXPG->getStatistics(mVXPGSettings, getVXPGContext());
 }
 
+Properties RTPT::getLocalLightStatistics() const
+{
+    auto stats = mpLocalLights->getStatistics();
+    stats["primarySurfaceBytes"] = mpPrimarySurface->getPayloadBytes();
+    stats["primarySurfaceFrameSerial"] = mpPrimarySurface->getView().frameSerial;
+    return stats;
+}
+
+Properties RTPT::captureLocalLightInspection()
+{
+    return mpLocalLights->captureInspection();
+}
+
 Properties RTPT::getVXPGTreeSnapshot() const
 {
     return mpVXPG->getTreeSnapshot(mVXPGSettings, getVXPGContext());
@@ -97,6 +117,7 @@ void RTPT::setProperties(const Properties& props)
     uint32_t sharcStaleFrames = mSHARCStaleFrames, sharcDebugMode = mSHARCDebugMode;
     float sharcSceneScale = mSHARCSceneScale, sharcMinRoughness = mSHARCMinRoughness;
     auto vxpg = mVXPGSettings;
+    auto localLights = mLocalLightSettings;
     auto guidingMode = mGuidingMode;
     bool enableVXPG = mEnableVXPG;
     for (const auto& [key, value] : props)
@@ -130,7 +151,7 @@ void RTPT::setProperties(const Properties& props)
             FALCOR_CHECK(mode == "BSDF" || mode == "VXPG", "Invalid RTPT guiding mode '{}'.", mode);
             guidingMode = mode == "BSDF" ? RTPTVXPG::GuidingMode::BSDF : RTPTVXPG::GuidingMode::VXPG;
         }
-        else if (!RTPTVXPG::parseSetting(key, value, vxpg))
+        else if (!RTPTVXPG::parseSetting(key, value, vxpg) && !RTPTLocalLights::parseSetting(key, value, localLights))
             FALCOR_THROW("Unknown RTPT property '{}'.", key);
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
@@ -142,6 +163,7 @@ void RTPT::setProperties(const Properties& props)
         "RTPT SHaRC mode requires accumulate=false; its world-space cache changes between frames.");
     FALCOR_CHECK(!enableVXPG || !accumulate, "RTPT VXPG requires accumulate=false; use the independent FrameAccumulation pass.");
     RTPTVXPG::Manager::validate(vxpg);
+    RTPTLocalLights::Manager::validate(localLights);
     FALCOR_CHECK(sharcEntries >= (1u << 16) && sharcEntries <= (1u << 22) && (sharcEntries & (sharcEntries - 1)) == 0,
         "SHaRC entries must be a power of two in [65536, 4194304].");
     FALCOR_CHECK(sharcUpdateStride >= 1 && sharcUpdateStride <= 32 && sharcUpdateBounces >= 1 && sharcUpdateBounces <= 32,
@@ -161,6 +183,9 @@ void RTPT::setProperties(const Properties& props)
     const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enableVXPG != mEnableVXPG ||
         guidingMode != mGuidingMode || pairedChanged;
     const auto vxpgChanges = RTPTVXPG::compareSettings(mVXPGSettings, vxpg);
+    const auto localLightChanges = RTPTLocalLights::compareSettings(mLocalLightSettings, localLights);
+    if (seed != mSeed || useNEE != mUseNEE)
+        mpLocalLights->invalidate(RTPTLocalLights::Invalidation::History);
     const bool vxpgStructureChanged = vxpgChanges.resources() || enableVXPG != mEnableVXPG;
     const bool vxpgTrainingChanged = useNEE != mUseNEE || seed != mSeed ||
         sharcUpdateStride != mSHARCUpdateStride || sharcUpdateBounces != mSHARCUpdateBounces ||
@@ -192,7 +217,8 @@ void RTPT::setProperties(const Properties& props)
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
-        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || vxpgSignalChanged;
+        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || vxpgSignalChanged ||
+        localLightChanges.signal;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= pairedChanged;
     if (sharcEntries != mSHARCEntries)
@@ -231,6 +257,8 @@ void RTPT::setProperties(const Properties& props)
     mSHARCMinRoughness = sharcMinRoughness;
     mEnableVXPG = enableVXPG;
     mVXPGSettings = vxpg;
+    mLocalLightSettings = localLights;
+    mpLocalLights->configure(mLocalLightSettings);
     mGuidingMode = guidingMode;
     if (modeChanged)
     {
@@ -270,6 +298,7 @@ Properties RTPT::getProperties() const
     props["enableVXPG"] = mEnableVXPG;
     props["guidingMode"] = mGuidingMode == RTPTVXPG::GuidingMode::BSDF ? "BSDF" : "VXPG";
     RTPTVXPG::writeSettings(props, mVXPGSettings);
+    RTPTLocalLights::writeSettings(props, mLocalLightSettings);
     return props;
 }
 
@@ -298,6 +327,9 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
         reflection.addOutput("vxpgDebug", "VXPG voxel/proposal diagnostics, independent of NRD")
             .format(ResourceFormat::RGBA32Float)
             .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+    reflection.addOutput("localLightDebug", "Local light Grid/Tile/sample diagnostics, independent of NRD and accumulation")
+        .format(ResourceFormat::RGBA32Float)
+        .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
     return reflection;
 }
 
@@ -331,6 +363,8 @@ void RTPT::validateScene() const
 void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
+    mpPrimarySurface->setScene(pScene);
+    mpLocalLights->setScene(pScene);
     mpVXPG->setScene(pScene);
     mpComputePass = nullptr;
     mpSHARCResolve = nullptr;
@@ -358,6 +392,8 @@ bool RTPT::updateSceneState()
     {
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
+        mpPrimarySurface->invalidate();
+        mpLocalLights->invalidate(RTPTLocalLights::Invalidation::Catalog);
         mpVXPG->setScene(mpScene);
     }
     if (is_set(updates, IScene::UpdateFlags::GeometryChanged) || is_set(updates, IScene::UpdateFlags::MaterialsChanged))
@@ -376,6 +412,7 @@ bool RTPT::updateSceneState()
 
     const auto discontinuities = IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::GeometryChanged |
         IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::EmissiveMaterialsChanged |
+        IScene::UpdateFlags::LightCollectionChanged |
         IScene::UpdateFlags::EnvMapChanged | IScene::UpdateFlags::EnvMapPropertiesChanged |
         IScene::UpdateFlags::LightIntensityChanged | IScene::UpdateFlags::LightPropertiesChanged |
         IScene::UpdateFlags::LightCountChanged | IScene::UpdateFlags::RenderSettingsChanged |
@@ -385,7 +422,13 @@ bool RTPT::updateSceneState()
     const auto worldInvalidations = discontinuities & ~IScene::UpdateFlags::CameraSwitched;
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
     const bool worldChanged = (updates & (worldInvalidations | movingScene)) != IScene::UpdateFlags::None;
-    if (worldChanged) mResetSHARCCache = true;
+    if (worldChanged)
+    {
+        mResetSHARCCache = true;
+        if (!programsChanged) mpLocalLights->invalidate(RTPTLocalLights::Invalidation::Catalog);
+    }
+    else if (projectionChanged || is_set(updates, IScene::UpdateFlags::CameraSwitched))
+        mpLocalLights->invalidate(RTPTLocalLights::Invalidation::History);
     // setScene() already invalidates the grid. World changes take precedence
     // over view-only changes; each scene update has one model invalidation.
     if (!programsChanged)
@@ -412,6 +455,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     if (lightingMask != mLightingMask)
     {
         mLightingMask = lightingMask;
+        mpLocalLights->invalidate(RTPTLocalLights::Invalidation::Catalog);
         mpVXPG->lightingChanged();
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
@@ -563,6 +607,8 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
 {
     FALCOR_PROFILE(pRenderContext, "SparseTrace");
     auto var = mpSparseUpdate->getRootVar();
+    mpLocalLights->bindSampling(var, RTPTLocalLights::QueryKind::SharedTraining);
+    mpLocalLights->bindFeedback(var, RTPTLocalLights::QueryKind::SharedTraining);
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
     mpSampleGenerator->bindShaderData(var);
     if (mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
@@ -672,6 +718,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext, const RTPTVXPG::Traini
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    renderData.getDictionary()["rtptLocalLightDebugEnabled"] = mLocalLightSettings.debugEnabled;
     auto vxpgUpdate = mpVXPG->beginUpdate();
     mVXPGSharedTrainingThisFrame = mVXPGSharedWithSHARCThisFrame = false;
     auto color = renderData.getTexture("color");
@@ -687,6 +734,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             for (const auto* output : kSHARCOutputs)
                 pRenderContext->clearTexture(renderData.getTexture(output).get());
         if (mEnableVXPG) pRenderContext->clearTexture(renderData.getTexture("vxpgDebug").get());
+        if (auto debug = renderData.getTexture("localLightDebug"))
+            pRenderContext->clearUAV(debug->getUAV().get(), float4(0.f));
         return;
     }
 
@@ -726,23 +775,43 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         // Restore the persistent average even if the graph output was reused or
         // reallocated. noisyColor retains the last traced frame at the limit.
         pRenderContext->copyResource(color.get(), mpAccumulation.get());
+        RTPTPrimarySurface::View heldPrimary;
+        if (mLocalLightSettings.debugEnabled)
+        {
+            const uint32_t lastSampleOffset = mSampleOffset >= mSamplesPerPixel ? mSampleOffset - mSamplesPerPixel : 0u;
+            const auto& cached = mpPrimarySurface->getView();
+            if (cached.isValid() && all(cached.frameDim == mFrameDim) && cached.seed == mSeed &&
+                cached.sampleOffset == lastSampleOffset && cached.useNRD == mEnableNRD)
+                heldPrimary = cached;
+            else
+                heldPrimary = mpPrimarySurface->prepare(pRenderContext, {mFrameDim, mSeed, lastSampleOffset, mEnableNRD});
+        }
+        // Display controls remain live after PT accumulation stops. This only
+        // reads the held proposal; it does not train it or advance its history.
+        mpLocalLights->renderHeldDebug(pRenderContext, renderData.getTexture("localLightDebug"), heldPrimary);
         return;
     }
     RTPTVXPG::TrainingInputs vxpgTraining;
     if (mEnableVXPG)
         vxpgTraining = vxpgUpdate.prepare(pRenderContext, mVXPGSettings, mFrameDim, mSHARCUpdateStride, mSHARCUpdateBounces,
             mGuidingMode, renderData.getTexture("vxpgDebug"));
+    RTPTPrimarySurface::View primarySurface;
+    if (vxpgTraining.writeObservations || mpLocalLights->needsPrimarySurface())
+        primarySurface = mpPrimarySurface->prepare(pRenderContext, {mFrameDim, mSeed, mSampleOffset, mEnableNRD});
+    mpLocalLights->prepareFrame(pRenderContext, {mFrameDim, mSampleOffset, mSeed, primarySurface, mUseNEE});
     if (mEnableSHARC || vxpgTraining.writeObservations)
     {
         if (mEnableSHARC && mResetSHARCCache) mResetNRDHistory = true;
         executeTraining(pRenderContext, vxpgTraining);
     }
-    vxpgUpdate.finish(pRenderContext, mSeed, mSampleOffset, mEnableNRD);
+    vxpgUpdate.finish(pRenderContext, primarySurface);
     if ((mEnableNRD || mEnableSHARC || mEnableVXPG) && mResetNRDHistory)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
 
     auto var = mpComputePass->getRootVar();
+    mpLocalLights->bindSampling(var, RTPTLocalLights::QueryKind::MainPrimary);
+    mpLocalLights->bindFeedback(var, RTPTLocalLights::QueryKind::MainPrimary);
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
     mpSampleGenerator->bindShaderData(var);
     if (mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
@@ -777,6 +846,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         FALCOR_PROFILE(pRenderContext, "MainRender");
         mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
     }
+    mpLocalLights->renderDebug(pRenderContext, renderData.getTexture("localLightDebug"));
+    mpLocalLights->finishFrame(pRenderContext);
     mVXPGDiagnosticFrameAvailable = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG &&
         mVXPGSettings.enabled && mVXPGSettings.detailedDiagnostics && mpVXPG->hasSubmittedModel();
     if (mVXPGDiagnosticFrameAvailable)
@@ -830,6 +901,15 @@ void RTPT::renderUI(Gui::Widgets& widget)
         widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
     mOptionsChanged |= changed;
     mResetSHARCCache |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
+    if (previousNEE != mUseNEE || previousSeed != mSeed)
+        mpLocalLights->invalidate(RTPTLocalLights::Invalidation::History);
+    if (auto local = widget.group("Local light sampling"))
+    {
+        const auto properties = mpLocalLights->renderSettingsUI(local);
+        if (!properties.empty()) setProperties(properties);
+        const auto diagnostics = mpLocalLights->renderDiagnosticsUI(local);
+        if (!diagnostics.empty()) setProperties(diagnostics);
+    }
     if (mEnableVXPG)
     {
         uint32_t mode = uint32_t(mGuidingMode);

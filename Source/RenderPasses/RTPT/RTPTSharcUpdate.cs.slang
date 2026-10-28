@@ -42,7 +42,7 @@ ParameterBlock<EnvMapSampler> gEnvMapSampler;
 #include "RTPTSharc.slang"
 #include "RTPTIntegrator.slang"
 
-void rtptUpdateSharcPath(Ray ray, inout SampleGenerator sg)
+void rtptUpdateSharcPath(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg)
 {
     SharcState state;
     SharcInit(state);
@@ -99,7 +99,9 @@ void rtptUpdateSharcPath(Ray ray, inout SampleGenerator sg)
 
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         const bool useNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
-        const float3 direct = useNEE ? rtptEstimateDirect(sd, mi, sg) : float3(0.f);
+        const RTPTLightingContext lightContext = rtptSurfaceLightContext(
+            sd, pixel, sampleIndex, bounce, RTPT_LIGHT_QUERY_TRAINING);
+        const float3 direct = useNEE ? rtptEstimateDirect(sd, mi, lightContext, sg) : float3(0.f);
         // SEPARATE_EMISSIVE stores only reflected Lo at this vertex. Arrival
         // MIS applies to emission propagated to earlier vertices, never to the
         // new vertex's NEE/cache value. No camera throughput is submitted here.
@@ -157,5 +159,5 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const uint sampleIndex = gParams.sampleOffset + gSharcSettings.frameIndex * 0x85ebca6bu + gParams.seed * 0x9e3779b9u;
     SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
     const Ray ray = rtptGenerateCameraRay(pixel, sg);
-    rtptUpdateSharcPath(ray, sg);
+    rtptUpdateSharcPath(ray, pixel, sampleIndex, sg);
 }

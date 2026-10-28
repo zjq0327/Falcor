@@ -3,6 +3,32 @@ add_plugin(RTPT)
 target_sources(RTPT PRIVATE
     RTPT.cpp
     RTPT.h
+    PrimarySurface/RTPTPrimarySurface.h
+    PrimarySurface/RTPTPrimarySurface.cpp
+    PrimarySurface/RTPTPrimarySurface.cs.slang
+    RTPTLightTypes.slang
+    LocalLights/RTPTLocalLights.h
+    LocalLights/RTPTLocalLights.cpp
+    LocalLights/RTPTLocalLightSettings.cpp
+    LocalLights/RTPTLocalLightResources.cpp
+    LocalLights/RTPTLocalLightLayout.slangh
+    LocalLights/RTPTLocalLightTypes.slang
+    LocalLights/RTPTLocalLightResources.slang
+    LocalLights/RTPTLocalLightModel.slang
+    LocalLights/RTPTFullLightCdf.slang
+    LocalLights/RTPTFullLightGrid.cs.slang
+    LocalLights/RTPTLocalLightCache.slang
+    LocalLights/RTPTLocalLightSampling.slang
+    LocalLights/RTPTLocalLightFeedback.slang
+    LocalLights/RTPTAdaptiveTile.cs.slang
+    LocalLights/RTPTLightFeedback.cs.slang
+    LocalLights/RTPTLocalLightProbe.cs.slang
+    LocalLights/Debug/RTPTLocalLightDebug.cpp
+    LocalLights/Debug/RTPTLocalLightDebug.cs.slang
+    LocalLights/Debug/RTPTLocalLightDebugLayout.slangh
+    LocalLights/Debug/RTPTLocalLightOverlay.h
+    LocalLights/Debug/RTPTLocalLightOverlay.cpp
+    LocalLights/Debug/RTPTLocalLightOverlay.cs.slang
     VXPG/RTPTVXPG.h
     VXPG/RTPTVXPG.cpp
     VXPG/RTPTVXPGResources.cpp

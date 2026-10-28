@@ -83,26 +83,40 @@ uint rtptVXPGSelectComponent(ShadingData sd, IMaterialInstance mi, inout SampleG
 // ShortBranch shares the SHaRC training partition for NEE/emission MIS.
 // The separate BRDF/guide partition compensates continuation sampling below.
 float3 rtptVXPGDirectFromSample(ShadingData sd, IMaterialInstance mi,
-    RTPTLightSample light, inout SampleGenerator sg)
+    RTPTLightSample light, inout SampleGenerator sg, out float3 raw)
 {
     float weight = 1.f;
+    float continuationPdf = 0.f;
     if (!light.analytic)
     {
-        const float p = mi.evalPdf(sd, light.dir);
-        weight = rtptPowerHeuristic(light.pdf, p);
+        continuationPdf = mi.evalPdf(sd, light.dir);
+        weight = rtptPowerHeuristic(light.misReferencePdf, continuationPdf);
     }
-    const float3 value = mi.eval(sd, light.dir, sg) * light.LiOverPdf * weight;
+    raw = mi.eval(sd, light.dir, sg) * light.LiOverPdf;
+    const float3 value = raw * weight;
+    // Keep the original evaluation/RNG and radiance behavior, but reject an
+    // invalid BSDF density from the independent feedback stream.
+    if (!isfinite(continuationPdf)) raw = float3(continuationPdf);
     return all(isfinite(value)) ? value : float3(0.f);
 }
 
-float3 rtptVXPGDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg, bool shortBranch = false)
+float3 rtptVXPGDirect(ShadingData sd, IMaterialInstance mi, RTPTLightingContext context,
+    inout SampleGenerator sg, bool shortBranch = false)
 {
     if (gParams.useNEE == 0 || (rtptVXPGActiveLobes(sd, mi) & uint(LobeType::NonDeltaReflection)) == 0) return 0.f;
     RTPTLightSample light;
-    if (!rtptSampleLight(sd, sg, light)) return 0.f;
+    if (!rtptSampleLight(sd, context, sg, light))
+    {
+        rtptLocalRecordFeedback(context, light, float3(0.f), false);
+        return 0.f;
+    }
     SceneRayQuery<true> query;
     rtptVXPGCount(shortBranch?RTPT_VXPG_STATE_PG_SHADOW:RTPT_VXPG_STATE_MAIN_SHADOW);
-    return query.traceVisibilityRay(light.visibilityRay) ? rtptVXPGDirectFromSample(sd, mi, light, sg) : float3(0.f);
+    const bool visible = query.traceVisibilityRay(light.visibilityRay);
+    float3 raw = 0.f, value = 0.f;
+    if (visible) value = rtptVXPGDirectFromSample(sd, mi, light, sg, raw);
+    if (all(isfinite(raw))) rtptLocalRecordFeedback(context, light, raw, visible, true);
+    return value;
 }
 
 void rtptVXPGCountRadianceRay(inout RTPTSharcStats stats)
@@ -113,7 +127,8 @@ void rtptVXPGCountRadianceRay(inout RTPTSharcStats stats)
 }
 
 float3 rtptVXPGShortBranch(ShadingData source, IMaterialInstance sourceMI, ShadingData component,
-    RTPTVXPGContext guide, uint bounce, float invRho, inout SampleGenerator sg, inout RTPTSharcStats stats)
+    RTPTVXPGContext guide, uint2 pixel, uint sampleIndex, uint bounce, float invRho,
+    inout SampleGenerator sg, inout RTPTSharcStats stats)
 {
     rtptVXPGCount(RTPT_VXPG_STATE_ATTEMPTS);
     rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_ATTEMPTS + bounce);
@@ -171,7 +186,9 @@ float3 rtptVXPGShortBranch(ShadingData source, IMaterialInstance sourceMI, Shadi
 #endif
     if (bounce + 1 < gParams.maxBounces)
     {
-        local += rtptVXPGDirect(sd, mi, sg, true);
+        const RTPTLightingContext lightContext = rtptSurfaceLightContext(
+            sd, pixel, sampleIndex, bounce + 1u, RTPT_LIGHT_QUERY_SECONDARY);
+        local += rtptVXPGDirect(sd, mi, lightContext, sg, true);
     }
     return sourceMI.eval(component, candidate.direction, sg) * invRho * local * (weights.guideLocal / candidate.pdf);
 }
@@ -203,8 +220,10 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
         RTPTVXPGContext guide;
         const bool hasGuide = rtptVXPGGetSurfaceContext(sd.computeRayOrigin(), sd.posW, sd.getOrientedFaceNormal(), pixel, sampleIndex, bounce, guide);
         const bool usedNEE = gParams.useNEE != 0 && (rtptVXPGActiveLobes(sd, mi) & uint(LobeType::NonDeltaReflection)) != 0;
+        const RTPTLightingContext lightContext = rtptSurfaceLightContext(sd, pixel, sampleIndex, bounce,
+            bounce == 0 ? RTPT_LIGHT_QUERY_MAIN_PRIMARY : RTPT_LIGHT_QUERY_SECONDARY);
         if (!(bounce == 0 && primaryNEEDone))
-            radiance += throughput * localWeight * rtptVXPGDirect(sd, mi, lightSG);
+            radiance += throughput * localWeight * rtptVXPGDirect(sd, mi, lightContext, lightSG);
         const float3 continuationThroughput = throughput * suffixWeight;
         float invRho;
         const uint lobe = rtptVXPGSelectComponent(sd, mi, componentSG, invRho);
@@ -215,7 +234,7 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
         const bool eligible = hasGuide && continuous;
         // The A branch executes independently of BRDF sample validity/cache.
         if (eligible)
-            radiance += continuationThroughput * rtptVXPGShortBranch(sd, mi, component, guide, bounce, invRho, guideSG, stats);
+            radiance += continuationThroughput * rtptVXPGShortBranch(sd, mi, component, guide, pixel, sampleIndex, bounce, invRho, guideSG, stats);
         BSDFSample bs = {};
         if (!mi.sample(component, brdfSG, bs) || bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
         const float p = bs.pdf;
@@ -379,16 +398,27 @@ float3 rtptVXPGTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout RTPTSharcS
     specular.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
     SampleGenerator lightSG = SampleGenerator(pixel ^ uint2(0x68bc21ebu, 0x02e5be93u), sampleIndex + 0x601u);
     RTPTLightSample light;
-    if (gParams.useNEE != 0 && (lobes & uint(LobeType::NonDeltaReflection)) != 0 && rtptSampleLight(sd, lightSG, light))
+    const RTPTLightingContext lightContext = rtptSurfaceLightContext(
+        sd, pixel, sampleIndex, 0u, RTPT_LIGHT_QUERY_MAIN_PRIMARY);
+    if (gParams.useNEE != 0 && (lobes & uint(LobeType::NonDeltaReflection)) != 0)
     {
-        rtptVXPGCount(RTPT_VXPG_STATE_MAIN_SHADOW);
-        if (query.traceVisibilityRay(light.visibilityRay))
+        const bool sampled = rtptSampleLight(sd, lightContext, lightSG, light);
+        bool visible = false;
+        float3 rawDiffuse = 0.f, rawSpecular = 0.f;
+        if (sampled)
         {
-            if ((lobes & uint(LobeType::DiffuseReflection)) != 0)
-                signals.diffuse = rtptVXPGDirectFromSample(diffuse, mi, light, lightSG);
-            if ((lobes & uint(LobeType::SpecularReflection)) != 0)
-                signals.specular = rtptVXPGDirectFromSample(specular, mi, light, lightSG);
+            rtptVXPGCount(RTPT_VXPG_STATE_MAIN_SHADOW);
+            visible = query.traceVisibilityRay(light.visibilityRay);
+            if (visible)
+            {
+                if ((lobes & uint(LobeType::DiffuseReflection)) != 0)
+                    signals.diffuse = rtptVXPGDirectFromSample(diffuse, mi, light, lightSG, rawDiffuse);
+                if ((lobes & uint(LobeType::SpecularReflection)) != 0)
+                    signals.specular = rtptVXPGDirectFromSample(specular, mi, light, lightSG, rawSpecular);
+            }
         }
+        const float3 raw = rawDiffuse + rawSpecular;
+        if (all(isfinite(raw))) rtptLocalRecordFeedback(lightContext, light, raw, visible, sampled);
     }
     if ((lobes & uint(LobeType::DiffuseReflection)) != 0)
         signals.diffuse += rtptVXPGTraceSurface(sd, materialID, uint(LobeType::DiffuseReflection), pixel, sampleIndex, 1, false, true, signals.diffuseHitDistance, stats);
