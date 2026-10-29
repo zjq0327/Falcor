@@ -19,6 +19,8 @@ struct FrameInputs
 struct View
 {
     Falcor::ref<Falcor::Texture> position;
+    // xyz is the oriented geometric face normal, never the material guide
+    // normal used by NRD. w retains the material roughness for spatial users.
     Falcor::ref<Falcor::Texture> normalRoughness;
     Falcor::ref<Falcor::Texture> hit;
     Falcor::uint2 frameDim = {};
@@ -44,15 +46,17 @@ public:
     void invalidate();
     const View& prepare(Falcor::RenderContext* context, const FrameInputs& inputs);
     const View& getView() const { return mView; }
+    bool matches(const View& view, const FrameInputs& inputs) const;
     uint64_t getPayloadBytes() const;
 
 private:
     void ensureResources(Falcor::uint2 frameDim);
-    void ensureProgram();
+    void ensureProgram(bool useNRD);
 
     Falcor::ref<Falcor::Device> mpDevice;
     Falcor::ref<Falcor::Scene> mpScene;
     Falcor::ref<Falcor::ComputePass> mpPass;
+    bool mProgramUsesNRD = false;
     Falcor::ref<Falcor::SampleGenerator> mpSampleGenerator;
     View mView;
     uint64_t mFrameSerial = 0;

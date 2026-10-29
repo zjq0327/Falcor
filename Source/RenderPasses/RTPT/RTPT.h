@@ -28,6 +28,7 @@ public:
     Properties getVXPGStatistics() const;
     Properties getLocalLightStatistics() const;
     Properties getNRDSplitStatistics() const;
+    Properties getPrimaryHitStatistics() const;
     Properties captureLocalLightInspection();
     // Explicit synchronization for completed-frame RTPT benchmarks. Never
     // called by the normal render loop or by diagnostic refreshes.
@@ -57,6 +58,12 @@ private:
     uint2 mNRDSplitFrameDim = uint2(0);
     bool mNRDSplitActiveThisFrame = false;
     bool mNRDSplitResourceFallback = false;
+    bool mPrimaryHitReuseActiveThisFrame = false;
+    bool mPrimarySurfaceProducedThisFrame = false;
+    bool mPrimaryRenderSubmittedThisFrame = false;
+    uint32_t mPrimaryHitSampleOffset = 0;
+    uint32_t mPrimaryHitSamplesPerPixel = 1;
+    std::string mPrimaryHitFallbackReason;
     ref<ComputePass> mpSHARCResolve;
     ref<ComputePass> mpSparseUpdate;
     std::unique_ptr<RTPTVXPG::Manager> mpVXPG;

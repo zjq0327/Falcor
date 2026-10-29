@@ -4,7 +4,9 @@
 using namespace Falcor;
 namespace RTPTVXPG
 {
-ref<ComputePass> Manager::createPass(const char* library, const char* entry, PassScene scene, PassCounters counters) const
+ref<ComputePass> Manager::createPass(
+    const char* library, const char* entry, PassScene scene, PassCounters counters, const DefineList& extraDefines
+) const
 {
     ProgramDesc desc;
     DefineList defines;
@@ -21,6 +23,7 @@ ref<ComputePass> Manager::createPass(const char* library, const char* entry, Pas
         defines.add(mpSampleGenerator->getDefines());
     if (counters == PassCounters::Configured)
         defines.add("RTPT_VXPG_DETAILED_DIAGNOSTICS", mSettings.detailedDiagnostics ? "1" : "0");
+    defines.add(extraDefines);
     return ComputePass::create(mpDevice, desc, defines, true);
 }
 
@@ -556,7 +559,9 @@ void Manager::ensureTrainingPasses()
         mProposal.pForestWork = createPass("RTPTVXPGPrepare.cs.slang", "forestWork");
     }
     if (!mView.pPrimary)
+    {
         mView.pPrimary = createPass("RTPTVXPGPrimary.cs.slang", "main", PassScene::None, PassCounters::Configured);
+    }
 }
 
 void Manager::ensureTrainingResources(RenderContext* context)

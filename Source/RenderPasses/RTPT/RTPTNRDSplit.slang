@@ -1,5 +1,21 @@
 #pragma once
 
+
+// A writes the unchanged material guide normal and motion directly to their
+// final textures. B only carries the FP32 signals it still reads or modifies.
+struct RTPTNRDSplitSignals
+{
+    float3 diffuse;
+    float3 specular;
+    float3 emission;
+    float3 diffuseReflectance;
+    float3 specularReflectance;
+    float3 residual;
+    float diffuseHitDistance;
+    float specularHitDistance;
+    float viewZ;
+};
+
 // The producer and consumer share one fixed record per pixel. Keep the primary
 // hit's existing packed bits and every intermediate radiance value at FP32.
 // No ShadingData or interface-bearing material instance crosses the dispatch.
@@ -10,7 +26,7 @@ struct RTPTNRDSplitRecord
     uint lobes;
     uint pending;
     uint hasSurface;
-    RTPTNRDSignals signals;
+    RTPTNRDSplitSignals signals;
     RTPTSharcStats stats;
 };
 RWStructuredBuffer<RTPTNRDSplitRecord> gNRDSplitRecords;
@@ -21,6 +37,23 @@ uint rtptNRDSplitIndex(uint2 pixel)
 }
 
 #if RTPT_NRD_SPLIT_STAGE == 1
+void rtptNRDSplitStoreSignals(inout RTPTNRDSplitRecord record, uint2 pixel, RTPTNRDSignals signals)
+{
+    // Both valid surfaces and misses write these outputs exactly once. No B
+    // stage reads them, so they need no cross-stage reconstruction or rounding.
+    gNRDNormalRoughness[pixel] = signals.normalRoughness;
+    gNRDMotionW[pixel] = float4(signals.motionW, 0.f);
+    record.signals.diffuse = signals.diffuse;
+    record.signals.specular = signals.specular;
+    record.signals.emission = signals.emission;
+    record.signals.diffuseReflectance = signals.diffuseReflectance;
+    record.signals.specularReflectance = signals.specularReflectance;
+    record.signals.residual = signals.residual;
+    record.signals.diffuseHitDistance = signals.diffuseHitDistance;
+    record.signals.specularHitDistance = signals.specularHitDistance;
+    record.signals.viewZ = signals.viewZ;
+}
+
 RTPTNRDSplitRecord rtptVXPGTraceNRDSplitA(Ray ray, uint2 pixel, uint sampleIndex, inout RTPTSharcStats stats)
 {
     RTPTNRDSplitRecord record = {};
@@ -31,10 +64,16 @@ RTPTNRDSplitRecord rtptVXPGTraceNRDSplitA(Ray ray, uint2 pixel, uint sampleIndex
     signals.normalRoughness = float4(0.5f, 0.5f, 0.f, 0.f);
     signals.viewZ = 60000.f;
     SceneRayQuery<true> query;
-    float t;
-    rtptVXPGCountRadianceRay(stats);
-    rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_RAYS);
-    const HitInfo hit = query.traceRay(ray, t);
+    HitInfo hit;
+#if RTPT_HAS_PRIMARY_HIT_INPUT
+    if (!rtptLoadSharedPrimaryHit(pixel, sampleIndex, hit))
+#endif
+    {
+        float t;
+        rtptVXPGCountRadianceRay(stats);
+        rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_RAYS);
+        hit = query.traceRay(ray, t);
+    }
 #if HIT_INFO_USE_COMPRESSION
     record.packedHit = uint4(hit.pack(), 0u, 0u);
 #else
@@ -47,7 +86,7 @@ RTPTNRDSplitRecord rtptVXPGTraceNRDSplitA(Ray ray, uint2 pixel, uint sampleIndex
 #if USE_ENV_BACKGROUND
         if (!hit.isValid()) signals.emission = gScene.envMap.eval(ray.dir);
 #endif
-        record.signals = signals;
+        rtptNRDSplitStoreSignals(record, pixel, signals);
         record.stats = stats;
         return record;
     }
@@ -98,16 +137,39 @@ RTPTNRDSplitRecord rtptVXPGTraceNRDSplitA(Ray ray, uint2 pixel, uint sampleIndex
     }
     if ((lobes & uint(LobeType::DiffuseReflection)) != 0)
         signals.diffuse += rtptVXPGTraceSurface(sd, materialID, uint(LobeType::DiffuseReflection), pixel, sampleIndex, 1, false, true, signals.diffuseHitDistance, stats);
-    record.signals = signals;
+    rtptNRDSplitStoreSignals(record, pixel, signals);
     record.stats = stats;
     return record;
 }
 #endif
 
 #if RTPT_NRD_SPLIT_STAGE == 2
+void rtptWriteNRDSplitLateSignals(uint2 pixel, RTPTNRDSignals signals)
+{
+    // Preserve the original FP32 operations and output order for every signal
+    // still owned by B. A already wrote the normal and motion without packing
+    // either one into this intermediate record.
+    gNRDDiffuseRadianceHitDist[pixel] = float4(signals.diffuse / signals.diffuseReflectance, signals.diffuseHitDistance);
+    gNRDSpecularRadianceHitDist[pixel] = float4(signals.specular / signals.specularReflectance, signals.specularHitDistance);
+    gNRDEmission[pixel] = float4(signals.emission, 1.f);
+    gNRDDiffuseReflectance[pixel] = float4(signals.diffuseReflectance, 1.f);
+    gNRDSpecularReflectance[pixel] = float4(signals.specularReflectance, 1.f);
+    gNRDResidualRadiance[pixel] = float4(signals.residual, 1.f);
+    gNRDViewZ[pixel] = signals.viewZ;
+}
+
 float3 rtptVXPGTraceNRDSplitB(RTPTNRDSplitRecord record, uint2 pixel, uint sampleIndex, inout RTPTSharcStats stats)
 {
-    RTPTNRDSignals signals = record.signals;
+    RTPTNRDSignals signals = {};
+    signals.diffuse = record.signals.diffuse;
+    signals.specular = record.signals.specular;
+    signals.emission = record.signals.emission;
+    signals.diffuseReflectance = record.signals.diffuseReflectance;
+    signals.specularReflectance = record.signals.specularReflectance;
+    signals.residual = record.signals.residual;
+    signals.diffuseHitDistance = record.signals.diffuseHitDistance;
+    signals.specularHitDistance = record.signals.specularHitDistance;
+    signals.viewZ = record.signals.viewZ;
     if (record.hasSurface != 0u)
     {
 #if HIT_INFO_USE_COMPRESSION
@@ -136,7 +198,7 @@ float3 rtptVXPGTraceNRDSplitB(RTPTNRDSplitRecord record, uint2 pixel, uint sampl
             signals.diffuseHitDistance = signals.specularHitDistance = 0.f;
         }
     }
-    rtptWriteNRDSignals(pixel, signals);
+    rtptWriteNRDSplitLateSignals(pixel, signals);
     return signals.emission + signals.diffuse + signals.specular + signals.residual;
 }
 #endif

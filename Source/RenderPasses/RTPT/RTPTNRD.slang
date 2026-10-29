@@ -188,11 +188,17 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerato
     signals.viewZ = kRTPTNRDMissDistance;
 
     SceneRayQuery<true> query;
-    float hitT;
-#if ENABLE_SHARC && SHARC_QUERY
-    ++sharcStats.radianceRays;
+    HitInfo hit;
+#if RTPT_HAS_PRIMARY_HIT_INPUT
+    if (!rtptLoadSharedPrimaryHit(pixel, sampleIndex, hit))
 #endif
-    const HitInfo hit = query.traceRay(ray, hitT);
+    {
+        float hitT;
+#if ENABLE_SHARC && SHARC_QUERY
+        ++sharcStats.radianceRays;
+#endif
+        hit = query.traceRay(ray, hitT);
+    }
     if (!hit.isValid())
     {
 #if USE_ENV_BACKGROUND

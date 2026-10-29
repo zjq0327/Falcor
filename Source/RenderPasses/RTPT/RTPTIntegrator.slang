@@ -26,11 +26,19 @@ float3 rtptTracePath(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerat
     // Both techniques therefore estimate exactly the same path lengths.
     for (uint bounce = 0; bounce <= gParams.maxBounces; ++bounce)
     {
-        float hitT;
-#if ENABLE_SHARC && SHARC_QUERY
-        ++sharcStats.radianceRays;
+        HitInfo hit;
+#if RTPT_HAS_PRIMARY_HIT_INPUT
+        bool sharedPrimaryHit = false;
+        if (bounce == 0) sharedPrimaryHit = rtptLoadSharedPrimaryHit(pixel, sampleIndex, hit);
+        if (!sharedPrimaryHit)
 #endif
-        const HitInfo hit = query.traceRay(ray, hitT);
+        {
+            float hitT;
+#if ENABLE_SHARC && SHARC_QUERY
+            ++sharcStats.radianceRays;
+#endif
+            hit = query.traceRay(ray, hitT);
+        }
         if (!hit.isValid())
         {
             bool evaluateEnvironment = false;

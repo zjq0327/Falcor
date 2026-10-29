@@ -251,7 +251,8 @@ private:
         const char* library,
         const char* entry,
         PassScene scene = PassScene::None,
-        PassCounters counters = PassCounters::None
+        PassCounters counters = PassCounters::None,
+        const Falcor::DefineList& extraDefines = {}
     ) const;
     void bindParameters(const Falcor::ShaderVar& root, uint32_t frameIndex, bool active) const;
     void bindResources(const Falcor::ShaderVar& root) const;

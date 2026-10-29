@@ -47,6 +47,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
         pass.def_property_readonly("vxpgStats", [](const RTPT& self) { return self.getVXPGStatistics().toPython(); });
         pass.def_property_readonly("localLightStats", [](const RTPT& self) { return self.getLocalLightStatistics().toPython(); });
         pass.def_property_readonly("nrdSplitStats", [](const RTPT& self) { return self.getNRDSplitStatistics().toPython(); });
+        pass.def_property_readonly("primaryHitStats", [](const RTPT& self) { return self.getPrimaryHitStatistics().toPython(); });
         pass.def("captureLocalLightInspection", [](RTPT& self) { return self.captureLocalLightInspection().toPython(); });
         pass.def("waitForGpu", &RTPT::waitForGpu);
         pass.def("vxpgTreeSnapshot", [](const RTPT& self) { return self.getVXPGTreeSnapshot().toPython(); });
@@ -105,9 +106,32 @@ Properties RTPT::getNRDSplitStatistics() const
     Properties stats;
     stats["enabled"] = mNRDSplitEnabled;
     stats["activeThisFrame"] = mNRDSplitActiveThisFrame;
+    stats["compactActiveThisFrame"] = mNRDSplitActiveThisFrame;
     stats["resourceFallback"] = mNRDSplitResourceFallback;
     stats["recordStride"] = mpNRDSplitRecords ? mpNRDSplitRecords->getStructSize() : 0u;
     stats["payloadBytes"] = mpNRDSplitRecords ? mpNRDSplitRecords->getSize() : 0ull;
+    return stats;
+}
+
+Properties RTPT::getPrimaryHitStatistics() const
+{
+    Properties stats;
+    const uint64_t pixels = uint64_t(mFrameDim.x) * uint64_t(mFrameDim.y);
+    const uint64_t reused = mPrimaryHitReuseActiveThisFrame ? pixels : 0ull;
+    const uint64_t producer = mPrimarySurfaceProducedThisFrame ? pixels : 0ull;
+    // Exact dispatch-derived camera-query counts, including misses. Independent
+    // sparse training, visibility and continuation rays are separate workloads.
+    const uint64_t main = mPrimaryRenderSubmittedThisFrame ? pixels * mPrimaryHitSamplesPerPixel - reused : 0ull;
+    stats["activeThisFrame"] = mPrimaryHitReuseActiveThisFrame;
+    stats["producerTraceRays"] = producer;
+    stats["mainTraceRays"] = main;
+    stats["cameraTraceRays"] = producer + main;
+    stats["reusedSamples"] = reused;
+    stats["sampleOffset"] = mPrimaryHitSampleOffset;
+    stats["frameSerial"] = mpPrimarySurface->getView().frameSerial;
+    stats["payloadBytes"] = mpPrimarySurface->getPayloadBytes();
+    stats["fallbackReason"] = mPrimaryHitFallbackReason;
+    stats["excludesIndependentTraining"] = true;
     return stats;
 }
 
@@ -537,6 +561,9 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
         defines.add("ENABLE_VXPG", compileVXPG ? "1" : "0");
+        // Only camera-rendering programs bind the shared primary input.
+        // Sparse training uses independent rays and never binds this view.
+        defines.add("RTPT_HAS_PRIMARY_HIT_INPUT", "1");
         defines.add("RTPT_VXPG_DETAILED_DIAGNOSTICS", mVXPGSettings.detailedDiagnostics ? "1" : "0");
         defines.add("RTPT_SHARC_PAIR", usesPairedSharc() ? "1" : "0");
         if (mEnableSHARC || mEnableVXPG)
@@ -577,6 +604,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             updateDesc.setShaderModel(ShaderModel::SM6_6);
             updateDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
             auto updateDefines = defines;
+            updateDefines.add("RTPT_HAS_PRIMARY_HIT_INPUT", "0");
             updateDefines.add("ENABLE_NRD", "0");
             updateDefines.add("SHARC_UPDATE", "1");
             updateDefines.add("SHARC_QUERY", "0");
@@ -779,6 +807,10 @@ void RTPT::executeTraining(RenderContext* pRenderContext, const RTPTVXPG::Traini
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     mNRDSplitActiveThisFrame = false;
+    mPrimaryHitReuseActiveThisFrame = false;
+    mPrimarySurfaceProducedThisFrame = false;
+    mPrimaryRenderSubmittedThisFrame = false;
+    mPrimaryHitFallbackReason.clear();
     renderData.getDictionary()["rtptLocalLightDebugEnabled"] = mLocalLightSettings.debugEnabled;
     auto vxpgUpdate = mpVXPG->beginUpdate();
     mVXPGSharedTrainingThisFrame = mVXPGSharedWithSHARCThisFrame = false;
@@ -845,7 +877,10 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
                 cached.sampleOffset == lastSampleOffset && cached.useNRD == mEnableNRD)
                 heldPrimary = cached;
             else
+            {
                 heldPrimary = mpPrimarySurface->prepare(pRenderContext, {mFrameDim, mSeed, lastSampleOffset, mEnableNRD});
+                mPrimarySurfaceProducedThisFrame = heldPrimary.isValid();
+            }
         }
         // Display controls remain live after PT accumulation stops. This only
         // reads the held proposal; it does not train it or advance its history.
@@ -857,8 +892,33 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         vxpgTraining = vxpgUpdate.prepare(pRenderContext, mVXPGSettings, mFrameDim, mSHARCUpdateStride, mSHARCUpdateBounces,
             mGuidingMode, renderData.getTexture("vxpgDebug"));
     RTPTPrimarySurface::View primarySurface;
-    if (vxpgTraining.writeObservations || mpLocalLights->needsPrimarySurface())
+    try
+    {
         primarySurface = mpPrimarySurface->prepare(pRenderContext, {mFrameDim, mSeed, mSampleOffset, mEnableNRD});
+        mPrimarySurfaceProducedThisFrame = primarySurface.isValid();
+    }
+    catch (const std::exception& e)
+    {
+        // No partially prepared view is published. Consumers retain their
+        // existing global-light / unavailable-model fallbacks this frame.
+        mPrimaryHitFallbackReason = e.what();
+        logWarning("RTPT primary surface unavailable; using original camera queries: {}", e.what());
+    }
+    mPrimaryHitSampleOffset = mSampleOffset;
+    mPrimaryHitSamplesPerPixel = mSamplesPerPixel;
+    const bool primarySampleMatches = mpPrimarySurface->matches(primarySurface, {mFrameDim, mSeed, mSampleOffset, mEnableNRD});
+    mPrimaryHitReuseActiveThisFrame = primarySampleMatches;
+    if (!primarySampleMatches) primarySurface = {};
+    if (!mPrimaryHitReuseActiveThisFrame && mPrimaryHitFallbackReason.empty())
+        mPrimaryHitFallbackReason = "Current-frame primary sample is unavailable or mismatched.";
+    if (vxpgTraining.writeObservations && !primarySurface.isValid())
+    {
+        // Preparation may have begun an incremental grid transaction. Retire
+        // it before training and rebuild next frame rather than publishing a
+        // partial model or asking finish() to snapshot an unavailable view.
+        mpVXPG->invalidate(RTPTVXPG::Invalidation::Grid, "Current primary surface unavailable; rebuild VXPG");
+        vxpgTraining.writeObservations = false;
+    }
     mpLocalLights->prepareFrame(pRenderContext, {mFrameDim, mSampleOffset, mSeed, primarySurface, mUseNEE});
     if (mEnableSHARC || vxpgTraining.writeObservations)
     {
@@ -918,12 +978,21 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         params["useNEE"] = mUseNEE ? 1u : 0u;
         params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
         params["accumulate"] = mAccumulate ? 1u : 0u;
+        // Split B consumes A's packed hit and needs no primary SRV itself.
+        auto primaryParams = var.findMember("gPrimaryHitParams");
+        if (primaryParams.isValid())
+        {
+            primaryParams["viewValid"] = mPrimaryHitReuseActiveThisFrame ? 1u : 0u;
+            primaryParams["sampleIndex"] = mSampleOffset + mSeed * 0x9e3779b9u;
+            var["gSharedPrimaryHit"] = mPrimaryHitReuseActiveThisFrame ? primarySurface.hit : nullptr;
+        }
         var["gColor"] = color;
         var["gNoisyColor"] = noisyColor;
         var["gAccumulation"] = mpAccumulation;
         if (mEnableNRD)
             for (const auto& output : kNRDOutputs)
-                var[output.shaderName] = renderData.getTexture(output.name);
+                if (auto member = var.findMember(output.shaderName); member.isValid())
+                    member = renderData.getTexture(output.name);
         if (mEnableSHARC)
         {
             bindSHARC(var);
@@ -944,7 +1013,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         specularVar["gNRDSplitRecords"] = mpNRDSplitRecords;
     }
     else bindRender(mpComputePass->getRootVar());
-    pRenderContext->uavBarrier(mpAccumulation.get());
+    if (mAccumulate) pRenderContext->uavBarrier(mpAccumulation.get());
     {
         FALCOR_PROFILE(pRenderContext, "MainRender");
         if (useNRDSplit)
@@ -961,6 +1030,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             mNRDSplitActiveThisFrame = true;
         }
         else mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
+        mPrimaryRenderSubmittedThisFrame = true;
     }
     mpLocalLights->renderDebug(pRenderContext, renderData.getTexture("localLightDebug"));
     mpLocalLights->finishFrame(pRenderContext);
@@ -992,6 +1062,12 @@ void RTPT::renderUI(Gui::Widgets& widget)
         widget.text("NRD: 1 primary sample, one path per active diffuse/specular lobe.");
     else
         changed |= widget.var("Samples per pixel", mSamplesPerPixel, 1u, 1024u);
+    if (auto primary = widget.group("Primary hit reuse"))
+    {
+        primary.text(mPrimaryHitReuseActiveThisFrame ? "Active: one shared camera query per pixel." : "Using original camera queries.");
+        if (!mPrimaryHitFallbackReason.empty()) primary.text(mPrimaryHitFallbackReason);
+        primary.tooltip("Share the current camera sample with local lights, VXPG and primary shading. Geometric normals remain separate from NRD material guide normals. Multi-sample PT shares sample 0 only. Unavailable or mismatched views use original camera queries.", true);
+    }
     if (auto split = widget.group("NRD continuation split"))
     {
         bool enabled = mNRDSplitEnabled;

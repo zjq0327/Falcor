@@ -7,15 +7,17 @@ import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
 #include "../RTPTCamera.slang"
 
+
 struct RTPTPrimarySurfaceParams
 {
     uint2 frameDim;
     uint seed;
     uint sampleOffset;
-    uint useNRD;
 };
 ConstantBuffer<RTPTPrimarySurfaceParams> gParams;
 RWTexture2D<float4> gPrimaryPosition;
+// Spatial consumers require the geometric face normal. Material guide normals
+// are reconstructed independently from this same hit by primary NRD shading.
 RWTexture2D<float4> gPrimaryNormalRoughness;
 RWTexture2D<uint4> gPrimaryHit;
 
@@ -40,11 +42,10 @@ void main(uint3 tid : SV_DispatchThreadID)
 {
     if (any(tid.xy >= gParams.frameDim)) return;
     const uint2 pixel = tid.xy;
-    gPrimaryPosition[pixel] = 0.f;
-    gPrimaryNormalRoughness[pixel] = 0.f;
-    gPrimaryHit[pixel] = 0u;
     SampleGenerator cameraSG = SampleGenerator(pixel, gParams.sampleOffset + gParams.seed * 0x9e3779b9u);
-    const Ray ray = rtptCameraRay(pixel, gParams.frameDim, gParams.useNRD != 0, cameraSG);
+    // Match the main integrator's compile-time camera branch. A runtime branch
+    // can change floating-point contraction and the resulting hit barycentrics.
+    const Ray ray = rtptCameraRay(pixel, gParams.frameDim, RTPT_PRIMARY_USE_NRD != 0, cameraSG);
     SceneRayQuery<true> query;
     float hitT;
     const HitInfo hit = query.traceRay(ray, hitT);
@@ -55,7 +56,12 @@ void main(uint3 tid : SV_DispatchThreadID)
 #endif
     ShadingData primary;
     uint materialID;
-    if (!rtptPrimaryPrepareHit(hit, ray, primary, materialID)) return;
+    if (!rtptPrimaryPrepareHit(hit, ray, primary, materialID))
+    {
+        gPrimaryPosition[pixel] = 0.f;
+        gPrimaryNormalRoughness[pixel] = 0.f;
+        return;
+    }
     const IMaterialInstance primaryMI = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
     gPrimaryPosition[pixel] = float4(primary.posW, 1.f);
     gPrimaryNormalRoughness[pixel] = float4(primary.getOrientedFaceNormal(), primaryMI.getProperties(primary).roughness);

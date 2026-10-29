@@ -68,6 +68,7 @@ RWTexture2D<float> gNRDViewZ;
 RWTexture2D<float4> gNRDMotionW;
 #endif
 
+#include "PrimarySurface/RTPTPrimaryHit.slang"
 #include "RTPTLighting.slang"
 #include "RTPTSharc.slang"
 #include "RTPTIntegrator.slang"
@@ -149,6 +150,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             (float(gParams.accumulatedSamples) + float(gParams.samplesPerPixel));
         result = lerp(gAccumulation[pixel].xyz, frameAverage, newSampleWeight);
     }
-    gAccumulation[pixel] = float4(result, 1.f);
+    if (gParams.accumulate != 0)
+        gAccumulation[pixel] = float4(result, 1.f);
     gColor[pixel] = float4(result, 1.f);
 }

@@ -6,6 +6,7 @@ target_sources(RTPT PRIVATE
     PrimarySurface/RTPTPrimarySurface.h
     PrimarySurface/RTPTPrimarySurface.cpp
     PrimarySurface/RTPTPrimarySurface.cs.slang
+    PrimarySurface/RTPTPrimaryHit.slang
     RTPTLightTypes.slang
     LocalLights/RTPTLocalLights.h
     LocalLights/RTPTLocalLights.cpp

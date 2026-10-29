@@ -35,9 +35,9 @@ void Manager::ensureResources(uint2 frameDim)
     mView.frameDim = frameDim;
 }
 
-void Manager::ensureProgram()
+void Manager::ensureProgram(bool useNRD)
 {
-    if (mpPass) return;
+    if (mpPass && mProgramUsesNRD == useNRD) return;
     ProgramDesc desc;
     desc.addShaderModules(mpScene->getShaderModules());
     desc.addShaderLibrary("RenderPasses/RTPT/PrimarySurface/RTPTPrimarySurface.cs.slang").csEntry("main");
@@ -45,7 +45,9 @@ void Manager::ensureProgram()
     desc.setShaderModel(ShaderModel::SM6_6);
     DefineList defines = mpScene->getSceneDefines();
     defines.add(mpSampleGenerator->getDefines());
+    defines.add("RTPT_PRIMARY_USE_NRD", useNRD ? "1" : "0");
     mpPass = ComputePass::create(mpDevice, desc, defines, true);
+    mProgramUsesNRD = useNRD;
 }
 
 const View& Manager::prepare(RenderContext* context, const FrameInputs& inputs)
@@ -54,7 +56,7 @@ const View& Manager::prepare(RenderContext* context, const FrameInputs& inputs)
     if (!mpScene || any(inputs.frameDim == uint2(0))) return mView;
     FALCOR_PROFILE(context, "RTPTPrimarySurface");
     ensureResources(inputs.frameDim);
-    ensureProgram();
+    ensureProgram(inputs.useNRD);
     for (const auto& texture : {mView.position, mView.normalRoughness, mView.hit}) context->uavBarrier(texture.get());
 
     auto root = mpPass->getRootVar();
@@ -63,7 +65,6 @@ const View& Manager::prepare(RenderContext* context, const FrameInputs& inputs)
     root["gParams"]["frameDim"] = inputs.frameDim;
     root["gParams"]["seed"] = inputs.seed;
     root["gParams"]["sampleOffset"] = inputs.sampleOffset;
-    root["gParams"]["useNRD"] = inputs.useNRD ? 1u : 0u;
     root["gPrimaryPosition"] = mView.position;
     root["gPrimaryNormalRoughness"] = mView.normalRoughness;
     root["gPrimaryHit"] = mView.hit;
@@ -87,5 +88,15 @@ uint64_t Manager::getPayloadBytes() const
     for (const auto& texture : {mView.position, mView.normalRoughness, mView.hit})
         if (texture) bytes += texture->getTextureSizeInBytes();
     return bytes;
+}
+
+bool Manager::matches(const View& view, const FrameInputs& inputs) const
+{
+    if (!mpScene || !view.isValid() || view.frameSerial != mView.frameSerial ||
+        view.sceneGeneration != mSceneGeneration || any(view.frameDim != inputs.frameDim) ||
+        view.seed != inputs.seed || view.sampleOffset != inputs.sampleOffset || view.useNRD != inputs.useNRD)
+        return false;
+    const auto& camera = mpScene->getCamera();
+    return view.viewProj == camera->getViewProjMatrix() && view.viewProjNoJitter == camera->getViewProjMatrixNoJitter();
 }
 } // namespace RTPTPrimarySurface

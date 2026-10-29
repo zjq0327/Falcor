@@ -334,10 +334,16 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
 float3 rtptVXPGTracePath(Ray ray, uint2 pixel, uint sampleIndex, inout RTPTSharcStats stats)
 {
     SceneRayQuery<true> query;
-    float t;
-    rtptVXPGCountRadianceRay(stats);
-    const HitInfo hit = query.traceRay(ray, t);
-    rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_RAYS);
+    HitInfo hit;
+#if RTPT_HAS_PRIMARY_HIT_INPUT
+    if (!rtptLoadSharedPrimaryHit(pixel, sampleIndex, hit))
+#endif
+    {
+        float t;
+        rtptVXPGCountRadianceRay(stats);
+        hit = query.traceRay(ray, t);
+        rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_RAYS);
+    }
     ShadingData sd;
     uint materialID;
     if (!rtptVXPGPrepareHit(hit, ray, sd, materialID))
@@ -364,10 +370,16 @@ float3 rtptVXPGTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout RTPTSharcS
     signals.normalRoughness = float4(0.5f, 0.5f, 0.f, 0.f);
     signals.viewZ = 60000.f;
     SceneRayQuery<true> query;
-    float t;
-    rtptVXPGCountRadianceRay(stats);
-    rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_RAYS);
-    const HitInfo hit = query.traceRay(ray, t);
+    HitInfo hit;
+#if RTPT_HAS_PRIMARY_HIT_INPUT
+    if (!rtptLoadSharedPrimaryHit(pixel, sampleIndex, hit))
+#endif
+    {
+        float t;
+        rtptVXPGCountRadianceRay(stats);
+        rtptVXPGCount(RTPT_VXPG_STATE_PRIMARY_RAYS);
+        hit = query.traceRay(ray, t);
+    }
     ShadingData sd;
     uint materialID;
     if (!rtptVXPGPrepareHit(hit, ray, sd, materialID))

@@ -5,6 +5,7 @@ pushd "%~dp0" || exit /b 1
 rem Module switches: 1 = enabled, 0 = disabled. These are local to this launch.
 set "RTPT_SHARC_ENABLED=1"
 set "RTPT_NRD_ENABLED=1"
+rem Primary-hit reuse, compact split records and single surface writes are fixed on.
 rem Experimental two-Pass VXPG NRD continuations; 0 keeps the original single Pass.
 set "RTPT_NRD_SPLIT_ENABLED=1"
 set "RTPT_ACCUMULATION_ENABLED=1"
@@ -57,7 +58,8 @@ if not exist "%RTPT_SCENE%" (
     exit /b 1
 )
 
-"%RTPT_EXE%" --device-type d3d12 --script "%RTPT_SCRIPT%" --scene "%RTPT_SCENE%"
+rem Forward optional Mogwai arguments, for example --headless for automated validation.
+"%RTPT_EXE%" --device-type d3d12 --script "%RTPT_SCRIPT%" --scene "%RTPT_SCENE%" %*
 set "RTPT_EXIT_CODE=%ERRORLEVEL%"
 popd
 if not "%RTPT_EXIT_CODE%"=="0" pause
