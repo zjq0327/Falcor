@@ -158,7 +158,7 @@ float3 rtptVXPGShortBranch(ShadingData source, IMaterialInstance sourceMI, Shadi
 #if ENABLE_SHARC && SHARC_QUERY && RTPT_SHARC_PAIR
     const BSDFProperties sourceProperties = sourceMI.getProperties(source);
     const BSDFProperties hitProperties = mi.getProperties(sd);
-    if (rtptSharcPairEligible(sd, mi, hitProperties, bounce+1, false, true, gVXPGParams.pgUseCache != 0,
+    if (rtptSharcPairEligible(sd, mi, hitProperties, bounce+1, false,
         component.mtl.getActiveLobes() == uint(LobeType::DiffuseReflection), sourceProperties.roughness, length(sd.posW-source.posW)))
     {
         ++stats.attemptedQueries;
@@ -263,13 +263,14 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
             const float segment = length(next.posW-sd.posW);
             const bool diffuse = lobe == uint(LobeType::DiffuseReflection);
             const SharcHitData cacheHit = rtptMakeSharcHit(next, nextProperties, float3(0.f));
-            if (gVXPGParams.pgUseCache != 0 && q > 0.f && rtptSharcPairEligible(next, nextMI, nextProperties,
-                bounce+1, delta, true, true, diffuse, properties.roughness, segment))
+            // Match the guide branch's actual eligibility/read outcome before sharing suffix MIS weight.
+            if (q > 0.f && rtptSharcPairEligible(next, nextMI, nextProperties,
+                bounce+1, delta, diffuse, properties.roughness, segment))
             {
                 rtptVXPGCount(RTPT_VXPG_STATE_PG_CACHE_CHECKS);
                 guideCacheAtBRDF = rtptSharcReadPair(cacheHit, cachedLocal, cachedSuffix);
             }
-            if (rtptSharcPairEligible(next, nextMI, nextProperties, bounce+1, delta, false, false, diffuse, properties.roughness, segment))
+            if (rtptSharcPairEligible(next, nextMI, nextProperties, bounce+1, delta, diffuse, properties.roughness, segment))
             {
                 ++stats.attemptedQueries;
                 brdfCache = guideCacheAtBRDF || rtptSharcReadPair(cacheHit, cachedLocal, cachedSuffix);

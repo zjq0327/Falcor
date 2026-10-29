@@ -20,10 +20,9 @@ set "RTPT_LOCAL_LIGHT_DEBUG_ENABLED=0"
 set "RTPT_LOCAL_LIGHT_OVERLAY_ENABLED=0"
 set "RTPT_GUIDING_MODE=VXPG"
 set "RTPT_VXPG_ENABLED=1"
-set "RTPT_VXPG_PG_SHARC_ENABLED=0"
 set "RTPT_VXPG_DEBUG_ENABLED=0"
 set "RTPT_VXPG_DIAGNOSTICS_ENABLED=0"
-rem VXPG always uses Visibility, shared multi-bounce training, incremental sparse distance LOD, camera/history reuse, confidence and local tree updates.
+rem VXPG always uses eligible PG SHaRC queries, Visibility, shared multi-bounce training, incremental sparse distance LOD, camera/history reuse, confidence and local tree updates.
 set "RTPT_VXPG_DISCOVERY_STRIDE=5"
 set "RTPT_VXPG_SPATIAL_STALE_FRAMES=512"
 set "RTPT_VXPG_TREE_REFRESH_FRAMES=16"

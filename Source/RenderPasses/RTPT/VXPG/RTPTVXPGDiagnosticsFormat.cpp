@@ -204,6 +204,7 @@ Properties statisticsProperties(const StatisticsSnapshot& snapshot)
         props["sharedInjectionPaths"] = counters[RTPT_VXPG_STATE_SHARED_PATHS];
         props["mainShadowRays"] = counters[RTPT_VXPG_STATE_MAIN_SHADOW];
         props["brdfCacheHits"] = counters[RTPT_VXPG_STATE_BRDF_CACHE_HITS];
+        props["pgCacheHits"] = counters[RTPT_VXPG_STATE_PG_CACHE_HITS];
         // Owner counters span training and rendering in this frame. Full
         // branch steps count both forward sampling and reverse PDF traversal.
         props["guideSelfRejected"] = counters[RTPT_VXPG_STATE_SELF_REJECTED];

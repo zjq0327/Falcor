@@ -240,12 +240,18 @@ SHaRC 正常更新时共用同一批路径；SHaRC 关闭或冻结时仍运行 V
 训练步幅/深度继续使用配置的 SHaRC Update 参数。VXPG 关闭、冻结或资源准备失败时停止
 VXPG 写入；内部 `writeSHARC` / `writeVXPG` 是本次调度的有效写入目标，不是可选模块开关。
 
+**PG SHaRC 固定开启，没有独立 CMD、UI、序列化或 GPU 参数开关。** PG 命中始终尝试符合资格的
+SHaRC 配对缓存查询，仍服从全局 `sharcEnabled` / `sharcUseCache`；反弹深度、粗糙度、
+射线段长度及材质资格检查保留。缓存缺失、样本不足或配对记录无效时，PG 分支计算真实局部光照后结束。
+局部光照保持 BSDF/PG 的 p/q 权重分配；后续间接光仅在 PG 确实能读取有效缓存时分配给 PG，
+否则完整保留给 BSDF 后续路径，避免重复计光或遗漏。旧 `vxpgPGUseCache` 属性会被拒绝。
+详细诊断开启时，只读 `vxpgStats.pgCacheHits` 报告本帧实际 PG 缓存命中数。
+
 主入口 VXPG 参数：
 
 - `RTPT_GUIDING_MODE=VXPG`；可选 BSDF / VXPG。`enableVXPG` 控制图资源，`vxpgEnabled` 控制运行时启用。
 - `RTPT_VXPG_ENABLED=1`；运行时还保留 Use guiding、Freeze updates 和 Reset VXPG。
-- `RTPT_VXPG_PG_SHARC_ENABLED=0`、`RTPT_VXPG_DEBUG_ENABLED=0`、
-  `RTPT_VXPG_DIAGNOSTICS_ENABLED=0`，各有运行时控制。
+- `RTPT_VXPG_DEBUG_ENABLED=0`、`RTPT_VXPG_DIAGNOSTICS_ENABLED=0`，各有运行时控制。
 - Discovery stride 5，空间寿命 512 次更新，拓扑刷新周期 16 次更新。
 - 光照历史窗口 32，历史寿命 128 次更新。有效零观测会更新历史，缺测不等于零；冻结暂停老化。
 - LOD scene scale 8，hash capacity 65536，geometry capacity 8192，模型预算 256 MiB。
@@ -447,5 +453,17 @@ CPU 对照程序将相同输入送入重构前实现和新实现，191 项检查
 冻结与诊断切换、独立训练、引导/VXPG 开关、手动重置、预算回退恢复和场景卸载。
 GPU 算法、资源布局和调度未修改，普通帧不增加读回。未做逐像素对比或性能基准；临时脚本、
 CPU 对照程序和依赖在交付前清理。见 [诊断分层验证](../../../build/vxpg-diagnostics-20261026/verification-summary.json)。
+
+2026-10-28 固定开启 PG SHaRC 后，Release RTPT 构建通过（零警告、零错误）。
+D3D12 debug layer 下 104 项运行检查通过，包含生产 MIS 函数的 8192 组 GPU 数值检查、
+1080p 完整主管线与 128 帧 Stop、全局 SHaRC/查询关闭及恢复、冻结、空缓存、反弹资格拦截、
+VXPG 关闭恢复及单/双 Pass；13 个状态均无无效样本或几何/分布溢出。
+旧属性 true/false 均被拒绝，配对缓存读取和 MIS 函数保持原样；积分器与原开启路径的源码契约检查通过。
+640×360、三个种子在 16/64/128 帧对照七路输出，共 63 组对照、126 份数组全部有限；
+128 帧最终 HDR 平均亮度与原开启状态的相对差均小于 0.05%。这是独立随机运行对照，不要求逐像素一致。
+实际通过 `RTPR_START.cmd` 打开 VeachAjar，确认默认 `ToneMapper.dst` 及 PG SHaRC 固定状态说明，独立 Enabled 已移除。
+见 [运行检查](../../../build/pg-sharc-fixed-20261028/runtime.json)、
+[图像对照](../../../build/pg-sharc-fixed-20261028/comparison.json) 和
+[MIS 源码契约](../../../build/pg-sharc-fixed-20261028/mis-source-contract.json)。临时验证脚本与图像数组已清理。
 
 历史实验、已删除功能与旧测试数量见 [历史记录](README_HISTORY.md)，不代表当前可用功能。

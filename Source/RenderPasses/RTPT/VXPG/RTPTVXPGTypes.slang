@@ -20,7 +20,6 @@ struct RTPTVXPGParams
     uint generation;
     uint enabled;
     uint useGuiding;
-    uint pgUseCache;
     uint debugEnabled;
     uint debugMode;
     uint superpixelSize;

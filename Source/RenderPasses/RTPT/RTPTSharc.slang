@@ -145,12 +145,11 @@ bool rtptTrySharcQuery(
 // No counters or side effects: also used at a BRDF hit to answer the
 // hypothetical VXPG eligibility question in the same path-event space.
 bool rtptSharcPairEligible(ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce,
-    bool previousDelta, bool guideSource, bool allowGuide, bool previousDiffuse, float previousRoughness, float segmentLength)
+    bool previousDelta, bool previousDiffuse, float previousRoughness, float segmentLength)
 {
     if (gSharcSettings.useCache == 0 || bounce == 0 || bounce < gSharcSettings.minBounce ||
         bounce >= gParams.maxBounces || previousDelta || properties.roughness < gSharcSettings.minRoughness ||
         any(properties.emission > 0.f) || (mi.getLobeTypes(sd) & uint(LobeType::DeltaReflection)) != 0) return false;
-    if (guideSource && !allowGuide) return false;
     const uint level = HashGridGetLevel(sd.posW, gSharc.hashGridParameters);
     const float voxelSize = HashGridGetVoxelSize(level, gSharc.hashGridParameters);
     if (!(segmentLength >= voxelSize)) return false;

@@ -28,7 +28,6 @@ struct Settings
     bool enabled = false;
     bool useGuiding = true;
     bool freezeUpdates = false;
-    bool pgUseCache = false;
     bool debugEnabled = false;
     bool detailedDiagnostics = false;
     uint32_t historyFrames = 32;

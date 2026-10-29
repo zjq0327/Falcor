@@ -161,7 +161,6 @@ void Manager::bindParameters(const ShaderVar& root, uint32_t frameIndex, bool ac
         parameters["generation"] = mGeneration;
         parameters["enabled"] = active && mSettings.enabled ? 1u : 0u;
         parameters["useGuiding"] = mSettings.useGuiding ? 1u : 0u;
-        parameters["pgUseCache"] = mSettings.pgUseCache ? 1u : 0u;
         parameters["debugEnabled"] = mSettings.debugEnabled ? 1u : 0u;
         parameters["debugMode"] = mSettings.debugMode;
         parameters["superpixelSize"] = mSettings.superpixelSize;

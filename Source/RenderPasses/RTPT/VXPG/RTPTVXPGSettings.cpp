@@ -18,8 +18,6 @@ bool parseSetting(const std::string& key, const Properties::ConstValue& value, S
         settings.useGuiding = value;
     else if (key == "vxpgFreezeUpdates")
         settings.freezeUpdates = value;
-    else if (key == "vxpgPGUseCache")
-        settings.pgUseCache = value;
     else if (key == "vxpgDebugEnabled")
         settings.debugEnabled = value;
     else if (key == "vxpgDetailedDiagnostics")
@@ -62,7 +60,6 @@ void writeSettings(Properties& props, const Settings& settings)
     props["vxpgEnabled"] = settings.enabled;
     props["vxpgUseGuiding"] = settings.useGuiding;
     props["vxpgFreezeUpdates"] = settings.freezeUpdates;
-    props["vxpgPGUseCache"] = settings.pgUseCache;
     props["vxpgDebugEnabled"] = settings.debugEnabled;
     props["vxpgDetailedDiagnostics"] = settings.detailedDiagnostics;
     props["vxpgDiscoveryStride"] = settings.discoveryStride;
@@ -122,7 +119,7 @@ SettingsChanges compareSettings(const Settings& previous, const Settings& next)
     change.diagnostics = next.detailedDiagnostics != previous.detailedDiagnostics;
     // Freeze and visualization do not change the transport signal.
     change.signal = change.resources() || change.history || change.spatialLifetime || change.topologyInterval ||
-                    next.useGuiding != previous.useGuiding || next.pgUseCache != previous.pgUseCache;
+                    next.useGuiding != previous.useGuiding;
     return change;
 }
 
@@ -203,13 +200,12 @@ Properties Manager::renderSettingsUI(Gui::Widgets& vx, const Settings& settings,
     auto cache = vx.group("PG SHaRC");
     if (cache)
     {
-        flag = settings.pgUseCache;
-        if (cache.checkbox("Enabled", flag))
-            props["vxpgPGUseCache"] = flag;
+        cache.text("Always enabled for eligible PG hits.");
         if (!runtime.sharcQueries)
             cache.text("Inactive: SHaRC cache queries are disabled.");
         cache.tooltip(
-            "Use full SHaRC on eligible PG hits; otherwise evaluate local lighting and end the branch. Resets NRD and final accumulation.",
+            "Follows the global SHaRC Enabled and Use cache controls. Uses full SHaRC only when eligibility and paired records are valid; "
+            "otherwise evaluates local lighting and ends the branch.",
             true
         );
     }

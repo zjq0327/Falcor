@@ -50,7 +50,6 @@ def render_graph_RTPTSHARCNRD():
         "enableVXPG": True,
         "guidingMode": _choice("RTPT_GUIDING_MODE", ("BSDF", "VXPG"), "VXPG"),
         "vxpgEnabled": _module_enabled("RTPT_VXPG_ENABLED", "1"),
-        "vxpgPGUseCache": _module_enabled("RTPT_VXPG_PG_SHARC_ENABLED", "0"),
         "vxpgDebugEnabled": _module_enabled("RTPT_VXPG_DEBUG_ENABLED", "0"),
         "vxpgDetailedDiagnostics": _module_enabled("RTPT_VXPG_DIAGNOSTICS_ENABLED", "0"),
         "vxpgDiscoveryStride": int(os.environ.get("RTPT_VXPG_DISCOVERY_STRIDE", "5")),
