@@ -5,10 +5,12 @@
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include "RTPTPG.h"
+#include <unordered_map>
 
+namespace Falcor { class Light; }
 using namespace Falcor;
 
-/** Single-pass, inline-ray-query Monte Carlo surface path tracer. */
+/** Compute-based, inline-ray-query Monte Carlo surface path tracer. */
 class RTPT : public RenderPass
 {
 public:
@@ -24,12 +26,30 @@ public:
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getPGStatistics() const;
+    Properties getStageStatistics() const;
+    Properties getDIStatistics() const;
     void resetPG() { mResetPG = true; mOptionsChanged = true; }
 
 private:
     void reset();
     void validateScene() const;
     void prepareProgram(RenderContext* pRenderContext);
+    void invalidateStages();
+    bool prepareStages();
+    void bindPrimarySettings(const ShaderVar& rootVar) const;
+    void bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const;
+    void executePrimarySurface(RenderContext* pRenderContext);
+    void executeFinalSignalResolve(RenderContext* pRenderContext, const RenderData& renderData);
+    void invalidateDirectLighting();
+    bool prepareDirectLighting();
+    void bindDISettings(const ShaderVar& rootVar) const;
+    void bindDIMainResources(const ShaderVar& rootVar) const;
+    void executeDirectLighting(RenderContext* pRenderContext);
+    void invalidateDIReuse();
+    void resetDIHistory(const std::string& reason);
+    bool prepareDIReuse();
+    void bindDIReuseSettings(const ShaderVar& rootVar, uint32_t inputBank, uint32_t outputBank) const;
+    void publishDIHistory(RenderContext* pRenderContext);
     void bindSHARC(const ShaderVar& rootVar);
     void clearSHARC(RenderContext* pRenderContext);
     void executeTraining(RenderContext* pRenderContext);
@@ -37,6 +57,67 @@ private:
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
+    ref<ComputePass> mpStageComputePass;
+    ref<ComputePass> mpPrimarySurfacePass;
+    ref<ComputePass> mpFinalSignalResolve;
+    ref<Buffer> mpPrimarySurfaces;
+    ref<Buffer> mpSignalRecords;
+    uint2 mStageResourceDim = uint2(0u);
+    uint32_t mPrimaryFrameStamp = 0u;
+    bool mStagesActive = false;
+    bool mStagePreparationFailed = false;
+    std::string mStageFallbackReason;
+    ref<ComputePass> mpDIComputePass;
+    ref<ComputePass> mpDIInitialPass;
+    ref<ComputePass> mpDIShadePass;
+    ref<Buffer> mpDILightCatalog;
+    ref<Buffer> mpDIUncoveredAnalyticIndices;
+    ref<Buffer> mpDIReservoirs;
+    ref<Buffer> mpDISampleRecords;
+    ref<Buffer> mpDIResults;
+    std::vector<uint64_t> mDICatalogSignature;
+    std::unordered_map<const Light*, uint32_t> mDILightIdentities;
+    uint32_t mDINextIdentity = 1u;
+    uint32_t mDICatalogGeneration = 1u;
+    uint32_t mDILightCount = 0u;
+    uint32_t mDIEmissiveCount = 0u;
+    uint32_t mDIPointCount = 0u;
+    uint32_t mDIUncoveredAnalyticCount = 0u;
+    uint32_t mDICoverageMask = 0u;
+    bool mRestirDIEnabled = false;
+    uint32_t mRestirDICandidateCount = 8u;
+    uint32_t mRestirDIBudgetMB = 512u;
+    bool mRestirDITemporalEnabled = false;
+    bool mRestirDISpatialEnabled = false;
+    uint32_t mRestirDIHistoryLength = 20u;
+    uint32_t mRestirDISpatialSamples = 4u;
+    float mRestirDISpatialRadius = 16.f;
+    bool mDIPrepared = false;
+    bool mDIActive = false;
+    bool mDIPreparationFailed = false;
+    std::string mDIFallbackReason;
+    ref<ComputePass> mpDIReuseInitialPass;
+    ref<ComputePass> mpDITemporalPass;
+    ref<ComputePass> mpDISpatialPass;
+    ref<ComputePass> mpDIReuseShadePass;
+    ref<Buffer> mpDIPreviousPrimarySurfaces;
+    ref<Buffer> mpDINeighborOffsets;
+    bool mDIReusePrepared = false;
+    bool mDIReusePreparationFailed = false;
+    bool mDITemporalActive = false;
+    bool mDISpatialActive = false;
+    bool mDIHistoryAvailable = false;
+    bool mDIHistoryReadValid = false;
+    uint32_t mDIFinalInputBank = 0u;
+    uint32_t mDIHistoryFrameStamp = 0u;
+    uint32_t mDIHistorySampleIndex = 0u;
+    uint32_t mDIHistoryGeneration = 0u;
+    uint32_t mDIHistoryFrames = 0u;
+    float4x4 mDIPreviousViewProj = float4x4::identity();
+    float3 mDIPreviousCameraPosition = float3(0.f);
+    float3 mDIPreviousCameraForward = float3(0.f, 0.f, -1.f);
+    std::string mDIHistoryResetReason;
+    std::string mDIReuseFallbackReason;
     ref<ComputePass> mpSHARCResolve;
     ref<ComputePass> mpSparseUpdate;
     ref<ComputePass> mpPGPrepare;

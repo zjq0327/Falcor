@@ -1,0 +1,327 @@
+#pragma once
+
+import Scene.RaytracingInline;
+import Utils.Sampling.SampleGenerator;
+import Utils.Math.MathHelpers;
+import Utils.Geometry.GeometryHelpers;
+import Rendering.Lights.LightHelpers;
+import Rendering.Lights.EmissiveLightSamplerInterface;
+import Rendering.Lights.EmissiveLightSamplerHelpers;
+#include "../PrimarySurface/RTPTPrimarySurfaceTypes.slang"
+#include "../DirectLighting/RTPTDIResources.slang"
+
+StructuredBuffer<RTPTPrimarySurface> gDIPrimarySurfaces;
+#if RTPT_DI_REUSE_ENABLED
+StructuredBuffer<RTPTPrimarySurface> gDIPreviousPrimarySurfaces;
+// HLSL static globals are private to an invocation. SDK 1.3 does not call
+// RAB_AreMaterialsSimilar in Temporal's search, so gate its previous surfaces
+// using the current thread's center material before the SDK finds a neighbor.
+static uint gDITemporalMaterialID = ~0u;
+static bool gDITemporalMaterialGate = false;
+#endif
+
+// ShadingData and the material instance are reconstructed in this pass. They
+// never become persistent reservoir data or a proxy for the final material.
+struct RAB_Surface
+{
+    bool valid = false;
+    uint2 pixel = uint2(0u);
+    uint materialID = ~0u;
+    uint lobes = 0u;
+    ShadingData sd;
+    float3 normal = float3(0.f);
+    float viewZ = 0.f;
+};
+
+typedef RTPTDILightInfo RAB_LightInfo;
+typedef SampleGenerator RAB_RandomSamplerState;
+
+struct RAB_LightSample
+{
+    bool valid;
+    uint kind;
+    float3 direction;
+    float distance;
+    float3 Li;
+    float solidAnglePdf;
+    float2 sampleUV;
+    Ray visibilityRay;
+};
+
+RAB_Surface RAB_EmptySurface() { return {}; }
+RAB_LightInfo RAB_EmptyLightInfo() { return {}; }
+RAB_LightSample RAB_EmptyLightSample() { return {}; }
+
+/** Return preparation independently from geometric validity. A prepared sky
+    pixel writes an empty reservoir; it is not a request for a second estimator.
+*/
+bool rtptDILoadSurface(uint2 pixel, out RAB_Surface surface)
+{
+    surface = RAB_EmptySurface();
+    surface.pixel = pixel;
+    if (gDISettings.prepared == 0u) return false;
+    if (any(pixel >= gDISettings.frameDim)) return false;
+    uint count, stride;
+    gDIPrimarySurfaces.GetDimensions(count, stride);
+    const uint index = pixel.y * gDISettings.frameDim.x + pixel.x;
+    if (index >= count) return false;
+    const RTPTPrimarySurface primary = gDIPrimarySurfaces[index];
+    if ((primary.flags & kRTPTPrimaryRecordReady) == 0u) return false;
+    if (primary.sampleIndex != gDISettings.sampleIndex) return false;
+    if (primary.frameStamp != gDISettings.frameStamp) return false;
+    const HitInfo hit = HitInfo(primary.packedHit);
+    if (!hit.isValid()) return true;
+    if (hit.getType() != HitType::Triangle) return true;
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+    const TriangleHit triangleHit = hit.getTriangleHit();
+    const VertexData vertex = gScene.getVertexData(triangleHit);
+    surface.materialID = gScene.getMaterialID(triangleHit.instanceID);
+    surface.sd = gScene.materials.prepareShadingData(vertex, surface.materialID, -primary.rayDirection);
+    surface.sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+    const IMaterialInstance mi = gScene.materials.getMaterialInstance(surface.sd, ExplicitLodTextureSampler(0.f));
+    surface.lobes = mi.getLobeTypes(surface.sd);
+    surface.normal = primary.guideNormal;
+    surface.viewZ = primary.viewZ;
+    surface.valid = true;
+#endif
+    return true;
+}
+
+RAB_Surface RAB_GetGBufferSurface(int2 pixel, bool previousFrame)
+{
+    if (any(pixel < 0)) return RAB_EmptySurface();
+    if (previousFrame)
+    {
+#if RTPT_DI_REUSE_ENABLED
+        if (gDIReuseSettings.enabled == 0u || gDIReuseSettings.historyValid == 0u) return RAB_EmptySurface();
+        if (gDIReuseSettings.historyGeneration != gDISettings.generation) return RAB_EmptySurface();
+        if (any(uint2(pixel) >= gDISettings.frameDim)) return RAB_EmptySurface();
+        uint count, stride;
+        gDIPreviousPrimarySurfaces.GetDimensions(count, stride);
+        const uint index = uint(pixel.y) * gDISettings.frameDim.x + uint(pixel.x);
+        if (index >= count) return RAB_EmptySurface();
+        const RTPTPrimarySurface primary = gDIPreviousPrimarySurfaces[index];
+        if ((primary.flags & kRTPTPrimaryRecordReady) == 0u) return RAB_EmptySurface();
+        if (primary.frameStamp != gDIReuseSettings.historyFrameStamp) return RAB_EmptySurface();
+        if (primary.sampleIndex != gDIReuseSettings.historySampleIndex) return RAB_EmptySurface();
+        const HitInfo hit = HitInfo(primary.packedHit);
+        if (!hit.isValid() || hit.getType() != HitType::Triangle) return RAB_EmptySurface();
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+        RAB_Surface previous = RAB_EmptySurface();
+        previous.pixel = uint2(pixel);
+        const TriangleHit triangleHit = hit.getTriangleHit();
+        const VertexData vertex = gScene.getVertexData(triangleHit);
+        previous.materialID = gScene.getMaterialID(triangleHit.instanceID);
+        if (gDITemporalMaterialGate && previous.materialID != gDITemporalMaterialID) return RAB_EmptySurface();
+        // Host history validity guarantees geometry, materials and lights have
+        // not changed, including movement. Old hit plus old view is exact here.
+        previous.sd = gScene.materials.prepareShadingData(vertex, previous.materialID, -primary.rayDirection);
+        previous.sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+        const IMaterialInstance mi = gScene.materials.getMaterialInstance(previous.sd, ExplicitLodTextureSampler(0.f));
+        previous.lobes = mi.getLobeTypes(previous.sd);
+        previous.normal = primary.guideNormal;
+        previous.viewZ = primary.viewZ;
+        previous.valid = true;
+        return previous;
+#else
+        return RAB_EmptySurface();
+#endif
+#else
+        return RAB_EmptySurface();
+#endif
+    }
+    RAB_Surface surface;
+    rtptDILoadSurface(uint2(pixel), surface);
+    return surface;
+}
+
+bool RAB_IsSurfaceValid(RAB_Surface surface) { return surface.valid; }
+float3 RAB_GetSurfaceWorldPos(RAB_Surface surface) { return surface.sd.posW; }
+float3 RAB_GetSurfaceNormal(RAB_Surface surface) { return surface.normal; }
+float RAB_GetSurfaceLinearDepth(RAB_Surface surface) { return max(0.f, surface.viewZ); }
+
+RAB_LightInfo RAB_LoadLightInfo(uint index, bool previousFrame)
+{
+    if (previousFrame)
+    {
+#if RTPT_DI_REUSE_ENABLED
+        if (gDIReuseSettings.historyValid == 0u) return RAB_EmptyLightInfo();
+        if (gDIReuseSettings.historyGeneration != gDISettings.generation) return RAB_EmptyLightInfo();
+#else
+        return RAB_EmptyLightInfo();
+#endif
+    }
+    if (index >= gDISettings.lightCount) return RAB_EmptyLightInfo();
+    uint count, stride;
+    gDILightCatalog.GetDimensions(count, stride);
+    if (index >= count) return RAB_EmptyLightInfo();
+    return gDILightCatalog[index];
+}
+
+RAB_RandomSamplerState RAB_InitRandomSampler(uint2 pixel, uint passIndex)
+{
+    uint seed = gDISettings.sampleIndex + passIndex * 0x85ebca6bu + 0x243f6a88u;
+#if RTPT_DI_REUSE_ENABLED
+    // Ordinary camera translation can reset PG and sampleOffset. The monotonic
+    // primary stamp keeps fresh DI candidates changing while history reprojects.
+    seed += gDISettings.frameStamp * 0x9e3779b9u;
+#endif
+    return SampleGenerator(pixel, seed);
+}
+
+float RAB_GetNextRandom(inout RAB_RandomSamplerState rng) { return sampleNext1D(rng); }
+
+RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo light, RAB_Surface surface, float2 uv)
+{
+    RAB_LightSample result = {};
+    result.kind = light.kind;
+    result.sampleUV = uv;
+    if (!surface.valid) return result;
+    if (light.generation != gDISettings.generation) return result;
+    const float3 origin = surface.sd.computeRayOrigin();
+
+    if (light.kind == kRTPTDILightEmissive)
+    {
+        if (light.sourceIndex >= gScene.lightCollection.getTriangleCount()) return result;
+        TriangleLightSample sample;
+        if (!sampleTriangle(surface.sd.posW, light.sourceIndex, uv, sample)) return result;
+        if (!(sample.pdf > 0.f) || !isfinite(sample.pdf)) return result;
+        // The visibility segment excludes the emitter endpoint after offsetting.
+        // Evaluate the endpoint alpha explicitly, with the same texture coords.
+        const EmissiveTriangle triangle = gScene.lightCollection.getTriangle(light.sourceIndex);
+        VertexData lightVertex = {};
+        lightVertex.posW = sample.posW;
+        lightVertex.texC = triangle.getTexCoord(sample_triangle(uv));
+        if (gScene.materials.alphaTest(lightVertex, triangle.materialID, 0.f)) return result;
+        result.direction = sample.dir;
+        result.distance = sample.distance;
+        result.solidAnglePdf = sample.pdf;
+        result.Li = sample.Le / sample.pdf;
+        const float3 lightOrigin = computeRayOrigin(sample.posW, sample.normalW);
+        const float3 shadowVector = lightOrigin - origin;
+        const float shadowDistance = length(shadowVector);
+        if (!(shadowDistance > 0.f) || !isfinite(shadowDistance)) return result;
+        result.visibilityRay = Ray(origin, shadowVector / shadowDistance, 0.f, shadowDistance);
+    }
+    else if (light.kind == kRTPTDILightPoint)
+    {
+        if (light.sourceIndex >= gScene.getLightCount()) return result;
+        const LightData data = gScene.getLight(light.sourceIndex);
+        if (data.type != uint(LightType::Point)) return result;
+        AnalyticLightSample sample;
+        if (!samplePointLight(surface.sd.posW, data, sample)) return result;
+        result.direction = sample.dir;
+        result.distance = sample.distance;
+        // Point/spot is a discrete direction: retain Falcor's Dirac pdf=0.
+        // Its physical Li is not divided by that zero or treated as area light.
+        result.solidAnglePdf = sample.pdf;
+        result.Li = sample.Li;
+        result.visibilityRay = Ray(origin, sample.dir, 0.f, sample.distance);
+    }
+    else return result;
+
+    if (!(dot(surface.sd.getOrientedFaceNormal(), result.direction) > 0.f)) return result;
+    if (!all(isfinite(result.direction)) || !all(isfinite(result.Li))) return result;
+    result.valid = true;
+    return result;
+}
+
+void rtptDIEvaluateComponents(
+    RAB_Surface surface, RAB_LightSample lightSample, float3 weightedLi,
+    inout SampleGenerator sg, out float3 diffuse, out float3 specular)
+{
+    diffuse = 0.f;
+    specular = 0.f;
+    const IMaterialInstance mi = gScene.materials.getMaterialInstance(surface.sd, ExplicitLodTextureSampler(0.f));
+    if ((surface.lobes & uint(LobeType::DiffuseReflection)) != 0u)
+    {
+        ShadingData sd = surface.sd;
+        sd.mtl.setActiveLobes(uint(LobeType::DiffuseReflection));
+        diffuse = mi.eval(sd, lightSample.direction, sg) * weightedLi;
+    }
+    if ((surface.lobes & uint(LobeType::SpecularReflection)) != 0u)
+    {
+        ShadingData sd = surface.sd;
+        sd.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
+        specular = mi.eval(sd, lightSample.direction, sg) * weightedLi;
+    }
+}
+
+float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample lightSample, RAB_Surface surface)
+{
+    if (!surface.valid || !lightSample.valid) return 0.f;
+    SampleGenerator sg = RAB_InitRandomSampler(surface.pixel, 19u);
+    float3 diffuse, specular;
+    // The current host accepts reflection-only StandardMaterial, whose eval is
+    // deterministic. Random-eval materials require a separate target-support
+    // design before expanding that restriction.
+    // Both evals include cosine. Li already includes the conditional sampling
+    // weight; the SDK accounts for the separate uniform light-selection PMF.
+    rtptDIEvaluateComponents(surface, lightSample, lightSample.Li, sg, diffuse, specular);
+    if (!all(isfinite(diffuse)) || !all(isfinite(specular))) return 0.f;
+    const float3 magnitude = max(abs(diffuse), abs(specular));
+    return max(magnitude.x, max(magnitude.y, magnitude.z));
+}
+
+void RAB_GetLightDirDistance(RAB_Surface surface, RAB_LightSample sample, out float3 direction, out float distance)
+{
+    direction = sample.direction;
+    distance = sample.distance;
+}
+bool RAB_IsAnalyticLightSample(RAB_LightSample sample) { return sample.kind == kRTPTDILightPoint; }
+float RAB_LightSampleSolidAnglePdf(RAB_LightSample sample) { return sample.solidAnglePdf; }
+
+bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample sample)
+{
+    if (!surface.valid || !sample.valid) return false;
+    SceneRayQuery<true> query;
+    return query.traceVisibilityRay(sample.visibilityRay);
+}
+
+// The SDK parses all reusable functions. History is available only through the
+// guarded static-scene bridge; BRDF/environment proposals and compact/ReGIR
+// data remain unsupported and are disabled in the runtime sample parameters.
+bool RAB_GetTemporalConservativeVisibility(RAB_Surface current, RAB_Surface previous, RAB_LightSample sample)
+{
+#if RTPT_DI_REUSE_ENABLED
+    // The host forbids reuse after any scene-content change. Current TLAS is
+    // therefore the same scene for this previous-surface visibility query.
+    return RAB_GetConservativeVisibility(previous, sample);
+#else
+    return false;
+#endif
+}
+int RAB_TranslateLightIndex(uint index, bool currentToPrevious)
+{
+#if RTPT_DI_REUSE_ENABLED
+    if (gDIReuseSettings.historyValid == 0u) return -1;
+    if (gDIReuseSettings.historyGeneration != gDISettings.generation) return -1;
+    if (index >= gDISettings.lightCount) return -1;
+    return int(index);
+#else
+    return -1;
+#endif
+}
+bool RAB_AreMaterialsSimilar(RAB_Surface a, RAB_Surface b) { return a.materialID == b.materialID; }
+bool RAB_GetSurfaceBrdfSample(RAB_Surface surface, inout RAB_RandomSamplerState rng, out float3 direction)
+{
+    direction = 0.f;
+    return false;
+}
+float RAB_GetSurfaceBrdfPdf(RAB_Surface surface, float3 direction) { return 0.f; }
+bool RAB_TraceRayForLocalLight(float3 origin, float3 direction, float tMin, float tMax, out uint lightIndex, out float2 uv)
+{
+    lightIndex = RTXDI_InvalidLightIndex;
+    uv = 0.f;
+    return false;
+}
+float RAB_EvaluateLocalLightSourcePdf(RTXDI_ResamplingRuntimeParameters params, uint lightIndex)
+{
+    if (lightIndex >= gDISettings.lightCount || gDISettings.lightCount == 0u) return 0.f;
+    return 1.f / float(gDISettings.lightCount);
+}
+float RAB_EvaluateEnvironmentMapSamplingPdf(float3 direction) { return 0.f; }
+float2 RAB_GetEnvironmentMapRandXYFromDir(float3 direction) { return 0.f; }
+float RAB_GetLightTargetPdfForVolume(RAB_LightInfo light, float3 center, float radius) { return 0.f; }
+bool RAB_StoreCompactLightInfo(uint index, RAB_LightInfo light) { return false; }
+RAB_LightInfo RAB_LoadCompactLightInfo(uint index) { return RAB_EmptyLightInfo(); }

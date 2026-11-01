@@ -43,6 +43,8 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
     {
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("pgStats", [](const RTPT& self) { return self.getPGStatistics().toPython(); });
+        pass.def_property_readonly("stageStats", [](const RTPT& self) { return self.getStageStatistics().toPython(); });
+        pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
         pass.def("resetPG", &RTPT::resetPG);
     });
 }
@@ -60,6 +62,11 @@ void RTPT::setProperties(const Properties& props)
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
     bool enableNRD = mEnableNRD;
+    bool restirDIEnabled = mRestirDIEnabled;
+    uint32_t restirDICandidateCount = mRestirDICandidateCount, restirDIBudgetMB = mRestirDIBudgetMB;
+    bool restirDITemporalEnabled = mRestirDITemporalEnabled, restirDISpatialEnabled = mRestirDISpatialEnabled;
+    uint32_t restirDIHistoryLength = mRestirDIHistoryLength, restirDISpatialSamples = mRestirDISpatialSamples;
+    float restirDISpatialRadius = mRestirDISpatialRadius;
     bool enableSHARC = mEnableSHARC, sharcUseCache = mSHARCUseCache, sharcFreeze = mSHARCFreeze;
     bool sharcEnabled = mSHARCEnabled;
     uint32_t sharcEntries = mSHARCEntries, sharcUpdateStride = mSHARCUpdateStride, sharcUpdateBounces = mSHARCUpdateBounces;
@@ -80,6 +87,14 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "accumulate") accumulate = value;
         else if (key == "maxAccumulationFrames") maxAccumulationFrames = value;
         else if (key == "enableNRD") enableNRD = value;
+        else if (key == "restirDIEnabled") restirDIEnabled = value;
+        else if (key == "restirDICandidateCount") restirDICandidateCount = value;
+        else if (key == "restirDIBudgetMB") restirDIBudgetMB = value;
+        else if (key == "restirDITemporalEnabled") restirDITemporalEnabled = value;
+        else if (key == "restirDISpatialEnabled") restirDISpatialEnabled = value;
+        else if (key == "restirDIHistoryLength") restirDIHistoryLength = value;
+        else if (key == "restirDISpatialSamples") restirDISpatialSamples = value;
+        else if (key == "restirDISpatialRadius") restirDISpatialRadius = value;
         else if (key == "enableSHARC") enableSHARC = value;
         else if (key == "sharcEnabled") sharcEnabled = value;
         else if (key == "sharcUseCache") sharcUseCache = value;
@@ -113,6 +128,16 @@ void RTPT::setProperties(const Properties& props)
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
+    FALCOR_CHECK(restirDICandidateCount >= 1 && restirDICandidateCount <= 128,
+        "ReSTIR DI Initial candidate count must be in [1, 128].");
+    FALCOR_CHECK(restirDIBudgetMB >= 16 && restirDIBudgetMB <= 2048,
+        "ReSTIR DI resource budget must be in [16, 2048] MiB.");
+    FALCOR_CHECK(restirDIHistoryLength >= 1 && restirDIHistoryLength <= 32,
+        "ReSTIR DI history length must be in [1, 32].");
+    FALCOR_CHECK(restirDISpatialSamples >= 1 && restirDISpatialSamples <= 32,
+        "ReSTIR DI spatial sample count must be in [1, 32].");
+    FALCOR_CHECK(std::isfinite(restirDISpatialRadius) && restirDISpatialRadius >= 1.f && restirDISpatialRadius <= 64.f,
+        "ReSTIR DI spatial radius must be in [1, 64] pixels.");
     FALCOR_CHECK(rrStartBounce >= 1 && rrStartBounce <= 64, "RTPT rrStartBounce must be in [1, 64].");
     FALCOR_CHECK(!enableNRD || (samplesPerPixel == 1 && !accumulate),
         "RTPT NRD mode requires samplesPerPixel=1 and accumulate=false; NRD manages temporal history.");
@@ -145,6 +170,11 @@ void RTPT::setProperties(const Properties& props)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
             "RTPT SHaRC currently requires D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
     const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enablePG != mEnablePG;
+    const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
+        restirDIBudgetMB != mRestirDIBudgetMB || restirDITemporalEnabled != mRestirDITemporalEnabled ||
+        restirDISpatialEnabled != mRestirDISpatialEnabled || restirDIHistoryLength != mRestirDIHistoryLength ||
+        restirDISpatialSamples != mRestirDISpatialSamples || restirDISpatialRadius != mRestirDISpatialRadius;
+    const bool diEligibilityChanged = useNEE != mUseNEE || samplesPerPixel != mSamplesPerPixel;
     const bool pgStructureChanged = enablePG != mEnablePG || pg.coarseLevels != mPGSettings.coarseLevels ||
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
         pg.maxNodesPerRegion != mPGSettings.maxNodesPerRegion || pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
@@ -159,7 +189,7 @@ void RTPT::setProperties(const Properties& props)
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
-        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged;
+        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged;
     mResetPG |= pgStructureChanged || pgDepthChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     if (sharcEntries != mSHARCEntries)
@@ -178,6 +208,15 @@ void RTPT::setProperties(const Properties& props)
     mAccumulate = accumulate;
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
+    mRestirDIEnabled = restirDIEnabled;
+    mRestirDICandidateCount = restirDICandidateCount;
+    mRestirDIBudgetMB = restirDIBudgetMB;
+    mRestirDITemporalEnabled = restirDITemporalEnabled;
+    mRestirDISpatialEnabled = restirDISpatialEnabled;
+    mRestirDIHistoryLength = restirDIHistoryLength;
+    mRestirDISpatialSamples = restirDISpatialSamples;
+    mRestirDISpatialRadius = restirDISpatialRadius;
+    if (diChanged || diEligibilityChanged) invalidateDirectLighting();
     mEnableSHARC = enableSHARC;
     mSHARCEnabled = sharcEnabled;
     mSHARCUseCache = sharcUseCache;
@@ -223,6 +262,14 @@ Properties RTPT::getProperties() const
     props["accumulate"] = mAccumulate;
     props["maxAccumulationFrames"] = mMaxAccumulationFrames;
     props["enableNRD"] = mEnableNRD;
+    props["restirDIEnabled"] = mRestirDIEnabled;
+    props["restirDICandidateCount"] = mRestirDICandidateCount;
+    props["restirDIBudgetMB"] = mRestirDIBudgetMB;
+    props["restirDITemporalEnabled"] = mRestirDITemporalEnabled;
+    props["restirDISpatialEnabled"] = mRestirDISpatialEnabled;
+    props["restirDIHistoryLength"] = mRestirDIHistoryLength;
+    props["restirDISpatialSamples"] = mRestirDISpatialSamples;
+    props["restirDISpatialRadius"] = mRestirDISpatialRadius;
     props["enableSHARC"] = mEnableSHARC;
     props["sharcEnabled"] = mSHARCEnabled;
     props["sharcUseCache"] = mSHARCUseCache;
@@ -364,7 +411,10 @@ void RTPT::validateScene() const
 
 void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    invalidateStages();
     mpScene = pScene;
+    mDILightIdentities.clear();
+    mDINextIdentity = 1u;
     mpComputePass = nullptr;
     mpSHARCResolve = nullptr;
     mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
@@ -408,6 +458,10 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             mpEnvMapSampler = std::make_unique<EnvMapSampler>(mpDevice, mpScene->getEnvMap());
     }
     else mpEnvMapSampler = nullptr;
+
+    // A new scene/type/lighting specialization also invalidates the private
+    // primary producer and its consumer. Ordinary camera motion does not.
+    if (!mpComputePass) invalidateStages();
 
     if (!mpComputePass || ((mEnableSHARC || mEnablePG) && !mpSparseUpdate) ||
         (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && !mpSHARCResolve))
@@ -487,6 +541,12 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             if (!mpPGTrain) mpPGTrain = makePGPass("RenderPasses/RTPT/RTPTPGTrain.cs.slang");
         }
     }
+}
+
+void RTPT::bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const
+{
+    for (const auto& output : kNRDOutputs)
+        rootVar[output.shaderName] = renderData.getTexture(output.name);
 }
 
 void RTPT::bindSHARC(const ShaderVar& rootVar)
@@ -679,6 +739,15 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // conservatively discards them when lighting, materials or geometry change.
     const auto sharcInvalidations = discontinuities & ~IScene::UpdateFlags::CameraSwitched;
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
+    // Previous hit/material reconstruction and temporal visibility use the
+    // current scene only while its physical state is unchanged. Camera motion
+    // is handled by reprojection, independently of PG/NRD history resets.
+    if ((updates & (discontinuities | movingScene)) != IScene::UpdateFlags::None)
+        resetDIHistory("Scene geometry, materials or lighting changed");
+    else if (is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum))
+        resetDIHistory("Camera frustum changed");
+    else if (mOptionsChanged)
+        resetDIHistory("Render options or seed changed");
     if ((updates & (sharcInvalidations | movingScene)) != IScene::UpdateFlags::None)
     {
         mResetSHARCCache = true;
@@ -694,6 +763,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const uint2 frameDim(color->getWidth(), color->getHeight());
     if (any(frameDim != mFrameDim) || !mpAccumulation)
     {
+        // Release old per-pixel records before allocating the new resolution.
+        invalidateStages();
         if (mEnablePG) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
         mFrameDim = frameDim;
         mpAccumulation = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
@@ -732,7 +803,12 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
 
-    auto var = mpComputePass->getRootVar();
+    const bool stagesActive = prepareStages();
+    if (stagesActive) executePrimarySurface(pRenderContext);
+    const bool diActive = prepareDirectLighting();
+    if (diActive) executeDirectLighting(pRenderContext);
+    const auto& mainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
+    auto var = mainPass->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
     mpSampleGenerator->bindShaderData(var);
     if (mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
@@ -747,12 +823,22 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     params["useNEE"] = mUseNEE ? 1u : 0u;
     params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
     params["accumulate"] = mAccumulate ? 1u : 0u;
-    var["gColor"] = color;
-    var["gNoisyColor"] = noisyColor;
-    var["gAccumulation"] = mpAccumulation;
-    if (mEnableNRD)
-        for (const auto& output : kNRDOutputs)
-            var[output.shaderName] = renderData.getTexture(output.name);
+    // In NRD mode the separate resolve owns all radiance/guide outputs. The
+    // legacy pass still writes them directly when stage preparation fails.
+    if (!stagesActive || !mEnableNRD)
+    {
+        var["gColor"] = color;
+        var["gNoisyColor"] = noisyColor;
+        var["gAccumulation"] = mpAccumulation;
+    }
+    if (mEnableNRD && !stagesActive) bindNRDOutputs(var, renderData);
+    if (stagesActive)
+    {
+        bindPrimarySettings(var);
+        var["gPrimarySurfaces"] = mpPrimarySurfaces;
+        if (mEnableNRD) var["gSignalRecords"] = mpSignalRecords;
+    }
+    if (diActive) bindDIMainResources(var);
     if (mEnableSHARC)
     {
         bindSHARC(var);
@@ -765,8 +851,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     pRenderContext->uavBarrier(mpAccumulation.get());
     {
         FALCOR_PROFILE(pRenderContext, "MainRender");
-        mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
+        mainPass->execute(pRenderContext, uint3(frameDim, 1));
     }
+    if (stagesActive && mEnableNRD) executeFinalSignalResolve(pRenderContext, renderData);
     if (mPGTrainingThisFrame)
     {
         FALCOR_PROFILE(pRenderContext, "PGPublishCPU");
@@ -792,6 +879,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
     const bool previousNEE = mUseNEE;
     const bool previousRR = mUseRussianRoulette;
     const uint32_t previousSeed = mSeed;
+    const uint32_t previousSPP = mSamplesPerPixel;
     if (mEnableNRD)
         widget.text("NRD: 1 primary sample, one path per active diffuse/specular lobe.");
     else
@@ -820,8 +908,36 @@ void RTPT::renderUI(Gui::Widgets& widget)
     if (!mEnableNRD)
         widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
     mOptionsChanged |= changed;
+    if (previousNEE != mUseNEE || previousSPP != mSamplesPerPixel) invalidateDirectLighting();
     mResetSHARCCache |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
     mResetPG |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
+    if (auto diWidget = widget.group("ReSTIR DI"))
+    {
+        Properties props;
+        bool enabled = mRestirDIEnabled;
+        if (diWidget.checkbox("Enabled", enabled)) props["restirDIEnabled"] = enabled;
+        uint32_t count = mRestirDICandidateCount;
+        if (diWidget.var("Initial candidates", count, 1u, 128u)) props["restirDICandidateCount"] = count;
+        uint32_t budget = mRestirDIBudgetMB;
+        if (diWidget.var("Resource budget (MiB)", budget, 16u, 2048u)) props["restirDIBudgetMB"] = budget;
+        bool temporal = mRestirDITemporalEnabled, spatial = mRestirDISpatialEnabled;
+        if (diWidget.checkbox("Temporal reuse", temporal)) props["restirDITemporalEnabled"] = temporal;
+        if (diWidget.checkbox("Spatial reuse", spatial)) props["restirDISpatialEnabled"] = spatial;
+        uint32_t history = mRestirDIHistoryLength, neighbors = mRestirDISpatialSamples;
+        float radius = mRestirDISpatialRadius;
+        if (diWidget.var("History length", history, 1u, 32u)) props["restirDIHistoryLength"] = history;
+        if (diWidget.var("Spatial samples", neighbors, 1u, 32u)) props["restirDISpatialSamples"] = neighbors;
+        if (diWidget.var("Spatial radius", radius, 1.f, 64.f)) props["restirDISpatialRadius"] = radius;
+        if (!props.empty()) setProperties(props);
+        diWidget.text(mDIActive ? "Active: global Initial RIS" : "Inactive");
+        if (mDITemporalActive) diWidget.text(mDIHistoryReadValid ? "Temporal: history available" : "Temporal: current frame only");
+        if (mDISpatialActive) diWidget.text("Spatial: active");
+        if (mRestirDIEnabled && !mDIFallbackReason.empty())
+            diWidget.text(mDIFallbackReason.substr(0, mDIFallbackReason.find('\n')));
+        if (mRestirDIEnabled && !mDIReuseFallbackReason.empty())
+            diWidget.text(mDIReuseFallbackReason.substr(0, mDIReuseFallbackReason.find('\n')));
+        diWidget.text("Supported lights: " + std::to_string(mDILightCount));
+    }
     if (mEnableSHARC)
     {
         auto sharcWidget = widget.group("SHaRC");

@@ -1,4 +1,10 @@
-/** Single-pass Monte Carlo path tracer using inline ray queries. */
+/** Monte Carlo path tracer using inline ray queries and current-frame signals. */
+#ifndef RTPT_SEPARATE_SIGNAL_RESOLVE
+#define RTPT_SEPARATE_SIGNAL_RESOLVE 0
+#endif
+#ifndef RTPT_USE_RESTIR_DI
+#define RTPT_USE_RESTIR_DI 0
+#endif
 #include "Scene/SceneDefines.slangh"
 #include "Utils/Math/MathConstants.slangh"
 
@@ -65,9 +71,13 @@ RWTexture2D<float> gNRDViewZ;
 RWTexture2D<float4> gNRDMotionW;
 #endif
 
+#if RTPT_USE_RESTIR_DI
+#include "DirectLighting/RTPTDIResources.slang"
+#endif
 #include "RTPTSampling.slang"
 #include "RTPTLighting.slang"
 #include "RTPTSharc.slang"
+#include "PrimarySurface/RTPTPrimarySurface.slang"
 #include "RTPTIntegrator.slang"
 #if ENABLE_NRD
 #include "RTPTNRD.slang"
@@ -92,9 +102,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if ENABLE_NRD
         // NRD mode uses one shared primary sample and one continuation per
         // reflection component. The host enforces 1 spp without PT accumulation.
-        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sg, sharcStats);
+        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sampleIndex, sg, sharcStats);
 #else
-        const float3 sampleRadiance = rtptTracePath(primaryRay, sg, sharcStats);
+        const float3 sampleRadiance = rtptTracePath(primaryRay, pixel, sampleIndex, s == 0u, sg, sharcStats);
 #endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
     }
@@ -102,6 +112,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     rtptWriteSharcDebug(pixel, sharcStats);
 #endif
 
+#if !(ENABLE_NRD && RTPT_SEPARATE_SIGNAL_RESOLVE)
     gNoisyColor[pixel] = float4(frameAverage, 1.f);
     float3 result = frameAverage;
     if (gParams.accumulate != 0 && gParams.accumulatedSamples != 0)
@@ -112,4 +123,5 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
     gAccumulation[pixel] = float4(result, 1.f);
     gColor[pixel] = float4(result, 1.f);
+#endif
 }

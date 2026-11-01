@@ -1,0 +1,39 @@
+#pragma once
+
+// Use the installed RTXDI 1.3 implementation directly. Initial is a single
+// uniform local-light proposal; these optional techniques have no resources.
+#define RTXDI_REGIR_MODE 0
+#define RTXDI_ENABLE_PRESAMPLING 0
+#include "rtxdi/RtxdiParameters.h"
+
+#ifndef RTPT_DI_WRITE_RESERVOIRS
+#define RTPT_DI_WRITE_RESERVOIRS 0
+#endif
+
+#if RTPT_DI_WRITE_RESERVOIRS
+RWStructuredBuffer<RTXDI_PackedReservoir> gDIReservoirs;
+#define RTXDI_ENABLE_STORE_RESERVOIR 1
+#else
+StructuredBuffer<RTXDI_PackedReservoir> gDIReservoirs;
+#define RTXDI_ENABLE_STORE_RESERVOIR 0
+#endif
+
+// Only parsed by unused neighbor-resampling functions in phase 2. There is no
+// Temporal/Spatial dispatch or allocation masquerading as an implemented stage.
+Buffer<float2> gDINeighborOffsets;
+#define RTXDI_LIGHT_RESERVOIR_BUFFER gDIReservoirs
+#define RTXDI_NEIGHBOR_OFFSETS_BUFFER gDINeighborOffsets
+
+#include "RTPTDIBridge.slangh"
+#include "rtxdi/ResamplingFunctions.hlsli"
+
+RTXDI_ResamplingRuntimeParameters rtptDIInitialRuntimeParameters()
+{
+    RTXDI_ResamplingRuntimeParameters params = {};
+    params.firstLocalLight = 0u;
+    params.numLocalLights = gDISettings.lightCount;
+    params.tileCount = 1u;
+    params.tileSize = 1u;
+    // No infinite, environment, BRDF, ReGIR, checkerboard or importance tiles.
+    return params;
+}

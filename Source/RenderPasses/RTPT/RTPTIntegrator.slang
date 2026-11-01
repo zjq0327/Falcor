@@ -1,23 +1,20 @@
 #pragma once
+#include "PrimarySurface/RTPTCamera.slang"
+#include "PrimarySurface/RTPTPrimarySurface.slang"
 
 Ray rtptGenerateCameraRay(uint2 pixel, inout SampleGenerator sg)
 {
-#if ENABLE_NRD
-    // Radiance, first-hit guides and NRD reprojection share camera jitter.
-    return gScene.camera.computeRayPinhole(pixel, gParams.frameDim);
-#else
-    // Own subpixel jitter so accumulating a stationary camera remains valid.
-    // External camera jitter is deliberately ignored; this version is pinhole.
-    const float2 p = (float2(pixel) + sampleNext2D(sg)) / float2(gParams.frameDim);
-    const float2 ndc = p * float2(2.f, -2.f) + float2(-1.f, 1.f);
-    let camera = gScene.camera.data;
-    const float3 direction = normalize(ndc.x * camera.cameraU + ndc.y * camera.cameraV + camera.cameraW);
-    const float inverseCosine = 1.f / dot(normalize(camera.cameraW), direction);
-    return Ray(camera.posW, direction, camera.nearZ * inverseCosine, camera.farZ * inverseCosine);
-#endif
+    return rtptGeneratePrimaryCameraRay(gScene.camera, pixel, gParams.frameDim, sg);
 }
 
-float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
+float3 rtptTracePath(
+    Ray ray,
+    uint2 pixel,
+    uint sampleIndex,
+    bool allowPrimary,
+    inout SampleGenerator sg,
+    inout RTPTSharcStats sharcStats
+)
 {
     float3 radiance = 0.f;
     float3 throughput = 1.f;
@@ -38,11 +35,23 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
     // Both techniques therefore estimate exactly the same path lengths.
     for (uint bounce = 0; bounce <= gParams.maxBounces; ++bounce)
     {
-        float hitT;
+        float hitT = 0.f;
 #if ENABLE_SHARC && SHARC_QUERY
         ++sharcStats.radianceRays;
 #endif
-        const HitInfo hit = query.traceRay(ray, hitT);
+        HitInfo hit = makeInvalidHit();
+        bool reusedPrimary = false;
+        if (bounce == 0u && allowPrimary)
+        {
+            RTPTPrimarySurface surface;
+            if (rtptTryLoadPrimary(pixel, sampleIndex, ray, surface))
+            {
+                hit = HitInfo(surface.packedHit);
+                hitT = surface.hitT;
+                reusedPrimary = true;
+            }
+        }
+        if (!reusedPrimary) hit = query.traceRay(ray, hitT);
         if (!hit.isValid())
         {
             bool evaluateEnvironment = false;
@@ -150,4 +159,10 @@ float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sha
     // Invalid input or arithmetic must not poison the persistent accumulation.
     // Finite samples, including fireflies, are never energy-clamped.
     return all(isfinite(radiance)) ? radiance : float3(0.f);
+}
+
+// Independent training and legacy internal callers never consume camera records.
+float3 rtptTracePath(Ray ray, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
+{
+    return rtptTracePath(ray, uint2(0u), 0u, false, sg, sharcStats);
 }

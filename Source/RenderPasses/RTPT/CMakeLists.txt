@@ -3,6 +3,9 @@ add_plugin(RTPT)
 target_sources(RTPT PRIVATE
     RTPT.cpp
     RTPT.h
+    RTPTStages.cpp
+    RTPTDirectLighting.cpp
+    RTPTDIReuse.cpp
     RTPTPG.h
     RTPTPG.cpp
     RTPTGrid.slang
@@ -16,6 +19,23 @@ target_sources(RTPT PRIVATE
     RTPTIntegrator.slang
     RTPTLighting.slang
     RTPTNRD.slang
+    PrimarySurface/RTPTCamera.slang
+    PrimarySurface/RTPTPrimarySurfaceTypes.slang
+    PrimarySurface/RTPTPrimarySurface.slang
+    PrimarySurface/RTPTPrimarySurface.cs.slang
+    Signal/RTPTSignalTypes.slang
+    Signal/RTPTSignalResolve.slang
+    Signal/RTPTFinalSignalResolve.cs.slang
+    DirectLighting/RTPTDITypes.slang
+    DirectLighting/RTPTDIResources.slang
+    ReSTIRDI/RTPTDIBridge.slangh
+    ReSTIRDI/RTPTDISDK.slangh
+    ReSTIRDI/RTPTDIInitial.cs.slang
+    ReSTIRDI/RTPTDIShade.cs.slang
+    ReSTIRDI/RTPTDIReprojection.slangh
+    ReSTIRDI/RTPTDIReuseSDK.slangh
+    ReSTIRDI/RTPTDITemporal.cs.slang
+    ReSTIRDI/RTPTDISpatial.cs.slang
     RTPTSharc.slang
     RTPTSharcUpdate.cs.slang
     RTPTSharcResolve.cs.slang

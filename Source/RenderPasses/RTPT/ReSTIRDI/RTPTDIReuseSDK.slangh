@@ -1,0 +1,150 @@
+#pragma once
+
+#ifndef RTPT_DI_REUSE_ENABLED
+#define RTPT_DI_REUSE_ENABLED 1
+#endif
+#define RTXDI_REGIR_MODE 0
+#define RTXDI_ENABLE_PRESAMPLING 0
+#include "rtxdi/RtxdiParameters.h"
+#include "RTPTDIBridge.slangh"
+
+RWStructuredBuffer<RTXDI_PackedReservoir> gDIReservoirs;
+Buffer<float2> gDINeighborOffsets;
+#define RTXDI_LIGHT_RESERVOIR_BUFFER gDIReservoirs
+#define RTXDI_NEIGHBOR_OFFSETS_BUFFER gDINeighborOffsets
+#define RTXDI_ENABLE_STORE_RESERVOIR 0
+
+// Keep the installed SDK unchanged. Its persistent reservoir format remains
+// standard, including packed UV16. Only an unpacked value inside resampling
+// carries a full-UV sidecar address in uvData; SDK Combine copies that address.
+#define RTXDI_GetReservoirSampleUV RTPTDI_SDK_GetPackedSampleUV
+#define RTXDI_LoadReservoir RTPTDI_SDK_LoadBlockLinearReservoir
+#include "rtxdi/Reservoir.hlsli"
+#undef RTXDI_GetReservoirSampleUV
+#undef RTXDI_LoadReservoir
+
+float2 RTXDI_GetReservoirSampleUV(const RTXDI_Reservoir reservoir)
+{
+    uint count, stride;
+    gDISampleRecords.GetDimensions(count, stride);
+    if (reservoir.uvData >= count) return 0.f;
+    return gDISampleRecords[reservoir.uvData].sample.sampleUV;
+}
+
+/** Preparation belongs to the bank, not to its selected winner. In particular,
+    a missing current input must not be laundered into a prepared black output.
+*/
+bool rtptDIIsBankPrepared(uint2 position, uint bank)
+{
+    if (any(position >= gDISettings.frameDim)) return false;
+    if (bank >= gDIReuseSettings.bankCount) return false;
+    const uint pixelCount = gDISettings.frameDim.x * gDISettings.frameDim.y;
+    const uint token = bank * pixelCount + position.y * gDISettings.frameDim.x + position.x;
+    uint count, stride;
+    gDIReservoirs.GetDimensions(count, stride);
+    if (token >= count) return false;
+    gDISampleRecords.GetDimensions(count, stride);
+    if (token >= count) return false;
+    const RTPTDISampleRecord record = gDISampleRecords[token];
+    if ((record.flags & kRTPTDIResultPrepared) == 0u) return false;
+    if (record.coverageMask != gDISettings.coverageMask) return false;
+    if (bank == gDIReuseSettings.historyBank)
+    {
+        if (gDIReuseSettings.historyValid == 0u) return false;
+        if (gDIReuseSettings.historyGeneration != gDISettings.generation) return false;
+        if (record.frameStamp != gDIReuseSettings.historyFrameStamp) return false;
+        if (record.sampleIndex != gDIReuseSettings.historySampleIndex) return false;
+    }
+    else
+    {
+        if (record.frameStamp != gDISettings.frameStamp) return false;
+        if (record.sampleIndex != gDISettings.sampleIndex) return false;
+    }
+    return true;
+}
+
+RTXDI_Reservoir RTXDI_LoadReservoir(
+    RTXDI_ResamplingRuntimeParameters params, uint2 position, uint bank)
+{
+    if (!rtptDIIsBankPrepared(position, bank)) return RTXDI_EmptyReservoir();
+    const uint pixelCount = gDISettings.frameDim.x * gDISettings.frameDim.y;
+    const uint token = bank * pixelCount + position.y * gDISettings.frameDim.x + position.x;
+    const RTPTDISampleRecord record = gDISampleRecords[token];
+    RTXDI_Reservoir reservoir = RTXDI_UnpackReservoir(gDIReservoirs[token]);
+    if (RTXDI_IsValidReservoir(reservoir))
+    {
+        const uint lightIndex = RTXDI_GetReservoirLightIndex(reservoir);
+        bool identityValid = lightIndex < gDISettings.lightCount;
+        if (identityValid)
+            identityValid = rtptDIMatchesSampleRef(RAB_LoadLightInfo(lightIndex, false), record.sample);
+        if (!all(isfinite(record.sample.sampleUV))) identityValid = false;
+        if (!identityValid)
+        {
+            // Follow the SDK's invalid-sample semantics without erasing M.
+            reservoir.lightData = 0u;
+            reservoir.weightSum = 0.f;
+        }
+        else reservoir.uvData = token;
+    }
+    return reservoir;
+}
+
+#include "rtxdi/ResamplingFunctions.hlsli"
+
+RTXDI_ResamplingRuntimeParameters rtptDIReuseRuntimeParameters()
+{
+    RTXDI_ResamplingRuntimeParameters params = {};
+    params.numLocalLights = gDISettings.lightCount;
+    params.tileCount = params.tileSize = 1u;
+    params.neighborOffsetMask = 255u;
+    params.uniformRandomNumber = gDISettings.frameStamp;
+    return params;
+}
+
+void rtptDIFilterReuseVisibility(inout RTXDI_Reservoir reservoir, RAB_Surface surface)
+{
+    if (!RTXDI_IsValidReservoir(reservoir)) return;
+    const RAB_LightInfo light = RAB_LoadLightInfo(RTXDI_GetReservoirLightIndex(reservoir), false);
+    const RAB_LightSample sample = RAB_SamplePolymorphicLight(light, surface, RTXDI_GetReservoirSampleUV(reservoir));
+    const bool visible = RAB_GetConservativeVisibility(surface, sample);
+    RTXDI_StoreVisibilityInReservoir(reservoir, visible ? float3(1.f) : float3(0.f), true);
+}
+
+/** Materialize the winner into this bank's own full-UV sidecar. No token is
+    persisted: standard SDK UV16 is restored before packing. This also detaches
+    the output from all source banks before a history bank can be overwritten.
+*/
+void rtptDIStoreReuseReservoir(uint2 pixel, uint outputBank, RTXDI_Reservoir reservoir, bool prepared)
+{
+    if (outputBank >= gDIReuseSettings.bankCount) return;
+    const uint pixelCount = gDISettings.frameDim.x * gDISettings.frameDim.y;
+    const uint index = outputBank * pixelCount + pixel.y * gDISettings.frameDim.x + pixel.x;
+    RTPTDISampleRecord record = {};
+    record.sample.generation = gDISettings.generation;
+    record.sampleIndex = gDISettings.sampleIndex;
+    record.frameStamp = gDISettings.frameStamp;
+    record.coverageMask = gDISettings.coverageMask;
+    record.flags = prepared ? kRTPTDIResultPrepared : 0u;
+    if (RTXDI_IsValidReservoir(reservoir))
+    {
+        uint count, stride;
+        gDISampleRecords.GetDimensions(count, stride);
+        if (reservoir.uvData < count)
+        {
+            record.sample = gDISampleRecords[reservoir.uvData].sample;
+            record.flags |= kRTPTDIResultSampleValid;
+            const float2 uv = record.sample.sampleUV;
+            reservoir.uvData = uint(saturate(uv.x) * 0xffffu) | (uint(saturate(uv.y) * 0xffffu) << 16);
+        }
+        else
+        {
+            reservoir.lightData = 0u;
+            reservoir.weightSum = 0.f;
+            reservoir.uvData = 0u;
+            record.flags |= kRTPTDIResultInvalidIdentity;
+        }
+    }
+    else reservoir.uvData = 0u;
+    gDIReservoirs[index] = RTXDI_PackReservoir(reservoir);
+    gDISampleRecords[index] = record;
+}

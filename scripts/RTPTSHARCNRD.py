@@ -13,6 +13,14 @@ def render_graph_RTPTSHARCNRD():
     graph = RenderGraph("RTPTSHARCNRD")
     graph.addPass(createPass("RTPT", {
         "enableNRD": True,
+        "restirDIEnabled": _module_enabled("RTPT_RESTIR_DI_ENABLED"),
+        "restirDICandidateCount": 8,
+        "restirDIBudgetMB": 512,
+        "restirDITemporalEnabled": _module_enabled("RTPT_RESTIR_DI_TEMPORAL_ENABLED"),
+        "restirDISpatialEnabled": _module_enabled("RTPT_RESTIR_DI_SPATIAL_ENABLED"),
+        "restirDIHistoryLength": 20,
+        "restirDISpatialSamples": 4,
+        "restirDISpatialRadius": 16.0,
         "samplesPerPixel": 1,
         "maxBounces": 4,
         "useNEE": True,

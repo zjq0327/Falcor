@@ -1,0 +1,72 @@
+#pragma once
+#include "../PrimarySurface/RTPTPrimarySurfaceTypes.slang"
+
+/** Project with the actual jittered camera matrix saved with the history bank.
+
+    Falcor's pinhole ray samples (pixel + .5) / dim + (-jitterX, +jitterY).
+    Camera::calculateCameraParameters() applies (+2*jitterX, +2*jitterY)
+    to clip/NDC XY. The full jittered VP therefore projects that ray back onto
+    its integer pixel index after the half-pixel subtraction below. Replacing
+    this matrix with prevViewProjMatNoJitter would omit the previous Halton jitter.
+
+    linearDepth is clip.w for the perspective camera used by RTPT, matching the
+    primary viewZ contract. D3D clip depth is [0,w]. Rejection only removes history
+    reuse; the current Initial reservoir remains the fallback estimator.
+*/
+bool rtptDIProjectPreviousPixel(
+    float3 previousPosition,
+    uint2 frameDim,
+    float4x4 previousViewProj,
+    out float2 previousPixel,
+    out float linearDepth
+)
+{
+    previousPixel = 0.f;
+    linearDepth = 0.f;
+    if (any(frameDim == 0u)) return false;
+    if (!all(isfinite(previousPosition))) return false;
+    const float4 clip = mul(previousViewProj, float4(previousPosition, 1.f));
+    if (!all(isfinite(clip))) return false;
+    if (!(clip.w > 0.f)) return false;
+    if (clip.z < 0.f || clip.z > clip.w) return false;
+    const float2 uv = clip.xy / clip.w * float2(0.5f, -0.5f) + 0.5f;
+    if (!all(isfinite(uv))) return false;
+    if (any(uv < 0.f) || any(uv >= 1.f)) return false;
+    previousPixel = uv * float2(frameDim) - 0.5f;
+    linearDepth = clip.w;
+    return true;
+}
+
+/** SDK 1.3 uses pixel + motion.xy, round(), and currentLinearDepth + motion.z.
+    Pixel coordinates here denote integer sample centers, not UV coordinates.
+    For a static camera/scene and only jitter changes, this returns
+      xy = (prevJitterX - curJitterX, curJitterY - prevJitterY) * frameDim,
+      z = 0.
+    The host separately invalidates history when geometry/material/light state
+    cannot reconstruct a previous surface. motionW retains the existing
+    previous-position-minus-current-position convention.
+*/
+bool rtptDIComputeMotion(
+    RTPTPrimarySurface current,
+    uint2 pixel,
+    uint2 frameDim,
+    float4x4 previousViewProj,
+    out float3 motion
+)
+{
+    motion = 0.f;
+    if (any(pixel >= frameDim)) return false;
+    if ((current.flags & kRTPTPrimaryRecordReady) == 0u) return false;
+    const HitInfo hit = HitInfo(current.packedHit);
+    if (!hit.isValid() || hit.getType() != HitType::Triangle) return false;
+    if (!(current.viewZ > 0.f) || !isfinite(current.viewZ)) return false;
+    if (!all(isfinite(current.position)) || !all(isfinite(current.motionW))) return false;
+    float2 previousPixel;
+    float previousDepth;
+    if (!rtptDIProjectPreviousPixel(current.position + current.motionW, frameDim, previousViewProj,
+        previousPixel, previousDepth)) return false;
+    const float3 candidate = float3(previousPixel - float2(pixel), previousDepth - current.viewZ);
+    if (!all(isfinite(candidate))) return false;
+    motion = candidate;
+    return true;
+}

@@ -1,5 +1,49 @@
 # RTPT、PG、SHaRC 与 NRD
 
+## 首表面 ReSTIR DI 与 NRD 及后续 ReGIR 接入方案
+
+[实施方案与参考代码](REGIR_RESTIR_DI_NRD_PLAN.md) 以当前 PG、SHaRC、NRD 版本为基线，按用户指定顺序先完成首表面 ReSTIR DI 与 NRD：全局候选 → 最终灯样本 → RayQuery 阴影 → 分别评价 D/S → 与原间接信号合成并送入 NRD，完整验收后再增加 ReGIR。首批保留当前 D/S 双续接，概率式根通道单路径单独评估。阶段 1 的结构拆分、阶段 2 的全局 Initial RIS 和阶段 3 的 Temporal/Spatial 已接入；ReGIR 留在阶段 5。
+
+方案第 11 节列出 ReSTIR DI 的具体实现：已安装 RTXDI 1.3 的算法调用、RTPT 私有 bridge、Initial/Temporal/Spatial、buffer bank、运动和灯身份、最终 D/S 着色，以及每一步对应的本地和官方参考代码。
+
+第 12 节补充 ReGIR 的完整实现参考：本地 SDK 的 Grid/Onion、建表与查询函数、体素目标及资源布局，NVIDIA 官方示例、原始论文与补充实现，并记录当前包装层空缺及 1.3 参数适配细节。ReGIR 仍在首批 ReSTIR DI 与 NRD 验收之后实施。
+
+## 阶段 3：Temporal 与 Spatial
+
+`RTPTDIReuse.cpp` 调度独立的 SDK 1.3 Temporal 和 Spatial ComputePass。四个 reservoir/完整 UV 侧车 bank 分别保存 Initial、Temporal、Spatial 和前帧 Temporal 结果；每个 Pass 只向独立区域写入，完成后设置 barrier。当前帧最终阴影与真实 D/S 读取最后启用阶段的结果；组合模式读取 Spatial，下一帧历史则独立从 Temporal 发布，空间混合结果不循环反馈。Temporal、Spatial 可分别关闭，两个都关闭恢复阶段 2。
+
+历史保存实际同帧 Primary 和完整 jittered view-projection 矩阵，按 `previousPixel-currentPixel` 和线性深度差重投影，检查边界、深度、法线、材质、灯代次及记录标签。当前版本在几何、材质或灯光改变（包括移动）时保守清历史；普通相机运动允许复用，大幅 camera cut 与 frustum 变化清历史。PG 重训或 NRD 重置不代替这些 DI 判定。
+
+重采样使用固定 RayTraced 校正，visibility shortcut 关闭。复用模式会对 Initial 与各级输出作规定的可见性零事件筛选，保留 M；最终仍重新测试当前阴影。因此额外可见性射线成本高于阶段 2，本轮不宣称加速。所有交叉评价使用真实当前/静态前帧材质及完整 float UV；仅在 SDK 函数内部用临时 token 访问侧车，持久 reservoir 恢复标准 24 B 格式。
+
+新增属性 `restirDITemporalEnabled`、`restirDISpatialEnabled`，裸 RTPT 默认 false，正式主图/CMD 默认 true；对应环境开关为 `RTPT_RESTIR_DI_TEMPORAL_ENABLED`、`RTPT_RESTIR_DI_SPATIAL_ENABLED`。历史权重上限默认 20，空间邻居数 4、半径 16 像素，可由 `restirDIHistoryLength`、`restirDISpatialSamples`、`restirDISpatialRadius` 调节。`diStats.historyValid` 表示本帧可读旧历史，`historyAvailable` 表示帧末已发布下帧历史；`historyInputBank` 报告发布来源，组合模式为 1，`finalInputBank` 为 2。另报告实际 T/S 状态、历史失效与复用回退原因。
+
+当前复用资源为 448 B/像素，加目录和 2 KiB 邻居偏移；两个复用开关都关时仍为阶段 2 的 120 B/像素。复用准备或预算失败保留 Initial；Initial 也不可用时保留旧根选灯，阶段 1 继续运行。详细协议与验证结果见 [阶段 3 验证说明](../../../tests/rtpt_stage3/README.md)。
+
+最终版本的 Release 构建、24 项 D3D12 GPU 测试、8 项 CPU 检查通过；关闭复用后 120 份数组与阶段 2 基线逐字节一致。三种复用模式各 6 场景、16 独立 seed 的 162 个均值通道，以及额外 16 个新 seed 的 9 个混合光源通道均通过预设统计区间。主图 213 帧的 441 项生命周期检查、720p 144 帧的 37 项检查、NRD 关闭直通及四模式 64 项精确零检查也通过。Initial、T-only、S-only 共 3,744 份数组与首版逐字节一致。
+
+首版空间结果反馈历史时，混合光源的两个均值通道曾越界；原始失败、独立审计和结构对照均已保留。当前采用独立 Temporal 历史，完整重验及新种子检查通过。这些有限样本检查不证明所有动态条件下严格无偏，也不构成性能提升结论；早期长会话 Slang 编译器崩溃及分进程恢复的证据另有记录。
+
+## 阶段 2：全局 Initial RIS 与最终 D/S 着色（2026-10-31）
+
+新增 RTPT 私有 `DirectLighting/`、`ReSTIRDI/` 和 `RTPTDirectLighting.cpp`。Initial 调用本地 RTXDI 1.3 的 `RTXDI_SampleLightsForSurface()`，关闭 ReGIR、BRDF、环境及时间/空间候选；全局均匀目录覆盖全部发光三角形与启用的点光/聚光灯。目录不按近似功率或 active 三角形列表剔除零代理灯。最终着色从完整精度 UV、稳定灯身份与代次重建当前灯样本，乘一次 SDK 已归一化的逆 PDF，共用一次当前 RayQuery 阴影，分别评价真实材质的 D/S。
+
+DI 接管首表面非 delta 的覆盖域：去掉该域的旧根 NEE 和首段命中发光面的 emission，同时继续原间接续接。环境、方向光及其他解析灯使用剩余域的正确选灯概率；主可见 emission、delta residual、深层 NEE 和独立 PG/SHaRC 训练保留原规则。合法空、黑色、遮挡或选中身份失效保留 DI 域，不根据结果补抽旧 NEE。只有准备或记录元数据失败才能恢复旧域。
+
+裸 RTPT 的 `restirDIEnabled` 默认关闭，正式主图与 `RTPR_START.cmd` 默认开启；设置 `RTPT_RESTIR_DI_ENABLED=0` 可关闭。`restirDICandidateCount` 默认 8（1–128），`restirDIBudgetMB` 默认 512（16–2048）。目前仅 NRD 输入模式、1 spp、NEE 开启时生效，普通积分器保留旧路径。当前新增 120 B/像素（SDK reservoir 24、完整 UV/身份 sidecar 48、D/S 48），加灯目录与剩余解析灯索引，使用独立预算；准备失败保留阶段 1 并回退原选灯。`RTPT.diStats` 报告实际生效状态、代次、覆盖域、字节、步长与原因。
+
+Release 构建、16 项 GPU 测试、183 项生命周期检查、720p 144 帧和 NRD 关闭直通检查通过。K=8 的 16 场景及 K=1/32 各 5 场景原始均值通过预设统计区间，关闭 DI 的 98 份源信号与封存基线逐字节一致；格式转换及后处理差异单独记录。协议、完整结果和限制见 [阶段 2 验证说明](../../../tests/rtpt_stage2/README.md)。本阶段不宣称时间/空间复用或性能提升，共享 Material/BSDF、RTXDI、NRDPass、ModulateIllumination 未修改。
+
+## 阶段 1：主表面与最终信号组装（2026-10-31）
+
+新增 RTPT 私有 `PrimarySurface/`、`Signal/` 与 `RTPTStages.cpp`。主表面由 ComputePass + RayQuery 生成，固定复用当前帧主命中；普通多 spp 仅复用 `s=0`，训练保持独立。主着色仍从该命中重建当前材质，并在原浮点上下文计算 NRD guides。Final Signal Resolve 收集材质化 direct/indirect D/S、emission、residual 和首段距离，合成后只去材质化一次，继续交给原 NRDPass 打包。原选灯、D/S 双续接、PG/SHaRC 资格和随机流保留。
+
+资源按反射分配，当前 Primary/Signal 分别为 112/144 B/像素；固定 1 GiB 上限仅约束这两类新增中间资源。准备失败完整回退原积分器，单像素元数据不匹配回退真实求交；没有增加主命中关闭开关。`RTPT.stageStats` 提供实际 active、字节数、步长及回退原因。
+
+Release 构建与 D3D12 debug layer 下 10 项 GPU 测试通过。默认编译的 88 份全部输出一致；完整组合的 499 份 RTPT 源信号一致，保留 6 份最终累积/ToneMapper 的严格差异，最大约 `9.09e-7`。后处理另按预先固定 `0.001` 绝对误差界验收，RTPT 源信号不放宽。资源准备故障注入后 88 份输出与原版一致，源码已按 SHA 恢复并重建。最终长窗口训练对照、同版本 A/A 非确定性证据及全部结果见 [阶段 1 验证说明](../../../tests/rtpt_stage1/README.md)。本轮不宣称性能提升。
+
+1280×720 正式主图全模块开启运行 144 帧、15 项检查通过，新增中间资源 225 MiB。核心结构验证通过，但完整长训练窗口的逐字节一致性没有全部通过：首次 `unlimited/128` 有 3 份源信号微差，最高约 `1.53e-5`；相同最终 DLL 的复跑与首次结果也不一致，复跑的 22 份源信号则与旧基线一致。首次失败保留，未用复跑覆盖。单独诊断的 NRD 后处理超出 `0.001` 界，相关比较仍标记失败；不能把它与完整套件中 `9.09e-7` 的结果混用，也没有证明两次训练模型缓冲字节同一或确定具体原因。
+
 ## 当前修改范围与 Material 恢复状态
 
 按用户要求，Falcor `Rendering/Materials` 中此前 PG 优化新增的接口、实现和 include 已恢复到优化前版本，新增 `MaterialInstanceOptional.slangh` 已移除。RTPT 续接改回通用 `sample`、`evalPdf`、`eval` 调用。NRD 首跳 diffuse/specular 的 PG 区域查询复用也已撤回，恢复各分量独立创建 sampling context；各分量 active-lobe 资格、独立采样和 NEE 规则保留。下文“主采样重复工作复用”第 2、3、4 项只属于历史实验，当前均已撤回；相关性能与查询计数不代表本次恢复后的版本。叶子 PDF 复用、发布优化和诊断开关仍保留。

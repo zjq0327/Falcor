@@ -1,22 +1,76 @@
 #pragma once
 
-// A finite miss distance that remains representable in NRD's fp16 resources.
-static const float kRTPTNRDMissDistance = 60000.f;
+#include "Signal/RTPTSignalResolve.slang"
 
-struct RTPTNRDSignals
+#ifndef RTPT_SEPARATE_SIGNAL_RESOLVE
+#define RTPT_SEPARATE_SIGNAL_RESOLVE 0
+#endif
+
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+RWStructuredBuffer<RTPTSignalRecord> gSignalRecords;
+
+void rtptStoreSignalRecord(
+    uint2 pixel,
+    RTPTNRDSignals directAndGuides,
+    float3 indirectDiffuse,
+    float3 indirectSpecular,
+    uint diffuseDistanceState,
+    uint specularDistanceState
+)
 {
-    float3 diffuse;
-    float3 specular;
-    float3 emission;
-    float3 diffuseReflectance;
-    float3 specularReflectance;
-    float3 residual;
-    float diffuseHitDistance;
-    float specularHitDistance;
-    float4 normalRoughness;
-    float viewZ;
-    float3 motionW;
-};
+    RTPTSignalRecord record = {};
+    record.directDiffuse = directAndGuides.diffuse;
+    record.directSpecular = directAndGuides.specular;
+    record.indirectDiffuse = indirectDiffuse;
+    record.indirectSpecular = indirectSpecular;
+    record.emission = directAndGuides.emission;
+    record.residual = directAndGuides.residual;
+    record.diffuseReflectance = directAndGuides.diffuseReflectance;
+    record.specularReflectance = directAndGuides.specularReflectance;
+    record.diffuseHitDistance = directAndGuides.diffuseHitDistance;
+    record.specularHitDistance = directAndGuides.specularHitDistance;
+    record.diffuseDistanceState = diffuseDistanceState;
+    record.specularDistanceState = specularDistanceState;
+    record.normalRoughness = directAndGuides.normalRoughness;
+    record.viewZ = directAndGuides.viewZ;
+    record.motionW = directAndGuides.motionW;
+    gSignalRecords[pixel.y * gParams.frameDim.x + pixel.x] = record;
+}
+#endif
+
+/** Establish domain ownership before sampling the original NEE/continuations.
+    Prepared is independent of whether the final reservoir is empty, black or
+    occluded. No brightness or winner-validity test may select the estimator.
+*/
+uint rtptLoadPrimaryDICoverage(uint2 pixel, uint sampleIndex, out float3 diffuse, out float3 specular)
+{
+    diffuse = specular = 0.f;
+#if RTPT_USE_RESTIR_DI
+    if (gParams.useNEE == 0u) return 0u;
+    if (gDISettings.prepared == 0u) return 0u;
+    if (any(gDISettings.frameDim != gParams.frameDim)) return 0u;
+#if RTPT_USE_PRIMARY_SURFACE
+    if (gDISettings.frameStamp != gPrimarySettings.frameStamp) return 0u;
+#endif
+    if (any(pixel >= gDISettings.frameDim)) return 0u;
+    if (sampleIndex != gDISettings.sampleIndex) return 0u;
+    uint count, stride;
+    gDIResults.GetDimensions(count, stride);
+    const uint index = pixel.y * gDISettings.frameDim.x + pixel.x;
+    if (index >= count) return 0u;
+    const RTPTDIResult result = gDIResults[index];
+    if ((result.flags & kRTPTDIResultPrepared) == 0u) return 0u;
+    if (result.generation != gDISettings.generation) return 0u;
+    if (result.sampleIndex != sampleIndex) return 0u;
+    if (result.frameStamp != gDISettings.frameStamp) return 0u;
+    if (result.coverageMask != gDISettings.coverageMask) return 0u;
+    diffuse = result.diffuse;
+    specular = result.specular;
+    return result.coverageMask;
+#else
+    return 0u;
+#endif
+}
 
 /** NRD uses regular octahedral normals, not equal-area environment coordinates.
     Preserve the projected components before folding; avoid overlapping swizzles.
@@ -40,10 +94,13 @@ float3 rtptTraceNRDContinuation(
     RTPTSamplingContext primarySampling,
     inout SampleGenerator sg,
     out float firstHitDistance,
-    inout RTPTSharcStats sharcStats
+    out uint firstHitDistanceState,
+    inout RTPTSharcStats sharcStats,
+    uint rootCoverage
 )
 {
     firstHitDistance = kRTPTNRDMissDistance;
+    firstHitDistanceState = kRTPTDistanceSampleRejected;
     primarySD.mtl.setActiveLobes(primaryLobes);
     BSDFSample bs = {};
     bool previousGuideSelected = false;
@@ -65,6 +122,7 @@ float3 rtptTraceNRDContinuation(
 #endif
     Ray ray = Ray(primarySD.computeRayOrigin(), bs.wo);
     SceneRayQuery<true> query;
+    firstHitDistanceState = kRTPTDistanceUntraced;
 
     // Always trace the first component ray before roulette so the distance is
     // available even when the radiance estimator later terminates.
@@ -75,15 +133,24 @@ float3 rtptTraceNRDContinuation(
         ++sharcStats.radianceRays;
 #endif
         const HitInfo hit = query.traceRay(ray, hitT);
+        if (bounce == 1)
+            firstHitDistanceState = hit.isValid() ? kRTPTDistanceHit : kRTPTDistanceMiss;
         if (bounce == 1 && hit.isValid())
             firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, hitT));
 
         if (!hit.isValid())
         {
 #if USE_ENV_LIGHT
+#if RTPT_USE_RESTIR_DI
+            const float misWeight = previousUsedNEE && !previousDelta
+                ? rtptPowerHeuristic(previousContinuationPdf,
+                    bounce == 1u ? rtptEnvironmentLightPdfForCoverage(ray.dir, rootCoverage) : rtptEnvironmentLightPdf(ray.dir))
+                : 1.f;
+#else
             const float misWeight = previousUsedNEE && !previousDelta
                 ? rtptPowerHeuristic(previousContinuationPdf, rtptEnvironmentLightPdf(ray.dir))
                 : 1.f;
+#endif
             const float3 contribution = throughput * gScene.envMap.eval(ray.dir) * misWeight;
             if (all(isfinite(contribution))) radiance += contribution;
 #endif
@@ -118,11 +185,29 @@ float3 rtptTraceNRDContinuation(
             emission *= gScene.materials.evalLightProfile(dot(sd.faceN, sd.V));
         if (any(emission > 0.f))
         {
+#if RTPT_USE_RESTIR_DI
+            bool coveredRootEvent = false;
+            if (bounce == 1u && !previousDelta)
+                coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, rootCoverage);
+            if (!coveredRootEvent)
+            {
+                const float misWeight = previousUsedNEE && !previousDelta
+                    ? rtptPowerHeuristic(previousContinuationPdf,
+                        bounce == 1u ? rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, rootCoverage)
+                                     : rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd))
+                    : 1.f;
+                const float3 contribution = throughput * emission * misWeight;
+                if (all(isfinite(contribution))) radiance += contribution;
+            }
+            // The covered emission is one event; the hit's reflected indirect
+            // transport below remains eligible for NEE, guiding and SHaRC.
+#else
             const float misWeight = previousUsedNEE && !previousDelta
                 ? rtptPowerHeuristic(previousContinuationPdf, rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd))
                 : 1.f;
             const float3 contribution = throughput * emission * misWeight;
             if (all(isfinite(contribution))) radiance += contribution;
+#endif
         }
 #endif
         if (bounce == gParams.maxBounces) break;
@@ -165,41 +250,86 @@ float3 rtptTraceNRDContinuation(
     return all(isfinite(radiance)) ? radiance : float3(0.f);
 }
 
-void rtptWriteNRDSignals(uint2 pixel, RTPTNRDSignals signals)
+// Existing callers, including the delta residual, retain the complete old
+// contribution domain. Only the root non-delta D/S calls pass DI ownership.
+float3 rtptTraceNRDContinuation(
+    ShadingData primarySD,
+    IMaterialInstance primaryMI,
+    uint primaryLobes,
+    RTPTSamplingContext primarySampling,
+    inout SampleGenerator sg,
+    out float firstHitDistance,
+    out uint firstHitDistanceState,
+    inout RTPTSharcStats sharcStats
+)
 {
-    gNRDDiffuseRadianceHitDist[pixel] = float4(signals.diffuse / signals.diffuseReflectance, signals.diffuseHitDistance);
-    gNRDSpecularRadianceHitDist[pixel] = float4(signals.specular / signals.specularReflectance, signals.specularHitDistance);
-    gNRDEmission[pixel] = float4(signals.emission, 1.f);
-    gNRDDiffuseReflectance[pixel] = float4(signals.diffuseReflectance, 1.f);
-    gNRDSpecularReflectance[pixel] = float4(signals.specularReflectance, 1.f);
-    gNRDResidualRadiance[pixel] = float4(signals.residual, 1.f);
-    gNRDNormalRoughness[pixel] = signals.normalRoughness;
-    gNRDViewZ[pixel] = signals.viewZ;
-    gNRDMotionW[pixel] = float4(signals.motionW, 0.f);
+    return rtptTraceNRDContinuation(primarySD, primaryMI, primaryLobes, primarySampling, sg,
+        firstHitDistance, firstHitDistanceState, sharcStats, 0u);
 }
 
-float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
+// Keep the original continuation interface for the inline fallback and delta
+// residual. Its unobserved event-state output is removed by shader compilation.
+float3 rtptTraceNRDContinuation(
+    ShadingData primarySD,
+    IMaterialInstance primaryMI,
+    uint primaryLobes,
+    RTPTSamplingContext primarySampling,
+    inout SampleGenerator sg,
+    out float firstHitDistance,
+    inout RTPTSharcStats sharcStats
+)
+{
+    uint unusedDistanceState;
+    return rtptTraceNRDContinuation(primarySD, primaryMI, primaryLobes, primarySampling, sg,
+        firstHitDistance, unusedDistanceState, sharcStats);
+}
+
+float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
 {
     RTPTNRDSignals signals = {};
     signals.diffuseReflectance = 1.f;
     signals.specularReflectance = 1.f;
     signals.normalRoughness = float4(0.5f, 0.5f, 0.f, 0.f);
     signals.viewZ = kRTPTNRDMissDistance;
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+    float3 indirectDiffuse = 0.f;
+    float3 indirectSpecular = 0.f;
+    uint diffuseDistanceState = kRTPTDistanceNoLobe;
+    uint specularDistanceState = kRTPTDistanceNoLobe;
+#endif
 
     SceneRayQuery<true> query;
     float hitT;
 #if ENABLE_SHARC && SHARC_QUERY
     ++sharcStats.radianceRays;
 #endif
+#if RTPT_USE_PRIMARY_SURFACE
+    RTPTPrimarySurface primarySurface;
+    const bool primaryLoaded = rtptTryLoadPrimary(pixel, sampleIndex, ray, primarySurface);
+    HitInfo hit;
+    if (primaryLoaded)
+    {
+        hit = HitInfo(primarySurface.packedHit);
+        hitT = primarySurface.hitT;
+    }
+    else
+        hit = query.traceRay(ray, hitT);
+#else
     const HitInfo hit = query.traceRay(ray, hitT);
+#endif
     if (!hit.isValid())
     {
 #if USE_ENV_BACKGROUND
         const float3 background = gScene.envMap.eval(ray.dir);
         signals.emission = all(isfinite(background)) ? background : float3(0.f);
 #endif
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+        rtptStoreSignalRecord(pixel, signals, indirectDiffuse, indirectSpecular, diffuseDistanceState, specularDistanceState);
+        return 0.f;
+#else
         rtptWriteNRDSignals(pixel, signals);
         return signals.emission;
+#endif
     }
 
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
@@ -224,6 +354,9 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSh
         const float NdotV = saturate(dot(properties.guideNormal, sd.V));
         const float alpha = properties.roughness * properties.roughness;
         signals.specularReflectance = max(kNRDMinReflectance, approxSpecularIntegralGGX(properties.specularReflectionAlbedo, alpha, NdotV));
+        // Reconstruct NRD guides from this same primary hit in the original
+        // shading context. Reusing separately compiled fast-math guides can
+        // change viewZ/motion by one ULP and perturb denoiser history.
         signals.normalRoughness = float4(rtptNRDPackNormal(properties.guideNormal), properties.roughness, 0.f);
         signals.viewZ = mul(gScene.camera.data.viewProjMatNoJitter, float4(sd.posW, 1.f)).w;
         signals.motionW = gScene.getPrevPosW(triangleHit) - sd.posW;
@@ -241,24 +374,66 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSh
         if (hasDiffuse) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
         if (hasSpecular) specularSampling = rtptMakeSamplingContext(specularSD, mi);
 
-        RTPTLightSample ls;
-        if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLight(sd, sg, ls))
+        uint rootCoverage = 0u;
+#if RTPT_USE_RESTIR_DI && RTPT_USE_PRIMARY_SURFACE
+        float3 diDiffuse = 0.f;
+        float3 diSpecular = 0.f;
+        if (primaryLoaded)
+            rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
+        if (rootCoverage != 0u)
         {
-            if (query.traceVisibilityRay(ls.visibilityRay))
+            signals.diffuse = diDiffuse;
+            signals.specular = diSpecular;
+        }
+#endif
+
+        RTPTLightSample ls;
+#if RTPT_USE_RESTIR_DI
+        if (rootCoverage != 0u)
+        {
+            if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLightForCoverage(sd, rootCoverage, sg, ls))
             {
-                if (hasDiffuse) signals.diffuse = rtptEvaluateDirectComponent(diffuseSD, mi, ls, diffuseSampling, sg);
-                if (hasSpecular) signals.specular = rtptEvaluateDirectComponent(specularSD, mi, ls, specularSampling, sg);
+                if (query.traceVisibilityRay(ls.visibilityRay))
+                {
+                    if (hasDiffuse) signals.diffuse += rtptEvaluateDirectComponent(diffuseSD, mi, ls, diffuseSampling, sg);
+                    if (hasSpecular) signals.specular += rtptEvaluateDirectComponent(specularSD, mi, ls, specularSampling, sg);
+                }
             }
         }
+        else
+#endif
+        {
+            if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLight(sd, sg, ls))
+            {
+                if (query.traceVisibilityRay(ls.visibilityRay))
+                {
+                    if (hasDiffuse) signals.diffuse = rtptEvaluateDirectComponent(diffuseSD, mi, ls, diffuseSampling, sg);
+                    if (hasSpecular) signals.specular = rtptEvaluateDirectComponent(specularSD, mi, ls, specularSampling, sg);
+                }
+            }
+        }
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
         if (hasDiffuse)
-            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg, signals.diffuseHitDistance, sharcStats);
+            indirectDiffuse = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
+                signals.diffuseHitDistance, diffuseDistanceState, sharcStats, rootCoverage);
         if (hasSpecular)
-            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg, signals.specularHitDistance, sharcStats);
+            indirectSpecular = rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
+                signals.specularHitDistance, specularDistanceState, sharcStats, rootCoverage);
+#else
+        uint unusedDiffuseState, unusedSpecularState;
+        if (hasDiffuse)
+            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
+                signals.diffuseHitDistance, unusedDiffuseState, sharcStats, rootCoverage);
+        if (hasSpecular)
+            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
+                signals.specularHitDistance, unusedSpecularState, sharcStats, rootCoverage);
+#endif
         if (hasDeltaSpecular)
         {
             float unusedDistance;
             signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
         }
+#if !RTPT_SEPARATE_SIGNAL_RESOLVE
         // NRD deliberately excludes surfaces outside its denoising range.
         // Preserve their energy through the unfiltered residual channel.
         if (signals.viewZ >= kNRDDepthRange)
@@ -269,9 +444,15 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, inout SampleGenerator sg, inout RTPTSh
             signals.diffuseHitDistance = 0.f;
             signals.specularHitDistance = 0.f;
         }
+#endif
     }
 #endif
 
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+    rtptStoreSignalRecord(pixel, signals, indirectDiffuse, indirectSpecular, diffuseDistanceState, specularDistanceState);
+    return 0.f;
+#else
     rtptWriteNRDSignals(pixel, signals);
     return signals.emission + signals.diffuse + signals.specular + signals.residual;
+#endif
 }

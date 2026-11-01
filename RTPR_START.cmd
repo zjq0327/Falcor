@@ -5,6 +5,9 @@ pushd "%~dp0" || exit /b 1
 rem Module switches: 1 = enabled, 0 = disabled. These are local to this launch.
 set "RTPT_SHARC_ENABLED=1"
 set "RTPT_NRD_ENABLED=1"
+set "RTPT_RESTIR_DI_ENABLED=1"
+set "RTPT_RESTIR_DI_TEMPORAL_ENABLED=1"
+set "RTPT_RESTIR_DI_SPATIAL_ENABLED=1"
 set "RTPT_ACCUMULATION_ENABLED=1"
 set "RTPT_TONEMAPPER_ENABLED=1"
 

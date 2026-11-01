@@ -2,6 +2,10 @@
 
 #include "RTPTSampling.slang"
 
+#ifndef RTPT_USE_RESTIR_DI
+#define RTPT_USE_RESTIR_DI 0
+#endif
+
 // All directional PDFs in this file are measured in solid angle. LiOverPdf
 // includes both the light category probability and the sampler's own PDF.
 struct RTPTLightSample
@@ -166,6 +170,175 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
 #endif
     }
 
+    return dot(sd.getOrientedFaceNormal(), result.dir) > 0.f &&
+        all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
+}
+
+/** The root DI domain covers the entire light-collection triangle catalogue,
+    including triangles absent from the legacy active-triangle proposal. A
+    zero proxy power or an empty reservoir never gives ownership back to NEE.
+*/
+bool rtptDICoversEmissiveHit(TriangleHit hit, uint coverage)
+{
+#if RTPT_USE_RESTIR_DI
+    if ((coverage & kRTPTDICoverEmissive) == 0u) return false;
+    const uint index = gScene.lightCollection.getTriangleIndex(hit.instanceID, hit.primitiveIndex);
+    if (index == LightCollection::kInvalidIndex) return false;
+    return index < gScene.lightCollection.getTriangleCount();
+#else
+    return false;
+#endif
+}
+
+uint rtptAnalyticLightCountForCoverage(uint coverage)
+{
+#if USE_ANALYTIC_LIGHTS
+#if RTPT_USE_RESTIR_DI
+    if ((coverage & kRTPTDICoverPoint) != 0u) return gDISettings.uncoveredAnalyticCount;
+#endif
+    return gScene.getLightCount();
+#else
+    return 0u;
+#endif
+}
+
+// Each nonempty remaining category receives equal probability, exactly as in
+// the legacy proposal. Analytic lights use the filtered list's actual size.
+float3 rtptLightCategoryProbabilitiesForCoverage(uint coverage)
+{
+    if (coverage == 0u) return rtptLightCategoryProbabilities();
+    float3 p = 0.f;
+    if (gParams.useNEE == 0u) return p;
+#if USE_ENV_LIGHT
+    p.x = rtptEnvironmentHasEnergy() ? 1.f : 0.f;
+#endif
+#if USE_EMISSIVE_LIGHTS
+#if RTPT_USE_RESTIR_DI
+    if ((coverage & kRTPTDICoverEmissive) == 0u)
+#endif
+        p.y = gScene.lightCollection.getActiveTriangleCount() > 0u ? 1.f : 0.f;
+#endif
+#if USE_ANALYTIC_LIGHTS
+    p.z = rtptAnalyticLightCountForCoverage(coverage) > 0u ? 1.f : 0.f;
+#endif
+    const float sum = p.x + p.y + p.z;
+    return sum > 0.f ? p / sum : float3(0.f);
+}
+
+float rtptEnvironmentLightPdfForCoverage(float3 dir, uint coverage)
+{
+    if (coverage == 0u) return rtptEnvironmentLightPdf(dir);
+#if USE_ENV_LIGHT
+    const float probability = rtptLightCategoryProbabilitiesForCoverage(coverage).x;
+    if (probability > 0.f)
+    {
+        const float3 localDir = gScene.envMap.toLocal(dir);
+        const float r = sqrt(max(0.f, 1.f - abs(localDir.z)));
+        const float v = r * atan2(abs(localDir.y), abs(localDir.x)) * M_2_PI;
+        const float u = r - v;
+        const float2 folded = localDir.z < 0.f ? float2(1.f - v, 1.f - u) : float2(u, v);
+        const float2 uv = folded * sign(localDir.xy) * 0.5f + 0.5f;
+        const float integral = gEnvMapSampler.importanceMap.Load(int3(0, 0, gEnvMapSampler.importanceBaseMip));
+        const float importance = gEnvMapSampler.importanceMap.SampleLevel(gEnvMapSampler.importanceSampler, uv, 0);
+        return probability * (importance / integral) * M_1_4PI;
+    }
+#endif
+    return 0.f;
+}
+
+float rtptEmissiveLightPdfForCoverage(
+    float3 previousPosition, float3 previousNormal, TriangleHit hit, ShadingData sd, uint coverage)
+{
+    if (coverage == 0u) return rtptEmissiveLightPdf(previousPosition, previousNormal, hit, sd);
+#if USE_EMISSIVE_LIGHTS
+    const float probability = rtptLightCategoryProbabilitiesForCoverage(coverage).y;
+    if (probability <= 0.f || !sd.frontFacing) return 0.f;
+    const uint triangleIndex = gScene.lightCollection.getTriangleIndex(hit.instanceID, hit.primitiveIndex);
+    if (triangleIndex == LightCollection::kInvalidIndex) return 0.f;
+    if (gScene.lightCollection.getActiveTriangleIndex(triangleIndex) == LightCollection::kInvalidIndex) return 0.f;
+    TriangleLightHit lightHit;
+    lightHit.triangleIndex = triangleIndex;
+    lightHit.posW = sd.posW;
+    lightHit.normalW = gScene.lightCollection.getTriangle(triangleIndex).normal;
+    EmissiveUniformSampler sampler = {};
+    return probability * sampler.evalPdf(previousPosition, previousNormal, true, lightHit);
+#else
+    return 0.f;
+#endif
+}
+
+/** Only the first surface uses this proposal. Deeper NEE and independent
+    BSDF-only training keep rtptSampleLight() and its original probabilities.
+*/
+bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGenerator sg, out RTPTLightSample result)
+{
+    if (coverage == 0u) return rtptSampleLight(sd, sg, result);
+    result = {};
+    const float3 probabilities = rtptLightCategoryProbabilitiesForCoverage(coverage);
+    if (all(probabilities == 0.f)) return false;
+    const float u = sampleNext1D(sg);
+    const float3 origin = sd.computeRayOrigin();
+    if (u < probabilities.x)
+    {
+#if USE_ENV_LIGHT
+        EnvMapSample ls;
+        if (!gEnvMapSampler.sample(sampleNext2D(sg), ls)) return false;
+        result.pdf = ls.pdf * probabilities.x;
+        if (!(result.pdf > 0.f) || !isfinite(result.pdf)) return false;
+        result.dir = ls.dir;
+        result.LiOverPdf = ls.Le / result.pdf;
+        result.visibilityRay = Ray(origin, ls.dir);
+#else
+        return false;
+#endif
+    }
+    else if (u < probabilities.x + probabilities.y)
+    {
+#if USE_EMISSIVE_LIGHTS
+        EmissiveUniformSampler sampler = {};
+        TriangleLightSample ls;
+        if (!sampler.sampleLight(sd.posW, sd.getOrientedFaceNormal(), true, sg, ls)) return false;
+        result.pdf = ls.pdf * probabilities.y;
+        if (!(result.pdf > 0.f) || !isfinite(result.pdf)) return false;
+        const EmissiveTriangle triangle = gScene.lightCollection.getTriangle(ls.triangleIndex);
+        VertexData lightVertex = {};
+        lightVertex.posW = ls.posW;
+        lightVertex.texC = triangle.getTexCoord(sample_triangle(ls.uv));
+        if (gScene.materials.alphaTest(lightVertex, triangle.materialID, 0.f)) return false;
+        result.dir = ls.dir;
+        result.LiOverPdf = ls.Le / result.pdf;
+        const float3 lightOrigin = computeRayOrigin(ls.posW, ls.normalW);
+        const float3 shadowVector = lightOrigin - origin;
+        const float distance = length(shadowVector);
+        if (!(distance > 0.f) || !isfinite(distance)) return false;
+        result.visibilityRay = Ray(origin, shadowVector / distance, 0.f, distance);
+#else
+        return false;
+#endif
+    }
+    else
+    {
+#if USE_ANALYTIC_LIGHTS
+        if (probabilities.z <= 0.f) return false;
+        const uint count = rtptAnalyticLightCountForCoverage(coverage);
+        if (count == 0u) return false;
+        const uint rank = min(uint(sampleNext1D(sg) * count), count - 1u);
+        uint index = rank;
+#if RTPT_USE_RESTIR_DI
+        if ((coverage & kRTPTDICoverPoint) != 0u) index = gDIUncoveredAnalyticIndices[rank];
+#endif
+        if (index >= gScene.getLightCount()) return false;
+        AnalyticLightSample ls;
+        if (!sampleLight(sd.posW, gScene.getLight(index), sg, ls)) return false;
+        result.dir = ls.dir;
+        result.pdf = ls.pdf * probabilities.z / float(count);
+        result.LiOverPdf = ls.Li * (float(count) / probabilities.z);
+        result.analytic = true;
+        result.visibilityRay = Ray(origin, ls.dir, 0.f, ls.distance);
+#else
+        return false;
+#endif
+    }
     return dot(sd.getOrientedFaceNormal(), result.dir) > 0.f &&
         all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
 }
