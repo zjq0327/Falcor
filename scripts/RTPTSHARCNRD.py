@@ -13,6 +13,15 @@ def render_graph_RTPTSHARCNRD():
     graph = RenderGraph("RTPTSHARCNRD")
     graph.addPass(createPass("RTPT", {
         "enableNRD": True,
+        "regirEnabled": _module_enabled("RTPT_REGIR_ENABLED"),
+        "regirSecondaryEnabled": _module_enabled("RTPT_REGIR_SECONDARY_ENABLED"),
+        "regirTrainingEnabled": _module_enabled("RTPT_REGIR_TRAINING_ENABLED"),
+        "regirGridSize": 16,
+        "regirLightsPerCell": 32,
+        "regirBuildSamples": 8,
+        "regirBudgetMB": 64,
+        "regirCellSize": 2.0,
+        "regirSamplingJitter": 1.0,
         "restirDIEnabled": _module_enabled("RTPT_RESTIR_DI_ENABLED"),
         "restirDICandidateCount": 8,
         "restirDIBudgetMB": 512,

@@ -34,6 +34,7 @@ uint64_t reflectedStride(const ShaderVar& var)
 void RTPT::invalidateDirectLighting()
 {
     invalidateDIReuse();
+    invalidateReGIR();
     mpDIComputePass = mpDIInitialPass = mpDIShadePass = nullptr;
     mpDILightCatalog = mpDIUncoveredAnalyticIndices = mpDIReservoirs = mpDISampleRecords = mpDIResults = nullptr;
     mDICatalogSignature.clear();
@@ -47,7 +48,7 @@ bool RTPT::prepareDirectLighting()
     mDIActive = mDIPrepared = false;
     mDITemporalActive = mDISpatialActive = mDIHistoryReadValid = false;
     mDIFinalInputBank = 0u;
-    if (!mRestirDIEnabled)
+    if (!mRestirDIEnabled && !mReGIREnabled)
     {
         resetDIHistory("DI disabled");
         mDIFallbackReason.clear();
@@ -128,7 +129,7 @@ bool RTPT::prepareDirectLighting()
         if (mDIPreparationFailed) return false;
         if (mpDIComputePass && mpDIResults)
         {
-            mDIPrepared = mDIActive = true;
+            mDIPrepared = true; mDIActive = mRestirDIEnabled;
             mDIFallbackReason.clear();
             return true;
         }
@@ -194,7 +195,7 @@ bool RTPT::prepareDirectLighting()
         // Resolve the consumer layout now. No estimator has been sampled if
         // any resource/layout preparation above fails.
         bindDIMainResources(mpDIComputePass->getRootVar());
-        mDIPrepared = mDIActive = true;
+        mDIPrepared = true; mDIActive = mRestirDIEnabled;
         mDIFallbackReason.clear();
         return true;
     }
@@ -255,9 +256,37 @@ void RTPT::executeDirectLighting(RenderContext* pRenderContext)
             if (var.hasMember("gDINeighborOffsets")) var["gDINeighborOffsets"] = mpDINeighborOffsets;
         }
     };
-    const auto initialPass = reuse ? mpDIReuseInitialPass : mpDIInitialPass;
+    auto initialPass = reuse ? mpDIReuseInitialPass : mpDIInitialPass;
+    if (mReGIRActive && !mReGIRInitialPreparationFailed)
+    {
+        try
+        {
+            if (!mpReGIRInitial || mReGIRInitialReuse != reuse)
+            {
+                auto defines = initialPass->getProgram()->getDefines();
+                defines.add("RTPT_REGIR_ENABLED", "1");
+                mpReGIRInitial = ComputePass::create(mpDevice, initialPass->getProgram()->getDesc(), defines, true);
+                mReGIRInitialReuse = reuse;
+            }
+            auto candidateVar = mpReGIRInitial->getRootVar();
+            bind(candidateVar);
+            bindReGIRInitial(candidateVar);
+            initialPass = mpReGIRInitial;
+            mReGIRInitialActive = true;
+            mReGIRInitialFallbackReason.clear();
+        }
+        catch (const std::exception& error)
+        {
+            // This is preparation only: no candidate has been sampled yet.
+            // The published grid remains valid for secondary/training users.
+            mpReGIRInitial = nullptr;
+            mReGIRInitialPreparationFailed = true;
+            mReGIRInitialFallbackReason = error.what();
+            logWarning("ReGIR Initial preparation failed; retaining global Initial: {}", error.what());
+        }
+    }
     auto initialVar = initialPass->getRootVar();
-    bind(initialVar);
+    if (!mReGIRInitialActive) bind(initialVar);
     {
         FALCOR_PROFILE(pRenderContext, "DIInitial");
         initialPass->execute(pRenderContext, uint3(mFrameDim, 1u));
@@ -305,7 +334,7 @@ Properties RTPT::getDIStatistics() const
 {
     Properties props;
     props["requested"] = mRestirDIEnabled;
-    props["prepared"] = mDIPrepared;
+    props["prepared"] = mDIPrepared && mRestirDIEnabled;
     props["active"] = mDIActive;
     props["coverageMask"] = mDIActive ? mDICoverageMask : 0u;
     props["lightCount"] = mDILightCount;

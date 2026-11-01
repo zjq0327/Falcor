@@ -3,6 +3,24 @@ add_falcor_executable(FalcorTest)
 target_sources(FalcorTest PRIVATE
     FalcorTest.cpp
 
+    Tests/RTPT/PrimarySurfaceTests.cpp
+    Tests/RTPT/ReGIRTests.cpp
+    Tests/RTPT/ReGIRTests.cs.slang
+    Tests/RTPT/PrimarySurfaceTests.cs.slang
+    Tests/RTPT/PrimarySurfaceSceneTests.cs.slang
+    Tests/RTPT/SignalResolveTests.cpp
+    Tests/RTPT/SignalResolveTests.cs.slang
+    Tests/RTPT/ReSTIRDIStage2Tests.cpp
+    Tests/RTPT/ReSTIRDIStage2Tests.cs.slang
+    Tests/RTPT/DIReprojectionTests.cpp
+    Tests/RTPT/DIReprojectionTests.cs.slang
+    Tests/RTPT/ReSTIRDIStage3Tests.cpp
+    Tests/RTPT/ReSTIRDIStage3Tests.cs.slang
+    Tests/RTPT/DIReuseUVTests.cpp
+    Tests/RTPT/DIReuseUVTests.cs.slang
+    Tests/RTPT/DIReuseHistoryLoopTests.cpp
+    Tests/RTPT/DIReuseHistoryLoopTests.cs.slang
+
     Tests/Core/AftermathTests.cpp
     Tests/Core/AftermathTests.cs.slang
     Tests/Core/AssetResolverTests.cpp
@@ -179,6 +197,9 @@ target_sources(FalcorTest PRIVATE
 
 
 target_link_libraries(FalcorTest PRIVATE args)
+
+# RTPT fixtures dispatch production shaders copied by the plugin target.
+add_dependencies(FalcorTest RTPT)
 
 target_copy_shaders(FalcorTest .)
 

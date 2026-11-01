@@ -1,4 +1,4 @@
-/** Global uniform Initial RIS using the installed SDK, without visibility. */
+/** Global uniform or ReGIR Initial RIS using the installed SDK. */
 #include "Scene/SceneDefines.slangh"
 #define RTPT_DI_WRITE_RESERVOIRS 1
 #define RTPT_DI_WRITE_SAMPLE_RECORDS 1
@@ -27,7 +27,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             RAB_RandomSamplerState rng = RAB_InitRandomSampler(pixel, 2u);
             RAB_RandomSamplerState coherentRng = RAB_InitRandomSampler(pixel / 16u, 3u);
             const RTXDI_SampleParameters samples = RTXDI_InitSampleParameters(
+#if RTPT_REGIR_ENABLED
+                // SDK 1.3's Grid query computes numSamples but the inner loop
+                // actually uses numLocalLightSamples. Tie both positive counts;
+                // the shared numMisSamples normalization then matches the loop.
+                gDISettings.candidateCount, gDISettings.candidateCount, 0u, 0u, 0u);
+#else
                 0u, gDISettings.candidateCount, 0u, 0u, 0u);
+#endif
             RAB_LightSample selectedSample;
             reservoir = RTXDI_SampleLightsForSurface(rng, coherentRng, surface,
                 samples, rtptDIInitialRuntimeParameters(), selectedSample);

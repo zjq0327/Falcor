@@ -17,6 +17,8 @@ struct RTPTLightSample
     Ray visibilityRay;
 };
 
+#include "ReGIR/RTPTReGIRTransport.slang"
+
 float rtptPowerHeuristic(float pdf, float otherPdf)
 {
     if (!(pdf > 0.f)) return 0.f;
@@ -180,7 +182,7 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
 */
 bool rtptDICoversEmissiveHit(TriangleHit hit, uint coverage)
 {
-#if RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
     if ((coverage & kRTPTDICoverEmissive) == 0u) return false;
     const uint index = gScene.lightCollection.getTriangleIndex(hit.instanceID, hit.primitiveIndex);
     if (index == LightCollection::kInvalidIndex) return false;
@@ -193,6 +195,10 @@ bool rtptDICoversEmissiveHit(TriangleHit hit, uint coverage)
 uint rtptAnalyticLightCountForCoverage(uint coverage)
 {
 #if USE_ANALYTIC_LIGHTS
+#if RTPT_REGIR_TRANSPORT
+    if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRTransportSettings.active != 0u)
+        return gReGIRTransportSettings.uncoveredAnalyticCount;
+#endif
 #if RTPT_USE_RESTIR_DI
     if ((coverage & kRTPTDICoverPoint) != 0u) return gDISettings.uncoveredAnalyticCount;
 #endif
@@ -213,7 +219,7 @@ float3 rtptLightCategoryProbabilitiesForCoverage(uint coverage)
     p.x = rtptEnvironmentHasEnergy() ? 1.f : 0.f;
 #endif
 #if USE_EMISSIVE_LIGHTS
-#if RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
     if ((coverage & kRTPTDICoverEmissive) == 0u)
 #endif
         p.y = gScene.lightCollection.getActiveTriangleCount() > 0u ? 1.f : 0.f;
@@ -324,8 +330,15 @@ bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGener
         if (count == 0u) return false;
         const uint rank = min(uint(sampleNext1D(sg) * count), count - 1u);
         uint index = rank;
+#if RTPT_REGIR_TRANSPORT
+        if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRTransportSettings.active != 0u)
+            index = gReGIRTransportUncoveredAnalyticIndices[rank];
+        else
+#endif
 #if RTPT_USE_RESTIR_DI
         if ((coverage & kRTPTDICoverPoint) != 0u) index = gDIUncoveredAnalyticIndices[rank];
+#else
+        { }
 #endif
         if (index >= gScene.getLightCount()) return false;
         AnalyticLightSample ls;
@@ -343,8 +356,42 @@ bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGener
         all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
 }
 
+#if RTPT_REGIR_TRANSPORT
+float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg, bool training)
+#else
 float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg)
+#endif
 {
+#if RTPT_REGIR_TRANSPORT
+    const uint coverage = rtptReGIRTransportCoverage(training);
+    if (coverage != 0u)
+    {
+        float3 contribution = 0.f;
+        RTPTLightSample local;
+        if (rtptReGIRSampleTransportLight(sd, sg, local))
+        {
+            const float3 value = mi.eval(sd, local.dir, sg) * local.LiOverPdf;
+            SceneRayQuery<true> query;
+            if (all(isfinite(value)) && any(value > 0.f) && query.traceVisibilityRay(local.visibilityRay)) contribution += value;
+        }
+        // The remaining categories retain their actual BSDF/PG MIS density.
+        RTPTLightSample remaining;
+        if (rtptSampleLightForCoverage(sd, coverage, sg, remaining))
+        {
+            float misWeight = 1.f;
+            if (!remaining.analytic)
+            {
+                const float continuationPdf = rtptContinuationPdf(sd, mi, sampling, remaining.dir);
+                if (!isfinite(continuationPdf)) return contribution;
+                misWeight = rtptPowerHeuristic(remaining.pdf, continuationPdf);
+            }
+            const float3 value = mi.eval(sd, remaining.dir, sg) * remaining.LiOverPdf * misWeight;
+            SceneRayQuery<true> query;
+            if (all(isfinite(value)) && any(value > 0.f) && query.traceVisibilityRay(remaining.visibilityRay)) contribution += value;
+        }
+        return contribution;
+    }
+#endif
     RTPTLightSample ls;
     if (!rtptSampleLight(sd, sg, ls)) return float3(0.f);
 
@@ -365,10 +412,21 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingCont
     return query.traceVisibilityRay(ls.visibilityRay) ? contribution : float3(0.f);
 }
 
+#if RTPT_REGIR_TRANSPORT
+float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg)
+{
+    return rtptEstimateDirect(sd, mi, sampling, sg, false);
+}
+#endif
+
 // Sparse cache updates intentionally retain the original BSDF-only transport.
 float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg)
 {
+#if RTPT_REGIR_TRANSPORT
+    return rtptEstimateDirect(sd, mi, rtptBSDFSamplingContext(), sg, true);
+#else
     return rtptEstimateDirect(sd, mi, rtptBSDFSamplingContext(), sg);
+#endif
 }
 
 #if ENABLE_NRD

@@ -279,8 +279,8 @@ bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample sample)
 }
 
 // The SDK parses all reusable functions. History is available only through the
-// guarded static-scene bridge; BRDF/environment proposals and compact/ReGIR
-// data remain unsupported and are disabled in the runtime sample parameters.
+// guarded static-scene bridge; BRDF/environment proposals and compact light
+// records remain unsupported. ReGIR Grid has a separate current-frame build.
 bool RAB_GetTemporalConservativeVisibility(RAB_Surface current, RAB_Surface previous, RAB_LightSample sample)
 {
 #if RTPT_DI_REUSE_ENABLED
@@ -322,6 +322,49 @@ float RAB_EvaluateLocalLightSourcePdf(RTXDI_ResamplingRuntimeParameters params, 
 }
 float RAB_EvaluateEnvironmentMapSamplingPdf(float3 direction) { return 0.f; }
 float2 RAB_GetEnvironmentMapRandXYFromDir(float3 direction) { return 0.f; }
-float RAB_GetLightTargetPdfForVolume(RAB_LightInfo light, float3 center, float radius) { return 0.f; }
+float RAB_GetLightTargetPdfForVolume(RAB_LightInfo light, float3 center, float radius)
+{
+#if RTPT_REGIR_ENABLED
+    if (light.generation != gDISettings.generation) return 0.f;
+    float3 lightCenter;
+    float extentSquared = 0.f;
+    float scale = 1.f;
+    if (light.kind == kRTPTDILightEmissive)
+    {
+        if (light.sourceIndex >= gScene.lightCollection.getTriangleCount()) return 0.f;
+        const EmissiveTriangle triangle = gScene.lightCollection.getTriangle(light.sourceIndex);
+        lightCenter = (triangle.posW[0] + triangle.posW[1] + triangle.posW[2]) / 3.f;
+        const float3 a = triangle.posW[0] - lightCenter;
+        const float3 b = triangle.posW[1] - lightCenter;
+        const float3 c = triangle.posW[2] - lightCenter;
+        extentSquared = max(dot(a, a), max(dot(b, b), dot(c, c)));
+        scale = max(1e-6f, triangle.area);
+        // No estimated flux or point texture sample is used to remove support.
+        // Even a zero-integral proxy can hide a nonzero emissive texture texel.
+        // Geometry-only importance is deliberately conservative about support.
+    }
+    else if (light.kind == kRTPTDILightPoint)
+    {
+        if (light.sourceIndex >= gScene.getLightCount()) return 0.f;
+        const LightData data = gScene.getLight(light.sourceIndex);
+        if (data.type != uint(LightType::Point)) return 0.f;
+        lightCenter = data.posW;
+        const float3 intensity = max(data.intensity, float3(0.f));
+        scale = max(1e-6f, max(intensity.x, max(intensity.y, intensity.z)));
+        // A spot cone is not a hard volume cull. Final surface sampling uses
+        // the actual point/spot evaluation and retains legal zero samples.
+    }
+    else return 0.f;
+    const float3 toLight = lightCenter - center;
+    const float denominator = max(1e-6f, dot(toLight, toLight) + radius * radius + extentSquared);
+    const float importance = scale / denominator;
+    // Finite positive endpoints bound numerical dynamic range without imposing
+    // distance/brightness support cuts. This is a proxy, not the receiver BSDF,
+    // a visibility estimate, or a claimed bound on physical irradiance.
+    return isfinite(importance) ? clamp(importance, 1e-6f, 1e6f) : 1.f;
+#else
+    return 0.f;
+#endif
+}
 bool RAB_StoreCompactLightInfo(uint index, RAB_LightInfo light) { return false; }
 RAB_LightInfo RAB_LoadCompactLightInfo(uint index) { return RAB_EmptyLightInfo(); }

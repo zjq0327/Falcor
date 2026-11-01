@@ -68,6 +68,9 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
     float previousPdf = 0.f;
     bool previousDelta = true;
     bool previousUsedNEE = false;
+#if RTPT_REGIR_TRANSPORT
+    uint previousReGIRCoverage = 0u;
+#endif
     SceneRayQuery<true> query;
     for (uint bounce = 0u; bounce <= gSparseSettings.updateBounces; ++bounce)
     {
@@ -80,7 +83,11 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
 #if USE_ENV_LIGHT
             environment = gScene.envMap.eval(ray.dir);
             if (previousUsedNEE && !previousDelta)
+#if RTPT_REGIR_TRANSPORT
+                hitMIS = rtptPowerHeuristic(previousPdf, rtptEnvironmentLightPdfForCoverage(ray.dir, previousReGIRCoverage));
+#else
                 hitMIS = rtptPowerHeuristic(previousPdf, rtptEnvironmentLightPdf(ray.dir));
+#endif
 #endif
             if (!all(isfinite(environment))) { valid = false; break; }
 #if ENABLE_SHARC
@@ -112,7 +119,12 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         if (sd.frontFacing && gScene.materials.hasLightProfile(materialID))
             emission *= gScene.materials.evalLightProfile(dot(sd.faceN, sd.V));
         if (previousUsedNEE && !previousDelta)
+#if RTPT_REGIR_TRANSPORT
+            hitMIS = rtptDICoversEmissiveHit(triangleHit, previousReGIRCoverage) ? 0.f :
+                rtptPowerHeuristic(previousPdf, rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, previousReGIRCoverage));
+#else
             hitMIS = rtptPowerHeuristic(previousPdf, rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd));
+#endif
 #endif
         if (!all(isfinite(emission))) { valid = false; break; }
         RTPTPGVertex vertex = {};
@@ -137,6 +149,9 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
             break;
         }
         const bool useNEE = gParams.useNEE != 0u && (lobes & uint(LobeType::NonDeltaReflection)) != 0u;
+#if RTPT_REGIR_TRANSPORT
+        previousReGIRCoverage = useNEE ? rtptReGIRTransportCoverage(true) : 0u;
+#endif
         vertex.direct = useNEE ? rtptEstimateDirect(sd, mi, sg) : float3(0.f);
         if (!all(isfinite(vertex.direct))) { valid = false; break; }
 #if ENABLE_SHARC

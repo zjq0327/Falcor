@@ -24,6 +24,9 @@ float3 rtptTracePath(
     bool previousDelta = true;
     bool previousGuideSelected = false;
     bool previousUsedNEE = false;
+#if RTPT_REGIR_TRANSPORT
+    uint previousReGIRCoverage = 0u;
+#endif
 #if ENABLE_SHARC && SHARC_QUERY
     bool previousDiffuse = false;
     float previousRoughness = 0.f;
@@ -65,7 +68,11 @@ float3 rtptTracePath(
             {
                 float misWeight = 1.f;
                 if (previousUsedNEE && !previousDelta)
+#if RTPT_REGIR_TRANSPORT
+                    misWeight = rtptPowerHeuristic(previousContinuationPdf, rtptEnvironmentLightPdfForCoverage(ray.dir, previousReGIRCoverage));
+#else
                     misWeight = rtptPowerHeuristic(previousContinuationPdf, rtptEnvironmentLightPdf(ray.dir));
+#endif
                 const float3 contribution = throughput * gScene.envMap.eval(ray.dir) * misWeight;
                 if (all(isfinite(contribution))) radiance += contribution;
             }
@@ -107,20 +114,37 @@ float3 rtptTracePath(
         // Primary emission stays visible even if emissive lighting is disabled.
         if ((bounce == 0 || USE_EMISSIVE_LIGHTS != 0) && any(emission > 0.f))
         {
+#if RTPT_REGIR_TRANSPORT
+            const bool coveredLocalEvent = previousUsedNEE && !previousDelta &&
+                rtptDICoversEmissiveHit(triangleHit, previousReGIRCoverage);
+            if (!coveredLocalEvent)
+            {
+#endif
             float misWeight = 1.f;
             if (previousUsedNEE && !previousDelta)
             {
+#if RTPT_REGIR_TRANSPORT
+                const float lightPdf = rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, previousReGIRCoverage);
+#else
                 const float lightPdf = rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd);
+#endif
                 misWeight = rtptPowerHeuristic(previousContinuationPdf, lightPdf);
             }
             const float3 contribution = throughput * emission * misWeight;
             if (all(isfinite(contribution))) radiance += contribution;
+#if RTPT_REGIR_TRANSPORT
+            }
+            // Ownership removes this emission event, never the reflected path.
+#endif
         }
 
         if (bounce == gParams.maxBounces) break;
         const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
+#if RTPT_REGIR_TRANSPORT
+        previousReGIRCoverage = previousUsedNEE ? rtptReGIRTransportCoverage(false) : 0u;
+#endif
         if (previousUsedNEE)
         {
             const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);

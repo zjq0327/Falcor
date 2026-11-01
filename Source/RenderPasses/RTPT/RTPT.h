@@ -5,6 +5,7 @@
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include "RTPTPG.h"
+#include <rtxdi/RTXDI.h>
 #include <unordered_map>
 
 namespace Falcor { class Light; }
@@ -28,9 +29,14 @@ public:
     Properties getPGStatistics() const;
     Properties getStageStatistics() const;
     Properties getDIStatistics() const;
+    Properties getReGIRStatistics() const;
     void resetPG() { mResetPG = true; mOptionsChanged = true; }
 
 private:
+    void invalidateReGIR();
+    bool prepareReGIR(RenderContext* pRenderContext);
+    void bindReGIRInitial(const ShaderVar& rootVar) const;
+    void bindReGIRTransport(const ShaderVar& rootVar) const;
     void reset();
     void validateScene() const;
     void prepareProgram(RenderContext* pRenderContext);
@@ -56,6 +62,31 @@ private:
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
 
     ref<Scene> mpScene;
+    bool mReGIREnabled = false;
+    bool mReGIRSecondaryEnabled = true;
+    bool mReGIRTrainingEnabled = true;
+    uint32_t mReGIRGridSize = 16u;
+    uint32_t mReGIRLightsPerCell = 32u;
+    uint32_t mReGIRBuildSamples = 8u;
+    uint32_t mReGIRBudgetMB = 64u;
+    float mReGIRCellSize = 2.f;
+    float mReGIRSamplingJitter = 1.f;
+    std::unique_ptr<rtxdi::Context> mpReGIRContext;
+    RTXDI_ResamplingRuntimeParameters mReGIRRuntime = {};
+    ref<ComputePass> mpReGIRBuild;
+    ref<ComputePass> mpReGIRInitial;
+    ref<Buffer> mpReGIRRIS;
+    bool mReGIRInitialReuse = false;
+    bool mReGIRInitialActive = false;
+    bool mReGIRInitialPreparationFailed = false;
+    std::string mReGIRInitialFallbackReason;
+    bool mReGIRPrepared = false;
+    bool mReGIRActive = false;
+    bool mReGIRPreparationFailed = false;
+    uint32_t mReGIRSlotCount = 0u;
+    uint32_t mReGIRBuildFrameStamp = 0u;
+    uint64_t mReGIRBuildCount = 0u;
+    std::string mReGIRFallbackReason;
     ref<ComputePass> mpComputePass;
     ref<ComputePass> mpStageComputePass;
     ref<ComputePass> mpPrimarySurfacePass;

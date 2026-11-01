@@ -116,6 +116,9 @@ float3 rtptTraceNRDContinuation(
     float3 previousNormal = primarySD.getOrientedFaceNormal();
     float previousContinuationPdf = bs.pdf;
     bool previousUsedNEE = gParams.useNEE != 0 && !previousDelta;
+#if RTPT_REGIR_TRANSPORT
+    uint previousReGIRCoverage = 0u;
+#endif
 #if ENABLE_SHARC && SHARC_QUERY
     bool previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
     float previousRoughness = primaryMI.getProperties(primarySD).roughness;
@@ -141,7 +144,12 @@ float3 rtptTraceNRDContinuation(
         if (!hit.isValid())
         {
 #if USE_ENV_LIGHT
-#if RTPT_USE_RESTIR_DI
+#if RTPT_REGIR_TRANSPORT
+            const float misWeight = previousUsedNEE && !previousDelta
+                ? rtptPowerHeuristic(previousContinuationPdf,
+                    rtptEnvironmentLightPdfForCoverage(ray.dir, bounce == 1u ? rootCoverage : previousReGIRCoverage))
+                : 1.f;
+#elif RTPT_USE_RESTIR_DI
             const float misWeight = previousUsedNEE && !previousDelta
                 ? rtptPowerHeuristic(previousContinuationPdf,
                     bounce == 1u ? rtptEnvironmentLightPdfForCoverage(ray.dir, rootCoverage) : rtptEnvironmentLightPdf(ray.dir))
@@ -185,16 +193,26 @@ float3 rtptTraceNRDContinuation(
             emission *= gScene.materials.evalLightProfile(dot(sd.faceN, sd.V));
         if (any(emission > 0.f))
         {
-#if RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
             bool coveredRootEvent = false;
+#if RTPT_REGIR_TRANSPORT
+            if (!previousDelta)
+                coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, bounce == 1u ? rootCoverage : previousReGIRCoverage);
+#else
             if (bounce == 1u && !previousDelta)
                 coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, rootCoverage);
+#endif
             if (!coveredRootEvent)
             {
                 const float misWeight = previousUsedNEE && !previousDelta
                     ? rtptPowerHeuristic(previousContinuationPdf,
+#if RTPT_REGIR_TRANSPORT
+                        rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd,
+                            bounce == 1u ? rootCoverage : previousReGIRCoverage))
+#else
                         bounce == 1u ? rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, rootCoverage)
                                      : rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd))
+#endif
                     : 1.f;
                 const float3 contribution = throughput * emission * misWeight;
                 if (all(isfinite(contribution))) radiance += contribution;
@@ -215,6 +233,9 @@ float3 rtptTraceNRDContinuation(
 
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
+#if RTPT_REGIR_TRANSPORT
+        previousReGIRCoverage = previousUsedNEE ? rtptReGIRTransportCoverage(false) : 0u;
+#endif
         if (previousUsedNEE)
         {
             const float3 contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
