@@ -217,8 +217,6 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
         if ((bounce == 0 && primaryEmission) || (bounce > 0 && USE_EMISSIVE_LIGHTS != 0))
             radiance += throughput * localWeight * rtptVXPGEmission(sd, mi, materialID) * arrivalWeight;
         if (bounce == gParams.maxBounces) break;
-        RTPTVXPGContext guide;
-        const bool hasGuide = rtptVXPGGetSurfaceContext(sd.computeRayOrigin(), sd.posW, sd.getOrientedFaceNormal(), pixel, sampleIndex, bounce, guide);
         const bool usedNEE = gParams.useNEE != 0 && (rtptVXPGActiveLobes(sd, mi) & uint(LobeType::NonDeltaReflection)) != 0;
         const RTPTLightingContext lightContext = rtptSurfaceLightContext(sd, pixel, sampleIndex, bounce,
             bounce == 0 ? RTPT_LIGHT_QUERY_MAIN_PRIMARY : RTPT_LIGHT_QUERY_SECONDARY);
@@ -231,7 +229,11 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
         ShadingData component = sd;
         component.mtl.setActiveLobes(lobe);
         const bool continuous = (lobe & uint(LobeType::NonDeltaReflection)) != 0;
-        const bool eligible = hasGuide && continuous;
+        // Delta events never use the guide. Its context does not consume RNG.
+        RTPTVXPGContext guide = {};
+        bool eligible = false;
+        if (continuous)
+            eligible = rtptVXPGGetSurfaceContext(sd.computeRayOrigin(), sd.posW, sd.getOrientedFaceNormal(), pixel, sampleIndex, bounce, guide);
         // The A branch executes independently of BRDF sample validity/cache.
         if (eligible)
             radiance += continuationThroughput * rtptVXPGShortBranch(sd, mi, component, guide, pixel, sampleIndex, bounce, invRho, guideSG, stats);
@@ -263,17 +265,14 @@ float3 rtptVXPGTraceSurface(ShadingData primary, uint primaryMaterialID, uint pr
             const float segment = length(next.posW-sd.posW);
             const bool diffuse = lobe == uint(LobeType::DiffuseReflection);
             const SharcHitData cacheHit = rtptMakeSharcHit(next, nextProperties, float3(0.f));
-            // Match the guide branch's actual eligibility/read outcome before sharing suffix MIS weight.
-            if (q > 0.f && rtptSharcPairEligible(next, nextMI, nextProperties,
-                bounce+1, delta, diffuse, properties.roughness, segment))
-            {
-                rtptVXPGCount(RTPT_VXPG_STATE_PG_CACHE_CHECKS);
-                guideCacheAtBRDF = rtptSharcReadPair(cacheHit, cachedLocal, cachedSuffix);
-            }
+            // Both techniques test the same hit against immutable resolved data.
+            // Keep guide support separate when deriving their suffix MIS weights.
             if (rtptSharcPairEligible(next, nextMI, nextProperties, bounce+1, delta, diffuse, properties.roughness, segment))
             {
+                if (q > 0.f) rtptVXPGCount(RTPT_VXPG_STATE_PG_CACHE_CHECKS);
                 ++stats.attemptedQueries;
-                brdfCache = guideCacheAtBRDF || rtptSharcReadPair(cacheHit, cachedLocal, cachedSuffix);
+                brdfCache = rtptSharcReadPair(cacheHit, cachedLocal, cachedSuffix);
+                guideCacheAtBRDF = q > 0.f && brdfCache;
             }
         }
 #endif
