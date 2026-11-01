@@ -10,7 +10,7 @@
 
 using namespace Falcor;
 
-/** Single-pass, inline-ray-query Monte Carlo surface path tracer. */
+/** Inline-ray-query path tracer with optional deferred NRD signal composition. */
 class RTPT : public RenderPass
 {
 public:
@@ -27,7 +27,7 @@ public:
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getVXPGStatistics() const;
     Properties getLocalLightStatistics() const;
-    Properties getNRDSplitStatistics() const;
+    Properties getNRDSignalStatistics() const;
     Properties getPrimaryHitStatistics() const;
     Properties captureLocalLightInspection();
     // Explicit synchronization for completed-frame RTPT benchmarks. Never
@@ -43,7 +43,8 @@ private:
     bool updateSceneState(); ///< Apply scene changes and report whether render history must reset.
     void prepareProgram(RenderContext* pRenderContext);
     void invalidateRenderPrograms();
-    void releaseNRDSplitRecords();
+    bool prepareNRDSignalPipeline();
+    void releaseNRDFrameSignals();
     void bindSHARC(const ShaderVar& rootVar, bool resolve = false);
     bool usesPairedSharc() const;
     void clearSHARC(RenderContext* pRenderContext);
@@ -53,11 +54,16 @@ private:
 
     ref<Scene> mpScene;
     ref<ComputePass> mpComputePass;
-    ref<ComputePass> mpNRDSplitDiffuse, mpNRDSplitSpecular;
-    ref<Buffer> mpNRDSplitRecords;
-    uint2 mNRDSplitFrameDim = uint2(0);
-    bool mNRDSplitActiveThisFrame = false;
-    bool mNRDSplitResourceFallback = false;
+    ref<ComputePass> mpNRDGenerate, mpNRDSignalResolve;
+    ref<Buffer> mpNRDFrameSignals;
+    uint2 mNRDSignalFrameDim = uint2(0);
+    uint32_t mNRDSignalRecordStride = 0;
+    bool mNRDSignalActiveThisFrame = false;
+    bool mNRDSignalResourceFailed = false;
+    bool mNRDSignalProgramsReady = false;
+    bool mNRDSignalBindingsLive = false;
+    bool mLastRenderUsedSignalPipeline = false;
+    std::string mNRDSignalFallbackReason;
     bool mPrimaryHitReuseActiveThisFrame = false;
     bool mPrimarySurfaceProducedThisFrame = false;
     bool mPrimaryRenderSubmittedThisFrame = false;
@@ -101,7 +107,9 @@ private:
     bool mAccumulate = true;
     uint32_t mMaxAccumulationFrames = 0; // 0 means unlimited.
     bool mEnableNRD = false;
-    bool mNRDSplitEnabled = false;
+    // Stage 2B only: fresh BSDF D/S paths, direct sum, no GRIS resampling.
+    bool mRestirPTEnabled = false;
+    uint32_t mRestirPTBudgetMB = 512;
     bool mResetNRDHistory = true;
     bool mEnableSHARC = false;
     bool mSHARCEnabled = true;

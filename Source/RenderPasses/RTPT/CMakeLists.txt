@@ -66,7 +66,8 @@ target_sources(RTPT PRIVATE
     RTPTIntegrator.slang
     RTPTLighting.slang
     RTPTNRD.slang
-    RTPTNRDSplit.slang
+    RTPTNRDSignals.slang
+    RTPTNRDResolve.cs.slang
     RTPTSharc.slang
     RTPTSharcPairCommon.slang
     RTPTSharcUpdate.cs.slang

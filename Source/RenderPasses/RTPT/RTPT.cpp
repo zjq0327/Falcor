@@ -4,6 +4,7 @@
 #include "Scene/Material/StandardMaterial.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
 #include "Utils/Timing/Profiler.h"
+#include "Core/Program/ProgramVersion.h"
 #include <cmath>
 #include <limits>
 
@@ -46,7 +47,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("vxpgStats", [](const RTPT& self) { return self.getVXPGStatistics().toPython(); });
         pass.def_property_readonly("localLightStats", [](const RTPT& self) { return self.getLocalLightStatistics().toPython(); });
-        pass.def_property_readonly("nrdSplitStats", [](const RTPT& self) { return self.getNRDSplitStatistics().toPython(); });
+        pass.def_property_readonly("nrdSignalStats", [](const RTPT& self) { return self.getNRDSignalStatistics().toPython(); });
         pass.def_property_readonly("primaryHitStats", [](const RTPT& self) { return self.getPrimaryHitStatistics().toPython(); });
         pass.def("captureLocalLightInspection", [](RTPT& self) { return self.captureLocalLightInspection().toPython(); });
         pass.def("waitForGpu", &RTPT::waitForGpu);
@@ -101,15 +102,23 @@ Properties RTPT::captureLocalLightInspection()
     return mpLocalLights->captureInspection();
 }
 
-Properties RTPT::getNRDSplitStatistics() const
+Properties RTPT::getNRDSignalStatistics() const
 {
     Properties stats;
-    stats["enabled"] = mNRDSplitEnabled;
-    stats["activeThisFrame"] = mNRDSplitActiveThisFrame;
-    stats["compactActiveThisFrame"] = mNRDSplitActiveThisFrame;
-    stats["resourceFallback"] = mNRDSplitResourceFallback;
-    stats["recordStride"] = mpNRDSplitRecords ? mpNRDSplitRecords->getStructSize() : 0u;
-    stats["payloadBytes"] = mpNRDSplitRecords ? mpNRDSplitRecords->getSize() : 0ull;
+    stats["requested"] = mRestirPTEnabled;
+    stats["enabled"] = mRestirPTEnabled;
+    stats["activeThisFrame"] = mNRDSignalActiveThisFrame;
+    stats["executionStage"] = mNRDSignalActiveThisFrame ? "GenerateResolveDirectSum" : "SinglePass";
+    stats["resamplingActive"] = false;
+    stats["fallbackReason"] = mNRDSignalFallbackReason;
+    stats["resourceFallback"] = mNRDSignalResourceFailed;
+    stats["recordStride"] = mNRDSignalRecordStride;
+    stats["payloadBytes"] = mpNRDFrameSignals ? mpNRDFrameSignals->getSize() : 0ull;
+    stats["budgetMB"] = mRestirPTBudgetMB;
+    stats["generatedPixels"] = mNRDSignalActiveThisFrame ? uint64_t(mFrameDim.x) * mFrameDim.y : 0ull;
+    stats["resolvedPixels"] = mNRDSignalActiveThisFrame ? uint64_t(mFrameDim.x) * mFrameDim.y : 0ull;
+    stats["countsAreDispatchDerived"] = true;
+    stats["sampleOffset"] = mPrimaryHitSampleOffset;
     return stats;
 }
 
@@ -145,7 +154,9 @@ void RTPT::setProperties(const Properties& props)
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
-    bool enableNRD = mEnableNRD, nrdSplitEnabled = mNRDSplitEnabled;
+    bool enableNRD = mEnableNRD;
+    bool restirPTEnabled = mRestirPTEnabled;
+    uint32_t restirPTBudgetMB = mRestirPTBudgetMB;
     bool enableSHARC = mEnableSHARC, sharcUseCache = mSHARCUseCache, sharcFreeze = mSHARCFreeze;
     bool sharcEnabled = mSHARCEnabled;
     uint32_t sharcEntries = mSHARCEntries, sharcUpdateStride = mSHARCUpdateStride, sharcUpdateBounces = mSHARCUpdateBounces;
@@ -167,7 +178,8 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "accumulate") accumulate = value;
         else if (key == "maxAccumulationFrames") maxAccumulationFrames = value;
         else if (key == "enableNRD") enableNRD = value;
-        else if (key == "nrdSplitEnabled") nrdSplitEnabled = value;
+        else if (key == "restirPTEnabled") restirPTEnabled = value;
+        else if (key == "restirPTBudgetMB") restirPTBudgetMB = value;
         else if (key == "enableSHARC") enableSHARC = value;
         else if (key == "sharcEnabled") sharcEnabled = value;
         else if (key == "sharcUseCache") sharcUseCache = value;
@@ -192,6 +204,7 @@ void RTPT::setProperties(const Properties& props)
             FALCOR_THROW("Unknown RTPT property '{}'.", key);
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
+    FALCOR_CHECK(restirPTBudgetMB <= 16384, "RTPT path signal budget must be in [0, 16384] MiB.");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
     FALCOR_CHECK(rrStartBounce >= 1 && rrStartBounce <= 64, "RTPT rrStartBounce must be in [1, 64].");
     FALCOR_CHECK(!enableNRD || (samplesPerPixel == 1 && !accumulate),
@@ -241,10 +254,6 @@ void RTPT::setProperties(const Properties& props)
         // not request a render-graph recompile or reset any temporal history.
         if (mpComputePass)
             mpComputePass->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", vxpg.detailedDiagnostics ? "1" : "0", true);
-        if (mpNRDSplitDiffuse)
-            mpNRDSplitDiffuse->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", vxpg.detailedDiagnostics ? "1" : "0", true);
-        if (mpNRDSplitSpecular)
-            mpNRDSplitSpecular->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", vxpg.detailedDiagnostics ? "1" : "0", true);
         if (mpSparseUpdate)
             mpSparseUpdate->addDefine("RTPT_VXPG_DETAILED_DIAGNOSTICS", vxpg.detailedDiagnostics ? "1" : "0", true);
         mVXPGDiagnosticFrameAvailable = false;
@@ -256,10 +265,18 @@ void RTPT::setProperties(const Properties& props)
     const bool sharcSignalChanged = sharcStructureChanged || sharcUseCache != mSHARCUseCache ||
         sharcUpdateStride != mSHARCUpdateStride || sharcMinBounce != mSHARCMinBounce || sharcMinRoughness != mSHARCMinRoughness ||
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
+    const bool signalPipelineChanged = restirPTEnabled != mRestirPTEnabled || restirPTBudgetMB != mRestirPTBudgetMB;
+    if (signalPipelineChanged)
+    {
+        releaseNRDFrameSignals();
+        mNRDSignalResourceFailed = false;
+        mNRDSignalActiveThisFrame = false;
+        mNRDSignalFallbackReason.clear();
+    }
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
         maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || vxpgSignalChanged ||
-        localLightChanges.signal || nrdSplitEnabled != mNRDSplitEnabled;
+        localLightChanges.signal || signalPipelineChanged;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= pairedChanged;
     if (sharcEntries != mSHARCEntries)
@@ -282,15 +299,9 @@ void RTPT::setProperties(const Properties& props)
     mUseRussianRoulette = useRussianRoulette;
     mAccumulate = accumulate;
     mMaxAccumulationFrames = maxAccumulationFrames;
-    if (nrdSplitEnabled != mNRDSplitEnabled)
-    {
-        releaseNRDSplitRecords();
-        mNRDSplitFrameDim = uint2(0);
-        mNRDSplitResourceFallback = false;
-        mNRDSplitActiveThisFrame = false;
-    }
     mEnableNRD = enableNRD;
-    mNRDSplitEnabled = nrdSplitEnabled;
+    mRestirPTEnabled = restirPTEnabled;
+    mRestirPTBudgetMB = restirPTBudgetMB;
     mEnableSHARC = enableSHARC;
     mSHARCEnabled = sharcEnabled;
     mSHARCUseCache = sharcUseCache;
@@ -331,7 +342,8 @@ Properties RTPT::getProperties() const
     props["accumulate"] = mAccumulate;
     props["maxAccumulationFrames"] = mMaxAccumulationFrames;
     props["enableNRD"] = mEnableNRD;
-    props["nrdSplitEnabled"] = mNRDSplitEnabled;
+    props["restirPTEnabled"] = mRestirPTEnabled;
+    props["restirPTBudgetMB"] = mRestirPTBudgetMB;
     props["enableSHARC"] = mEnableSHARC;
     props["sharcEnabled"] = mSHARCEnabled;
     props["sharcUseCache"] = mSHARCUseCache;
@@ -394,26 +406,112 @@ void RTPT::reset()
 
 void RTPT::invalidateRenderPrograms()
 {
+    releaseNRDFrameSignals();
     mpComputePass = nullptr;
-    mpNRDSplitDiffuse = mpNRDSplitSpecular = nullptr;
-    mpNRDSplitRecords = nullptr;
-    mNRDSplitFrameDim = uint2(0);
-    mNRDSplitResourceFallback = false;
-    mNRDSplitActiveThisFrame = false;
+    mpNRDGenerate = mpNRDSignalResolve = nullptr;
+    mNRDSignalRecordStride = 0;
+    mNRDSignalResourceFailed = mNRDSignalActiveThisFrame = false;
+    mNRDSignalProgramsReady = false;
+    mLastRenderUsedSignalPipeline = false;
+    mNRDSignalFallbackReason.clear();
 }
 
-void RTPT::releaseNRDSplitRecords()
+void RTPT::releaseNRDFrameSignals()
 {
-    if (mpNRDSplitRecords)
+    // Parameter blocks keep strong resource references. Detach both views
+    // before retiring the allocation, including budget/resize failure paths.
+    for (const auto& pass : {mpNRDGenerate, mpNRDSignalResolve})
+        if (pass)
+            if (auto member = pass->getRootVar().findMember("gNRDFrameSignals"); member.isValid())
+                member.setBuffer(nullptr);
+    if (mNRDSignalBindingsLive)
     {
-        // Parameter blocks retain strong resource references after binding.
-        // Detach both views before replacing or disabling this allocation.
-        if (mpNRDSplitDiffuse)
-            mpNRDSplitDiffuse->getRootVar()["gNRDSplitRecords"].setBuffer(nullptr);
-        if (mpNRDSplitSpecular)
-            mpNRDSplitSpecular->getRootVar()["gNRDSplitRecords"].setBuffer(nullptr);
-        mpNRDSplitRecords = nullptr;
+        // The inactive integrator must not pin old shared caches, primary
+        // surfaces or output textures after their active owners resize them.
+        // Keep the programs/kernel cache; retire their bindings only once.
+        mNRDSignalBindingsLive = false;
+        mNRDSignalProgramsReady = false;
+        try
+        {
+            for (const auto& pass : {mpNRDGenerate, mpNRDSignalResolve})
+                if (pass) pass->setVars(nullptr);
+        }
+        catch (const std::exception&)
+        {
+            // Retirement must remain possible under allocation pressure.
+            mpNRDGenerate = mpNRDSignalResolve = nullptr;
+        }
     }
+    mpNRDFrameSignals = nullptr;
+}
+
+bool RTPT::prepareNRDSignalPipeline()
+{
+    if (!mRestirPTEnabled) return false;
+    if (!mEnableNRD || mSamplesPerPixel != 1 || mAccumulate)
+        mNRDSignalFallbackReason = "Stage 2B requires NRD signals, 1 spp and RTPT accumulation off.";
+    else if (mGuidingMode != RTPTVXPG::GuidingMode::BSDF || (mEnableVXPG && mVXPGSettings.enabled))
+        mNRDSignalFallbackReason = "Stage 2B requires BSDF mode with VXPG guiding and training disabled; original mode retained.";
+    else
+    {
+        if (any(mNRDSignalFrameDim != mFrameDim))
+        {
+            releaseNRDFrameSignals();
+            mNRDSignalFrameDim = mFrameDim;
+            mNRDSignalResourceFailed = false;
+            mNRDSignalFallbackReason.clear();
+        }
+        if (mNRDSignalResourceFailed) return false;
+        try
+        {
+            if (!mpNRDGenerate)
+            {
+                ProgramDesc desc;
+                desc.addShaderModules(mpScene->getShaderModules());
+                desc.addShaderLibrary("RenderPasses/RTPT/RTPT.cs.slang").csEntry("generateNRD");
+                desc.addTypeConformances(mpScene->getTypeConformances());
+                if (mEnableSHARC || mEnableVXPG)
+                {
+                    desc.setShaderModel(ShaderModel::SM6_6);
+                    desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+                }
+                mpNRDGenerate = ComputePass::create(mpDevice, desc, mpComputePass->getProgram()->getDefines(), true);
+            }
+            if (!mpNRDSignalResolve)
+            {
+                ProgramDesc desc;
+                desc.addShaderLibrary("RenderPasses/RTPT/RTPTNRDResolve.cs.slang").csEntry("main");
+                mpNRDSignalResolve = ComputePass::create(mpDevice, desc, {}, true);
+            }
+            const auto var = mpNRDGenerate->getRootVar()["gNRDFrameSignals"];
+            const auto stride = var.getType()->asResourceType()->getStructType()->getSlangTypeLayout()->getStride();
+            FALCOR_CHECK(stride > 0 && stride <= std::numeric_limits<uint32_t>::max(), "Invalid NRD signal record stride.");
+            mNRDSignalRecordStride = uint32_t(stride);
+            const uint64_t pixels = uint64_t(mFrameDim.x) * mFrameDim.y;
+            FALCOR_CHECK(pixels <= std::numeric_limits<uint32_t>::max(), "NRD signal pixel count exceeds buffer capacity.");
+            FALCOR_CHECK(pixels * stride <= uint64_t(mRestirPTBudgetMB) * 1024ull * 1024ull,
+                "NRD signal records exceed the configured {} MiB budget.", mRestirPTBudgetMB);
+            if (!mpNRDFrameSignals)
+                mpNRDFrameSignals = mpDevice->createStructuredBuffer(var, uint32_t(pixels),
+                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+            // Force both reflections and record bindings before any rendering.
+            mNRDSignalBindingsLive = true;
+            var = mpNRDFrameSignals;
+            mpNRDSignalResolve->getRootVar()["gNRDFrameSignals"] = mpNRDFrameSignals;
+            mNRDSignalFallbackReason.clear();
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            releaseNRDFrameSignals();
+            mNRDSignalResourceFailed = true;
+            mNRDSignalFallbackReason = e.what();
+            logWarning("RTPT signal preparation unavailable; original single pass retained: {}", e.what());
+            return false;
+        }
+    }
+    releaseNRDFrameSignals();
+    return false;
 }
 
 void RTPT::validateScene() const
@@ -543,8 +641,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     }
     else mpEnvMapSampler = nullptr;
 
-    const bool compileNRDSplit = mNRDSplitEnabled && mEnableNRD && compileVXPG;
-    if (!mpComputePass || (compileNRDSplit && (!mpNRDSplitDiffuse || !mpNRDSplitSpecular)) ||
+    if (!mpComputePass ||
         ((mEnableSHARC || compileVXPG) && !mpSparseUpdate) ||
         (mEnableSHARC && !mpSHARCResolve))
     {
@@ -587,14 +684,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         }
         if (!mpComputePass)
             mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
-        if (compileNRDSplit && (!mpNRDSplitDiffuse || !mpNRDSplitSpecular))
-        {
-            auto splitDefines = defines;
-            splitDefines.add("RTPT_NRD_SPLIT_STAGE", "1");
-            mpNRDSplitDiffuse = ComputePass::create(mpDevice, desc, splitDefines, true);
-            splitDefines.add("RTPT_NRD_SPLIT_STAGE", "2");
-            mpNRDSplitSpecular = ComputePass::create(mpDevice, desc, splitDefines, true);
-        }
         if ((mEnableSHARC || compileVXPG) && !mpSparseUpdate)
         {
             ProgramDesc updateDesc;
@@ -806,7 +895,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext, const RTPTVXPG::Traini
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    mNRDSplitActiveThisFrame = false;
+    mNRDSignalActiveThisFrame = false;
     mPrimaryHitReuseActiveThisFrame = false;
     mPrimarySurfaceProducedThisFrame = false;
     mPrimaryRenderSubmittedThisFrame = false;
@@ -861,6 +950,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     else if (mEnableNRD)
         mpJitterCamera->setPatternGenerator(mpCameraPattern, 1.f / float2(frameDim));
     prepareProgram(pRenderContext);
+    bool useNRDSignalPipeline = prepareNRDSignalPipeline();
     // Process scene, option, resolution and lighting changes before testing the
     // limit so a completed image starts accumulating again after invalidation.
     if (mAccumulate && mMaxAccumulationFrames != 0 && mAccumulatedFrames >= mMaxAccumulationFrames)
@@ -932,34 +1022,6 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
     const bool vxpgRenderingActive = mEnableVXPG && mGuidingMode == RTPTVXPG::GuidingMode::VXPG &&
         mVXPGSettings.enabled && mpVXPG->hasSubmittedModel();
-    bool useNRDSplit = mNRDSplitEnabled && mEnableNRD && vxpgRenderingActive &&
-        mpNRDSplitDiffuse && mpNRDSplitSpecular;
-    if (useNRDSplit && any(mNRDSplitFrameDim != frameDim))
-    {
-        releaseNRDSplitRecords();
-        mNRDSplitFrameDim = frameDim;
-        mNRDSplitResourceFallback = false;
-    }
-    if (useNRDSplit && !mpNRDSplitRecords && !mNRDSplitResourceFallback)
-    {
-        // Every pixel owns one slot, so there is no capacity-dependent sample loss.
-        // Allocate before either render dispatch; failure retains the complete
-        // original path for this and subsequent frames at the same dimensions.
-        try
-        {
-            const uint64_t count = uint64_t(frameDim.x) * uint64_t(frameDim.y);
-            FALCOR_CHECK(count <= std::numeric_limits<uint32_t>::max(), "NRD split pixel count exceeds structured-buffer capacity.");
-            mpNRDSplitRecords = mpDevice->createStructuredBuffer(mpNRDSplitDiffuse->getRootVar()["gNRDSplitRecords"],
-                uint32_t(count), ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal, nullptr, false);
-        }
-        catch (const std::exception& e)
-        {
-            logWarning("RTPT NRD split buffer unavailable; using the original single pass: {}", e.what());
-            mNRDSplitResourceFallback = true;
-        }
-    }
-    useNRDSplit = useNRDSplit && bool(mpNRDSplitRecords);
     auto bindRender = [&](const ShaderVar& var)
     {
         mpLocalLights->bindSampling(var, RTPTLocalLights::QueryKind::MainPrimary);
@@ -978,7 +1040,6 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         params["useNEE"] = mUseNEE ? 1u : 0u;
         params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
         params["accumulate"] = mAccumulate ? 1u : 0u;
-        // Split B consumes A's packed hit and needs no primary SRV itself.
         auto primaryParams = var.findMember("gPrimaryHitParams");
         if (primaryParams.isValid())
         {
@@ -986,9 +1047,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             primaryParams["sampleIndex"] = mSampleOffset + mSeed * 0x9e3779b9u;
             var["gSharedPrimaryHit"] = mPrimaryHitReuseActiveThisFrame ? primarySurface.hit : nullptr;
         }
-        var["gColor"] = color;
-        var["gNoisyColor"] = noisyColor;
-        var["gAccumulation"] = mpAccumulation;
+        if (auto member = var.findMember("gColor"); member.isValid()) member = color;
+        if (auto member = var.findMember("gNoisyColor"); member.isValid()) member = noisyColor;
+        if (auto member = var.findMember("gAccumulation"); member.isValid()) member = mpAccumulation;
         if (mEnableNRD)
             for (const auto& output : kNRDOutputs)
                 if (auto member = var.findMember(output.shaderName); member.isValid())
@@ -1003,34 +1064,67 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         if (mEnableVXPG)
             mpVXPG->bindRendering(var, mSampleOffset, vxpgRenderingActive);
     };
-    if (useNRDSplit)
+    if (useNRDSignalPipeline)
     {
-        auto diffuseVar = mpNRDSplitDiffuse->getRootVar();
-        auto specularVar = mpNRDSplitSpecular->getRootVar();
-        bindRender(diffuseVar);
-        bindRender(specularVar);
-        diffuseVar["gNRDSplitRecords"] = mpNRDSplitRecords;
-        specularVar["gNRDSplitRecords"] = mpNRDSplitRecords;
-    }
-    else bindRender(mpComputePass->getRootVar());
-    if (mAccumulate) pRenderContext->uavBarrier(mpAccumulation.get());
-    {
-        FALCOR_PROFILE(pRenderContext, "MainRender");
-        if (useNRDSplit)
+        // Finish binding and compile both kernels before the first rendering
+        // dispatch. Never retry a sample after Generate has submitted feedback.
+        try
         {
+            auto generate = mpNRDGenerate->getRootVar();
+            bindRender(generate);
+            generate["gNRDFrameSignals"] = mpNRDFrameSignals;
+            auto resolve = mpNRDSignalResolve->getRootVar();
+            resolve["PerFrame"]["gFrameDim"] = frameDim;
+            resolve["gNRDFrameSignals"] = mpNRDFrameSignals;
+            resolve["gColor"] = color;
+            resolve["gNoisyColor"] = noisyColor;
+            for (const auto& output : kNRDOutputs) resolve[output.shaderName] = renderData.getTexture(output.name);
+            if (!mNRDSignalProgramsReady)
             {
-                FALCOR_PROFILE(pRenderContext, "SplitDiffuse");
-                mpNRDSplitDiffuse->execute(pRenderContext, uint3(frameDim, 1));
+                for (const auto& pass : {mpNRDGenerate, mpNRDSignalResolve})
+                {
+                    auto state = ComputeState::create(mpDevice);
+                    state->setProgram(pass->getProgram());
+                    state->getCSO(pass->getVars().get());
+                }
+                mNRDSignalProgramsReady = true;
             }
-            pRenderContext->uavBarrier(mpNRDSplitRecords.get());
-            {
-                FALCOR_PROFILE(pRenderContext, "SplitSpecular");
-                mpNRDSplitSpecular->execute(pRenderContext, uint3(frameDim, 1));
-            }
-            mNRDSplitActiveThisFrame = true;
+            if (!mLastRenderUsedSignalPipeline)
+                mpComputePass->setVars(nullptr);
         }
-        else mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
+        catch (const std::exception& e)
+        {
+            useNRDSignalPipeline = false;
+            mNRDSignalResourceFailed = true;
+            mNRDSignalFallbackReason = e.what();
+            releaseNRDFrameSignals();
+            logWarning("RTPT signal binding/compilation failed before sampling; original single pass retained: {}", e.what());
+        }
+    }
+    if (useNRDSignalPipeline)
+    {
+        {
+            FALCOR_PROFILE(pRenderContext, "NRDGenerate");
+            mpNRDGenerate->execute(pRenderContext, uint3(frameDim, 1));
+        }
+        pRenderContext->uavBarrier(mpNRDFrameSignals.get());
+        {
+            FALCOR_PROFILE(pRenderContext, "NRDFinalResolve");
+            mpNRDSignalResolve->execute(pRenderContext, uint3(frameDim, 1));
+        }
+        mNRDSignalActiveThisFrame = true;
+        mLastRenderUsedSignalPipeline = true;
         mPrimaryRenderSubmittedThisFrame = true;
+    }
+    else
+    {
+        if (mLastRenderUsedSignalPipeline) releaseNRDFrameSignals();
+        bindRender(mpComputePass->getRootVar());
+        if (mAccumulate) pRenderContext->uavBarrier(mpAccumulation.get());
+        FALCOR_PROFILE(pRenderContext, "MainRender");
+        mpComputePass->execute(pRenderContext, uint3(frameDim, 1));
+        mPrimaryRenderSubmittedThisFrame = true;
+        mLastRenderUsedSignalPipeline = false;
     }
     mpLocalLights->renderDebug(pRenderContext, renderData.getTexture("localLightDebug"));
     mpLocalLights->finishFrame(pRenderContext);
@@ -1062,27 +1156,22 @@ void RTPT::renderUI(Gui::Widgets& widget)
         widget.text("NRD: 1 primary sample, one path per active diffuse/specular lobe.");
     else
         changed |= widget.var("Samples per pixel", mSamplesPerPixel, 1u, 1024u);
+    if (auto pipeline = widget.group("Path signal pipeline (stage 2B)"))
+    {
+        bool enabled = mRestirPTEnabled;
+        uint32_t budget = mRestirPTBudgetMB;
+        if (pipeline.checkbox("Enabled", enabled)) setProperties({{"restirPTEnabled", enabled}});
+        if (pipeline.var("Record budget (MiB)", budget, 0u, 16384u)) setProperties({{"restirPTBudgetMB", budget}});
+        pipeline.text("Fresh BSDF paths -> Generate / Resolve direct sum. GRIS resampling is not implemented.");
+        pipeline.text(mNRDSignalActiveThisFrame ? "Active: Generate / Final Resolve." : "Active: original single pass.");
+        if (!mNRDSignalFallbackReason.empty()) pipeline.text(mNRDSignalFallbackReason);
+        pipeline.tooltip("Requires BSDF mode and VXPG training disabled. Preserves requested settings and uses the original integrator when unavailable. 0 MiB forces resource fallback.", true);
+    }
     if (auto primary = widget.group("Primary hit reuse"))
     {
         primary.text(mPrimaryHitReuseActiveThisFrame ? "Active: one shared camera query per pixel." : "Using original camera queries.");
         if (!mPrimaryHitFallbackReason.empty()) primary.text(mPrimaryHitFallbackReason);
         primary.tooltip("Share the current camera sample with local lights, VXPG and primary shading. Geometric normals remain separate from NRD material guide normals. Multi-sample PT shares sample 0 only. Unavailable or mismatched views use original camera queries.", true);
-    }
-    if (auto split = widget.group("NRD continuation split"))
-    {
-        bool enabled = mNRDSplitEnabled;
-        if (split.checkbox("Enabled", enabled))
-        {
-            Properties props;
-            props["nrdSplitEnabled"] = enabled;
-            setProperties(props);
-        }
-        split.tooltip("Use two RayQuery compute passes for VXPG NRD continuations. Other modes retain the original single pass. Switching restarts NRD and final accumulation.", true);
-        if (mNRDSplitEnabled)
-        {
-            split.text(mNRDSplitActiveThisFrame ? "Active: diffuse, then specular / delta." : "Using the original single pass.");
-            if (mNRDSplitResourceFallback) split.text("Intermediate buffer unavailable.");
-        }
     }
     changed |= widget.var("Max BSDF bounces", mMaxBounces, 1u, 64u);
     widget.tooltip("Number of BSDF scatter events. The final ray only collects emission or environment light.", true);

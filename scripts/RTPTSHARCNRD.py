@@ -31,7 +31,9 @@ def render_graph_RTPTSHARCNRD():
     graph.addPass(createPass("RTPT", {
         **_vxpg_grid(),
         "enableNRD": True,
-        "nrdSplitEnabled": _module_enabled("RTPT_NRD_SPLIT_ENABLED", "1"),
+        # Stage 2B prepares the future GRIS pipeline; currently direct sum only.
+        "restirPTEnabled": _module_enabled("RTPT_RESTIR_PT_ENABLED", "0"),
+        "restirPTBudgetMB": int(os.environ.get("RTPT_RESTIR_PT_BUDGET_MB", "512")),
         "samplesPerPixel": 1,
         "maxBounces": 4,
         "useNEE": True,

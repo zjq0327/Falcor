@@ -5,9 +5,11 @@ pushd "%~dp0" || exit /b 1
 rem Module switches: 1 = enabled, 0 = disabled. These are local to this launch.
 set "RTPT_SHARC_ENABLED=1"
 set "RTPT_NRD_ENABLED=1"
-rem Primary-hit reuse, compact split records and single surface writes are fixed on.
-rem Experimental two-Pass VXPG NRD continuations; 0 keeps the original single Pass.
-set "RTPT_NRD_SPLIT_ENABLED=1"
+rem Optional BSDF Generate/Resolve direct-sum path; GRIS resampling is not implemented.
+rem Requires RTPT_GUIDING_MODE=BSDF and RTPT_VXPG_ENABLED=0; otherwise retains the requested original mode.
+set "RTPT_RESTIR_PT_ENABLED=0"
+set "RTPT_RESTIR_PT_BUDGET_MB=512"
+rem Primary-hit reuse and single surface writes remain fixed on.
 set "RTPT_ACCUMULATION_ENABLED=1"
 set "RTPT_TONEMAPPER_ENABLED=1"
 set "RTPT_LIGHT_GRID_ENABLED=1"

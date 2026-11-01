@@ -18,6 +18,75 @@ FrameAccumulation 管理，默认 Enabled、128 帧、Stop、autoReset；0 表�
 NRD 关闭时传递当前帧信号；SHaRC 的 `sharcEnabled` 控制更新和查询，`sharcUseCache`
 只控制查询。影响信号的切换会重置 NRD 历史及最终累积。
 
+## NRD 信号重构：Generate → Final Resolve / Pack
+
+2026-10-31 按用户决定删除旧 NRD continuation split：旧 A/B 续接实现、188 B 专用记录、
+资源、调度、CMD/UI/序列化开关及专用统计均移除。旧 `nrdSplitEnabled`、
+`RTPT_NRD_SPLIT_ENABLED` 和 `nrdSplitStats` 不再提供。VXPG 保留原单 Pass NRD 积分器；
+配对 SHaRC 的 `RTPT_SHARC_SPLIT_RESOLVE` 与 full/local/suffix 缓存行为继续保留。
+文末及 [历史记录](README_HISTORY.md) 中注明日期的单/双 Pass 验收属于当时版本的记录，
+不表示旧 NRD continuation split 仍可使用。
+
+阶段 2B 的新可选路径将普通 BSDF 追踪与最终信号写入分开：
+
+`PrimarySurface / LocalLights / SHaRC 准备 → Generate（RayQuery）→ Final Resolve / Pack → NRD → ModulateIllumination → FrameAccumulation → ToneMapper`。
+
+Generate 保存本像素的 D/S 光照和、emission、residual、材质恢复因子、guides 及 D/S 新鲜首段距离；
+Final Resolve / Pack 直接求和，执行一次 NRD 范围处理与去材质化，并统一写出当前帧信号。
+NRDPass 自身的打包及 RELAX 算法仍沿用共享实现。保留原采样、权重、RR、SHaRC 查询、
+选灯与反馈时序；Resolve 不重复追踪或提交反馈。当前阶段为 **DirectSum**，尚未接入
+GRIS Initial、Temporal、Spatial 或 reservoir；启用该路径不代表 GRIS 重采样已运行。
+
+NRD 直通的格式契约保持现状：RTPT 原始光照与材质因子为 FP32，而共享 NRDPass 的 filtered D/S
+输出是 `RGBA16Float`；`NRD.enabled=False` 的 blit 同样经过 FP16 转换。当前 D3D12 / RTX 5070
+实测采用 round-toward-zero（RTZ，向零舍入），不能用 NumPy 默认 float16 最近值转换替代。
+FP32 原始信号乘回材质后的重建以严格 FP32 容差比较 noisyColor；实际直通 filtered D/S 先与
+显式 `Q_fp16_RTZ(D/S 去材质光照)` 逐位核对，再将其转为 FP32 并恢复材质，与 Modulate 输出比较。
+舍入行为及实际图像相对 noisyColor 的格式量化误差单独报告；其他后端的舍入另行确认。
+不能靠任意放宽等价门限通过测试；共享 NRDPass 不修改。
+
+主入口提供 `RTPT_RESTIR_PT_ENABLED=0`，对应属性 `restirPTEnabled=False` 及窗口中的
+Enabled；默认保持现有 VXPG 完整管线。`RTPT_RESTIR_PT_BUDGET_MB=512` 对应
+`restirPTBudgetMB=512`，限制新路径中间资源预算。内部记录布局不单独提供 Enabled。
+新 BSDF 路径的验收配置使用 `guidingMode=BSDF`、`vxpgEnabled=False`，同时关闭 VXPG 引导与训练。
+若仍请求 VXPG、NRD 信号模式不满足要求或准备失败，保留原积分器并报告原因，不静默关闭现有模块。
+
+只读 `RTPT.nrdSignalStats` 用于核对请求、实际执行状态、DirectSum 阶段、中间记录占用及回退原因。
+应核对实际 active 状态，不能只根据启动开关判断新路径已执行。新路径保持 NRD 信号模式的
+1 spp、`accumulate=False`；NRD Enabled 仅控制降噪/直通，最终累积仍由 FrameAccumulation 独立管理。
+新路径开关或信号配置变化时重置受影响的 NRD 历史及最终累积；正常缓存更新不应每帧清空历史。
+
+验收分为两组：无 VXPG 的新路径原始信号等价，以及 VXPG、SHaRC、Grid/CDF/Persistent/Tile/Adaptive、
+NRD、累积与后处理全部开启的主入口兼容性。两组均须通过，且全开启组必须运行超过默认 128 帧
+Stop 上限，验证上游继续运行、模块关闭后重开、相机运动、显露、resize 与不限帧数模式。
+2026-10-31 声明范围内验收完成，详见 [验证汇总](../../../build/rtpt-nrd-refactor-20261031/validation-summary.json)：
+
+- [完整必需验收](../../../build/rtpt-nrd-refactor-20261031/stage2b-verified/report.json) 从主入口运行，320×180 全部 57 项通过，包含实际 VXPG 等现有功能全开启、128 Stop / 0 不限、运动与显露、resize、模块关闭后恢复及边界夹具。
+- [新路径](../../../build/rtpt-nrd-refactor-20261031/stage2b-final-active/report.json) 与 [保留单 Pass](../../../build/rtpt-nrd-refactor-20261031/stage2b-final-singlepass/report.json) 各 12 个 BSDF 检查点的原始信号与原始源码重建基线逐位相同；[补充开关 / 纯 PT](../../../build/rtpt-nrd-refactor-20261031/stage2b-pure/report.json) 另通过 11 项。
+- [分辨率验证](../../../build/rtpt-nrd-refactor-20261031/stage2b-resolutions/report.json) 4 项通过。新路径记录为 136 B / 像素，1080p 约 269 MiB、1440p 约 478 MiB；4K 在默认 512 MiB 预算下明确回退并释放中间记录，333×187 后恢复。记录占用不代表总显存。
+- [性能采集](../../../build/rtpt-nrd-refactor-20261031/stage2b-performance/report.json) 记录 BSDF / VXPG 共 8 个 ABBA 窗口，不据此承诺提速。新路径仍默认关闭，GRIS 重采样未接入。
+
+[720p 扩展报告](../../../build/rtpt-nrd-refactor-20261031/stage2b-complete/report.json) 执行完 57 项必需用例后，在额外空分支实验的材质零质量假设处失败，整份报告仍保留 `passed=false`，不称为 720p 全部通过。独立在线 VXPG 冷启动因模型首次写入非确定性，逐样本同状态对照保持 inconclusive；2A 使用受控引导与预处理程序身份检查补充证据。完整边界见汇总和 GRIS 计划，不删除历史失败或放宽门限。
+
+## VeachAjar：1080p / 1440p 性能与画面补测
+
+2026-10-31 使用同一 `RTPR_START.cmd` 主图、VeachAjar、D3D12 和 RTX 5070 / 驱动 610.88，
+补测日常分辨率。固定 0/19/37 三个 seed，每个配置重新建立图和场景，按 Latin rotation 平衡顺序；
+静止预热 160 帧，平滑相机平移预热 256 帧，每窗口渲染 129 帧、取得 128 个 GPU 记录。
+计时期间不读回图像、统计或 DXGI；保留主图默认输出及 128/Stop/autoReset，画面在计时后采集。
+协议、原始窗口和独立确认组见 [VeachAjar 汇总](../../../build/rtpt-veach-benchmark-20261031/summary.json)
+及 [预登记协议](../../../build/rtpt-veach-benchmark-20261031/protocol.json)。
+
+- **1080p 静止整帧 GPU 均值**：BSDF 单 Pass 11.0944 ms，新 Generate/Resolve 12.5136 ms，VXPG 完整管线 32.4103 ms。
+- **1080p 平移整帧 GPU 均值**：BSDF 单 Pass 11.2609 ms，新 Generate/Resolve 12.6690 ms，VXPG 完整管线 32.6899 ms。新结构在这组测量中增加约 12.5–12.8% 整帧 GPU 时间，不能作为提速交付。
+- **1440p VXPG 预算边界**：默认 `vxpgLodBudgetMB=256` 不足约 388.98 MiB 的准备估算，会明确回退。完整 VXPG 计时仅在测试属性临时设为 512 MiB 后采集，主入口默认值未改；该配置静止 GPU 均值为 58.2782 ms。
+- **1440p 异常与确认分开保留**：原矩阵出现单 Pass 静止 seed 37 为 46.739 ms、新路径平移 seed 0 为 167.720 ms、VXPG 平移 seed 37 为 303.296 ms 的持续异常窗口，原始数据不删，不将总体旧/新对比写成明确结论。预登记的独立进程确认中，静止 seed 37 单 Pass 为 21.464/21.251 ms、新路径为 23.901/23.922 ms；平移 seed 0 单 Pass 为 21.808/21.824 ms、新路径为 24.458/24.575 ms。确认数据不替换原矩阵，也不与原矩阵混合平均；异常根因仍未确定。
+- **1440p VXPG 平移独立确认**：三个 seed 各自从新进程启动，512 MiB 测试预算下 GPU 均值分别为 58.583、58.783、58.940 ms，合计均值 58.7685 ms（约 17.02 GPU 等效帧/秒），未复现原矩阵的持续慢窗口。该组单独报告，不替换原始异常数据。
+
+上述数值为 GPU 时间。`1000 / GPU 毫秒` 只能称为 GPU 等效帧率，不代表实测窗口/UI 帧率。
+BSDF 两路均关闭 VXPG 引导和训练；VXPG 完整管线保留原单 Pass，不将不支持的新路径请求当成新实现计时。
+新结构仍默认关闭，暂不含 GRIS 重采样。测试方法和独立单窗口选择器见 [专项测试说明](../../../tests/RTPT/README.md)。
+
 ## 局部光源采样与显示
 
 主入口接入独立的 LocalLights 模块。`RTPT_LIGHT_GRID_ENABLED`、

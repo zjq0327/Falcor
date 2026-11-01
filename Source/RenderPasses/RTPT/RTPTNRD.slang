@@ -1,22 +1,6 @@
 #pragma once
 
-// A finite miss distance that remains representable in NRD's fp16 resources.
-static const float kRTPTNRDMissDistance = 60000.f;
-
-struct RTPTNRDSignals
-{
-    float3 diffuse;
-    float3 specular;
-    float3 emission;
-    float3 diffuseReflectance;
-    float3 specularReflectance;
-    float3 residual;
-    float diffuseHitDistance;
-    float specularHitDistance;
-    float4 normalRoughness;
-    float viewZ;
-    float3 motionW;
-};
+#include "RTPTNRDSignals.slang"
 
 /** NRD uses regular octahedral normals, not equal-area environment coordinates.
     Preserve the projected components before folding; avoid overlapping swizzles.
@@ -166,21 +150,9 @@ float3 rtptTraceNRDContinuation(
     return all(isfinite(radiance)) ? radiance : float3(0.f);
 }
 
-void rtptWriteNRDSignals(uint2 pixel, RTPTNRDSignals signals)
+RTPTNRDFrameSignals rtptGenerateNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
 {
-    gNRDDiffuseRadianceHitDist[pixel] = float4(signals.diffuse / signals.diffuseReflectance, signals.diffuseHitDistance);
-    gNRDSpecularRadianceHitDist[pixel] = float4(signals.specular / signals.specularReflectance, signals.specularHitDistance);
-    gNRDEmission[pixel] = float4(signals.emission, 1.f);
-    gNRDDiffuseReflectance[pixel] = float4(signals.diffuseReflectance, 1.f);
-    gNRDSpecularReflectance[pixel] = float4(signals.specularReflectance, 1.f);
-    gNRDResidualRadiance[pixel] = float4(signals.residual, 1.f);
-    gNRDNormalRoughness[pixel] = signals.normalRoughness;
-    gNRDViewZ[pixel] = signals.viewZ;
-    gNRDMotionW[pixel] = float4(signals.motionW, 0.f);
-}
-
-float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
-{
+    RTPTNRDFrameSignals frame = {};
     RTPTNRDSignals signals = {};
     signals.diffuseReflectance = 1.f;
     signals.specularReflectance = 1.f;
@@ -205,8 +177,8 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerato
         const float3 background = gScene.envMap.eval(ray.dir);
         signals.emission = all(isfinite(background)) ? background : float3(0.f);
 #endif
-        rtptWriteNRDSignals(pixel, signals);
-        return signals.emission;
+        frame.surface = signals;
+        return frame;
     }
 
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
@@ -267,27 +239,26 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerato
             if (all(isfinite(raw))) rtptLocalRecordFeedback(lightContext, ls, raw, visible, sampled);
         }
         if (hasDiffuse)
-            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), pixel, sampleIndex, sg, signals.diffuseHitDistance, sharcStats);
+            frame.diffusePath = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), pixel, sampleIndex, sg, signals.diffuseHitDistance, sharcStats);
         if (hasSpecular)
-            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), pixel, sampleIndex, sg, signals.specularHitDistance, sharcStats);
+            frame.specularPath = rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), pixel, sampleIndex, sg, signals.specularHitDistance, sharcStats);
         if (hasDeltaSpecular)
         {
             float unusedDistance;
             signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), pixel, sampleIndex, sg, unusedDistance, sharcStats);
         }
-        // NRD deliberately excludes surfaces outside its denoising range.
-        // Preserve their energy through the unfiltered residual channel.
-        if (signals.viewZ >= kNRDDepthRange)
-        {
-            signals.residual += signals.diffuse + signals.specular;
-            signals.diffuse = 0.f;
-            signals.specular = 0.f;
-            signals.diffuseHitDistance = 0.f;
-            signals.specularHitDistance = 0.f;
-        }
+
     }
 #endif
 
+    frame.surface = signals;
+    return frame;
+}
+
+// Retained single-pass integrator and pre-dispatch resource-failure fallback.
+float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
+{
+    const RTPTNRDSignals signals = rtptResolveNRDSignals(rtptGenerateNRD(ray, pixel, sampleIndex, sg, sharcStats));
     rtptWriteNRDSignals(pixel, signals);
     return signals.emission + signals.diffuse + signals.specular + signals.residual;
 }
