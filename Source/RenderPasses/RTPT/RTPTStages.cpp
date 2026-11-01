@@ -136,6 +136,8 @@ Properties RTPT::getStageStatistics() const
     Properties props;
     props["primaryActive"] = mStagesActive;
     props["finalResolveActive"] = mStagesActive && mEnableNRD;
+    props["nrdHistoryReset"] = mNRDHistoryResetThisFrame;
+    props["pgTranslationPreservedNRD"] = mPGTranslationPreservedNRDThisFrame;
     const uint64_t primaryBytes = mpPrimarySurfaces ? mpPrimarySurfaces->getSize() : 0;
     const uint64_t signalBytes = mpSignalRecords ? mpSignalRecords->getSize() : 0;
     props["primaryBytes"] = primaryBytes;

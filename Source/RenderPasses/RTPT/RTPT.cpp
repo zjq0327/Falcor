@@ -628,7 +628,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     }
 }
 
-void RTPT::executeTraining(RenderContext* pRenderContext)
+void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistoryOnPGReset)
 {
     mPGTrainingThisFrame = mSharedTrainingThisFrame = false;
     if (mEnableSHARC)
@@ -653,7 +653,12 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
             mPGFrameIndex = 0;
             mPGCameraPosition = mpScene->getCamera()->getPosition();
             mResetPG = false;
-            reset();
+            // Translation only changes the direction proposal, not the radiance
+            // being estimated. Keep NRD reprojection and its sampling sequence
+            // alive while rebuilding PG. Structural or explicit resets retain
+            // the existing full-reset behavior.
+            mPGTranslationPreservedNRDThisFrame = preserveNRDHistoryOnPGReset && !rebuilt && !mResetNRDHistory;
+            if (rebuilt || !preserveNRDHistoryOnPGReset) reset();
         }
         pg &= mpPG->getPathCapacity() > 0;
         if (pg)
@@ -694,6 +699,8 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    mNRDHistoryResetThisFrame = false;
+    mPGTranslationPreservedNRDThisFrame = false;
     auto color = renderData.getTexture("color");
     auto noisyColor = renderData.getTexture("noisyColor");
     if (!mpScene)
@@ -755,8 +762,10 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
     // First PG version has no LOD hysteresis or cross-LOD model retention.
     // Actual camera translation restarts PG; projection jitter changes no position.
-    if (mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition))
-        mResetPG = true;
+    const bool pgCameraTranslated = mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition);
+    const bool preserveNRDHistoryOnPGReset = mEnableNRD && pgCameraTranslated && !mResetPG && !mResetNRDHistory &&
+        !mOptionsChanged && !nrdDiscontinuity && refreshFlags == RenderPassRefreshFlags::None;
+    if (pgCameraTranslated) mResetPG = true;
     if ((mEnableNRD ? nrdDiscontinuity : sceneChanged) || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
     mOptionsChanged = false;
 
@@ -792,14 +801,17 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
     if (mEnableSHARC || mEnablePG)
     {
-        if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mResetPG)) mResetNRDHistory = true;
-        executeTraining(pRenderContext);
+        if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mResetPG && !preserveNRDHistoryOnPGReset))
+            mResetNRDHistory = true;
+        executeTraining(pRenderContext, preserveNRDHistoryOnPGReset);
     }
     if (mSampleOffset > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel ||
         mAccumulatedSamples > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel)
         reset();
 
-    if ((mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory)
+    mNRDHistoryResetThisFrame = (mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory;
+    mPGTranslationPreservedNRDThisFrame &= !mNRDHistoryResetThisFrame;
+    if (mNRDHistoryResetThisFrame)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
 

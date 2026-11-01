@@ -52,7 +52,7 @@ private:
     void publishDIHistory(RenderContext* pRenderContext);
     void bindSHARC(const ShaderVar& rootVar);
     void clearSHARC(RenderContext* pRenderContext);
-    void executeTraining(RenderContext* pRenderContext);
+    void executeTraining(RenderContext* pRenderContext, bool preserveNRDHistoryOnPGReset = false);
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
 
     ref<Scene> mpScene;
@@ -151,6 +151,8 @@ private:
     uint32_t mMaxAccumulationFrames = 0; // 0 means unlimited.
     bool mEnableNRD = false;
     bool mResetNRDHistory = true;
+    bool mNRDHistoryResetThisFrame = false;
+    bool mPGTranslationPreservedNRDThisFrame = false;
     bool mEnableSHARC = false;
     bool mSHARCEnabled = true;
     bool mSHARCUseCache = true;
