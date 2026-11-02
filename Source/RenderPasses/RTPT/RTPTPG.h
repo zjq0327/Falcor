@@ -8,6 +8,7 @@
 namespace RTPTPG
 {
 using namespace Falcor;
+inline constexpr uint32_t kDirectionBins = 4;
 
 struct Settings
 {
@@ -20,11 +21,7 @@ struct Settings
     uint32_t coarseLevels = 2;
     uint32_t pollFrames = 16;
     uint32_t maxRegions = 16384;
-    uint32_t initialNodes = 1;
-    uint32_t maxNodesPerRegion = 85;
-    uint32_t maxDirectionalDepth = 8;
     float guideFraction = 0.5f;
-    float directionalThreshold = 0.01f;
     float weightScale = 1e-4f;
 };
 
@@ -84,12 +81,24 @@ struct Statistics
 class Manager
 {
 public:
+    struct NativeTrainingData
+    {
+        // t0..t2 followed by u0..u4 in RTPT_PG_NATIVE's fixed root binding contract.
+        std::array<ref<Buffer>, 8> buffers;
+        // Seven 16-byte HLSL constant-buffer rows, including the final row's padding.
+        std::array<uint32_t, 28> constants = {};
+    };
+
     explicit Manager(ref<Device> pDevice);
     bool prepare(RenderContext* pContext, const Settings& settings, uint2 frameDim, uint32_t updateBounces, uint32_t preferredStride);
     void reset(RenderContext* pContext);
     void beginFrame(RenderContext* pContext);
-    void barrierTraining(RenderContext* pContext) const;
-    void bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive) const;
+    void barrierTraining(RenderContext* pContext, bool separateDiagnostics = false) const;
+    void bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive,
+        bool separateDiagnostics = false, bool readOnlyResources = false) const;
+    NativeTrainingData getNativeTrainingData(float3 cameraPosition, float sceneScale, uint32_t frameIndex,
+        bool trainingActive = true) const;
+    void prepareNativeTraining(RenderContext* pContext) const;
     bool finishTrainingFrame(RenderContext* pContext);
     const Statistics& getStatistics() const { return mStatistics; }
     uint32_t getRecordStride() const { return mRecordStride; }
@@ -135,7 +144,6 @@ private:
     void uploadModel(RenderContext* pContext);
     bool publish(RenderContext* pContext);
     std::vector<Node> makeInitialTree() const;
-    std::vector<Node> refine(const std::vector<Node>& nodes, const std::vector<NodeStats>& statistics) const;
     static uint32_t hashKey(uint64_t key);
     static uint32_t childIndex(const Node& node, uint32_t quadrant);
     static float asFloat(uint32_t bits);
@@ -148,7 +156,7 @@ private:
     ref<Device> mpDevice;
     ref<Buffer> mpReadMap, mpReadRegions, mpReadNodes;
     ref<Buffer> mpBuildMap, mpBuildRegions, mpBuildNodes, mpBuildStats;
-    ref<Buffer> mpRequests, mpDiagnostics, mpPathHeaders, mpVertices;
+    ref<Buffer> mpRequests, mpDiagnostics, mpTrainingDiagnostics, mpPathHeaders, mpVertices;
     ref<Buffer> mpUploadStage, mpReadbackStage;
     Settings mSettings;
     Statistics mStatistics;
@@ -160,8 +168,10 @@ private:
     std::vector<NodeStats> mReadbackStatsCPU, mUploadStatsCPU;
     std::vector<std::array<double, 4>> mMassCPU;
     std::vector<ReadbackPiece> mReadbackPieces;
+    std::array<uint32_t, 16> mTrainingDiagnosticsCPU = {};
     bool mReadMapDirty = false;
     bool mBuildMapDirty = false;
+    bool mBuildLayoutDirty = true;
     uint2 mFrameDim = uint2(0);
     uint32_t mNodeCapacity = 0;
     uint32_t mRegionCapacity = 0;

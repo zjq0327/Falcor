@@ -4,8 +4,10 @@
 
 float rtptPGGuidePdf(RTPTPGGuide guide, float3 direction)
 {
-    float2 uv = rtptPGDirectionToSquare(direction);
-    float pdf = 0.07957747154594767f;
+    const float3 localDirection = rtptPGToLocal(guide.frame, direction);
+    if (!all(isfinite(localDirection)) || localDirection.z < 0.f) return 0.f;
+    float2 uv = rtptPGDirectionToSquare(localDirection);
+    float pdf = 0.15915494309189535f;
     uint index = guide.root;
     for (uint depth = 0u; depth < 16u; ++depth)
     {
@@ -30,7 +32,7 @@ float3 rtptPGSampleGuide(RTPTPGGuide guide, float2 randoms, out float guidePdf)
     float2 random = clamp(randoms, float2(0.f), float2(asfloat(0x3f7fffffu)));
     float2 lower = 0.f;
     float extent = 1.f;
-    guidePdf = 0.07957747154594767f;
+    guidePdf = 0.15915494309189535f;
     uint index = guide.root;
     for (uint depth = 0u; depth < 16u; ++depth)
     {
@@ -62,11 +64,14 @@ float3 rtptPGSampleGuide(RTPTPGGuide guide, float2 randoms, out float guidePdf)
         const uint child = rtptPGChild(node.topology, quadrant);
         if (child == RTPT_PG_INVALID)
         {
-            float3 direction = rtptPGSquareToDirection(lower + extent * random);
-            const float2 actual = rtptPGDirectionToSquare(direction);
-            if (any(actual < lower) || any(actual >= lower + extent))
+            float3 direction = normalize(rtptPGToWorld(guide.frame, rtptPGSquareToDirection(lower + extent * random)));
+            // Include the world-space round trip: a rotation can move a rounded
+            // direction across a bin boundary even when its local value did not.
+            const float3 actualLocal = rtptPGToLocal(guide.frame, direction);
+            const float2 actual = rtptPGDirectionToSquare(actualLocal);
+            if (actualLocal.z < 0.f || any(actual < lower) || any(actual >= lower + extent))
             {
-                direction = rtptPGSquareToDirection(lower + extent * 0.5f);
+                direction = normalize(rtptPGToWorld(guide.frame, rtptPGSquareToDirection(lower + extent * 0.5f)));
                 guidePdf = -1.f;
             }
             else
@@ -87,7 +92,7 @@ float3 rtptPGSampleGuide(RTPTPGGuide guide, float2 randoms, out float guidePdf)
     }
     // Invalid nodes/totals or an exhausted depth limit retain the old center
     // fallback. A partial traversal density is not the PDF of that direction.
-    const float3 direction = rtptPGSquareToDirection(lower + extent * 0.5f);
+    const float3 direction = normalize(rtptPGToWorld(guide.frame, rtptPGSquareToDirection(lower + extent * 0.5f)));
     guidePdf = -1.f;
     return direction;
 }
@@ -127,6 +132,7 @@ bool rtptPGGetGuide(ShadingData sd, out RTPTPGGuide guide)
             guide.nodeCount = region.nodeCount;
             guide.generation = region.generation;
             guide.alpha = gPGSettings.guideFraction;
+            guide.frame = rtptPGMakeFrame(sd.getOrientedFaceNormal());
             return true;
         }
     }

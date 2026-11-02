@@ -12,6 +12,9 @@ target_sources(RTPT PRIVATE
     RTPTDIReuse.cpp
     RTPTPG.h
     RTPTPG.cpp
+    RTPTPGAsync.cpp
+    RTPTNativePGTrain.h
+    RTPTNativePGTrain.cpp
     RTPTGrid.slang
     RTPTPGTypes.slang
     RTPTPG.slang

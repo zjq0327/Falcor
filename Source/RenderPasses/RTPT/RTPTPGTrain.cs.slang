@@ -53,6 +53,9 @@ bool rtptPGAddWeight(uint index, uint quadrant, float value, bool square)
 
 void rtptPGTrainVertex(RTPTPGVertex vertex, float3 incident)
 {
+    // Training labels use the same local geometric-normal hemisphere as the
+    // sampling and PDF functions. Never clamp lower directions into a valid bin.
+    if (vertex.direction.z < 0.f) return;
     if (!(vertex.samplePdf > 0.f) || !isfinite(vertex.samplePdf) ||
         !(vertex.sampleSurvival > 0.f) || !(vertex.sampleSurvival <= 1.f))
     { rtptPGCount(RTPT_PG_DIAG_INVALID_PDF); return; }

@@ -188,7 +188,7 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         if (continued)
         {
             vertex.flags |= RTPT_PG_VERTEX_OUTGOING;
-            vertex.direction = bs.wo;
+            vertex.direction = rtptPGToLocal(rtptPGMakeFrame(sd.getOrientedFaceNormal()), bs.wo);
             vertex.samplePdf = bs.pdf;
             vertex.transport = transport;
         }

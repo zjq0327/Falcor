@@ -1,5 +1,7 @@
 # RTPT、PG、SHaRC 与 NRD
 
+> RTPT 实验测试代码、场景及验证说明已归档到 `build/rtpt-experiment-tests-backup-20261101/`，并从当前测试构建中移除。下文的阶段验证链接指向历史归档；已有性能报告和图像仍保留在 `build/`。
+
 ## 首表面 ReSTIR DI 与 NRD 及后续 ReGIR 接入方案
 
 [实施方案与参考代码](REGIR_RESTIR_DI_NRD_PLAN.md) 以当前 PG、SHaRC、NRD 版本为基线，按用户指定顺序先完成首表面 ReSTIR DI 与 NRD：全局候选 → 最终灯样本 → RayQuery 阴影 → 分别评价 D/S → 与原间接信号合成并送入 NRD，完整验收后再增加 ReGIR。首批保留当前 D/S 双续接，概率式根通道单路径单独评估。阶段 1 的结构拆分、阶段 2 的全局 Initial RIS 和阶段 3 的 Temporal/Spatial 已接入；ReGIR 留在阶段 5。
@@ -18,7 +20,7 @@
 
 新增属性 `restirDITemporalEnabled`、`restirDISpatialEnabled`，裸 RTPT 默认 false，正式主图/CMD 默认 true；对应环境开关为 `RTPT_RESTIR_DI_TEMPORAL_ENABLED`、`RTPT_RESTIR_DI_SPATIAL_ENABLED`。历史权重上限默认 20，空间邻居数 4、半径 16 像素，可由 `restirDIHistoryLength`、`restirDISpatialSamples`、`restirDISpatialRadius` 调节。`diStats.historyValid` 表示本帧可读旧历史，`historyAvailable` 表示帧末已发布下帧历史；`historyInputBank` 报告发布来源，组合模式为 1，`finalInputBank` 为 2。另报告实际 T/S 状态、历史失效与复用回退原因。
 
-当前复用资源为 448 B/像素，加目录和 2 KiB 邻居偏移；两个复用开关都关时仍为阶段 2 的 120 B/像素。复用准备或预算失败保留 Initial；Initial 也不可用时保留旧根选灯，阶段 1 继续运行。详细协议与验证结果见 [阶段 3 验证说明](../../../tests/rtpt_stage3/README.md)。
+当前复用资源为 448 B/像素，加目录和 2 KiB 邻居偏移；两个复用开关都关时仍为阶段 2 的 120 B/像素。复用准备或预算失败保留 Initial；Initial 也不可用时保留旧根选灯，阶段 1 继续运行。详细协议与验证结果见 [阶段 3 验证说明](../../../build/rtpt-experiment-tests-backup-20261101/tests/rtpt_stage3/README.md)。
 
 最终版本的 Release 构建、24 项 D3D12 GPU 测试、8 项 CPU 检查通过；关闭复用后 120 份数组与阶段 2 基线逐字节一致。三种复用模式各 6 场景、16 独立 seed 的 162 个均值通道，以及额外 16 个新 seed 的 9 个混合光源通道均通过预设统计区间。主图 213 帧的 441 项生命周期检查、720p 144 帧的 37 项检查、NRD 关闭直通及四模式 64 项精确零检查也通过。Initial、T-only、S-only 共 3,744 份数组与首版逐字节一致。
 
@@ -32,7 +34,7 @@ DI 接管首表面非 delta 的覆盖域：去掉该域的旧根 NEE 和首段�
 
 裸 RTPT 的 `restirDIEnabled` 默认关闭，正式主图与 `RTPR_START.cmd` 默认开启；设置 `RTPT_RESTIR_DI_ENABLED=0` 可关闭。`restirDICandidateCount` 默认 8（1–128），`restirDIBudgetMB` 默认 512（16–2048）。目前仅 NRD 输入模式、1 spp、NEE 开启时生效，普通积分器保留旧路径。当前新增 120 B/像素（SDK reservoir 24、完整 UV/身份 sidecar 48、D/S 48），加灯目录与剩余解析灯索引，使用独立预算；准备失败保留阶段 1 并回退原选灯。`RTPT.diStats` 报告实际生效状态、代次、覆盖域、字节、步长与原因。
 
-Release 构建、16 项 GPU 测试、183 项生命周期检查、720p 144 帧和 NRD 关闭直通检查通过。K=8 的 16 场景及 K=1/32 各 5 场景原始均值通过预设统计区间，关闭 DI 的 98 份源信号与封存基线逐字节一致；格式转换及后处理差异单独记录。协议、完整结果和限制见 [阶段 2 验证说明](../../../tests/rtpt_stage2/README.md)。本阶段不宣称时间/空间复用或性能提升，共享 Material/BSDF、RTXDI、NRDPass、ModulateIllumination 未修改。
+Release 构建、16 项 GPU 测试、183 项生命周期检查、720p 144 帧和 NRD 关闭直通检查通过。K=8 的 16 场景及 K=1/32 各 5 场景原始均值通过预设统计区间，关闭 DI 的 98 份源信号与封存基线逐字节一致；格式转换及后处理差异单独记录。协议、完整结果和限制见 [阶段 2 验证说明](../../../build/rtpt-experiment-tests-backup-20261101/tests/rtpt_stage2/README.md)。本阶段不宣称时间/空间复用或性能提升，共享 Material/BSDF、RTXDI、NRDPass、ModulateIllumination 未修改。
 
 ## 阶段 1：主表面与最终信号组装（2026-10-31）
 
@@ -40,7 +42,7 @@ Release 构建、16 项 GPU 测试、183 项生命周期检查、720p 144 帧和
 
 资源按反射分配，当前 Primary/Signal 分别为 112/144 B/像素；固定 1 GiB 上限仅约束这两类新增中间资源。准备失败完整回退原积分器，单像素元数据不匹配回退真实求交；没有增加主命中关闭开关。`RTPT.stageStats` 提供实际 active、字节数、步长及回退原因。
 
-Release 构建与 D3D12 debug layer 下 10 项 GPU 测试通过。默认编译的 88 份全部输出一致；完整组合的 499 份 RTPT 源信号一致，保留 6 份最终累积/ToneMapper 的严格差异，最大约 `9.09e-7`。后处理另按预先固定 `0.001` 绝对误差界验收，RTPT 源信号不放宽。资源准备故障注入后 88 份输出与原版一致，源码已按 SHA 恢复并重建。最终长窗口训练对照、同版本 A/A 非确定性证据及全部结果见 [阶段 1 验证说明](../../../tests/rtpt_stage1/README.md)。本轮不宣称性能提升。
+Release 构建与 D3D12 debug layer 下 10 项 GPU 测试通过。默认编译的 88 份全部输出一致；完整组合的 499 份 RTPT 源信号一致，保留 6 份最终累积/ToneMapper 的严格差异，最大约 `9.09e-7`。后处理另按预先固定 `0.001` 绝对误差界验收，RTPT 源信号不放宽。资源准备故障注入后 88 份输出与原版一致，源码已按 SHA 恢复并重建。最终长窗口训练对照、同版本 A/A 非确定性证据及全部结果见 [阶段 1 验证说明](../../../build/rtpt-experiment-tests-backup-20261101/tests/rtpt_stage1/README.md)。本轮不宣称性能提升。
 
 1280×720 正式主图全模块开启运行 144 帧、15 项检查通过，新增中间资源 225 MiB。核心结构验证通过，但完整长训练窗口的逐字节一致性没有全部通过：首次 `unlimited/128` 有 3 份源信号微差，最高约 `1.53e-5`；相同最终 DLL 的复跑与首次结果也不一致，复跑的 22 份源信号则与旧基线一致。首次失败保留，未用复跑覆盖。单独诊断的 NRD 后处理超出 `0.001` 界，相关比较仍标记失败；不能把它与完整套件中 `9.09e-7` 的结果混用，也没有证明两次训练模型缓冲字节同一或确定具体原因。
 

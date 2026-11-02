@@ -5,10 +5,12 @@
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include "RTPTPG.h"
+#include "RTPTNativePGTrain.h"
 #include <rtxdi/RTXDI.h>
 #include <unordered_map>
 
 namespace Falcor { class Light; }
+struct RTPTPGTimingResources;
 using namespace Falcor;
 
 /** Compute-based, inline-ray-query Monte Carlo surface path tracer. */
@@ -19,6 +21,7 @@ public:
 
     static ref<RTPT> create(ref<Device> pDevice, const Properties& props) { return make_ref<RTPT>(pDevice, props); }
     RTPT(ref<Device> pDevice, const Properties& props);
+    ~RTPT() override;
 
     Properties getProperties() const override;
     void setProperties(const Properties& props) override;
@@ -27,6 +30,7 @@ public:
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getPGStatistics() const;
+    Properties getPGAsyncStatistics() const;
     Properties getStageStatistics() const;
     Properties getDIStatistics() const;
     Properties getReGIRStatistics() const;
@@ -60,6 +64,13 @@ private:
     void clearSHARC(RenderContext* pRenderContext);
     void executeTraining(RenderContext* pRenderContext, bool preserveNRDHistoryOnPGReset = false);
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
+    bool preparePGAsync();
+    void recordPGAsyncTraining(RenderContext* pRenderContext);
+    void finishPGAsync(RenderContext* pRenderContext);
+    void drainPGAsync();
+    void collectPGAsyncTiming();
+    void beginPGAsyncTiming(RenderContext* pMain, RenderContext* pTrain);
+    void writePGAsyncTimestamp(RenderContext* pContext, uint32_t index);
 
     ref<Scene> mpScene;
     bool mReGIREnabled = false;
@@ -159,6 +170,34 @@ private:
     bool mResetPG = true;
     bool mPGTrainingThisFrame = false;
     bool mSharedTrainingThisFrame = false;
+    bool mPGAsyncTraining = true;
+    bool mPGAsyncMeasure = false;
+    bool mPGAsyncRecorded = false;
+    bool mPGTimingThisFrame = false;
+    bool mPGAsyncFailed = false;
+    std::string mPGAsyncFallbackReason;
+    std::unique_ptr<RTPTNativePGTrain> mpPGAsyncTrainer;
+    ref<Fence> mpPGInputsReady, mpPGTrainingDone;
+    uint64_t mPGTrainingDoneValue = 0;
+    uint64_t mPGInputsReadyValue = 0;
+    uint64_t mPGAsyncSubmissions = 0;
+    struct PGAsyncTiming
+    {
+        std::shared_ptr<RTPTPGTimingResources> resources;
+        ref<Fence> complete;
+        uint64_t completeValue = 0;
+        uint64_t frameIndex = 0;
+        uint64_t mainGpu = 0, mainCpu = 0, mainFrequency = 0;
+        uint64_t trainGpu = 0, trainCpu = 0, trainFrequency = 0;
+        uint64_t qpcFrequency = 0, calibrationError = 0;
+    };
+    std::array<PGAsyncTiming, 4> mPGAsyncTimings;
+    uint32_t mPGAsyncTimingSlot = 0;
+    uint32_t mPGAsyncCurrentTimingSlot = 0;
+    uint64_t mPGMeasuredFrames = 0, mPGOverlappingFrames = 0;
+    uint64_t mPGTimingSequence = 0, mPGLastTimingSequence = 0;
+    double mPGMaxOverlapMs = 0.;
+    Properties mPGLastAsyncTiming;
     uint32_t mPGUpdateStride = 5;
     uint32_t mPGUpdateBounces = 8;
     uint32_t mPGFrameIndex = 0;

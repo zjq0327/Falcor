@@ -19,7 +19,6 @@ constexpr size_t kReadbackStageBytes = 2u * 1024u * 1024u;
 constexpr size_t kUploadStageBytes = 4u * 1024u * 1024u;
 constexpr uint32_t kReady = 1u;
 constexpr uint32_t kObservedZero = 2u;
-constexpr uint32_t kMinSplitSamples = 32u;
 
 uint32_t nextPowerOfTwo(uint32_t x)
 {
@@ -90,17 +89,10 @@ bool Manager::prepare(RenderContext* pContext, const Settings& settings, uint2 f
     FALCOR_CHECK(settings.guideFraction >= 0.f && settings.guideFraction < 1.f, "PG guide fraction must be in [0,1).");
     FALCOR_CHECK(std::isfinite(settings.weightScale) && settings.weightScale > 0.f, "PG weight scale must be positive and finite.");
     FALCOR_CHECK(settings.maxRegions >= 1 && settings.maxRegions <= 65536, "PG maxRegions must be 1..65536.");
-    FALCOR_CHECK(settings.maxDirectionalDepth >= 1 && settings.maxDirectionalDepth <= 16, "PG direction depth must be 1..16.");
-    FALCOR_CHECK(settings.maxNodesPerRegion >= 1 && settings.maxNodesPerRegion <= 4096, "PG nodes per region must be 1..4096.");
-    FALCOR_CHECK(settings.initialNodes == 1 || settings.initialNodes == 5, "PG initialNodes must be 1 or 5.");
-    FALCOR_CHECK(settings.initialNodes <= settings.maxNodesPerRegion, "PG initial topology exceeds the per-region node cap.");
-    FALCOR_CHECK(settings.initialNodes == 1 || settings.maxDirectionalDepth >= 2, "PG five-node initialization requires depth two.");
-    FALCOR_CHECK(settings.directionalThreshold > 0.f && settings.directionalThreshold <= 1.f, "PG directional threshold must be in (0,1].");
     FALCOR_CHECK(updateBounces <= 64, "PG record depth exceeds the supported 64-bounce bound.");
     const bool structural = !mpReadMap || settings.treeBudgetMiB != mSettings.treeBudgetMiB ||
         settings.maxRegions != mSettings.maxRegions || settings.coarseLevels != mSettings.coarseLevels ||
-        settings.initialNodes != mSettings.initialNodes || settings.maxNodesPerRegion != mSettings.maxNodesPerRegion ||
-        settings.maxDirectionalDepth != mSettings.maxDirectionalDepth || settings.weightScale != mSettings.weightScale;
+        settings.weightScale != mSettings.weightScale;
     mSettings = settings;
     if (structural) allocateModel(pContext);
 
@@ -142,19 +134,19 @@ void Manager::allocateModel(RenderContext* pContext)
     pContext->submit(true);
     mpReadMap = mpReadRegions = mpReadNodes = nullptr;
     mpBuildMap = mpBuildRegions = mpBuildNodes = mpBuildStats = nullptr;
-    mpRequests = mpDiagnostics = nullptr;
+    mpRequests = mpDiagnostics = mpTrainingDiagnostics = nullptr;
     mpUploadStage = mpReadbackStage = nullptr;
     mpDevice->wait();
     mRegionCapacity = mSettings.maxRegions;
     mMapCapacity = nextPowerOfTwo(std::max(16u, mRegionCapacity * 4u));
     mRequestCapacity = mMapCapacity;
     const uint64_t auxiliary = uint64_t(mMapCapacity) * sizeof(MapEntry) * 2 +
-        uint64_t(mRegionCapacity) * sizeof(RegionDesc) * 2 + uint64_t(mRequestCapacity) * 16 + 16 * sizeof(uint32_t);
+        uint64_t(mRegionCapacity) * sizeof(RegionDesc) * 2 + uint64_t(mRequestCapacity) * 16 + 32 * sizeof(uint32_t);
     const uint64_t budget = uint64_t(mSettings.treeBudgetMiB) * kMiB;
     FALCOR_CHECK(auxiliary + kTransferReserve + uint64_t(mRegionCapacity) * 88 < budget,
         "PG tree budget cannot contain the requested region table and one node per region.");
     mNodeCapacity = uint32_t((budget - auxiliary - kTransferReserve) / 88);
-    mNodeCapacity = std::min(mNodeCapacity, 1u << 24);
+    mNodeCapacity = std::min(mNodeCapacity, mRegionCapacity);
     mpReadMap = mpDevice->createStructuredBuffer(16u, mMapCapacity);
     mpBuildMap = mpDevice->createStructuredBuffer(16u, mMapCapacity);
     mpReadRegions = mpDevice->createStructuredBuffer(32u, mRegionCapacity);
@@ -165,6 +157,8 @@ void Manager::allocateModel(RenderContext* pContext)
     // Shader sees uint64 elements, with two elements per logical request slot.
     mpRequests = mpDevice->createStructuredBuffer(8u, mRequestCapacity * 2u);
     mpDiagnostics = mpDevice->createStructuredBuffer(4u, 16u);
+    // Queue-local counters avoid concurrent writes to one resource by rendering and PGTrain.
+    mpTrainingDiagnostics = mpDevice->createStructuredBuffer(4u, 16u);
     mpUploadStage = mpDevice->createBuffer(kUploadStageBytes, ResourceBindFlags::None, MemoryType::Upload);
     mpReadbackStage = mpDevice->createBuffer(kReadbackStageBytes, ResourceBindFlags::None, MemoryType::ReadBack);
     mStatistics.modelBytes = auxiliary + uint64_t(mNodeCapacity) * 88 + kUploadStageBytes + kReadbackStageBytes;
@@ -188,11 +182,13 @@ void Manager::reset(RenderContext* pContext)
     mBuildMapCPU.assign(mMapCapacity, {});
     mRequestsCPU.resize(mRequestCapacity);
     mReadMapDirty = mBuildMapDirty = false;
+    mBuildLayoutDirty = true;
     const auto bytes = mStatistics.modelBytes;
     const auto reserved = mStatistics.modelReservedBytes;
     const auto records = mStatistics.recordBytes;
     const auto recordReserved = mStatistics.recordReservedBytes;
     mStatistics = {};
+    mTrainingDiagnosticsCPU.fill(0u);
     mStatistics.modelBytes = bytes;
     mStatistics.modelReservedBytes = reserved;
     mStatistics.recordBytes = records;
@@ -200,7 +196,7 @@ void Manager::reset(RenderContext* pContext)
     mStatistics.nodeCapacity = mNodeCapacity;
     mStatistics.regionCapacity = mRegionCapacity;
     for (auto& buffer : {mpReadMap, mpReadRegions, mpReadNodes, mpBuildMap, mpBuildRegions, mpBuildNodes,
-                         mpBuildStats, mpRequests, mpDiagnostics, mpPathHeaders})
+                         mpBuildStats, mpRequests, mpDiagnostics, mpTrainingDiagnostics, mpPathHeaders})
         if (buffer)
         {
             pContext->clearUAV(buffer->getUAV().get(), uint4(0));
@@ -215,27 +211,32 @@ void Manager::beginFrame(RenderContext* pContext)
     if (!mRecordGeneration) ++mRecordGeneration;
 }
 
-void Manager::barrierTraining(RenderContext* pContext) const
+void Manager::barrierTraining(RenderContext* pContext, bool separateDiagnostics) const
 {
     // Falcor's uavBarrier() requires a concrete resource; nullptr is not a
     // global UAV barrier and dereferences a null pointer in this framework.
-    for (auto& buffer : {mpPathHeaders, mpVertices, mpBuildStats, mpRequests, mpDiagnostics})
+    const auto& diagnostics = separateDiagnostics ? mpTrainingDiagnostics : mpDiagnostics;
+    for (auto& buffer : {mpPathHeaders, mpVertices, mpBuildStats, mpRequests, diagnostics})
         if (buffer) pContext->uavBarrier(buffer.get());
 }
 
-void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive) const
+void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive,
+    bool separateDiagnostics, bool readOnlyResources) const
 {
     setIfPresent(rootVar, "gPGReadMap", mpReadMap);
     setIfPresent(rootVar, "gPGReadRegions", mpReadRegions);
     setIfPresent(rootVar, "gPGReadNodes", mpReadNodes);
-    setIfPresent(rootVar, "gPGBuildMap", mpBuildMap);
-    setIfPresent(rootVar, "gPGBuildRegions", mpBuildRegions);
-    setIfPresent(rootVar, "gPGBuildNodes", mpBuildNodes);
-    setIfPresent(rootVar, "gPGBuildStats", mpBuildStats);
-    setIfPresent(rootVar, "gPGRequests", mpRequests);
-    setIfPresent(rootVar, "gPGDiagnostics", mpDiagnostics);
-    setIfPresent(rootVar, "gPGPathHeaders", mpPathHeaders);
-    setIfPresent(rootVar, "gPGVertices", mpVertices);
+    if (!readOnlyResources)
+    {
+        setIfPresent(rootVar, "gPGBuildMap", mpBuildMap);
+        setIfPresent(rootVar, "gPGBuildRegions", mpBuildRegions);
+        setIfPresent(rootVar, "gPGBuildNodes", mpBuildNodes);
+        setIfPresent(rootVar, "gPGBuildStats", mpBuildStats);
+        setIfPresent(rootVar, "gPGRequests", mpRequests);
+        setIfPresent(rootVar, "gPGPathHeaders", mpPathHeaders);
+        setIfPresent(rootVar, "gPGVertices", mpVertices);
+    }
+    setIfPresent(rootVar, "gPGDiagnostics", separateDiagnostics ? mpTrainingDiagnostics : mpDiagnostics);
     auto var = rootVar.findMember("gPGSettings");
     if (!var.isValid()) return;
     setIfPresent(var, "frameDim", mFrameDim);
@@ -260,6 +261,56 @@ void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneS
     setIfPresent(var, "buildRegionCount", uint32_t(mRegions.size()));
     setIfPresent(var, "readNodeCount", mStatistics.readNodes);
     setIfPresent(var, "buildNodeCount", mStatistics.buildNodes);
+}
+
+Manager::NativeTrainingData Manager::getNativeTrainingData(
+    float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive) const
+{
+    NativeTrainingData data;
+    data.buffers = {mpBuildMap, mpBuildRegions, mpBuildNodes, mpBuildStats,
+        mpRequests, mpTrainingDiagnostics, mpPathHeaders, mpVertices};
+    auto& words = data.constants;
+    static_assert(sizeof(words) == 112);
+    words[0] = mFrameDim.x;
+    words[1] = mFrameDim.y;
+    words[2] = mRecordStride;
+    words[3] = frameIndex;
+    words[4] = mPathCapacity;
+    words[5] = mVerticesPerPath;
+    words[6] = mSceneGeneration;
+    words[7] = mRecordGeneration;
+    words[8] = mMapCapacity;
+    words[9] = mMapCapacity;
+    words[10] = mRequestCapacity;
+    words[11] = mSettings.coarseLevels;
+    words[12] = mSettings.enabled && mSettings.useGuiding ? 1u : 0u;
+    words[13] = mSettings.enabled && mSettings.trainingEnabled && trainingActive ? 1u : 0u;
+    const auto setFloat = [&](size_t index, float value) { std::memcpy(&words[index], &value, sizeof(value)); };
+    setFloat(14, mSettings.guideFraction);
+    setFloat(15, mSettings.weightScale);
+    setFloat(16, cameraPosition.x);
+    setFloat(17, cameraPosition.y);
+    setFloat(18, cameraPosition.z);
+    setFloat(19, sceneScale);
+    words[20] = uint32_t(mRegions.size());
+    words[21] = uint32_t(mRegions.size());
+    words[22] = mStatistics.readNodes;
+    words[23] = mStatistics.buildNodes;
+    words[24] = mSettings.detailedDiagnostics ? 1u : 0u;
+    return data;
+}
+
+void Manager::prepareNativeTraining(RenderContext* pContext) const
+{
+    // Run transitions on the default direct queue before signaling input readiness.
+    // The native compute list then only accesses resources in these established states.
+    for (auto& buffer : {mpBuildMap, mpBuildRegions, mpBuildNodes})
+        pContext->resourceBarrier(buffer.get(), Resource::State::NonPixelShader);
+    for (auto& buffer : {mpBuildStats, mpRequests, mpTrainingDiagnostics, mpPathHeaders, mpVertices})
+    {
+        pContext->resourceBarrier(buffer.get(), Resource::State::UnorderedAccess);
+        pContext->uavBarrier(buffer.get());
+    }
 }
 
 uint32_t Manager::hashKey(uint64_t key)
@@ -354,54 +405,8 @@ void Manager::uploadBatch(RenderContext* pContext, std::initializer_list<UploadT
 std::vector<Manager::Node> Manager::makeInitialTree() const
 {
     std::vector<Node> nodes(1);
-    if (mSettings.initialNodes == 5 && mSettings.maxNodesPerRegion >= 5 && mSettings.maxDirectionalDepth >= 2)
-    {
-        nodes.resize(5);
-        nodes[0].topology = (1u << 4) | 15u;
-    }
+    nodes[0].topology = 1u << 4;
     return nodes;
-}
-
-std::vector<Manager::Node> Manager::refine(const std::vector<Node>& nodes, const std::vector<NodeStats>& statistics) const
-{
-    auto result = nodes;
-    std::vector<uint32_t> depth(nodes.size(), 1u);
-    for (size_t i = 0; i < nodes.size(); ++i)
-        for (uint32_t q = 0; q < 4; ++q)
-            if (nodes[i].topology & (1u << q)) depth[childIndex(nodes[i], q)] = depth[i] + 1;
-    // Existing direct children and new direct children must be contiguous. Build
-    // an intermediate set of child links, then flatten it breadth first.
-    std::vector<std::array<int32_t, 4>> links(nodes.size(), {-1, -1, -1, -1});
-    for (size_t i = 0; i < nodes.size(); ++i)
-        for (uint32_t q = 0; q < 4; ++q)
-        {
-            if (nodes[i].topology & (1u << q)) links[i][q] = int32_t(childIndex(nodes[i], q));
-            else if (depth[i] < mSettings.maxDirectionalDepth && links.size() < mSettings.maxNodesPerRegion &&
-                     nodes[i].mass[q] > mSettings.directionalThreshold && statistics[i].count[q] >= kMinSplitSamples)
-            {
-                const auto child = int32_t(links.size());
-                links[i][q] = child;
-                links.push_back({-1, -1, -1, -1});
-            }
-        }
-    result.clear();
-    result.resize(1);
-    std::vector<size_t> queue{0};
-    for (size_t cursor = 0; cursor < queue.size(); ++cursor)
-    {
-        const size_t source = queue[cursor];
-        uint32_t mask = 0;
-        for (uint32_t q = 0; q < 4; ++q) if (links[source][q] >= 0) mask |= 1u << q;
-        const uint32_t base = uint32_t(result.size());
-        result[cursor].topology = (base << 4) | mask;
-        for (uint32_t q = 0; q < 4; ++q)
-            if (mask & (1u << q))
-            {
-                queue.push_back(size_t(links[source][q]));
-                result.emplace_back();
-            }
-    }
-    return result;
 }
 
 void Manager::uploadModel(RenderContext* pContext)
@@ -412,12 +417,19 @@ void Manager::uploadModel(RenderContext* pContext)
     auto& buildNodes = mBuildNodesCPU;
     auto& statistics = mUploadStatsCPU;
     readRegions.clear();
-    buildRegions.clear();
     readNodes.clear();
-    buildNodes.clear();
+    // Build contains only topology and zero masses. Retain its packed layout
+    // until admission or reset changes it.
+    if (mBuildLayoutDirty)
+    {
+        buildRegions.clear();
+        buildNodes.clear();
+    }
     statistics.clear();
-    readRegions.reserve(mRegions.size());
-    buildRegions.reserve(mRegions.size());
+    // New regions arrive gradually. Reserving the exact count every publication
+    // repeatedly reallocates these arrays; their maximum size is already bounded.
+    readRegions.reserve(mRegionCapacity);
+    buildRegions.reserve(mRegionCapacity);
     auto insert = [&](std::vector<MapEntry>& map, const Region& region, uint32_t id)
     {
         uint32_t slot = hashKey(region.key) % mMapCapacity;
@@ -427,10 +439,11 @@ void Manager::uploadModel(RenderContext* pContext)
     auto append = [](std::vector<Node>& dst, const std::vector<Node>& source)
     {
         const uint32_t offset = uint32_t(dst.size());
-        for (auto node : source)
+        dst.insert(dst.end(), source.begin(), source.end());
+        for (size_t i = offset; i < dst.size(); ++i)
         {
+            auto& node = dst[i];
             if (node.topology & 15u) node.topology = (((node.topology >> 4) + offset) << 4) | (node.topology & 15u);
-            dst.push_back(node);
         }
         return offset;
     };
@@ -439,11 +452,14 @@ void Manager::uploadModel(RenderContext* pContext)
     {
         auto& region = mRegions[id];
         const auto readRoot = append(readNodes, region.read);
-        const auto buildRoot = append(buildNodes, region.build);
         readRegions.push_back({uint32_t(region.key), uint32_t(region.key >> 32), readRoot, uint32_t(region.read.size()),
             region.generation, region.flags, region.observationCount, 0.f});
-        buildRegions.push_back({uint32_t(region.key), uint32_t(region.key >> 32), buildRoot, uint32_t(region.build.size()),
-            region.generation, 0u, 0u, 0.f});
+        if (mBuildLayoutDirty)
+        {
+            const auto buildRoot = append(buildNodes, region.build);
+            buildRegions.push_back({uint32_t(region.key), uint32_t(region.key >> 32), buildRoot, uint32_t(region.build.size()),
+                region.generation, 0u, 0u, 0.f});
+        }
         statistics.insert(statistics.end(), region.statistics.begin(), region.statistics.end());
         if (!region.read.empty() && !region.readMapped)
         {
@@ -474,12 +490,13 @@ void Manager::uploadModel(RenderContext* pContext)
         {mpReadMap, mReadMapCPU.data(), mReadMapDirty ? mReadMapCPU.size() * sizeof(MapEntry) : 0},
         {mpBuildMap, mBuildMapCPU.data(), mBuildMapDirty ? mBuildMapCPU.size() * sizeof(MapEntry) : 0},
         {mpReadRegions, readRegions.data(), readRegions.size() * sizeof(RegionDesc)},
-        {mpBuildRegions, buildRegions.data(), buildRegions.size() * sizeof(RegionDesc)},
+        {mpBuildRegions, buildRegions.data(), mBuildLayoutDirty ? buildRegions.size() * sizeof(RegionDesc) : 0},
         {mpReadNodes, readNodes.data(), readNodes.size() * sizeof(Node)},
-        {mpBuildNodes, buildNodes.data(), buildNodes.size() * sizeof(Node)},
+        {mpBuildNodes, buildNodes.data(), mBuildLayoutDirty ? buildNodes.size() * sizeof(Node) : 0},
         {mpBuildStats, statistics.data(), statistics.size() * sizeof(NodeStats)},
     });
     mReadMapDirty = mBuildMapDirty = false;
+    mBuildLayoutDirty = false;
     mStatistics.regions = uint32_t(mRegions.size());
     mStatistics.readNodes = uint32_t(readNodes.size());
     mStatistics.buildNodes = uint32_t(buildNodes.size());
@@ -516,7 +533,12 @@ bool Manager::publish(RenderContext* pContext)
         {mpBuildStats, statistics.data(), statistics.size() * sizeof(NodeStats)},
         {mpRequests, requests.data(), requests.size() * sizeof(MapEntry)},
         {mpDiagnostics, mStatistics.diagnostics.data(), sizeof(mStatistics.diagnostics)},
+        {mpTrainingDiagnostics, mTrainingDiagnosticsCPU.data(), sizeof(mTrainingDiagnosticsCPU)},
     });
+    // The caller joins the training queue before publication. Both buffers are cumulative;
+    // reread each source before adding so mode changes preserve the original counter semantics.
+    for (size_t i = 0; i < mStatistics.diagnostics.size(); ++i)
+        mStatistics.diagnostics[i] += mTrainingDiagnosticsCPU[i];
     mStatistics.lastReadbackMs = elapsedMs(readbackStart);
     const bool accumulationFailed = mStatistics.diagnostics[3] != mStatistics.accumulationOverflow;
     if (accumulationFailed) ++mStatistics.rejectedTrainingWindows;
@@ -529,7 +551,9 @@ bool Manager::publish(RenderContext* pContext)
     uint64_t plannedNodes = mStatistics.buildNodes;
     for (auto& region : mRegions)
     {
-        region.statistics.assign(statistics.begin() + offset, statistics.begin() + offset + region.build.size());
+        // Inspect the readback in place. Consumed windows are cleared below, so
+        // copying them into each region first only adds work immediately undone.
+        const NodeStats* regionStats = statistics.data() + offset;
         offset += region.build.size();
         if (accumulationFailed)
         {
@@ -546,13 +570,18 @@ bool Manager::publish(RenderContext* pContext)
             for (uint32_t q = 0; q < 4; ++q)
                 if (!(region.build[i].topology & (1u << q)))
                 {
-                    const double value = asFloat(region.statistics[i].weightBits[q]);
-                    const double squared = asFloat(region.statistics[i].squareBits[q]);
+                    const double value = asFloat(regionStats[i].weightBits[q]);
+                    const double squared = asFloat(regionStats[i].squareBits[q]);
                     valid &= std::isfinite(value) && value >= 0. && std::isfinite(squared) && squared >= 0.;
                     positiveMass |= value > 0.;
-                    observations += region.statistics[i].count[q];
+                    observations += regionStats[i].count[q];
                 }
-        if (!observations) continue; // Preserve the previous Read and all Build data.
+        if (!observations)
+        {
+            // Preserve all bytes, including nonleaf statistics, just as before.
+            region.statistics.assign(regionStats, regionStats + region.build.size());
+            continue;
+        }
         if (!valid)
         {
             ++mStatistics.rejectedTrainingWindows;
@@ -569,17 +598,7 @@ bool Manager::publish(RenderContext* pContext)
             for (auto& node : region.read) node.mass = {};
             region.flags = kObservedZero;
             region.observationCount = uint32_t(std::min<uint64_t>(observations, std::numeric_limits<uint32_t>::max()));
-            // refine() cannot split a zero tree. Retain every existing branch
-            // and reproduce its BFS child-base encoding without allocating its
-            // result/depth/links/queue work vectors, including unused leaf bases.
-            uint32_t base = 1;
-            for (auto& node : region.build)
-            {
-                const uint32_t mask = node.topology & 15u;
-                node.topology = (base << 4) | mask;
-                base += popcount4(mask);
-                node.mass = {};
-            }
+            // Fixed Build topology and its zero masses remain unchanged.
             region.statistics.assign(region.build.size(), {});
             ++mStatistics.lastZeroFastPathRegions;
             changed = true;
@@ -592,7 +611,7 @@ bool Manager::publish(RenderContext* pContext)
         for (size_t i = 0; i < normalized.size(); ++i)
             for (uint32_t q = 0; q < 4; ++q)
                 if (!(normalized[i].topology & (1u << q)))
-                    mass[i][q] = asFloat(region.statistics[i].weightBits[q]);
+                    mass[i][q] = asFloat(regionStats[i].weightBits[q]);
         for (size_t reverse = normalized.size(); reverse-- > 0;)
             for (uint32_t q = 0; q < 4; ++q)
                 if (normalized[reverse].topology & (1u << q))
@@ -617,13 +636,6 @@ bool Manager::publish(RenderContext* pContext)
         region.read = normalized;
         region.flags = total > 0. ? kReady : kObservedZero;
         region.observationCount = uint32_t(std::min<uint64_t>(observations, std::numeric_limits<uint32_t>::max()));
-        auto next = refine(normalized, region.statistics);
-        if (plannedNodes - region.build.size() + next.size() <= mNodeCapacity)
-        {
-            plannedNodes = plannedNodes - region.build.size() + next.size();
-            region.build = std::move(next);
-        }
-        for (auto& node : region.build) node.mass = {};
         region.statistics.assign(region.build.size(), {});
         changed = true;
     }
@@ -649,6 +661,7 @@ bool Manager::publish(RenderContext* pContext)
         region.statistics.resize(region.build.size());
         plannedNodes += region.build.size();
         mRegions.push_back(std::move(region));
+        mBuildLayoutDirty = true;
         mKnownKeys.insert(key);
     }
     uploadModel(pContext);

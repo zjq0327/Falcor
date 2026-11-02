@@ -49,7 +49,7 @@ def render_graph_RTPTSHARCNRD():
         "pgRecordBudgetMB": 128,
         "pgPublishInterval": 16,
         "pgMaxRegions": 16384,
-        "pgMaxNodesPerRegion": 85,
+        "pgDirectionBins": 4,
         "pgUpdateStride": 5,
         "pgUpdateBounces": 8,
         "sharcEnabled": _module_enabled("RTPT_SHARC_ENABLED"),

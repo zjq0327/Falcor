@@ -43,6 +43,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
     {
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("pgStats", [](const RTPT& self) { return self.getPGStatistics().toPython(); });
+        pass.def_property_readonly("pgAsyncStats", [](const RTPT& self) { return self.getPGAsyncStatistics().toPython(); });
         pass.def_property_readonly("stageStats", [](const RTPT& self) { return self.getStageStatistics().toPython(); });
         pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
         pass.def_property_readonly("regirStats", [](const RTPT& self) { return self.getReGIRStatistics().toPython(); });
@@ -59,6 +60,7 @@ RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 
 void RTPT::setProperties(const Properties& props)
 {
+    drainPGAsync();
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
@@ -79,6 +81,7 @@ void RTPT::setProperties(const Properties& props)
     uint32_t sharcStaleFrames = mSHARCStaleFrames, sharcDebugMode = mSHARCDebugMode;
     float sharcSceneScale = mSHARCSceneScale, sharcMinRoughness = mSHARCMinRoughness;
     bool enablePG = mEnablePG;
+    bool pgAsyncTraining = mPGAsyncTraining, pgAsyncMeasure = mPGAsyncMeasure;
     auto pg = mPGSettings;
     uint32_t pgUpdateStride = mPGUpdateStride, pgUpdateBounces = mPGUpdateBounces;
     for (const auto& [key, value] : props)
@@ -126,6 +129,8 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "pgEnabled") pg.enabled = value;
         else if (key == "pgUseGuiding") pg.useGuiding = value;
         else if (key == "pgFreeze") pg.trainingEnabled = !bool(value);
+        else if (key == "pgAsyncTraining") pgAsyncTraining = value;
+        else if (key == "pgAsyncMeasure") pgAsyncMeasure = value;
         else if (key == "pgDetailedDiagnostics") pg.detailedDiagnostics = value;
         else if (key == "pgGuideFraction") pg.guideFraction = value;
         else if (key == "pgTreeBudgetMB") pg.treeBudgetMiB = value;
@@ -133,9 +138,10 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "pgCoarseLevels") pg.coarseLevels = value;
         else if (key == "pgPublishInterval") pg.pollFrames = value;
         else if (key == "pgMaxRegions") pg.maxRegions = value;
-        else if (key == "pgMaxNodesPerRegion") pg.maxNodesPerRegion = value;
-        else if (key == "pgMaxDirectionalDepth") pg.maxDirectionalDepth = value;
-        else if (key == "pgDirectionalThreshold") pg.directionalThreshold = value;
+        else if (key == "pgDirectionBins")
+            FALCOR_CHECK(uint32_t(value) == RTPTPG::kDirectionBins, "PG uses four fixed hemisphere regions; directional resolution is no longer configurable.");
+        else if (key == "pgMaxNodesPerRegion" || key == "pgMaxDirectionalDepth" || key == "pgDirectionalThreshold")
+            logWarning("PG uses four fixed hemisphere regions; '{}' is ignored.", key);
         else if (key == "pgUpdateStride") pgUpdateStride = value;
         else if (key == "pgUpdateBounces") pgUpdateBounces = value;
         else FALCOR_THROW("Unknown RTPT property '{}'.", key);
@@ -164,10 +170,6 @@ void RTPT::setProperties(const Properties& props)
         "PG model budget must be in [16,1024] MiB and record budget in [1,2048] MiB.");
     FALCOR_CHECK(pg.coarseLevels <= 8 && pg.pollFrames >= 1 && pg.pollFrames <= 1024 && pg.maxRegions >= 1 && pg.maxRegions <= 65536,
         "Invalid PG coarse level, publish interval or region limit.");
-    FALCOR_CHECK(pg.maxNodesPerRegion >= 1 && pg.maxNodesPerRegion <= 1024 &&
-        pg.maxDirectionalDepth >= 1 && pg.maxDirectionalDepth <= 16 &&
-        std::isfinite(pg.directionalThreshold) && pg.directionalThreshold > 0.f && pg.directionalThreshold <= 1.f,
-        "Invalid PG directional tree limits.");
     FALCOR_CHECK(std::isfinite(pg.guideFraction) && pg.guideFraction >= 0.f && pg.guideFraction < 1.f,
         "PG guide fraction must be in [0,1), preserving BSDF support.");
     FALCOR_CHECK(sharcEntries >= (1u << 16) && sharcEntries <= (1u << 22) && (sharcEntries & (sharcEntries - 1)) == 0,
@@ -202,8 +204,7 @@ void RTPT::setProperties(const Properties& props)
     const bool diEligibilityChanged = useNEE != mUseNEE || samplesPerPixel != mSamplesPerPixel;
     const bool pgStructureChanged = enablePG != mEnablePG || pg.coarseLevels != mPGSettings.coarseLevels ||
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
-        pg.maxNodesPerRegion != mPGSettings.maxNodesPerRegion || pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
-    const bool pgDepthChanged = pg.maxDirectionalDepth != mPGSettings.maxDirectionalDepth;
+        pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
     const bool pgRecordsChanged = pg.recordBudgetMiB != mPGSettings.recordBudgetMiB || pgUpdateStride != mPGUpdateStride;
     const bool pgSignalChanged = pgStructureChanged || pg.enabled != mPGSettings.enabled || pg.useGuiding != mPGSettings.useGuiding ||
         pg.guideFraction != mPGSettings.guideFraction;
@@ -215,7 +216,7 @@ void RTPT::setProperties(const Properties& props)
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
         maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged || regirChanged;
-    mResetPG |= pgStructureChanged || pgDepthChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
+    mResetPG |= pgStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     if (sharcEntries != mSHARCEntries)
         mpSHARCHashEntries = mpSHARCAccumulation = mpSHARCResolved = nullptr;
@@ -267,10 +268,12 @@ void RTPT::setProperties(const Properties& props)
     mSHARCSceneScale = sharcSceneScale;
     mSHARCMinRoughness = sharcMinRoughness;
     mEnablePG = enablePG;
+    mPGAsyncTraining = pgAsyncTraining;
+    mPGAsyncMeasure = pgAsyncMeasure;
     mPGSettings = pg;
     mPGUpdateStride = pgUpdateStride;
     mPGUpdateBounces = pgUpdateBounces;
-    if (pgStructureChanged || pgDepthChanged)
+    if (pgStructureChanged)
     {
         // Drop parameter-block references before rebuilding bounded PG pools.
         mpComputePass = mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
@@ -332,6 +335,8 @@ Properties RTPT::getProperties() const
     props["pgEnabled"] = mPGSettings.enabled;
     props["pgUseGuiding"] = mPGSettings.useGuiding;
     props["pgFreeze"] = !mPGSettings.trainingEnabled;
+    props["pgAsyncTraining"] = mPGAsyncTraining;
+    props["pgAsyncMeasure"] = mPGAsyncMeasure;
     props["pgDetailedDiagnostics"] = mPGSettings.detailedDiagnostics;
     props["pgGuideFraction"] = mPGSettings.guideFraction;
     props["pgTreeBudgetMB"] = mPGSettings.treeBudgetMiB;
@@ -339,9 +344,7 @@ Properties RTPT::getProperties() const
     props["pgCoarseLevels"] = mPGSettings.coarseLevels;
     props["pgPublishInterval"] = mPGSettings.pollFrames;
     props["pgMaxRegions"] = mPGSettings.maxRegions;
-    props["pgMaxNodesPerRegion"] = mPGSettings.maxNodesPerRegion;
-    props["pgMaxDirectionalDepth"] = mPGSettings.maxDirectionalDepth;
-    props["pgDirectionalThreshold"] = mPGSettings.directionalThreshold;
+    props["pgDirectionBins"] = RTPTPG::kDirectionBins;
     props["pgUpdateStride"] = mPGUpdateStride;
     props["pgUpdateBounces"] = mPGUpdateBounces;
     return props;
@@ -353,6 +356,9 @@ Properties RTPT::getPGStatistics() const
     const auto& s = mpPG->getStatistics();
     props["enabled"] = mEnablePG && mPGSettings.enabled;
     props["trainingEnabled"] = mPGSettings.trainingEnabled;
+    props["directionBins"] = RTPTPG::kDirectionBins;
+    props["hemisphereOnly"] = true;
+    props["adaptiveRefinement"] = false;
     props["detailedDiagnostics"] = mPGSettings.detailedDiagnostics;
     props["regions"] = s.regions;
     props["readyRegions"] = s.readyRegions;
@@ -456,6 +462,7 @@ void RTPT::validateScene() const
 
 void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
+    drainPGAsync();
     invalidateStages();
     mpScene = pScene;
     mDILightIdentities.clear();
@@ -727,10 +734,22 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
     }
     if (pg)
     {
-        FALCOR_PROFILE(pRenderContext, "PGTrain");
-        mpPG->bind(mpPGTrain->getRootVar(), mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, true);
-        mpPGTrain->execute(pRenderContext, uint3(mpPG->getPathCapacity(), 1, 1));
-        mpPG->barrierTraining(pRenderContext);
+        const bool async = preparePGAsync();
+        if (async)
+        {
+            recordPGAsyncTraining(pRenderContext);
+        }
+        else
+        {
+            beginPGAsyncTiming(pRenderContext, pRenderContext);
+            writePGAsyncTimestamp(pRenderContext, 0);
+            pRenderContext->getLowLevelData()->beginDebugEvent("PGTrainSerial");
+            mpPG->bind(mpPGTrain->getRootVar(), mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, true);
+            mpPGTrain->execute(pRenderContext, uint3(mpPG->getPathCapacity(), 1, 1));
+            mpPG->barrierTraining(pRenderContext);
+            pRenderContext->getLowLevelData()->endDebugEvent();
+            writePGAsyncTimestamp(pRenderContext, 1);
+        }
         mPGTrainingThisFrame = true;
     }
     if (sharc)
@@ -746,6 +765,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
 
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    collectPGAsyncTiming();
     mReGIRInitialActive = false;
     mNRDHistoryResetThisFrame = false;
     mPGTranslationPreservedNRDThisFrame = false;
@@ -919,13 +939,23 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         var["gSharcStats"] = renderData.getTexture("sharcStats");
     }
     if (mEnablePG)
-        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false);
+        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false, false, true);
     pRenderContext->uavBarrier(mpAccumulation.get());
+    if (mPGAsyncRecorded)
+    {
+        // PGTrain is short. Start it after SHaRC/DI preparation, alongside Main,
+        // rather than letting it finish entirely during those earlier passes.
+        pRenderContext->submit(false);
+        mPGInputsReadyValue = pRenderContext->signal(mpPGInputsReady.get());
+    }
     {
         FALCOR_PROFILE(pRenderContext, "MainRender");
+        writePGAsyncTimestamp(pRenderContext, 2);
         mainPass->execute(pRenderContext, uint3(frameDim, 1));
+        writePGAsyncTimestamp(pRenderContext, 3);
     }
     if (stagesActive && mEnableNRD) executeFinalSignalResolve(pRenderContext, renderData);
+    finishPGAsync(pRenderContext);
     if (mPGTrainingThisFrame)
     {
         FALCOR_PROFILE(pRenderContext, "PGPublishCPU");
@@ -1085,6 +1115,8 @@ void RTPT::renderUI(Gui::Widgets& widget)
             if (pgWidget.checkbox("Use guiding", value)) props["pgUseGuiding"] = value;
             value = !mPGSettings.trainingEnabled;
             if (pgWidget.checkbox("Freeze training", value)) props["pgFreeze"] = value;
+            value = mPGAsyncTraining;
+            if (pgWidget.checkbox("Independent PGTrain queue", value)) props["pgAsyncTraining"] = value;
             value = mPGSettings.detailedDiagnostics;
             if (pgWidget.checkbox("Detailed diagnostics enabled", value)) props["pgDetailedDiagnostics"] = value;
             pgWidget.tooltip("Count queries and training activity with GPU atomics. Error counters stay enabled. Toggling preserves the model and image history.", true);
@@ -1104,10 +1136,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
             if (pgWidget.var("Record budget (MiB)", number, 1u, 2048u)) props["pgRecordBudgetMB"] = number;
             number = mPGSettings.maxRegions;
             if (pgWidget.var("Max regions", number, 1u, 65536u)) props["pgMaxRegions"] = number;
-            number = mPGSettings.maxNodesPerRegion;
-            if (pgWidget.var("Max nodes per region", number, 1u, 1024u)) props["pgMaxNodesPerRegion"] = number;
-            number = mPGSettings.maxDirectionalDepth;
-            if (pgWidget.var("Max direction depth", number, 1u, 16u)) props["pgMaxDirectionalDepth"] = number;
+            pgWidget.text("Fixed hemisphere regions: 4");
             if (!props.empty()) setProperties(props);
             if (pgWidget.button("Reset PG")) resetPG();
             const auto& stats = mpPG->getStatistics();

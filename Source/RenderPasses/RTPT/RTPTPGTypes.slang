@@ -75,6 +75,7 @@ struct RTPTPGVertex // 80 B; keys preserve the capture-frame spatial LOD.
     uint2 key;
     uint flags;
     uint padding0;
+    // Outgoing direction in the capture vertex's deterministic geometric-normal frame.
     float3 direction;
     float samplePdf;
     float3 emission;
@@ -85,6 +86,12 @@ struct RTPTPGVertex // 80 B; keys preserve the capture-frame spatial LOD.
     float3 transport;
     uint padding2;
 };
+struct RTPTPGFrame
+{
+    float3 T;
+    float3 B;
+    float3 N;
+};
 struct RTPTPGGuide
 {
     uint regionId;
@@ -92,9 +99,22 @@ struct RTPTPGGuide
     uint nodeCount;
     uint generation;
     float alpha;
+    RTPTPGFrame frame;
 };
 
 #if ENABLE_PG
+#if defined(RTPT_PG_NATIVE) && RTPT_PG_NATIVE
+// Fixed binding contract for the native D3D12 compute queue's training-only pipeline.
+ConstantBuffer<RTPTPGSettings> gPGSettings : register(b0);
+StructuredBuffer<RTPTPGMapEntry> gPGBuildMap : register(t0);
+StructuredBuffer<RTPTPGRegion> gPGBuildRegions : register(t1);
+StructuredBuffer<RTPTPGNode> gPGBuildNodes : register(t2);
+RWStructuredBuffer<RTPTPGStats> gPGBuildStats : register(u0);
+RWStructuredBuffer<uint64_t> gPGRequests : register(u1);
+RWStructuredBuffer<uint> gPGDiagnostics : register(u2);
+RWStructuredBuffer<RTPTPGPathHeader> gPGPathHeaders : register(u3);
+RWStructuredBuffer<RTPTPGVertex> gPGVertices : register(u4);
+#else
 ConstantBuffer<RTPTPGSettings> gPGSettings;
 StructuredBuffer<RTPTPGMapEntry> gPGReadMap;
 StructuredBuffer<RTPTPGRegion> gPGReadRegions;
@@ -108,6 +128,7 @@ RWStructuredBuffer<uint64_t> gPGRequests;
 RWStructuredBuffer<uint> gPGDiagnostics;
 RWStructuredBuffer<RTPTPGPathHeader> gPGPathHeaders;
 RWStructuredBuffer<RTPTPGVertex> gPGVertices;
+#endif
 
 void rtptPGCount(uint counter)
 {
@@ -128,9 +149,33 @@ uint rtptPGChild(uint topology, uint quadrant)
     return (topology >> 4) + countbits(topology & ((1u << quadrant) - 1u));
 }
 
+// The same frame is used when recording training labels and querying a guide.
+// It depends only on the oriented geometric normal, never on mesh tangents.
+RTPTPGFrame rtptPGMakeFrame(float3 normal)
+{
+    RTPTPGFrame frame;
+    frame.N = normalize(normal);
+    const float3 reference = abs(frame.N.z) < 0.999f ? float3(0.f, 0.f, 1.f) : float3(0.f, 1.f, 0.f);
+    frame.T = normalize(cross(reference, frame.N));
+    frame.B = cross(frame.N, frame.T);
+    return frame;
+}
+
+float3 rtptPGToLocal(RTPTPGFrame frame, float3 direction)
+{
+    return float3(dot(direction, frame.T), dot(direction, frame.B), dot(direction, frame.N));
+}
+
+float3 rtptPGToWorld(RTPTPGFrame frame, float3 direction)
+{
+    return frame.T * direction.x + frame.B * direction.y + frame.N * direction.z;
+}
+
+// Equal-area coordinates on the local upper hemisphere. Callers reject z < 0
+// before using this mapping, so lower directions never fold into a horizon bin.
 float2 rtptPGDirectionToSquare(float3 direction)
 {
-    const float u = saturate((direction.z + 1.f) * 0.5f);
+    const float u = saturate(direction.z);
     float v = atan2(direction.y, direction.x) * (1.f / 6.283185307179586f);
     v -= floor(v);
     return min(float2(u, v), float2(asfloat(0x3f7fffffu)));
@@ -138,7 +183,7 @@ float2 rtptPGDirectionToSquare(float3 direction)
 
 float3 rtptPGSquareToDirection(float2 uv)
 {
-    const float z = 2.f * uv.x - 1.f;
+    const float z = uv.x;
     const float r = sqrt(max(0.f, 1.f - z * z));
     float sine, cosine;
     sincos(6.283185307179586f * uv.y, sine, cosine);
