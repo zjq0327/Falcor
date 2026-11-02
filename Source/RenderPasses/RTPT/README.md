@@ -2,6 +2,16 @@
 
 > RTPT 实验测试代码、场景及验证说明已归档到 `build/rtpt-experiment-tests-backup-20261101/`，并从当前测试构建中移除。下文的阶段验证链接指向历史归档；已有性能报告和图像仍保留在 `build/`。
 
+## ReGIR：3D LOD cell 候选光源列表
+
+ReGIR 使用与 SHaRC 同类的世界空间对数 LOD，尺寸独立设置：`regirCellSize=2.0`，`regirCoarsenCellDistance=16.0`。相机欧氏距离达到 16 个当前层 cell 边长时变粗一级，默认距离 32、64、128 分别换为边长 4、8、16；改变 `sharcSceneScale` 不改变 ReGIR。`regirGridSize=20` 是兼容容量提示，向上取二次幂后分配 8192 个持久哈希槽，不表示空间边长。
+
+每个 cell 缓存完整的候选稳定 ID 列表，RIS 只从该列表抽样，首表面、次反弹和独立训练均无全局候选混合或全局回退。新 cell 首次使用先完整筛选候选，再从 cell 内抽取；没有当前 RIS 的新 cell 先使用列表内均匀提议。构建中的并发查询不自旋等待，而使用同一完整筛选集合的程序化视图。哈希或 ID 池不足也使用完整 cell 视图，不截断列表，不随机从全局取灯再拒绝；这条保留支持的路径可能增加成本，由统计明确报告。首表面记录未通过逐位相机射线校验时，仍对新追踪的表面使用 cell 内估计，并保留相同覆盖域，不能进入旧的全局 NEE；关闭屏幕 DI 时也采用该 cell 内根估计。准备和专用资源预算失败会明确报错，独立关闭 ReGIR 时保留原全局模式。
+
+`regirLightCullingEnabled` 控制整 cell 剔除；LOD 先按未抖动位置选择，再扩展 AABB 覆盖该层完整 jitter 范围与数值余量。单面发光面须整个体积都背向才剔除，双面材质跳过背向判断；聚光灯使用完整包围体与光锥。`regirBrightnessThreshold=1e-4` 是可调的线性入射光强度代理阈值，0 关闭弱光距离截断，启动脚本可用 `RTPT_REGIR_BRIGHTNESS_THRESHOLD` 覆盖。点光以最大绝对 RGB 强度、无纹理面光以面积乘最大绝对 RGB 辐亮度估计上界；发光纹理/光源方向配置没有可靠最大值时保留距离支持。距离取源/接收 AABB 的保守最近距离，不用中心距离。这是已接受的弱光近似，不是最终像素误差上限。
+
+静态光源不重复构建描述和候选列表；光源增删、移动、朝向或强度变化时，只重建旧/新候选归属不同的 cell。稳定 ID 与当前目录位置分离，压缩重排不串灯；RIS 使用当前光源每帧刷新，归一化分母为本 cell 候选数量。120 帧未查询的 cell 回收并复用候选存储段。64 MiB 专用预算计入所有新增缓存、描述、映射和临时资源；默认 32 RIS 槽/每槽 8 候选。`regirStats` 报告实际字节、列表构建/复用、程序化视图、容量压力、回收与稳定 ID。测试代码已清理，历史验证结果见 [验证汇总](../../../build/regir-cell-validation/summary.json)，VeachAjar 开关对比见 [场景报告](../../../build/regir-veach-comparison/summary.json)。
+
 ## 首表面 ReSTIR DI 与 NRD 及后续 ReGIR 接入方案
 
 [实施方案与参考代码](REGIR_RESTIR_DI_NRD_PLAN.md) 以当前 PG、SHaRC、NRD 版本为基线，按用户指定顺序先完成首表面 ReSTIR DI 与 NRD：全局候选 → 最终灯样本 → RayQuery 阴影 → 分别评价 D/S → 与原间接信号合成并送入 NRD，完整验收后再增加 ReGIR。首批保留当前 D/S 双续接，概率式根通道单路径单独评估。阶段 1 的结构拆分、阶段 2 的全局 Initial RIS 和阶段 3 的 Temporal/Spatial 已接入；ReGIR 留在阶段 5。

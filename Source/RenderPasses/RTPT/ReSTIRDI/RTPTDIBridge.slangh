@@ -9,6 +9,9 @@ import Rendering.Lights.EmissiveLightSamplerInterface;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 #include "../PrimarySurface/RTPTPrimarySurfaceTypes.slang"
 #include "../DirectLighting/RTPTDIResources.slang"
+#if RTPT_REGIR_ENABLED || RTPT_REGIR_TRANSPORT
+#include "../ReGIR/RTPTReGIRCellLists.slang"
+#endif
 
 StructuredBuffer<RTPTPrimarySurface> gDIPrimarySurfaces;
 #if RTPT_DI_REUSE_ENABLED
@@ -178,6 +181,18 @@ RAB_LightSample RAB_SamplePolymorphicLight(RAB_LightInfo light, RAB_Surface surf
     result.sampleUV = uv;
     if (!surface.valid) return result;
     if (light.generation != gDISettings.generation) return result;
+#if RTPT_REGIR_ENABLED || RTPT_REGIR_TRANSPORT
+    // Define one receiver-local approximate light model for Initial, temporal/
+    // spatial cross-evaluation and final shading. Every nonzero target under
+    // this model is supported by every conservative cell containing its point.
+    // Cell-dependent truncation alone would let reused samples reintroduce a
+    // light whose contribution had no support in the current proposal.
+    if (gReGIRSettings.active != 0u)
+    {
+        if (light.pad0 >= gReGIRSettings.stableIdCount) return result;
+        if (!rtptReGIRLightCanAffectCell(gReGIRLightDescriptors[light.pad0], surface.sd.posW, float3(0.f))) return result;
+    }
+#endif
     const float3 origin = surface.sd.computeRayOrigin();
 
     if (light.kind == kRTPTDILightEmissive)
@@ -280,7 +295,7 @@ bool RAB_GetConservativeVisibility(RAB_Surface surface, RAB_LightSample sample)
 
 // The SDK parses all reusable functions. History is available only through the
 // guarded static-scene bridge; BRDF/environment proposals and compact light
-// records remain unsupported. ReGIR Grid has a separate current-frame build.
+// records remain unsupported. ReGIR has a separate current-frame LOD build.
 bool RAB_GetTemporalConservativeVisibility(RAB_Surface current, RAB_Surface previous, RAB_LightSample sample)
 {
 #if RTPT_DI_REUSE_ENABLED
@@ -351,8 +366,8 @@ float RAB_GetLightTargetPdfForVolume(RAB_LightInfo light, float3 center, float r
         lightCenter = data.posW;
         const float3 intensity = max(data.intensity, float3(0.f));
         scale = max(1e-6f, max(intensity.x, max(intensity.y, intensity.z)));
-        // A spot cone is not a hard volume cull. Final surface sampling uses
-        // the actual point/spot evaluation and retains legal zero samples.
+        // The ReGIR builder performs conservative whole-cell cone culling.
+        // Remaining point/spot proposals retain a strictly positive proxy.
     }
     else return 0.f;
     const float3 toLight = lightCenter - center;

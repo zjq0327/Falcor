@@ -7,7 +7,11 @@ target_sources(RTPT PRIVATE
     RTPTDirectLighting.cpp
     RTPTReGIR.cpp
     ReGIR/RTPTReGIRResources.slang
+    ReGIR/RTPTReGIRGrid.slang
+    ReGIR/RTPTReGIRCulling.slang
     ReGIR/RTPTReGIRBuild.cs.slang
+    ReGIR/RTPTReGIRCellLists.slang
+    ReGIR/RTPTReGIRUpdate.cs.slang
     ReGIR/RTPTReGIRTransport.slang
     RTPTDIReuse.cpp
     RTPTPG.h
@@ -48,9 +52,7 @@ target_sources(RTPT PRIVATE
     RTPTSharcResolve.cs.slang
 )
 
-add_library(RTPTReGIRSDK STATIC ${PROJECT_SOURCE_DIR}/external/packman/rtxdi/rtxdi-sdk/src/RTXDI.cpp)
-target_link_libraries(RTPTReGIRSDK PRIVATE rtxdi)
-target_link_libraries(RTPT PRIVATE rtxdi RTPTReGIRSDK)
+target_link_libraries(RTPT PRIVATE rtxdi)
 
 set(sharc_sdk_files
     ThirdParty/SHARC/HashGridCommon.h

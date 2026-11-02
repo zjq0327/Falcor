@@ -12,7 +12,9 @@ static const uint kRTPTDIResultInvalidIdentity = 8u;
 
 /** One current-frame catalogue entry (32 B). sourceIndex is a fast current
     scene lookup; kind/stable0/stable1 plus generation identify the light.
-    sourcePMF records the actual uniform catalogue proposal, not a direction PDF.
+    sourcePMF is the canonical global-mode PMF/identity metadata, not the ReGIR
+    cell proposal or a direction PDF. ReGIR uses its actual cell candidate count.
+    pad0 is the stable ReGIR ID mapped separately to the current catalogue rank.
 */
 struct RTPTDILightInfo
 {

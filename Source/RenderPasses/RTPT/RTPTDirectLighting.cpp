@@ -4,6 +4,8 @@
 #include "Utils/Timing/Profiler.h"
 #include <algorithm>
 #include <limits>
+#include <tuple>
+#include <unordered_set>
 
 namespace
 {
@@ -31,13 +33,22 @@ uint64_t reflectedStride(const ShaderVar& var)
 }
 }
 
-void RTPT::invalidateDirectLighting()
+void RTPT::invalidateDirectLighting(bool preserveReGIR)
 {
     invalidateDIReuse();
-    invalidateReGIR();
+    if (preserveReGIR)
+    {
+        // Catalogue ranks/defines may change while stable ReGIR IDs and cell
+        // memberships remain reusable. Only recreate the dependent Initial pass.
+        mpReGIRInitial = nullptr;
+        mReGIRInitialActive = mReGIRInitialPreparationFailed = false;
+        mReGIRInitialFallbackReason.clear();
+    }
+    else invalidateReGIR();
     mpDIComputePass = mpDIInitialPass = mpDIShadePass = nullptr;
     mpDILightCatalog = mpDIUncoveredAnalyticIndices = mpDIReservoirs = mpDISampleRecords = mpDIResults = nullptr;
     mDICatalogSignature.clear();
+    mReGIRIdToCatalogData.clear();
     mDIPrepared = mDIActive = mDIPreparationFailed = false;
     mDILightCount = mDIEmissiveCount = mDIPointCount = mDIUncoveredAnalyticCount = mDICoverageMask = 0u;
     mDIFallbackReason.clear();
@@ -84,6 +95,18 @@ bool RTPT::prepareDirectLighting()
         // every texture sample is black, so it never removes proposal support.
         emissiveCount = collection ? collection->getTotalLightCount() : 0u;
         const auto& activeLights = mpScene->getActiveAnalyticLights();
+        // Keep the previous active objects alive until this snapshot has its
+        // identities. This prevents delete+new between snapshots from reusing a
+        // raw address and accidentally inheriting an unrelated light's ID.
+        std::unordered_set<const Light*> activeLightPointers;
+        activeLightPointers.reserve(activeLights.size());
+        for (const auto& light : activeLights) activeLightPointers.insert(light.get());
+        for (auto identity = mDILightIdentities.begin(); identity != mDILightIdentities.end();)
+        {
+            if (activeLightPointers.find(identity->first) == activeLightPointers.end())
+                identity = mDILightIdentities.erase(identity);
+            else ++identity;
+        }
         std::vector<uint32_t> pointIndices, pointIdentities, uncoveredIndices;
         signature = {uint64_t(emissiveCount), uint64_t(renderSettings.useAnalyticLights),
             collection ? uint64_t(collection->getMeshLights().size()) : 0u,
@@ -112,6 +135,7 @@ bool RTPT::prepareDirectLighting()
                 }
                 else uncoveredIndices.push_back(index);
             }
+        mDILightIdentityOwners.assign(activeLights.begin(), activeLights.end());
         pointCount = uint32_t(pointIndices.size());
         uncoveredCount = uint32_t(uncoveredIndices.size());
         coverage = (emissiveCount ? kEmissive : 0u) | (pointCount ? kPoint : 0u);
@@ -119,7 +143,7 @@ bool RTPT::prepareDirectLighting()
         const bool layoutChanged = signature != mDICatalogSignature;
         if (layoutChanged)
         {
-            invalidateDirectLighting();
+            invalidateDirectLighting(true);
             mDICatalogSignature = signature;
         }
         mDIEmissiveCount = emissiveCount;
@@ -150,7 +174,7 @@ bool RTPT::prepareDirectLighting()
             desc.addShaderModules(mpScene->getShaderModules());
             desc.addTypeConformances(mpScene->getTypeConformances());
             desc.addShaderLibrary(path).csEntry("main");
-            if (mEnablePG || mEnableSHARC)
+            if (mEnablePG || mEnableSHARC || mReGIREnabled)
             {
                 desc.setShaderModel(ShaderModel::SM6_6);
                 desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
@@ -184,6 +208,24 @@ bool RTPT::prepareDirectLighting()
         for (uint32_t rank = 0u; rank < pointCount; ++rank)
             catalogue[emissiveCount + rank] = {kPoint, pointIndices[rank], pointIdentities[rank], 0u,
                 mDICatalogGeneration, sourcePMF, 0u, 0u};
+        // pad0 is a separate ReGIR identity. DI keeps its existing kind,
+        // stable0/stable1 and generation contract; array compaction only changes
+        // the ID-to-current-catalogue mapping used by persistent cell lists.
+        for (uint32_t rank = 0u; rank < mDILightCount; ++rank)
+        {
+            auto& light = catalogue[rank];
+            const auto key = std::make_tuple(light.kind, light.stable0, light.stable1);
+            auto stable = mReGIRStableLightIds.find(key);
+            if (stable == mReGIRStableLightIds.end())
+            {
+                FALCOR_CHECK(mReGIRNextLightId != 0xffffffffu, "ReGIR stable light identity range exhausted.");
+                stable = mReGIRStableLightIds.emplace(key, mReGIRNextLightId++).first;
+            }
+            light.pad0 = stable->second;
+        }
+        mReGIRIdToCatalogData.assign(mReGIRNextLightId, 0xffffffffu);
+        for (uint32_t rank = 0u; rank < mDILightCount; ++rank)
+            mReGIRIdToCatalogData[catalogue[rank].pad0] = rank;
         mpDILightCatalog = mpDevice->createStructuredBuffer(initialVar["gDILightCatalog"], uint32_t(catalogue.size()),
             ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, catalogue.data(), false);
         if (uncoveredIndices.empty()) uncoveredIndices.push_back(0u);
@@ -211,6 +253,8 @@ bool RTPT::prepareDirectLighting()
         mDILightCount = lightCount <= 0x7fffffffu ? uint32_t(lightCount) : 0u;
         mDICoverageMask = coverage;
         mDIFallbackReason = reason;
+        if (mReGIREnabled)
+            FALCOR_THROW("ReGIR cell-only light catalogue preparation failed; global sampling is disabled: {}", reason);
         logWarning("ReSTIR DI preparation failed; using original root lighting: {}", reason);
         return false;
     }
@@ -239,6 +283,9 @@ void RTPT::bindDIMainResources(const ShaderVar& rootVar) const
 
 void RTPT::executeDirectLighting(RenderContext* pRenderContext)
 {
+    mReGIRInitialActive = false;
+    FALCOR_CHECK(!mReGIREnabled || !mReGIRInitialPreparationFailed,
+        "ReGIR cell-only Initial is unavailable; global Initial sampling is disabled: {}", mReGIRInitialFallbackReason);
     const bool reuse = prepareDIReuse();
     auto bind = [&](const ShaderVar& var)
     {
@@ -249,6 +296,7 @@ void RTPT::executeDirectLighting(RenderContext* pRenderContext)
         var["gDILightCatalog"] = mpDILightCatalog;
         var["gDIReservoirs"] = mpDIReservoirs;
         var["gDISampleRecords"] = mpDISampleRecords;
+        if (mReGIREnabled) bindReGIRInitial(var);
         if (reuse)
         {
             bindDIReuseSettings(var, 0u, 0u);
@@ -265,7 +313,10 @@ void RTPT::executeDirectLighting(RenderContext* pRenderContext)
             {
                 auto defines = initialPass->getProgram()->getDefines();
                 defines.add("RTPT_REGIR_ENABLED", "1");
-                mpReGIRInitial = ComputePass::create(mpDevice, initialPass->getProgram()->getDesc(), defines, true);
+                auto desc = initialPass->getProgram()->getDesc();
+                desc.setShaderModel(ShaderModel::SM6_6);
+                desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+                mpReGIRInitial = ComputePass::create(mpDevice, desc, defines, true);
                 mReGIRInitialReuse = reuse;
             }
             auto candidateVar = mpReGIRInitial->getRootVar();
@@ -277,12 +328,10 @@ void RTPT::executeDirectLighting(RenderContext* pRenderContext)
         }
         catch (const std::exception& error)
         {
-            // This is preparation only: no candidate has been sampled yet.
-            // The published grid remains valid for secondary/training users.
             mpReGIRInitial = nullptr;
             mReGIRInitialPreparationFailed = true;
             mReGIRInitialFallbackReason = error.what();
-            logWarning("ReGIR Initial preparation failed; retaining global Initial: {}", error.what());
+            FALCOR_THROW("ReGIR cell-only Initial preparation failed; global Initial sampling is disabled: {}", error.what());
         }
     }
     auto initialVar = initialPass->getRootVar();

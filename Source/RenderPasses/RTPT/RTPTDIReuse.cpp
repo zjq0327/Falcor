@@ -56,7 +56,7 @@ bool RTPT::prepareDIReuse()
                 desc.addShaderModules(mpScene->getShaderModules());
                 desc.addTypeConformances(mpScene->getTypeConformances());
                 desc.addShaderLibrary(path).csEntry("main");
-                if (mEnablePG || mEnableSHARC)
+                if (mEnablePG || mEnableSHARC || mReGIREnabled)
                 {
                     desc.setShaderModel(ShaderModel::SM6_6);
                     desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});

@@ -6,8 +6,9 @@
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include "RTPTPG.h"
 #include "RTPTNativePGTrain.h"
-#include <rtxdi/RTXDI.h>
 #include <unordered_map>
+#include <map>
+#include <tuple>
 
 namespace Falcor { class Light; }
 struct RTPTPGTimingResources;
@@ -44,13 +45,13 @@ private:
     void reset();
     void validateScene() const;
     void prepareProgram(RenderContext* pRenderContext);
-    void invalidateStages();
+    void invalidateStages(bool preserveReGIR = false);
     bool prepareStages();
     void bindPrimarySettings(const ShaderVar& rootVar) const;
     void bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const;
     void executePrimarySurface(RenderContext* pRenderContext);
     void executeFinalSignalResolve(RenderContext* pRenderContext, const RenderData& renderData);
-    void invalidateDirectLighting();
+    void invalidateDirectLighting(bool preserveReGIR = false);
     bool prepareDirectLighting();
     void bindDISettings(const ShaderVar& rootVar) const;
     void bindDIMainResources(const ShaderVar& rootVar) const;
@@ -76,17 +77,38 @@ private:
     bool mReGIREnabled = false;
     bool mReGIRSecondaryEnabled = true;
     bool mReGIRTrainingEnabled = true;
-    uint32_t mReGIRGridSize = 16u;
+    bool mReGIRCullingEnabled = true;
+    uint32_t mReGIRGridSize = 20u;
     uint32_t mReGIRLightsPerCell = 32u;
     uint32_t mReGIRBuildSamples = 8u;
     uint32_t mReGIRBudgetMB = 64u;
     float mReGIRCellSize = 2.f;
+    float mReGIRCoarsenCellDistance = 16.f;
+    float mReGIRBrightnessThreshold = 1e-4f;
     float mReGIRSamplingJitter = 1.f;
-    std::unique_ptr<rtxdi::Context> mpReGIRContext;
-    RTXDI_ResamplingRuntimeParameters mReGIRRuntime = {};
     ref<ComputePass> mpReGIRBuild;
     ref<ComputePass> mpReGIRInitial;
+    ref<ComputePass> mpReGIRUpdateLights;
+    ref<ComputePass> mpReGIRUpdateCells;
     ref<Buffer> mpReGIRRIS;
+    ref<Buffer> mpReGIRCells;
+    ref<Buffer> mpReGIRCellRequests;
+    ref<Buffer> mpReGIRCellMeta;
+    ref<Buffer> mpReGIRCellEpoch;
+    ref<Buffer> mpReGIRCellRISFrame;
+    ref<Buffer> mpReGIRCellLastUsed;
+    ref<Buffer> mpReGIRCandidateIds;
+    ref<Buffer> mpReGIRState;
+    ref<Buffer> mpReGIRIdToCatalog;
+    ref<Buffer> mpReGIRLightDescriptors;
+    ref<Buffer> mpReGIRPreviousLightDescriptors;
+    ref<Buffer> mpReGIRDirtyLights;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint32_t> mReGIRStableLightIds;
+    std::vector<uint32_t> mReGIRIdToCatalogData;
+    uint32_t mReGIRNextLightId = 0u;
+    uint32_t mReGIRLightIdCapacity = 0u;
+    uint32_t mReGIRPoolCapacity = 0u;
+    uint32_t mReGIRCatalogGeneration = 0u;
     bool mReGIRInitialReuse = false;
     bool mReGIRInitialActive = false;
     bool mReGIRInitialPreparationFailed = false;
@@ -95,6 +117,7 @@ private:
     bool mReGIRActive = false;
     bool mReGIRPreparationFailed = false;
     uint32_t mReGIRSlotCount = 0u;
+    uint32_t mReGIRCellCapacity = 0u;
     uint32_t mReGIRBuildFrameStamp = 0u;
     uint64_t mReGIRBuildCount = 0u;
     std::string mReGIRFallbackReason;
@@ -119,6 +142,7 @@ private:
     ref<Buffer> mpDIResults;
     std::vector<uint64_t> mDICatalogSignature;
     std::unordered_map<const Light*, uint32_t> mDILightIdentities;
+    std::vector<ref<Light>> mDILightIdentityOwners;
     uint32_t mDINextIdentity = 1u;
     uint32_t mDICatalogGeneration = 1u;
     uint32_t mDILightCount = 0u;

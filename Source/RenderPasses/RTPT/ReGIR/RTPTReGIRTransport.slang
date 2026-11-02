@@ -6,93 +6,72 @@
 
 #if RTPT_REGIR_TRANSPORT
 #include "../DirectLighting/RTPTDITypes.slang"
-
-/** A read-only view of the same model published by the SDK build. These flat
-    parameters use the SDK's actual Grid runtime values, including its jitter
-    conversion. The buffer contains finalized RIS weights, not marginal PDFs.
-*/
-struct RTPTReGIRTransportSettings
-{
-    float3 center;
-    float cellSize;
-    uint3 cellCount;
-    uint lightsPerCell;
-    float samplingJitter;
-    uint risBufferOffset;
-    uint slotCount;
-    uint active;
-    uint lightCount;
-    uint generation;
-    uint coverageMask;
-    uint uncoveredAnalyticCount;
-    uint secondaryEnabled;
-    uint trainingEnabled;
-    uint pad0;
-    uint pad1;
-};
-
-ConstantBuffer<RTPTReGIRTransportSettings> gReGIRTransportSettings;
-StructuredBuffer<uint2> gReGIRTransportRIS;
+#include "RTPTReGIRCellLists.slang"
 StructuredBuffer<RTPTDILightInfo> gReGIRTransportCatalog;
 StructuredBuffer<uint> gReGIRTransportUncoveredAnalyticIndices;
 
 uint rtptReGIRTransportCoverage(bool training)
 {
-    if (gReGIRTransportSettings.active == 0u || gReGIRTransportSettings.lightCount == 0u) return 0u;
-    if (training ? gReGIRTransportSettings.trainingEnabled == 0u : gReGIRTransportSettings.secondaryEnabled == 0u) return 0u;
-    return gReGIRTransportSettings.coverageMask;
+    if (gReGIRSettings.active == 0u || gReGIRSettings.lightCount == 0u) return 0u;
+    if (training ? gReGIRSettings.trainingEnabled == 0u : gReGIRSettings.secondaryEnabled == 0u) return 0u;
+    return gReGIRSettings.coverageMask;
 }
 
 /** One uniformly selected published RIS slot with a fresh light-surface UV.
-    For a slot built from K uniform catalogue proposals, its SDK weight is
+    For a slot built from K uniform cell-list proposals, its published weight is
     sum(t_i * N / K) / t_selected. Thus weight * f(light,uv)/p(uv|light)
     estimates the covered local-light integral in expectation over the build.
     Reusing slots correlates estimates; it does not turn this weight into a PDF.
-    An in-grid empty/zero slot contributes zero and never triggers a retry.
+    A populated cell's empty/zero slot contributes zero and never triggers a retry.
 */
 bool rtptReGIRSampleTransportLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSample result)
 {
     result = {};
-    const float3 jitter = sampleNext3D(sg) - 0.5f;
-    const float3 samplingPosition = sd.posW + jitter *
-        (gReGIRTransportSettings.samplingJitter * gReGIRTransportSettings.cellSize);
-    const float3 origin = gReGIRTransportSettings.center -
-        float3(gReGIRTransportSettings.cellCount) * (gReGIRTransportSettings.cellSize * 0.5f);
-    const int3 cell = int3(floor((samplingPosition - origin) / gReGIRTransportSettings.cellSize));
-    const bool inGrid = all(cell >= 0) && all(cell < int3(gReGIRTransportSettings.cellCount));
+    const RTPTReGIRCellView view = rtptReGIRGetCellView(sd.posW, sampleNext3D(sg));
+    if (view.ready == 0u || view.count == 0u) return false;
+    const uint cell = view.cell;
     uint lightIndex;
     float estimatorWeight;
-    if (inGrid)
+    bool currentRIS = false;
+    if (cell != kRTPTReGIRInvalidCell)
+        currentRIS = gReGIRCellRISFrame[cell] == gReGIRSettings.frameStamp;
+    if (currentRIS)
     {
-        const uint cellIndex = uint(cell.x) + (uint(cell.y) + uint(cell.z) * gReGIRTransportSettings.cellCount.y) *
-            gReGIRTransportSettings.cellCount.x;
-        const uint localSlot = min(uint(sampleNext1D(sg) * gReGIRTransportSettings.lightsPerCell),
-            gReGIRTransportSettings.lightsPerCell - 1u);
-        const uint slot = cellIndex * gReGIRTransportSettings.lightsPerCell + localSlot;
-        if (slot >= gReGIRTransportSettings.slotCount) return false;
+        const uint localSlot = min(uint(sampleNext1D(sg) * gReGIRSettings.lightsPerCell),
+            gReGIRSettings.lightsPerCell - 1u);
+        const uint slot = cell * gReGIRSettings.lightsPerCell + localSlot;
+        if (slot >= gReGIRSettings.slotCount) return false;
         uint count, stride;
-        gReGIRTransportRIS.GetDimensions(count, stride);
-        const uint address = gReGIRTransportSettings.risBufferOffset + slot;
+        gReGIRRIS.GetDimensions(count, stride);
+        const uint address = slot;
         if (address >= count) return false;
-        const uint2 stored = gReGIRTransportRIS[address];
+        const uint2 stored = gReGIRRIS[address];
         // This RTPT build never writes SDK compact-light payloads.
         lightIndex = stored.x & 0x7fffffffu;
         estimatorWeight = asfloat(stored.y);
     }
     else
     {
-        // Out-of-grid is a predeclared proposal fallback, independent of value.
-        lightIndex = min(uint(sampleNext1D(sg) * gReGIRTransportSettings.lightCount),
-            gReGIRTransportSettings.lightCount - 1u);
-        estimatorWeight = float(gReGIRTransportSettings.lightCount);
+        // A new cell has a complete list but no published RIS yet. Draw only
+        // from that list, including the complete procedural form under cache
+        // pressure; never draw an unordered/global candidate and reject it.
+        const uint threshold = (0u - view.count) % view.count;
+        uint random;
+        do { random = sg.next(); } while (random < threshold);
+        lightIndex = rtptReGIRLoadCandidate(view, random % view.count);
+        estimatorWeight = float(view.count);
     }
     if (!(estimatorWeight > 0.f) || !isfinite(estimatorWeight)) return false;
-    if (lightIndex >= gReGIRTransportSettings.lightCount) return false;
+    if (lightIndex >= gReGIRSettings.lightCount) return false;
     uint catalogCount, catalogStride;
     gReGIRTransportCatalog.GetDimensions(catalogCount, catalogStride);
     if (lightIndex >= catalogCount) return false;
     const RTPTDILightInfo light = gReGIRTransportCatalog[lightIndex];
-    if (light.generation != gReGIRTransportSettings.generation) return false;
+    if (light.generation != gReGIRSettings.generation) return false;
+    // The same receiver-local cutoff is used by DI Initial/reuse/final shade.
+    // Rejecting this sample is a counted zero event, never a resampling retry.
+    if (light.pad0 >= gReGIRSettings.stableIdCount) return false;
+    if (!rtptReGIRLightCanAffectCell(gReGIRLightDescriptors[light.pad0], sd.posW, float3(0.f))) return false;
     const float3 rayOrigin = sd.computeRayOrigin();
     if (light.kind == kRTPTDILightEmissive)
     {

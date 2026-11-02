@@ -196,8 +196,8 @@ uint rtptAnalyticLightCountForCoverage(uint coverage)
 {
 #if USE_ANALYTIC_LIGHTS
 #if RTPT_REGIR_TRANSPORT
-    if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRTransportSettings.active != 0u)
-        return gReGIRTransportSettings.uncoveredAnalyticCount;
+    if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRSettings.active != 0u)
+        return gReGIRSettings.uncoveredAnalyticCount;
 #endif
 #if RTPT_USE_RESTIR_DI
     if ((coverage & kRTPTDICoverPoint) != 0u) return gDISettings.uncoveredAnalyticCount;
@@ -331,7 +331,7 @@ bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGener
         const uint rank = min(uint(sampleNext1D(sg) * count), count - 1u);
         uint index = rank;
 #if RTPT_REGIR_TRANSPORT
-        if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRTransportSettings.active != 0u)
+        if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRSettings.active != 0u)
             index = gReGIRTransportUncoveredAnalyticIndices[rank];
         else
 #endif
@@ -430,6 +430,41 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGene
 }
 
 #if ENABLE_NRD
+#if RTPT_REGIR_TRANSPORT
+/** A freshly traced root can fail the primary-record bitwise ray guard. It
+    still belongs to the cell-only local-light model: construct/query its cell
+    and evaluate a counted world-space estimate, never the global light pool.
+    Return coverage even for a legitimate zero/empty cell to retain ownership.
+*/
+uint rtptEstimateReGIRRootDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg,
+    out float3 diffuse, out float3 specular)
+{
+    diffuse = specular = float3(0.f);
+    const uint coverage = gReGIRSettings.active != 0u ? gReGIRSettings.coverageMask : 0u;
+    if (coverage == 0u) return 0u;
+    RTPTLightSample light;
+    if (!rtptReGIRSampleTransportLight(sd, sg, light)) return coverage;
+    SceneRayQuery<true> query;
+    if (!query.traceVisibilityRay(light.visibilityRay)) return coverage;
+    const uint lobes = mi.getLobeTypes(sd);
+    if ((lobes & uint(LobeType::DiffuseReflection)) != 0u)
+    {
+        ShadingData component = sd;
+        component.mtl.setActiveLobes(uint(LobeType::DiffuseReflection));
+        diffuse = mi.eval(component, light.dir, sg) * light.LiOverPdf;
+        if (!all(isfinite(diffuse))) diffuse = 0.f;
+    }
+    if ((lobes & uint(LobeType::SpecularReflection)) != 0u)
+    {
+        ShadingData component = sd;
+        component.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
+        specular = mi.eval(component, light.dir, sg) * light.LiOverPdf;
+        if (!all(isfinite(specular))) specular = 0.f;
+    }
+    return coverage;
+}
+#endif
+
 /** Evaluate a previously sampled and visibility-tested light for one component.
     A diffuse continuation and a specular continuation are both generated, so
     each component competes with its own BSDF/guide continuation density.

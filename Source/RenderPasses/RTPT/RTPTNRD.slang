@@ -393,7 +393,8 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerato
         RTPTSamplingContext diffuseSampling = rtptBSDFSamplingContext();
         RTPTSamplingContext specularSampling = rtptBSDFSamplingContext();
         if (hasDiffuse) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
-        if (hasSpecular) specularSampling = rtptMakeSamplingContext(specularSD, mi);
+        // Keep primary specular NEE and continuation on the BSDF-only density.
+        // Later vertices build their own context and remain eligible for PG.
 
         uint rootCoverage = 0u;
 #if RTPT_USE_RESTIR_DI && RTPT_USE_PRIMARY_SURFACE
@@ -408,8 +409,15 @@ float3 rtptTraceNRD(Ray ray, uint2 pixel, uint sampleIndex, inout SampleGenerato
         }
 #endif
 
+#if RTPT_REGIR_TRANSPORT
+        // A rejected/missing primary record requires a fresh traced surface,
+        // not a global-light proposal. ReGIR retains the same local domain.
+        if (rootCoverage == 0u && gParams.useNEE != 0u && (hasDiffuse || hasSpecular))
+            rootCoverage = rtptEstimateReGIRRootDirect(sd, mi, sg, signals.diffuse, signals.specular);
+#endif
+
         RTPTLightSample ls;
-#if RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
         if (rootCoverage != 0u)
         {
             if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLightForCoverage(sd, rootCoverage, sg, ls))

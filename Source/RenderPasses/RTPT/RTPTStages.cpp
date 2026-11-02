@@ -16,9 +16,9 @@ uint64_t structuredStride(const ShaderVar& var)
 }
 }
 
-void RTPT::invalidateStages()
+void RTPT::invalidateStages(bool preserveReGIR)
 {
-    invalidateDirectLighting();
+    invalidateDirectLighting(preserveReGIR);
     // Release parameter blocks as well as our own references before reallocating.
     mpStageComputePass = mpPrimarySurfacePass = mpFinalSignalResolve = nullptr;
     mpPrimarySurfaces = mpSignalRecords = nullptr;
@@ -30,7 +30,7 @@ void RTPT::invalidateStages()
 
 bool RTPT::prepareStages()
 {
-    if (any(mStageResourceDim != mFrameDim)) invalidateStages();
+    if (any(mStageResourceDim != mFrameDim)) invalidateStages(mReGIREnabled);
     mStageResourceDim = mFrameDim;
     if (mStagePreparationFailed) return false;
     if (mStagesActive) return true;
@@ -50,7 +50,7 @@ bool RTPT::prepareStages()
         primaryDesc.addShaderModules(mpScene->getShaderModules());
         primaryDesc.addShaderLibrary("RenderPasses/RTPT/PrimarySurface/RTPTPrimarySurface.cs.slang").csEntry("main");
         primaryDesc.addTypeConformances(mpScene->getTypeConformances());
-        if (mEnableSHARC || mEnablePG)
+        if (mEnableSHARC || mEnablePG || mReGIREnabled)
         {
             primaryDesc.setShaderModel(ShaderModel::SM6_6);
             primaryDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});

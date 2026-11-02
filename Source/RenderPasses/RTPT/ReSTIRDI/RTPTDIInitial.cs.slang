@@ -1,8 +1,39 @@
-/** Global uniform or ReGIR Initial RIS using the installed SDK. */
+/** Global Initial when ReGIR is disabled; otherwise cell-only Initial RIS. */
 #include "Scene/SceneDefines.slangh"
 #define RTPT_DI_WRITE_RESERVOIRS 1
 #define RTPT_DI_WRITE_SAMPLE_RECORDS 1
 #include "RTPTDISDK.slangh"
+#if RTPT_REGIR_ENABLED
+#include "../ReGIR/RTPTReGIRCellLists.slang"
+
+uint rtptDIUniformCellRank(inout RAB_RandomSamplerState rng, uint count)
+{
+    const uint threshold = (0u - count) % count;
+    uint value;
+    do { value = rng.next(); } while (value < threshold);
+    return value % count;
+}
+
+RTXDI_Reservoir rtptDISampleCellCandidates(inout RAB_RandomSamplerState rng,
+    RAB_Surface surface, RTPTReGIRCellView view, out RAB_LightSample selectedSample)
+{
+    RTXDI_Reservoir reservoir = RTXDI_EmptyReservoir();
+    selectedSample = RAB_EmptyLightSample();
+    if (view.ready == 0u || view.count == 0u) return reservoir;
+    for (uint i = 0u; i < gDISettings.candidateCount; ++i)
+    {
+        const uint lightIndex = rtptReGIRLoadCandidate(view, rtptDIUniformCellRank(rng, view.count));
+        const float2 uv = float2(RAB_GetNextRandom(rng), RAB_GetNextRandom(rng));
+        const RAB_LightSample sample = RAB_SamplePolymorphicLight(RAB_LoadLightInfo(lightIndex, false), surface, uv);
+        const float target = RAB_GetLightSampleTargetPdfForSurface(sample, surface);
+        if (RTXDI_StreamSample(reservoir, lightIndex, uv, RAB_GetNextRandom(rng), target, float(view.count)))
+            selectedSample = sample;
+    }
+    RTXDI_FinalizeResampling(reservoir, 1.f, float(gDISettings.candidateCount));
+    reservoir.M = 1.f;
+    return reservoir;
+}
+#endif
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
@@ -27,17 +58,27 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             RAB_RandomSamplerState rng = RAB_InitRandomSampler(pixel, 2u);
             RAB_RandomSamplerState coherentRng = RAB_InitRandomSampler(pixel / 16u, 3u);
             const RTXDI_SampleParameters samples = RTXDI_InitSampleParameters(
-#if RTPT_REGIR_ENABLED
-                // SDK 1.3's Grid query computes numSamples but the inner loop
-                // actually uses numLocalLightSamples. Tie both positive counts;
-                // the shared numMisSamples normalization then matches the loop.
-                gDISettings.candidateCount, gDISettings.candidateCount, 0u, 0u, 0u);
-#else
                 0u, gDISettings.candidateCount, 0u, 0u, 0u);
-#endif
             RAB_LightSample selectedSample;
+#if RTPT_REGIR_ENABLED
+            const float3 jitter = float3(RAB_GetNextRandom(rng), RAB_GetNextRandom(rng), RAB_GetNextRandom(rng));
+            const RTPTReGIRCellView view = rtptReGIRGetCellView(surface.sd.posW, jitter);
+            bool currentRIS = false;
+            // Falcor's shader settings do not guarantee short-circuit loads.
+            if (view.ready != 0u && view.cell != kRTPTReGIRInvalidCell)
+                currentRIS = gReGIRCellRISFrame[view.cell] == gReGIRSettings.frameStamp;
+            if (currentRIS)
+                reservoir = RTXDI_SampleLocalLightsInternal(rng, surface, samples,
+                    rtptDIInitialRuntimeParameters(), true, view.cell * gReGIRSettings.lightsPerCell,
+                    gReGIRSettings.lightsPerCell, selectedSample);
+            else
+                // First use establishes a complete cell list before drawing a
+                // local rank. No unordered/global-light proposal is available.
+                reservoir = rtptDISampleCellCandidates(rng, surface, view, selectedSample);
+#else
             reservoir = RTXDI_SampleLightsForSurface(rng, coherentRng, surface,
                 samples, rtptDIInitialRuntimeParameters(), selectedSample);
+#endif
             // The high-level SDK function already finalized and set M=1.
             // Do not normalize again or reinterpret streaming weightSum here.
 #if RTPT_DI_REUSE_ENABLED

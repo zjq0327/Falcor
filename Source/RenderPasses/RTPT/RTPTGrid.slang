@@ -14,15 +14,31 @@ uint rtptGridHash32(uint value)
 uint rtptGridKeyHash(uint2 key) { return rtptGridHash32(key.x) ^ rtptGridHash32(key.y); }
 uint64_t rtptGridPackKey(uint2 key) { return uint64_t(key.x) | (uint64_t(key.y) << 32u); }
 
+uint rtptGridLevel(float3 position, float3 cameraPosition)
+{
+    const float3 offset = cameraPosition - (position + float3(1e-4f));
+    return uint(clamp(0.5f * log2(max(dot(offset, offset), 1e-10f)), 1.f, 511.f));
+}
+
+float rtptGridVoxelSize(uint level, float sceneScale)
+{
+    return exp2(float(level)) * rcp(max(sceneScale, 1e-20f));
+}
+
+int3 rtptGridPosition(float3 position, float3 cameraPosition, float sceneScale, out uint level, out float voxelSize)
+{
+    level = rtptGridLevel(position, cameraPosition);
+    voxelSize = rtptGridVoxelSize(level, sceneScale);
+    return int3(floor((position + float3(1e-4f)) * rcp(voxelSize)));
+}
+
 uint2 rtptGridKey(float3 position, float3 normal, float3 cameraPosition, float sceneScale, uint coarseLevels)
 {
     const float3 biasedPosition = position + float3(1e-4f);
-    const float3 offset = cameraPosition - biasedPosition;
-    const float distanceSquared = max(dot(offset, offset), 1e-10f);
-    uint level = uint(clamp(0.5f * log2(distanceSquared), 1.f, 511.f));
+    uint level = rtptGridLevel(position, cameraPosition);
     level = min(511u, level + min(coarseLevels, 510u));
-    const float voxelSize = exp2(float(level)) / max(sceneScale, 1e-20f);
-    const uint3 cell = uint3(int3(floor(biasedPosition / voxelSize)));
+    const float voxelSize = rtptGridVoxelSize(level, sceneScale);
+    const uint3 cell = uint3(int3(floor(biasedPosition * rcp(voxelSize))));
     uint64_t key = uint64_t(cell.x & 0x1ffffu) |
         (uint64_t(cell.y & 0x1ffffu) << 17u) |
         (uint64_t(cell.z & 0x1ffffu) << 34u) |

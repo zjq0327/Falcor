@@ -35,7 +35,7 @@ if not exist "%RTPT_SCENE%" (
     exit /b 1
 )
 
-"%RTPT_EXE%" --device-type d3d12 --script "%RTPT_SCRIPT%" --scene "%RTPT_SCENE%"
+"%RTPT_EXE%" --device-type d3d12 --width 1280 --height 720 --script "%RTPT_SCRIPT%" --scene "%RTPT_SCENE%"
 set "RTPT_EXIT_CODE=%ERRORLEVEL%"
 popd
 if not "%RTPT_EXIT_CODE%"=="0" pause
