@@ -82,11 +82,13 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
             float hitMIS = 1.f;
 #if USE_ENV_LIGHT
             environment = gScene.envMap.eval(ray.dir);
+#if !RTPT_REGIR_ONLY
             if (previousUsedNEE && !previousDelta)
 #if RTPT_REGIR_TRANSPORT
                 hitMIS = rtptPowerHeuristic(previousPdf, rtptEnvironmentLightPdfForCoverage(ray.dir, previousReGIRCoverage));
 #else
                 hitMIS = rtptPowerHeuristic(previousPdf, rtptEnvironmentLightPdf(ray.dir));
+#endif
 #endif
 #endif
             if (!all(isfinite(environment))) { valid = false; break; }
@@ -118,12 +120,16 @@ void rtptSparseTrace(Ray ray, inout SampleGenerator sg, uint path, uint ownerPix
         emission = properties.emission;
         if (sd.frontFacing && gScene.materials.hasLightProfile(materialID))
             emission *= gScene.materials.evalLightProfile(dot(sd.faceN, sd.V));
+#if RTPT_REGIR_ONLY
+        if (!previousDelta && rtptDICoversEmissiveHit(triangleHit, previousReGIRCoverage)) hitMIS = 0.f;
+#else
         if (previousUsedNEE && !previousDelta)
 #if RTPT_REGIR_TRANSPORT
             hitMIS = rtptDICoversEmissiveHit(triangleHit, previousReGIRCoverage) ? 0.f :
                 rtptPowerHeuristic(previousPdf, rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, previousReGIRCoverage));
 #else
             hitMIS = rtptPowerHeuristic(previousPdf, rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd));
+#endif
 #endif
 #endif
         if (!all(isfinite(emission))) { valid = false; break; }

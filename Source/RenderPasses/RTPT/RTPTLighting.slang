@@ -5,6 +5,9 @@
 #ifndef RTPT_USE_RESTIR_DI
 #define RTPT_USE_RESTIR_DI 0
 #endif
+#ifndef RTPT_REGIR_ONLY
+#define RTPT_REGIR_ONLY 0
+#endif
 
 // All directional PDFs in this file are measured in solid angle. LiOverPdf
 // includes both the light category probability and the sampler's own PDF.
@@ -356,43 +359,9 @@ bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGener
         all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
 }
 
-#if RTPT_REGIR_TRANSPORT
-float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg, bool training)
-#else
-float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg)
-#endif
+float3 rtptEstimateDirectSample(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling,
+    inout SampleGenerator sg, out RTPTLightSample ls)
 {
-#if RTPT_REGIR_TRANSPORT
-    const uint coverage = rtptReGIRTransportCoverage(training);
-    if (coverage != 0u)
-    {
-        float3 contribution = 0.f;
-        RTPTLightSample local;
-        if (rtptReGIRSampleTransportLight(sd, sg, local))
-        {
-            const float3 value = mi.eval(sd, local.dir, sg) * local.LiOverPdf;
-            SceneRayQuery<true> query;
-            if (all(isfinite(value)) && any(value > 0.f) && query.traceVisibilityRay(local.visibilityRay)) contribution += value;
-        }
-        // The remaining categories retain their actual BSDF/PG MIS density.
-        RTPTLightSample remaining;
-        if (rtptSampleLightForCoverage(sd, coverage, sg, remaining))
-        {
-            float misWeight = 1.f;
-            if (!remaining.analytic)
-            {
-                const float continuationPdf = rtptContinuationPdf(sd, mi, sampling, remaining.dir);
-                if (!isfinite(continuationPdf)) return contribution;
-                misWeight = rtptPowerHeuristic(remaining.pdf, continuationPdf);
-            }
-            const float3 value = mi.eval(sd, remaining.dir, sg) * remaining.LiOverPdf * misWeight;
-            SceneRayQuery<true> query;
-            if (all(isfinite(value)) && any(value > 0.f) && query.traceVisibilityRay(remaining.visibilityRay)) contribution += value;
-        }
-        return contribution;
-    }
-#endif
-    RTPTLightSample ls;
     if (!rtptSampleLight(sd, sg, ls)) return float3(0.f);
 
     // Falcor's analytic lights have no intersectable geometry, hence no
@@ -410,6 +379,65 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingCont
     if (!all(isfinite(contribution)) || !any(contribution > 0.f)) return float3(0.f);
     SceneRayQuery<true> query;
     return query.traceVisibilityRay(ls.visibilityRay) ? contribution : float3(0.f);
+}
+
+#if RTPT_REGIR_TRANSPORT
+float3 rtptEstimateReGIRDirectSample(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg,
+    out RTPTLightSample lightSample, out uint stableID, out float2 uv, out float estimatorWeight)
+{
+    if (!rtptReGIRSampleTransportLight(sd, sg, lightSample, stableID, uv, estimatorWeight)) return float3(0.f);
+    const float3 value = mi.eval(sd, lightSample.dir, sg) * lightSample.LiOverPdf;
+    if (!all(isfinite(value)) || !any(value > 0.f)) return float3(0.f);
+    SceneRayQuery<true> query;
+    return query.traceVisibilityRay(lightSample.visibilityRay) ? value : float3(0.f);
+}
+
+float3 rtptEstimateReGIRDirectSample(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg,
+    out RTPTLightSample lightSample)
+{
+    uint unusedID;
+    float2 unusedUV;
+    float unusedWeight;
+    return rtptEstimateReGIRDirectSample(sd, mi, sg, lightSample, unusedID, unusedUV, unusedWeight);
+}
+
+float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg, bool training)
+#else
+float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg)
+#endif
+{
+#if RTPT_REGIR_TRANSPORT
+    const uint coverage = rtptReGIRTransportCoverage(training);
+    if (coverage != 0u)
+    {
+        RTPTLightSample local;
+        float3 contribution = rtptEstimateReGIRDirectSample(sd, mi, sg, local);
+#if !RTPT_REGIR_ONLY
+        // The remaining categories retain their actual BSDF/PG MIS density.
+        RTPTLightSample remaining;
+        if (rtptSampleLightForCoverage(sd, coverage, sg, remaining))
+        {
+            float misWeight = 1.f;
+            if (!remaining.analytic)
+            {
+                const float continuationPdf = rtptContinuationPdf(sd, mi, sampling, remaining.dir);
+                if (!isfinite(continuationPdf)) return contribution;
+                misWeight = rtptPowerHeuristic(remaining.pdf, continuationPdf);
+            }
+            const float3 value = mi.eval(sd, remaining.dir, sg) * remaining.LiOverPdf * misWeight;
+            SceneRayQuery<true> query;
+            if (all(isfinite(value)) && any(value > 0.f) && query.traceVisibilityRay(remaining.visibilityRay)) contribution += value;
+        }
+#endif
+        return contribution;
+    }
+#endif
+#if RTPT_REGIR_ONLY
+    return float3(0.f);
+#else
+    RTPTLightSample ls;
+    return rtptEstimateDirectSample(sd, mi, sampling, sg, ls);
+#endif
 }
 
 #if RTPT_REGIR_TRANSPORT
@@ -431,6 +459,11 @@ float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGene
 
 #if ENABLE_NRD
 #if RTPT_REGIR_TRANSPORT
+uint rtptReGIRRootCoverage()
+{
+    return gParams.useNEE != 0u && gReGIRSettings.active != 0u ? gReGIRSettings.coverageMask : 0u;
+}
+
 /** A freshly traced root can fail the primary-record bitwise ray guard. It
     still belongs to the cell-only local-light model: construct/query its cell
     and evaluate a counted world-space estimate, never the global light pool.
@@ -440,7 +473,7 @@ uint rtptEstimateReGIRRootDirect(ShadingData sd, IMaterialInstance mi, inout Sam
     out float3 diffuse, out float3 specular)
 {
     diffuse = specular = float3(0.f);
-    const uint coverage = gReGIRSettings.active != 0u ? gReGIRSettings.coverageMask : 0u;
+    const uint coverage = rtptReGIRRootCoverage();
     if (coverage == 0u) return 0u;
     RTPTLightSample light;
     if (!rtptReGIRSampleTransportLight(sd, sg, light)) return coverage;

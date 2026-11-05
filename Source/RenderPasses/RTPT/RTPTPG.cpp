@@ -171,6 +171,7 @@ void Manager::allocateModel(RenderContext* pContext)
 void Manager::reset(RenderContext* pContext)
 {
     pContext->submit(true);
+    ++mReadSnapshotVersion;
     ++mSceneGeneration;
     if (!mSceneGeneration) ++mSceneGeneration;
     mRecordGeneration = 1;
@@ -668,7 +669,11 @@ bool Manager::publish(RenderContext* pContext)
     const auto finalizeStart = std::chrono::steady_clock::now();
     pContext->clearUAV(mpRequests->getUAV().get(), uint4(0));
     pContext->uavBarrier(mpRequests.get());
-    if (changed) ++mStatistics.publications;
+    if (changed)
+    {
+        ++mReadSnapshotVersion;
+        ++mStatistics.publications;
+    }
     mStatistics.lastUploadMs += elapsedMs(finalizeStart);
     return changed;
 }

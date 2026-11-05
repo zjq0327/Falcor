@@ -162,6 +162,10 @@ interface IMaterialInstance
     */
     float evalPdf(const ShadingData sd, const float3 wo, bool useImportanceSampling = true);
 
+    /** Evaluate one selected continuous reflection lobe and its joint sampling density. */
+    bool evalReflectionLobe<S : ISampleGenerator>(const ShadingData sd, const float3 wo, const uint lobeType,
+        inout S sg, out float3 value, out float jointPdf);
+
     /** Return BSDF properties.
         \param[in] sd Shading data.
         \return A struct with properties.
@@ -189,6 +193,14 @@ interface IMaterialInstance
 [open]
 struct MaterialInstanceBase
 {
+    bool evalReflectionLobe<S : ISampleGenerator>(const ShadingData sd, const float3 wo, const uint lobeType,
+        inout S sg, out float3 value, out float jointPdf)
+    {
+        value = 0.f;
+        jointPdf = 0.f;
+        return false;
+    }
+
     bool hasVolumeProperties()
     {
         return false;

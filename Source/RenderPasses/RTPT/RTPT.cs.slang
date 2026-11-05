@@ -5,6 +5,15 @@
 #ifndef RTPT_USE_RESTIR_DI
 #define RTPT_USE_RESTIR_DI 0
 #endif
+#ifndef RTPT_USE_GRIS
+#define RTPT_USE_GRIS 0
+#endif
+#ifndef RTPT_GRIS_GENERATE
+#define RTPT_GRIS_GENERATE 0
+#endif
+#ifndef RTPT_GRIS_SPATIAL
+#define RTPT_GRIS_SPATIAL 0
+#endif
 #include "Scene/SceneDefines.slangh"
 #include "Utils/Math/MathConstants.slangh"
 
@@ -83,6 +92,13 @@ RWTexture2D<float4> gNRDMotionW;
 #include "RTPTNRD.slang"
 #endif
 
+#if RTPT_GRIS_GENERATE
+#include "GRIS/RTPTGRISGenerate.slang"
+#elif defined(RTPT_GRIS_TEMPORAL_PASS)
+#include "GRIS/RTPTGRISTemporal.slang"
+#elif defined(RTPT_GRIS_SPATIAL_PASS)
+#include "GRIS/RTPTGRISSpatial.slang"
+#else
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
@@ -91,6 +107,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     float3 frameAverage = 0.f;
     RTPTSharcStats sharcStats = {};
+#if ENABLE_SHARC && SHARC_QUERY && RTPT_USE_GRIS
+    const float3 generateStats = gSharcStats[pixel].xyz;
+    sharcStats.cacheTerminations = uint(generateStats.x);
+    sharcStats.radianceRays = uint(generateStats.y);
+    sharcStats.attemptedQueries = uint(generateStats.z);
+#endif
     for (uint s = 0; s < gParams.samplesPerPixel; ++s)
     {
         // Offset the absolute sample index by an odd seed stride. Unlike XOR,
@@ -98,12 +120,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         // The stream remains independent of how samples are grouped into frames.
         const uint sampleIndex = gParams.sampleOffset + s + gParams.seed * 0x9e3779b9u;
         SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
-        const Ray primaryRay = rtptGenerateCameraRay(pixel, sg);
 #if ENABLE_NRD
         // NRD mode uses one shared primary sample and one continuation per
         // reflection component. The host enforces 1 spp without PT accumulation.
-        const float3 sampleRadiance = rtptTraceNRD(primaryRay, pixel, sampleIndex, sg, sharcStats);
+        const float3 sampleRadiance = rtptTraceNRD(pixel, sampleIndex, sg, sharcStats);
 #else
+        const Ray primaryRay = rtptGenerateCameraRay(pixel, sg);
         const float3 sampleRadiance = rtptTracePath(primaryRay, pixel, sampleIndex, s == 0u, sg, sharcStats);
 #endif
         frameAverage += (sampleRadiance - frameAverage) / float(s + 1);
@@ -125,3 +147,4 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     gColor[pixel] = float4(result, 1.f);
 #endif
 }
+#endif

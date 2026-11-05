@@ -66,6 +66,9 @@ void RTPT::setProperties(const Properties& props)
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
     bool enableNRD = mEnableNRD;
+    bool grisEnabled = mGRISEnabled;
+    bool grisSpatialEnabled = mGRISSpatialEnabled;
+    bool grisTemporalEnabled = mGRISTemporalEnabled;
     bool restirDIEnabled = mRestirDIEnabled;
     bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
     bool regirLightCullingEnabled = mReGIRCullingEnabled;
@@ -98,6 +101,9 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "accumulate") accumulate = value;
         else if (key == "maxAccumulationFrames") maxAccumulationFrames = value;
         else if (key == "enableNRD") enableNRD = value;
+        else if (key == "grisEnabled") grisEnabled = value;
+        else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
+        else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
         else if (key == "restirDIEnabled") restirDIEnabled = value;
         else if (key == "regirEnabled") regirEnabled = value;
         else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
@@ -206,7 +212,7 @@ void RTPT::setProperties(const Properties& props)
         regirBudgetMB != mReGIRBudgetMB || regirCellSize != mReGIRCellSize || regirSamplingJitter != mReGIRSamplingJitter ||
         regirLightCullingEnabled != mReGIRCullingEnabled || regirCoarsenCellDistance != mReGIRCoarsenCellDistance ||
         regirBrightnessThreshold != mReGIRBrightnessThreshold;
-    const bool regirCompileChanged = regirEnabled != mReGIREnabled;
+    const bool regirCompileChanged = regirEnabled != mReGIREnabled || (regirEnabled && restirDIEnabled != mRestirDIEnabled);
     const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enablePG != mEnablePG || regirCompileChanged;
     const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
         restirDIBudgetMB != mRestirDIBudgetMB || restirDITemporalEnabled != mRestirDITemporalEnabled ||
@@ -224,6 +230,8 @@ void RTPT::setProperties(const Properties& props)
     const bool sharcSignalChanged = sharcStructureChanged || sharcUseCache != mSHARCUseCache ||
         sharcUpdateStride != mSHARCUpdateStride || sharcMinBounce != mSHARCMinBounce || sharcMinRoughness != mSHARCMinRoughness ||
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
+    const bool sharcQuery = enableSHARC && sharcEnabled && sharcUseCache;
+    const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
         maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged || regirChanged;
@@ -245,6 +253,15 @@ void RTPT::setProperties(const Properties& props)
     mAccumulate = accumulate;
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
+    if (grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
+        grisTemporalEnabled != mGRISTemporalEnabled || (grisEnabled && grisSharcReuseChanged))
+    {
+        mGRISEnabled = grisEnabled;
+        mGRISSpatialEnabled = grisSpatialEnabled;
+        mGRISTemporalEnabled = grisTemporalEnabled;
+        mOptionsChanged = true;
+        invalidateGRIS();
+    }
     mRestirDIEnabled = restirDIEnabled;
     mRestirDICandidateCount = restirDICandidateCount;
     mRestirDIBudgetMB = restirDIBudgetMB;
@@ -266,8 +283,8 @@ void RTPT::setProperties(const Properties& props)
     mReGIRCoarsenCellDistance = regirCoarsenCellDistance;
     mReGIRBrightnessThreshold = regirBrightnessThreshold;
     if (diChanged || diEligibilityChanged || regirChanged) invalidateDirectLighting();
-    mResetPG |= regirChanged;
-    mResetSHARCCache |= regirChanged;
+    mResetPG |= regirChanged || regirCompileChanged;
+    mResetSHARCCache |= regirChanged || regirCompileChanged;
     mEnableSHARC = enableSHARC;
     mSHARCEnabled = sharcEnabled;
     mSHARCUseCache = sharcUseCache;
@@ -315,6 +332,9 @@ Properties RTPT::getProperties() const
     props["accumulate"] = mAccumulate;
     props["maxAccumulationFrames"] = mMaxAccumulationFrames;
     props["enableNRD"] = mEnableNRD;
+    props["grisEnabled"] = mGRISEnabled;
+    props["grisSpatialEnabled"] = mGRISSpatialEnabled;
+    props["grisTemporalEnabled"] = mGRISTemporalEnabled;
     props["restirDIEnabled"] = mRestirDIEnabled;
     props["regirEnabled"] = mReGIREnabled;
     props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
@@ -421,6 +441,7 @@ Properties RTPT::getPGStatistics() const
     props["actualStride"] = mpPG->getRecordStride();
     props["pathCapacity"] = mpPG->getPathCapacity();
     props["generation"] = mpPG->getGeneration();
+    props["snapshotVersion"] = mpPG->getReadSnapshotVersion();
     props["sharedTraining"] = mSharedTrainingThisFrame;
     for (uint32_t i = 0; i < s.diagnostics.size(); ++i)
         props["diagnostic" + std::to_string(i)] = s.diagnostics[i];
@@ -453,6 +474,7 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
 
 void RTPT::reset()
 {
+    invalidateGRISHistory();
     mSampleOffset = 0;
     mAccumulatedSamples = 0;
     mAccumulatedFrames = 0;
@@ -471,8 +493,9 @@ void RTPT::validateScene() const
     {
         const auto& material = materials.getMaterial(MaterialID(i));
         const auto* standard = dynamic_cast<const StandardMaterial*>(material.get());
-        FALCOR_CHECK(standard && standard->getSpecularTransmission() == 0.f && standard->getDiffuseTransmission() == 0.f,
-            "RTPT currently supports opaque/alpha-tested StandardMaterial surfaces with reflection only (material '{}').",
+        const bool grisDiffuse = mGRISEnabled && material->getType() == MaterialType::PBRTDiffuse;
+        FALCOR_CHECK(grisDiffuse || (standard && standard->getSpecularTransmission() == 0.f && standard->getDiffuseTransmission() == 0.f),
+            "RTPT supports reflection-only StandardMaterial surfaces and PBRTDiffuse surfaces in GRIS scenes (material '{}').",
             material->getName());
     }
 }
@@ -552,7 +575,11 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
         defines.add("ENABLE_PG", mEnablePG ? "1" : "0");
-        if (mReGIREnabled) defines.add("RTPT_REGIR_TRANSPORT", "1");
+        if (mReGIREnabled)
+        {
+            defines.add("RTPT_REGIR_TRANSPORT", "1");
+            if (!mRestirDIEnabled) defines.add("RTPT_REGIR_ONLY", "1");
+        }
         if (mEnableSHARC || mEnablePG || mReGIREnabled)
         {
             desc.setShaderModel(ShaderModel::SM6_6);
@@ -670,7 +697,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     auto var = mpSparseUpdate->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
     mpSampleGenerator->bindShaderData(var);
-    if (mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
+    if (mpEnvMapSampler && var.hasMember("gEnvMapSampler")) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
     auto params = var["gParams"];
     params["frameDim"] = mFrameDim;
     params["samplesPerPixel"] = 1u;
@@ -733,7 +760,9 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
             // alive while rebuilding PG. Structural or explicit resets retain
             // the existing full-reset behavior.
             mPGTranslationPreservedNRDThisFrame = preserveNRDHistoryOnPGReset && !rebuilt && !mResetNRDHistory;
+            // A PG reset invalidates GRIS history even when NRD history is kept.
             if (rebuilt || !preserveNRDHistoryOnPGReset) reset();
+            else invalidateGRISHistory();
         }
         pg &= mpPG->getPathCapacity() > 0;
         if (pg)
@@ -835,6 +864,10 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // conservatively discards them when lighting, materials or geometry change.
     const auto sharcInvalidations = discontinuities & ~IScene::UpdateFlags::CameraSwitched;
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
+    const auto cameraUpdates = IScene::UpdateFlags::CameraMoved | IScene::UpdateFlags::CameraPropertiesChanged;
+    if (mGRISTemporalEnabled && ((updates & ~cameraUpdates) != IScene::UpdateFlags::None ||
+        is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum)))
+        invalidateGRISHistory();
     // Previous hit/material reconstruction and temporal visibility use the
     // current scene only while its physical state is unchanged. Camera motion
     // is handled by reprojection, independently of PG/NRD history resets.
@@ -904,6 +937,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     {
         if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mResetPG && !preserveNRDHistoryOnPGReset))
             mResetNRDHistory = true;
+        // Complete SHaRC resolve before GRIS and MainRender query the current frame's cache.
         executeTraining(pRenderContext, preserveNRDHistoryOnPGReset);
     }
     if (mSampleOffset > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel ||
@@ -920,22 +954,15 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (stagesActive) executePrimarySurface(pRenderContext);
     const bool diActive = mReGIREnabled ? (earlyDIPrepared && mRestirDIEnabled) : prepareDirectLighting();
     if (diActive) executeDirectLighting(pRenderContext);
-    const auto& mainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
+    const auto& baseMainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
+    const bool grisActive = prepareGRIS(baseMainPass, diActive);
+    if (grisActive) executeGRIS(pRenderContext, renderData, diActive);
+    const auto& mainPass = grisActive ? mpGRISMainPass : baseMainPass;
     auto var = mainPass->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
     mpSampleGenerator->bindShaderData(var);
-    if (mpEnvMapSampler) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
-    auto params = var["gParams"];
-    params["frameDim"] = frameDim;
-    params["samplesPerPixel"] = mSamplesPerPixel;
-    params["maxBounces"] = mMaxBounces;
-    params["rrStartBounce"] = mRRStartBounce;
-    params["seed"] = mSeed;
-    params["sampleOffset"] = mSampleOffset;
-    params["accumulatedSamples"] = mAccumulate ? mAccumulatedSamples : 0u;
-    params["useNEE"] = mUseNEE ? 1u : 0u;
-    params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
-    params["accumulate"] = mAccumulate ? 1u : 0u;
+    if (mpEnvMapSampler && var.hasMember("gEnvMapSampler")) mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
+    bindMainParams(var);
     // In NRD mode the separate resolve owns all radiance/guide outputs. The
     // legacy pass still writes them directly when stage preparation fails.
     if (!stagesActive || !mEnableNRD)

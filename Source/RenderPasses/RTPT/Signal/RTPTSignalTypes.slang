@@ -11,6 +11,7 @@ static const uint kRTPTDistanceSampleRejected = 1u;
 static const uint kRTPTDistanceHit = 2u;
 static const uint kRTPTDistanceMiss = 3u;
 static const uint kRTPTDistanceUntraced = 4u;
+static const uint kRTPTDistanceNotSelected = 5u;
 
 struct RTPTNRDSignals
 {

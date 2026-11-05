@@ -239,6 +239,30 @@ struct StandardBSDF : IBSDF, IDifferentiable
         return result;
     }
 
+    // Match the numerator and joint PDF of sample() for one continuous reflection lobe.
+    // evalPdf() remains the directional marginal used by ordinary light MIS.
+    bool evalReflectionLobe<S : ISampleGenerator>(const float3 wi, const float3 wo, const uint lobeType,
+        inout S sg, BSDFContext bc, out float3 value, out float jointPdf)
+    {
+        value = 0.f;
+        jointPdf = 0.f;
+        if (lobeType == uint(LobeType::DiffuseReflection) && pDiffuseReflection > 0.f)
+        {
+            jointPdf = pDiffuseReflection * diffuseReflection.evalPdf(wi, wo, bc);
+            if (!(jointPdf > 0.f)) return false;
+            value = (1.f - specTrans) * (1.f - diffTrans) * diffuseReflection.eval(wi, wo, sg, bc);
+            return true;
+        }
+        if (lobeType == uint(LobeType::SpecularReflection) && pSpecularReflection > 0.f)
+        {
+            jointPdf = pSpecularReflection * specularReflection.evalPdf(wi, wo, bc);
+            if (!(jointPdf > 0.f)) return false;
+            value = (1.f - specTrans) * specularReflection.eval(wi, wo, sg, bc);
+            return true;
+        }
+        return false;
+    }
+
     bool sample<S : ISampleGenerator>(
         const float3 wi,
         out float3 wo,

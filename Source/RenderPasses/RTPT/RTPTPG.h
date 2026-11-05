@@ -104,6 +104,7 @@ public:
     uint32_t getRecordStride() const { return mRecordStride; }
     uint32_t getPathCapacity() const { return mPathCapacity; }
     uint32_t getGeneration() const { return mSceneGeneration; }
+    uint64_t getReadSnapshotVersion() const { return mReadSnapshotVersion; }
 
 private:
     struct Node
@@ -181,6 +182,7 @@ private:
     uint32_t mVerticesPerPath = 0;
     uint32_t mRecordStride = 1;
     uint32_t mSceneGeneration = 1;
+    uint64_t mReadSnapshotVersion = 0;
     uint32_t mRecordGeneration = 1;
     uint32_t mFramesSincePoll = 0;
 };

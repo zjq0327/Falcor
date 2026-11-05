@@ -128,6 +128,18 @@ struct PBRTDiffuseMaterialInstance : MaterialInstanceBase, IMaterialInstance
         return bsdf.evalPdf(wiLocal, woLocal, BSDFContext());
     }
 
+    bool evalReflectionLobe<S : ISampleGenerator>(const ShadingData sd, const float3 wo, const uint lobeType,
+        inout S sg, out float3 value, out float jointPdf)
+    {
+        value = 0.f;
+        jointPdf = 0.f;
+        if (lobeType != uint(LobeType::DiffuseReflection)) return false;
+        jointPdf = evalPdf(sd, wo);
+        if (!(jointPdf > 0.f)) return false;
+        value = eval(sd, wo, sg);
+        return true;
+    }
+
     BSDFProperties getProperties(const ShadingData sd)
     {
         BSDFProperties p = {};

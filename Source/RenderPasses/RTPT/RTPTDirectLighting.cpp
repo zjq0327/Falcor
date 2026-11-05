@@ -77,7 +77,7 @@ bool RTPT::prepareDirectLighting()
         mDIFallbackReason = "Initial DI requires NRD input mode and one sample per pixel";
         return false;
     }
-    if (!mUseNEE)
+    if (!mUseNEE && (mRestirDIEnabled || !mReGIREnabled))
     {
         resetDIHistory("Next-event estimation disabled");
         mDIFallbackReason = "Next-event estimation is disabled";

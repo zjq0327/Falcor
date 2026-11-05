@@ -127,6 +127,19 @@ struct StandardMaterialInstance : MaterialInstanceBase, IMaterialInstance
         }
     }
 
+    bool evalReflectionLobe<S : ISampleGenerator>(const ShadingData sd, const float3 wo, const uint lobeType,
+        inout S sg, out float3 value, out float jointPdf)
+    {
+        value = 0.f;
+        jointPdf = 0.f;
+        const float3 wiLocal = sf.toLocal(sd.V);
+        const float3 woLocal = sf.toLocal(wo);
+        if (!isValidHemisphereReflectionOrTransmission(sd, sf, wiLocal, woLocal, wo)) return false;
+
+        const StandardBSDF bsdf = StandardBSDF(wiLocal, sd.mtl, data);
+        return bsdf.evalReflectionLobe(wiLocal, woLocal, lobeType, sg, BSDFContext(), value, jointPdf);
+    }
+
     BSDFProperties getProperties(const ShadingData sd)
     {
         BSDFProperties p = {};

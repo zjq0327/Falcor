@@ -45,6 +45,9 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     if (!mReGIREnabled) return false;
     FALCOR_CHECK(!mReGIRPreparationFailed, "ReGIR cell-only resources are unavailable: {}", mReGIRFallbackReason);
     FALCOR_CHECK(mDIPrepared && mpDILightCatalog, "ReGIR cell-only sampling requires a prepared light catalogue.");
+    FALCOR_CHECK(mRestirDIEnabled || !mUseNEE || mDIUncoveredAnalyticCount == 0u,
+        "ReGIR-only light sampling supports emissive triangles and point lights. The scene contains {} unsupported analytic lights.",
+        mDIUncoveredAnalyticCount);
 
     const uint64_t budgetBytes = uint64_t(mReGIRBudgetMB) << 20u;
     const uint64_t requestedCells = uint64_t(mReGIRGridSize) * mReGIRGridSize * mReGIRGridSize;
@@ -292,8 +295,8 @@ Properties RTPT::getReGIRStatistics() const
     props["lightsPerCell"] = mReGIRLightsPerCell;
     props["gridSize"] = mReGIRGridSize;
     props["gridCenter"] = mpScene ? mpScene->getCamera()->getPosition() : float3(0.f);
-    props["secondaryActive"] = mReGIRActive && mReGIRSecondaryEnabled;
-    props["trainingActive"] = mReGIRActive && mReGIRTrainingEnabled &&
+    props["secondaryActive"] = mReGIRActive && mUseNEE && mReGIRSecondaryEnabled;
+    props["trainingActive"] = mReGIRActive && mUseNEE && mReGIRTrainingEnabled &&
         ((mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled) || (mEnableSHARC && mSHARCEnabled && !mSHARCFreeze));
     props["fallbackReason"] = mReGIRFallbackReason;
     if (mpReGIRState)

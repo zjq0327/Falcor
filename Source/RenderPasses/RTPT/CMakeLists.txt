@@ -30,6 +30,16 @@ target_sources(RTPT PRIVATE
     RTPTIntegrator.slang
     RTPTLighting.slang
     RTPTNRD.slang
+    GRIS/RTPTGRISGenerate.cs.slang
+    GRIS/RTPTGRISGenerate.slang
+    GRIS/RTPTGRISShade.cs.slang
+    GRIS/RTPTGRISSpatial.cs.slang
+    GRIS/RTPTGRISSpatial.slang
+    GRIS/RTPTGRISTemporal.cs.slang
+    GRIS/RTPTGRISTemporal.slang
+    GRIS/RTPTGRISSupport.slang
+    GRIS/RTPTGRISTypes.slang
+    GRIS/RTPTGRISTerminalPicker.slang
     PrimarySurface/RTPTCamera.slang
     PrimarySurface/RTPTPrimarySurfaceTypes.slang
     PrimarySurface/RTPTPrimarySurface.slang

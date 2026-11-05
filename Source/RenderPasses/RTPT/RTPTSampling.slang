@@ -51,14 +51,25 @@ RTPTSamplingContext rtptMakeSamplingContext(ShadingData sd, IMaterialInstance mi
     return result;
 }
 
-float rtptContinuationPdf(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext context, float3 direction)
+float rtptContinuationPdf(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext context, float3 direction,
+    out float bsdfPdf, out float guidePdf)
 {
-    const float bsdfPdf = mi.evalPdf(sd, direction);
+    bsdfPdf = mi.evalPdf(sd, direction);
+    guidePdf = 0.f;
 #if ENABLE_PG
     if (context.alpha > 0.f)
-        return (1.f - context.alpha) * bsdfPdf + context.alpha * rtptPGGuidePdf(context.guide, direction);
+    {
+        guidePdf = rtptPGGuidePdf(context.guide, direction);
+        return (1.f - context.alpha) * bsdfPdf + context.alpha * guidePdf;
+    }
 #endif
     return bsdfPdf;
+}
+
+float rtptContinuationPdf(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext context, float3 direction)
+{
+    float bsdfPdf, guidePdf;
+    return rtptContinuationPdf(sd, mi, context, direction, bsdfPdf, guidePdf);
 }
 
 bool rtptSampleContinuation(
