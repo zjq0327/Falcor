@@ -37,19 +37,7 @@ import Rendering.Materials.IsotropicGGX;
 import RenderPasses.Shared.Denoising.NRDConstants;
 #endif
 
-struct RTPTParams
-{
-    uint2 frameDim;
-    uint samplesPerPixel;
-    uint maxBounces;           // Maximum number of BSDF scattering events.
-    uint rrStartBounce;
-    uint seed;
-    uint sampleOffset;
-    uint accumulatedSamples;
-    uint useNEE;
-    uint useRussianRoulette;
-    uint accumulate;
-};
+#include "RTPTParams.slangh"
 
 ConstantBuffer<RTPTParams> gParams;
 #if USE_ENV_LIGHT

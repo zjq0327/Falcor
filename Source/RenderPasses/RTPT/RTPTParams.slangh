@@ -1,0 +1,15 @@
+#pragma once
+
+struct RTPTParams
+{
+    uint2 frameDim;
+    uint samplesPerPixel;
+    uint maxBounces;           // Maximum number of BSDF scattering events.
+    uint rrStartBounce;
+    uint seed;
+    uint sampleOffset;
+    uint accumulatedSamples;
+    uint useNEE;
+    uint useRussianRoulette;
+    uint accumulate;
+};

@@ -12,19 +12,8 @@ import Rendering.Lights.EmissiveLightSamplerInterface;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 import Rendering.Materials.IsotropicGGX;
 
-struct RTPTParams
-{
-    uint2 frameDim;
-    uint samplesPerPixel;
-    uint maxBounces;
-    uint rrStartBounce;
-    uint seed;
-    uint sampleOffset;
-    uint accumulatedSamples;
-    uint useNEE;
-    uint useRussianRoulette;
-    uint accumulate;
-};
+#include "RTPTParams.slangh"
+
 struct RTPTSparseSettings
 {
     uint2 frameDim;

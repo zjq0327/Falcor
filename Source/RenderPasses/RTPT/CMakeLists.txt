@@ -26,6 +26,7 @@ target_sources(RTPT PRIVATE
     RTPTPGPrepare.cs.slang
     RTPTPGTrain.cs.slang
     RTPTSparseUpdate.cs.slang
+    RTPTParams.slangh
     RTPT.cs.slang
     RTPTIntegrator.slang
     RTPTLighting.slang
@@ -60,7 +61,6 @@ target_sources(RTPT PRIVATE
     ReSTIRDI/RTPTDITemporal.cs.slang
     ReSTIRDI/RTPTDISpatial.cs.slang
     RTPTSharc.slang
-    RTPTSharcUpdate.cs.slang
     RTPTSharcResolve.cs.slang
 )
 
