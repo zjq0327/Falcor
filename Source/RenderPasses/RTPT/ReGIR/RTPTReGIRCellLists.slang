@@ -116,7 +116,8 @@ RTPTReGIRCellView rtptReGIRGetStoredCellView(uint cell)
     view.key = gReGIRCells[cell];
     if (!rtptReGIRCellBounds(view.key, view.center, view.halfExtent)) return view;
     uint state;
-    InterlockedCompareExchange(gReGIRCellMeta[cell].w, kRTPTReGIRListReady, kRTPTReGIRListReady, state);
+    if (gReGIRSettings.freezeSnapshot != 0u) state = gReGIRCellMeta[cell].w;
+    else InterlockedCompareExchange(gReGIRCellMeta[cell].w, kRTPTReGIRListReady, kRTPTReGIRListReady, state);
     if (state != kRTPTReGIRListReady) return view;
     // Cross-wave publication for cells built in this consumer dispatch. Cells
     // with current RIS already crossed the host's build-to-consumer UAV barrier.
@@ -186,10 +187,11 @@ RTPTReGIRCellView rtptReGIRGetCellView(float3 position, float3 random)
     view.offset = kRTPTReGIRInvalidCandidate;
     if (gReGIRSettings.active == 0u ||
         !rtptReGIRGetQueryBounds(position, random, view.key, view.center, view.halfExtent)) return view;
+    const bool frozen = gReGIRSettings.freezeSnapshot != 0u;
     view.cell = rtptReGIRFindOrInsertCell(view.key);
     if (view.cell != kRTPTReGIRInvalidCell)
     {
-        if (gReGIRCellLastUsed[view.cell] != gReGIRSettings.frameStamp)
+        if (!frozen && gReGIRCellLastUsed[view.cell] != gReGIRSettings.frameStamp)
         {
             uint previousUse;
             // Consumer dispatches are frame-ordered, and all lanes write the
@@ -202,19 +204,23 @@ RTPTReGIRCellView rtptReGIRGetCellView(float3 position, float3 random)
             if (stored.cached == 0u) InterlockedAdd(gReGIRState[1], 1u);
             return stored;
         }
-        uint previous;
-        InterlockedCompareExchange(gReGIRCellMeta[view.cell].w, kRTPTReGIRListUnbuilt, kRTPTReGIRListBuilding, previous);
-        if (previous == kRTPTReGIRListUnbuilt)
+        if (!frozen)
         {
-            InterlockedAdd(gReGIRState[8], 1u);
-            const RTPTReGIRCellView built = rtptReGIRBuildCellList(view.cell, view.center, view.halfExtent);
-            if (built.cached == 0u) InterlockedAdd(gReGIRState[1], 1u);
-            return built;
+            uint previous;
+            InterlockedCompareExchange(gReGIRCellMeta[view.cell].w, kRTPTReGIRListUnbuilt, kRTPTReGIRListBuilding, previous);
+            if (previous == kRTPTReGIRListUnbuilt)
+            {
+                InterlockedAdd(gReGIRState[8], 1u);
+                const RTPTReGIRCellView built = rtptReGIRBuildCellList(view.cell, view.center, view.halfExtent);
+                if (built.cached == 0u) InterlockedAdd(gReGIRState[1], 1u);
+                return built;
+            }
         }
     }
     // Hash/ID-pool pressure and a concurrently building owner change caching
     // only. A complete cell-specific count is established before any random
     // rank is drawn; there is no global-light proposal or retry loop.
+    if (frozen) view.cell = kRTPTReGIRInvalidCell;
     view.count = rtptReGIRCountCellCandidates(view.center, view.halfExtent);
     view.ready = 1u;
     view.cached = 0u;

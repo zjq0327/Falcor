@@ -13,9 +13,6 @@ bool rtptSelectGrisTerminal(inout TerminalPicker picker, inout SampleGenerator r
         picker.winnerH = h;
         picker.winnerF = contribution;
         picker.winnerKind = uint(kind);
-#if RTPT_GRIS_SPATIAL
-        picker.winnerSpatial = {};
-#endif
         return true;
     }
     return false;

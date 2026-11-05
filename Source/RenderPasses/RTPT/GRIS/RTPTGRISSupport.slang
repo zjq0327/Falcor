@@ -11,3 +11,9 @@ bool rtptGRISSupportsSurface(ShadingData sd, uint lobes)
     return sd.frontFacing && (material == MaterialType::PBRTDiffuse || material == MaterialType::Standard) &&
         lobes != 0u && (lobes & ~continuousReflection) == 0u;
 }
+
+bool rtptGRISSupportsFirstVertex(ShadingData sd, uint lobes)
+{
+    // A single diffuse lobe has the same proposal in sampling and evaluation.
+    return lobes == uint(LobeType::DiffuseReflection) && rtptGRISSupportsSurface(sd, lobes);
+}

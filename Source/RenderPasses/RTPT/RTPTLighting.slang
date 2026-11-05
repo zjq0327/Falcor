@@ -359,15 +359,13 @@ bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGener
         all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
 }
 
-float3 rtptEstimateDirectSample(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling,
-    inout SampleGenerator sg, out RTPTLightSample ls)
+float3 rtptEvaluateLightSample(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling,
+    RTPTLightSample ls, inout SampleGenerator sg, bool hasBSDFCompetitor = true)
 {
-    if (!rtptSampleLight(sd, sg, ls)) return float3(0.f);
-
     // Falcor's analytic lights have no intersectable geometry, hence no
     // competing BSDF technique. This includes its analytic area lights.
     float misWeight = 1.f;
-    if (!ls.analytic)
+    if (hasBSDFCompetitor && !ls.analytic)
     {
         const float continuationPdf = rtptContinuationPdf(sd, mi, sampling, ls.dir);
         if (!isfinite(continuationPdf)) return float3(0.f);
@@ -375,7 +373,14 @@ float3 rtptEstimateDirectSample(ShadingData sd, IMaterialInstance mi, RTPTSampli
     }
 
     // mi.eval() already includes the shading-normal cosine.
-    const float3 contribution = mi.eval(sd, ls.dir, sg) * ls.LiOverPdf * misWeight;
+    return mi.eval(sd, ls.dir, sg) * ls.LiOverPdf * misWeight;
+}
+
+float3 rtptEstimateDirectSample(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling,
+    inout SampleGenerator sg, out RTPTLightSample ls, bool hasBSDFCompetitor = true)
+{
+    if (!rtptSampleLight(sd, sg, ls)) return float3(0.f);
+    const float3 contribution = rtptEvaluateLightSample(sd, mi, sampling, ls, sg, hasBSDFCompetitor);
     if (!all(isfinite(contribution)) || !any(contribution > 0.f)) return float3(0.f);
     SceneRayQuery<true> query;
     return query.traceVisibilityRay(ls.visibilityRay) ? contribution : float3(0.f);

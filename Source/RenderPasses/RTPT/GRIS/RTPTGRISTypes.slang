@@ -4,6 +4,12 @@
 #ifndef RTPT_GRIS_SPATIAL
 #define RTPT_GRIS_SPATIAL 0
 #endif
+#ifndef RTPT_GRIS_ALTERNATING
+#define RTPT_GRIS_ALTERNATING 0
+#endif
+#ifndef RTPT_REGIR_ONLY
+#define RTPT_REGIR_ONLY 0
+#endif
 #if RTPT_GRIS_SPATIAL
 import Scene.HitInfo;
 #endif
@@ -38,30 +44,68 @@ struct GrisCandidate
 };
 
 #if RTPT_GRIS_SPATIAL
-enum GrisReconnectCase : uint
+struct GrisLocalPrefix
 {
-    CanonicalOnly,
-    NeeAtX1,
-    BsdfHitLightAfterX1,
-    PgHitLightAfterX1,
-    ReGIRAtX1,
-    CacheAtX1,
+    PackedHitInfo x1Hit;
+    float3 firstDirW;
+    float3 throughputToX1;
+    float3 localRadiance;
 };
 
+// Reusable events are direct-light samples or SHaRC terminations at x2.
+// A zero area PDF denotes no suffix.
 struct GrisSpatialRecord
 {
     GrisCandidate candidate;
-    float M;
-    uint reconnectCase;
-    PackedHitInfo reconnectHit; // Hit at x1.
-    bool rootGuideSelected; // Actual guide/BSDF branch on the edge to x1.
-    float3 suffixDirection; // Light UV in xy for ReGIRAtX1, otherwise world-space direction from x1.
-    uint suffixLobe; // Stable light ID for ReGIRAtX1, selected lobe for BSDF light hits.
-    float3 suffixLight; // RIS weight in x for ReGIRAtX1, LiOverPdf for NeeAtX1, or Le for a continuation light hit.
-    float lightPdf; // Directional density for ordinary light MIS.
+    PackedHitInfo reconnectHit;
+    float areaPdf;          // Canonical x1 -> x2 proposal, in area measure.
+    float3 suffixDirection; // ReGIR stores light-surface UV in xy.
+    float3 suffixLight;     // Ordinary NEE stores Li / PDF. ReGIR stores RIS weight in x.
+#if RTPT_REGIR_ONLY && RTPT_GRIS_ALTERNATING
+    uint lightStableID;     // Uses the ordinary NEE lightPdf slot.
+#else
+    float lightPdf;
+#endif
     bool lightIsAnalytic;
-    bool hadNeeCompetitor;
+#if RTPT_REGIR_ONLY && !RTPT_GRIS_ALTERNATING
+    uint lightStableID;
+#endif
 };
+
+#if RTPT_GRIS_ALTERNATING
+struct GrisAlternatingFresh
+{
+    GrisLocalPrefix prefix[2]; // D, S.
+    GrisSpatialRecord raw;
+    GrisFirstHit inactiveFirstHit;
+    uint preparedMask;
+};
+
+uint rtptGrisSourceSlot(uint rootLobe)
+{
+    return uint(rootLobe == uint(GrisRootComponent::GrisSpecular));
+}
+#endif
+
+// One raw proposal from Generate. A missing suffix can still have a valid x1
+// prefix whose proposal must participate in the reverse MIS evaluation.
+struct GrisTemporalFreshHistory
+{
+    PackedHitInfo sourceX1;
+    float3 sourceFirstDir;
+    uint rootLobe;
+    PackedHitInfo reconnectHit;
+    float sourceAreaPdf;
+    float3 suffixDirection; // ReGIR stores the light UV in xy.
+    float3 suffixLight;     // ReGIR stores the original RIS weight in x.
+    uint lightPdfOrStableID;
+    uint terminalAndFlags;
+#if defined(HIT_INFO_USE_COMPRESSION) && HIT_INFO_USE_COMPRESSION
+    uint4 padding; // Keep the history stride fixed when each packed hit is 8 bytes.
+#endif
+};
+
+static const uint kGrisHistoryAnalytic = 0x80000000u;
 #endif
 
 struct TerminalPicker
@@ -70,9 +114,6 @@ struct TerminalPicker
     float winnerH;
     float3 winnerF;
     uint winnerKind;
-#if RTPT_GRIS_SPATIAL
-    GrisSpatialRecord winnerSpatial;
-#endif
 };
 
 struct GrisShadedIndirect
@@ -82,3 +123,20 @@ struct GrisShadedIndirect
     uint state;
     GrisFirstHit firstHit;
 };
+
+#if RTPT_GRIS_ALTERNATING
+struct GrisDualWinner
+{
+    float3 F_D;
+    float3 F_S;
+    float W;
+    uint hasWinner;
+};
+
+struct GrisDualShadedIndirect
+{
+    float3 radiance[2];
+    GrisFirstHit firstHit[2];
+    uint preparedMask;
+};
+#endif

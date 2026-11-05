@@ -1,5 +1,8 @@
-#if RTPT_GRIS_SPATIAL
+#if RTPT_GRIS_ALTERNATING
+RWStructuredBuffer<GrisAlternatingFresh> gGRISFresh;
+#elif RTPT_GRIS_SPATIAL
 RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
+RWStructuredBuffer<GrisLocalPrefix> gGRISLocalPrefixes;
 #else
 RWStructuredBuffer<GrisCandidate> gGRISCandidates;
 #endif
@@ -13,15 +16,26 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     // Every invocation overwrites its record, including primary misses and
     // surfaces outside the supported domain.
+    RTPTSharcStats sharcStats = {};
+#if RTPT_GRIS_ALTERNATING
+    GrisAlternatingFresh fresh = {};
+    const uint sourceSlot = (gPrimarySettings.frameStamp - 1u) & 1u;
+    fresh.raw.candidate.rootLobe = sourceSlot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
+    fresh.raw.candidate.firstHit.distanceState = kRTPTDistanceUntraced;
+    fresh.inactiveFirstHit.distanceState = kRTPTDistanceUntraced;
+#else
     GrisCandidate candidate = {};
     candidate.firstHit.distanceState = kRTPTDistanceUntraced;
-    RTPTSharcStats sharcStats = {};
 #if RTPT_GRIS_SPATIAL
     GrisSpatialRecord spatial = {};
+    GrisLocalPrefix prefix = {};
+#endif
 #endif
 
     const uint sampleIndex = gParams.sampleOffset + gParams.seed * 0x9e3779b9u;
+#if !RTPT_GRIS_ALTERNATING
     SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
+#endif
     RTPTPrimarySurface primary;
     if (rtptTryLoadPrimary(pixel, sampleIndex, primary))
     {
@@ -36,6 +50,37 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             sd.mtl.setActiveLobes(uint(LobeType::Reflection));
             const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
             const uint lobes = mi.getLobeTypes(sd);
+#if RTPT_GRIS_ALTERNATING
+#if RTPT_REGIR_ONLY
+            const uint rootCoverage = rtptReGIRRootCoverage();
+#else
+            const uint rootCoverage = 0u;
+#endif
+            [unroll]
+            for (uint slot = 0u; slot < 2u; ++slot)
+            {
+                const uint activeLobe = slot == 0u ? uint(LobeType::DiffuseReflection) : uint(LobeType::SpecularReflection);
+                if ((lobes & activeLobe) == 0u) continue;
+                const bool generateSuffix = slot == sourceSlot;
+                sd.mtl.setActiveLobes(activeLobe);
+                const RTPTSamplingContext sampling = slot == 0u ? rtptMakeSamplingContext(sd, mi) : rtptBSDFSamplingContext();
+                SampleGenerator sg = SampleGenerator(pixel, sampleIndex ^ (slot == 0u ? 0x87fb1a4du : 0x98d6d257u));
+                GrisLocalPrefix prefix = {};
+                GrisSpatialRecord suffix = {};
+                GrisFirstHit firstHit;
+                prefix.localRadiance = rtptTraceNRDContinuation(sd, mi, activeLobe, sampling, sg,
+                    firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix, suffix, generateSuffix);
+                fresh.prefix[slot] = prefix;
+                fresh.preparedMask |= 1u << slot;
+                if (generateSuffix)
+                {
+                    suffix.candidate.rootLobe = fresh.raw.candidate.rootLobe;
+                    suffix.candidate.firstHit = firstHit;
+                    fresh.raw = suffix;
+                }
+                else fresh.inactiveFirstHit = firstHit;
+            }
+#else
             const bool hasDiffuse = (lobes & uint(LobeType::DiffuseReflection)) != 0u;
             const bool hasSpecular = (lobes & uint(LobeType::SpecularReflection)) != 0u;
 
@@ -60,12 +105,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 float3 diDiffuse, diSpecular;
                 const uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
 #endif
+#if RTPT_GRIS_SPATIAL
+                prefix.localRadiance = rtptTraceNRDContinuation(sd, mi, activeLobe, sampling, sg,
+                    candidate.firstHit.hitT, candidate.firstHit.distanceState, sharcStats, rootCoverage, rootProbability, prefix, spatial);
+                candidate.F = spatial.candidate.F;
+                candidate.terminalKind = spatial.candidate.terminalKind;
+                candidate.W = 1.f;
+                candidate.hasWinner = spatial.areaPdf > 0.f;
+#else
                 // Keep picker draws separate from the path's scattering and light draws.
                 SampleGenerator terminalRng = SampleGenerator(pixel, sampleIndex ^ 0xa511e9b3u);
                 TerminalPicker picker = {};
-                GrisFirstHit firstHit;
                 rtptTraceNRDContinuation(sd, mi, activeLobe, sampling, sg,
-                    firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, rootProbability, picker, terminalRng);
+                    candidate.firstHit.hitT, candidate.firstHit.distanceState, sharcStats, rootCoverage, rootProbability, picker, terminalRng);
 
                 if (picker.winnerH > 0.f)
                 {
@@ -76,20 +128,20 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                         candidate.W = W;
                         candidate.terminalKind = picker.winnerKind;
                         candidate.hasWinner = true;
-                        candidate.firstHit = firstHit;
-#if RTPT_GRIS_SPATIAL
-                        spatial = picker.winnerSpatial;
-#endif
                     }
                 }
+#endif
             }
+#endif
         }
 #endif
     }
-#if RTPT_GRIS_SPATIAL
+#if RTPT_GRIS_ALTERNATING
+    gGRISFresh[index] = fresh;
+#elif RTPT_GRIS_SPATIAL
     spatial.candidate = candidate;
-    spatial.M = candidate.prepared ? 1.f : 0.f;
     gGRISSpatialInput[index] = spatial;
+    gGRISLocalPrefixes[index] = prefix;
 #else
     gGRISCandidates[index] = candidate;
 #endif

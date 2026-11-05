@@ -61,6 +61,7 @@ RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 
 void RTPT::setProperties(const Properties& props)
 {
+    const bool couldUseGRISTemporal = canUseGRISTemporal();
     drainPGAsync();
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
@@ -71,6 +72,7 @@ void RTPT::setProperties(const Properties& props)
     bool grisTemporalEnabled = mGRISTemporalEnabled;
     bool restirDIEnabled = mRestirDIEnabled;
     bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
+    bool regirFreeze = mReGIRFreeze;
     bool regirLightCullingEnabled = mReGIRCullingEnabled;
     uint32_t regirGridSize = mReGIRGridSize, regirLightsPerCell = mReGIRLightsPerCell;
     uint32_t regirBuildSamples = mReGIRBuildSamples, regirBudgetMB = mReGIRBudgetMB;
@@ -108,6 +110,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "regirEnabled") regirEnabled = value;
         else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
         else if (key == "regirTrainingEnabled") regirTrainingEnabled = value;
+        else if (key == "regirFreeze") regirFreeze = value;
         else if (key == "regirLightCullingEnabled") regirLightCullingEnabled = value;
         else if (key == "regirGridSize") regirGridSize = value;
         else if (key == "regirLightsPerCell") regirLightsPerCell = value;
@@ -234,7 +237,8 @@ void RTPT::setProperties(const Properties& props)
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
-        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged || regirChanged;
+        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged ||
+        regirChanged || regirFreeze != mReGIRFreeze;
     mResetPG |= pgStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
     if (sharcEntries != mSHARCEntries)
@@ -273,6 +277,7 @@ void RTPT::setProperties(const Properties& props)
     mReGIREnabled = regirEnabled;
     mReGIRSecondaryEnabled = regirSecondaryEnabled;
     mReGIRTrainingEnabled = regirTrainingEnabled;
+    mReGIRFreeze = regirFreeze;
     mReGIRCullingEnabled = regirLightCullingEnabled;
     mReGIRGridSize = regirGridSize;
     mReGIRLightsPerCell = regirLightsPerCell;
@@ -304,6 +309,8 @@ void RTPT::setProperties(const Properties& props)
     mPGSettings = pg;
     mPGUpdateStride = pgUpdateStride;
     mPGUpdateBounces = pgUpdateBounces;
+    if (mStagePreparationFailed && couldUseGRISTemporal != canUseGRISTemporal())
+        invalidateStages(mReGIREnabled);
     if (pgStructureChanged)
     {
         // Drop parameter-block references before rebuilding bounded PG pools.
@@ -339,6 +346,7 @@ Properties RTPT::getProperties() const
     props["regirEnabled"] = mReGIREnabled;
     props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
     props["regirTrainingEnabled"] = mReGIRTrainingEnabled;
+    props["regirFreeze"] = mReGIRFreeze;
     props["regirLightCullingEnabled"] = mReGIRCullingEnabled;
     props["regirGridSize"] = mReGIRGridSize;
     props["regirLightsPerCell"] = mReGIRLightsPerCell;
@@ -474,11 +482,11 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
 
 void RTPT::reset()
 {
-    invalidateGRISHistory();
     mSampleOffset = 0;
     mAccumulatedSamples = 0;
     mAccumulatedFrames = 0;
     mResetNRDHistory = true;
+    resetGRISHistory();
 }
 
 void RTPT::validateScene() const
@@ -688,6 +696,7 @@ void RTPT::clearSHARC(RenderContext* pRenderContext)
     pRenderContext->uavBarrier(mpSHARCResolved.get());
     mSHARCCameraPositionPrev = mpScene->getCamera()->getPosition();
     mSHARCFrameIndex = 0;
+    ++mSHARCResolveVersion;
     mResetSHARCCache = false;
 }
 
@@ -760,9 +769,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
             // alive while rebuilding PG. Structural or explicit resets retain
             // the existing full-reset behavior.
             mPGTranslationPreservedNRDThisFrame = preserveNRDHistoryOnPGReset && !rebuilt && !mResetNRDHistory;
-            // A PG reset invalidates GRIS history even when NRD history is kept.
             if (rebuilt || !preserveNRDHistoryOnPGReset) reset();
-            else invalidateGRISHistory();
         }
         pg &= mpPG->getPathCapacity() > 0;
         if (pg)
@@ -807,6 +814,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
         FALCOR_PROFILE(pRenderContext, "SHARCResolve");
         bindSHARC(mpSHARCResolve->getRootVar());
         mpSHARCResolve->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
+        ++mSHARCResolveVersion;
         pRenderContext->uavBarrier(mpSHARCHashEntries.get());
         pRenderContext->uavBarrier(mpSHARCAccumulation.get());
         pRenderContext->uavBarrier(mpSHARCResolved.get());
@@ -864,10 +872,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // conservatively discards them when lighting, materials or geometry change.
     const auto sharcInvalidations = discontinuities & ~IScene::UpdateFlags::CameraSwitched;
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
-    const auto cameraUpdates = IScene::UpdateFlags::CameraMoved | IScene::UpdateFlags::CameraPropertiesChanged;
-    if (mGRISTemporalEnabled && ((updates & ~cameraUpdates) != IScene::UpdateFlags::None ||
-        is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum)))
-        invalidateGRISHistory();
+    if ((updates & (movingScene | IScene::UpdateFlags::LightCollectionChanged)) != IScene::UpdateFlags::None)
+        resetGRISHistory();
     // Previous hit/material reconstruction and temporal visibility use the
     // current scene only while its physical state is unchanged. Camera motion
     // is handled by reprojection, independently of PG/NRD history resets.
@@ -889,6 +895,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         !mOptionsChanged && !nrdDiscontinuity && refreshFlags == RenderPassRefreshFlags::None;
     if (pgCameraTranslated) mResetPG = true;
     if ((mEnableNRD ? nrdDiscontinuity : sceneChanged) || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
+    if (mOptionsChanged) mGRISTemporalFallbackReason.clear();
     mOptionsChanged = false;
 
     const uint2 frameDim(color->getWidth(), color->getHeight());
@@ -1066,9 +1073,11 @@ void RTPT::renderUI(Gui::Widgets& widget)
     {
         Properties props;
         bool enabled = mReGIREnabled, secondary = mReGIRSecondaryEnabled, training = mReGIRTrainingEnabled, culling = mReGIRCullingEnabled;
+        bool freeze = mReGIRFreeze;
         if (regirWidget.checkbox("Enabled", enabled)) props["regirEnabled"] = enabled;
         if (regirWidget.checkbox("Secondary lighting", secondary)) props["regirSecondaryEnabled"] = secondary;
         if (regirWidget.checkbox("Independent training", training)) props["regirTrainingEnabled"] = training;
+        if (regirWidget.checkbox("Freeze RIS snapshot", freeze)) props["regirFreeze"] = freeze;
         if (regirWidget.checkbox("Light culling", culling)) props["regirLightCullingEnabled"] = culling;
         uint32_t size = mReGIRGridSize, slots = mReGIRLightsPerCell, build = mReGIRBuildSamples, budget = mReGIRBudgetMB;
         if (regirWidget.var("Hash capacity cube root", size, 1u, 128u)) props["regirGridSize"] = size;

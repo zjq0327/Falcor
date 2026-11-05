@@ -24,6 +24,7 @@ struct RTPTReGIRSettings
     uint candidateCapacity;
     uint listEpoch;
     uint frameStamp;
+    uint freezeSnapshot;
 };
 
 ConstantBuffer<RTPTReGIRSettings> gReGIRSettings;

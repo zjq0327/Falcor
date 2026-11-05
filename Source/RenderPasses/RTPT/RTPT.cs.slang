@@ -14,6 +14,9 @@
 #ifndef RTPT_GRIS_SPATIAL
 #define RTPT_GRIS_SPATIAL 0
 #endif
+#ifndef RTPT_GRIS_ALTERNATING
+#define RTPT_GRIS_ALTERNATING 0
+#endif
 #include "Scene/SceneDefines.slangh"
 #include "Utils/Math/MathConstants.slangh"
 

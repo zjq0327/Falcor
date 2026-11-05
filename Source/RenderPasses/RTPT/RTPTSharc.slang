@@ -101,7 +101,7 @@ void rtptCaptureSharcPrimary(ShadingData sd, BSDFProperties properties, inout RT
         stats.primaryCachedRadiance = cachedRadiance;
 }
 
-bool rtptTrySharcQuery(
+bool rtptTrySharcQueryOnEdge(
     ShadingData sd,
     IMaterialInstance mi,
     BSDFProperties properties,
@@ -111,6 +111,8 @@ bool rtptTrySharcQuery(
     bool previousDiffuse,
     float previousRoughness,
     float segmentLength,
+    RTPTSamplingContext previousSampling,
+    float3 direction,
     inout RTPTSharcStats stats,
     out float3 cachedRadiance
 )
@@ -143,6 +145,14 @@ bool rtptTrySharcQuery(
         const float footprint = 2.f * segmentLength * sqrt(0.5f * alpha2 / max(1e-6f, 1.f - alpha2));
         if (!(footprint >= voxelSize)) return false;
     }
+#if ENABLE_PG
+    if (previousSampling.alpha > 0.f &&
+        !rtptPGAllowsCacheFootprint(previousSampling.guide, direction, 0.5f * voxelSize / segmentLength))
+    {
+        rtptPGCount(RTPT_PG_DIAG_CACHE_SKIP);
+        return false;
+    }
+#endif
 
     ++stats.attemptedQueries;
     const SharcHitData cacheHit = rtptMakeSharcHit(sd, properties, float3(0.f));
@@ -151,6 +161,14 @@ bool rtptTrySharcQuery(
         return false;
     ++stats.cacheTerminations;
     return true;
+}
+
+bool rtptTrySharcQuery(ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce,
+    bool previousDelta, bool previousGuideSelected, bool previousDiffuse, float previousRoughness, float segmentLength,
+    inout RTPTSharcStats stats, out float3 cachedRadiance)
+{
+    return rtptTrySharcQueryOnEdge(sd, mi, properties, bounce, previousDelta, previousGuideSelected, previousDiffuse,
+        previousRoughness, segmentLength, rtptBSDFSamplingContext(), float3(0.f), stats, cachedRadiance);
 }
 
 float3 rtptSharcOccupancy(uint2 pixel)

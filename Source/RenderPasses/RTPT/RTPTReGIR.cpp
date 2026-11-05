@@ -77,7 +77,8 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::GeometryChanged | IScene::UpdateFlags::MeshesChanged |
         IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::EmissiveMaterialsChanged;
     const bool descriptorsChanged = firstAllocation || growLightIds || catalogueChanged ||
-        (mpScene->getUpdates() & lightUpdates) != IScene::UpdateFlags::None;
+        (mpScene->getUpdates() & lightUpdates) != IScene::UpdateFlags::None ||
+        (mReGIRFreeze && is_set(mpScene->getUpdates(), IScene::UpdateFlags::LightCollectionChanged));
     if (firstAllocation)
     {
         mReGIRCellCapacity = cellCapacity;
@@ -154,6 +155,13 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISFrame, mpReGIRCellLastUsed, mpReGIRCandidateIds})
         pRenderContext->uavBarrier(buffer.get());
 
+    const float3 cameraPosition = mpScene->getCamera()->getPosition();
+    if (mReGIRFreeze && mReGIRPrepared && !descriptorsChanged && all(cameraPosition == mReGIRBuildCameraPosition))
+    {
+        mReGIRActive = true;
+        return true;
+    }
+
     // Previous descriptors retain removed lights long enough to remove their
     // membership from old cells. Stable IDs and the candidate allocator persist.
     if (descriptorsChanged) std::swap(mpReGIRLightDescriptors, mpReGIRPreviousLightDescriptors);
@@ -201,6 +209,7 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     pRenderContext->uavBarrier(mpReGIRRIS.get());
     pRenderContext->uavBarrier(mpReGIRCellRISFrame.get());
     ++mReGIRBuildCount;
+    mReGIRBuildCameraPosition = cameraPosition;
     mReGIRFallbackReason.clear();
     return true;
 }
@@ -231,6 +240,7 @@ void RTPT::bindReGIRInitial(const ShaderVar& var) const
         settings["candidateCapacity"] = mReGIRPoolCapacity;
         settings["listEpoch"] = 1u;
         settings["frameStamp"] = mReGIRBuildFrameStamp;
+        settings["freezeSnapshot"] = mReGIRFreeze ? 1u : 0u;
     }
     if (var.hasMember("gReGIRCells")) var["gReGIRCells"] = mpReGIRCells;
     if (var.hasMember("gReGIRCellMeta")) var["gReGIRCellMeta"] = mpReGIRCellMeta;
@@ -291,6 +301,7 @@ Properties RTPT::getReGIRStatistics() const
     props["budgetBytes"] = uint64_t(mReGIRBudgetMB) << 20u;
     props["buildFrameStamp"] = mReGIRBuildFrameStamp;
     props["buildCount"] = mReGIRBuildCount;
+    props["freeze"] = mReGIRFreeze;
     props["buildSamples"] = mReGIRBuildSamples;
     props["lightsPerCell"] = mReGIRLightsPerCell;
     props["gridSize"] = mReGIRGridSize;

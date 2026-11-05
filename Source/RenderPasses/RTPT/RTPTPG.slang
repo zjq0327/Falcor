@@ -24,6 +24,71 @@ float rtptPGGuidePdf(RTPTPGGuide guide, float3 direction)
     return 0.f;
 }
 
+#if ENABLE_SHARC && SHARC_QUERY
+struct RTPTPGConeCell
+{
+    uint index;
+    float2 lower;
+    float extent;
+    float mass;
+};
+
+bool rtptPGAllowsCacheFootprint(RTPTPGGuide guide, float3 direction, float radiusOverDistance)
+{
+    const float3 local = rtptPGToLocal(guide.frame, direction);
+    const float cosTheta = rsqrt(1.f + radiusOverDistance * radiusOverDistance);
+    const float sinTheta = radiusOverDistance * cosTheta;
+    const float radial = length(local.xy);
+    const float minZ = max(0.f, local.z * cosTheta - radial * sinTheta);
+    const float maxZ = local.z >= cosTheta ? 1.f : min(1.f, local.z * cosTheta + radial * sinTheta);
+    if (maxZ <= minZ) return true;
+    const float azimuth = rtptPGDirectionToSquare(local).y;
+    const float halfAzimuth = radial <= sinTheta ? 0.5f : asin(sinTheta / radial) * (1.f / 6.283185307179586f);
+
+    // Integrate a bounding rectangle of the cone in the equal-area map.
+    // Uniform leaves integrate exactly. At the depth limit, count all of an
+    // overlapping subtree so a narrow peak cannot disappear in quadrature.
+    const float maxMass = 0.25f;
+    RTPTPGConeCell pending[16];
+    pending[0] = {guide.root, float2(0.f), 1.f, 1.f};
+    uint count = 1u;
+    float mass = 0.f;
+    for (uint visited = 0u; count > 0u && visited < 32u; ++visited)
+    {
+        const RTPTPGConeCell cell = pending[--count];
+        if (cell.index < guide.root || cell.index - guide.root >= guide.nodeCount || cell.index >= gPGSettings.readNodeCount)
+            return false;
+        const RTPTPGNode node = gPGReadNodes[cell.index];
+        const float total = dot(node.mass, float4(1.f));
+        if (!(total > 0.f) || !isfinite(total)) return false;
+        const float extent = cell.extent * 0.5f;
+        for (uint q = 0u; q < 4u; ++q)
+        {
+            if (!(node.mass[q] > 0.f)) continue;
+            const float2 lower = cell.lower + extent * float2(q & 1u, q >> 1u);
+            const float2 upper = lower + extent;
+            const float zOverlap = min(upper.x, maxZ) - max(lower.x, minZ);
+            if (!(zOverlap > 0.f)) continue;
+            float azimuthOverlap = 0.f;
+            for (int wrap = -1; wrap <= 1; ++wrap)
+            {
+                const float center = azimuth + float(wrap);
+                azimuthOverlap += max(0.f, min(upper.y, center + halfAzimuth) - max(lower.y, center - halfAzimuth));
+            }
+            if (!(azimuthOverlap > 0.f)) continue;
+            const float childMass = cell.mass * (node.mass[q] / total);
+            const float fraction = min(1.f, (zOverlap * azimuthOverlap) / (extent * extent));
+            const uint child = rtptPGChild(node.topology, q);
+            if (child == RTPT_PG_INVALID) mass += childMass * fraction;
+            else if (fraction >= 1.f || extent <= 0.0625f) mass += childMass;
+            else pending[count++] = {child, lower, extent, childMass};
+            if (mass >= maxMass) return false;
+        }
+    }
+    return count == 0u;
+}
+#endif
+
 // A PDF of -1 requests the original general evaluation at the caller. Keeping
 // that evaluation outside the producer avoids folding a float round trip back
 // to its pre-rounded square coordinate at cell boundaries.

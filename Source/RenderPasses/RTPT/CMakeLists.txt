@@ -32,12 +32,14 @@ target_sources(RTPT PRIVATE
     RTPTNRD.slang
     GRIS/RTPTGRISGenerate.cs.slang
     GRIS/RTPTGRISGenerate.slang
+    GRIS/RTPTGRISPublishHistory.cs.slang
+    GRIS/RTPTGRISReuse.slang
     GRIS/RTPTGRISShade.cs.slang
     GRIS/RTPTGRISSpatial.cs.slang
     GRIS/RTPTGRISSpatial.slang
+    GRIS/RTPTGRISSupport.slang
     GRIS/RTPTGRISTemporal.cs.slang
     GRIS/RTPTGRISTemporal.slang
-    GRIS/RTPTGRISSupport.slang
     GRIS/RTPTGRISTypes.slang
     GRIS/RTPTGRISTerminalPicker.slang
     PrimarySurface/RTPTCamera.slang

@@ -151,7 +151,7 @@ bool RTPT::prepareDirectLighting()
         mDIUncoveredAnalyticCount = uncoveredCount;
         mDICoverageMask = coverage;
         if (mDIPreparationFailed) return false;
-        if (mpDIComputePass && mpDIResults)
+        if (mpDILightCatalog && (!mRestirDIEnabled || (mpDIComputePass && mpDIResults)))
         {
             mDIPrepared = true; mDIActive = mRestirDIEnabled;
             mDIFallbackReason.clear();
@@ -165,31 +165,37 @@ bool RTPT::prepareDirectLighting()
         const uint64_t pixelCount = uint64_t(mFrameDim.x) * mFrameDim.y;
         FALCOR_CHECK(pixelCount > 0u && pixelCount <= std::numeric_limits<uint32_t>::max(), "Invalid DI image dimensions.");
 
-        auto defines = mpStageComputePass->getProgram()->getDefines();
-        defines.add("RTPT_USE_RESTIR_DI", "1");
-        mpDIComputePass = ComputePass::create(mpDevice, mpStageComputePass->getProgram()->getDesc(), defines, true);
-        auto makeScenePass = [&](const char* path)
+        const uint32_t catalogStride = sizeof(DILightInfo);
+        uint64_t pixelBytes = 0u;
+        // ReGIR-only needs the catalogue, without per-pixel DI resources.
+        if (mRestirDIEnabled)
         {
-            ProgramDesc desc;
-            desc.addShaderModules(mpScene->getShaderModules());
-            desc.addTypeConformances(mpScene->getTypeConformances());
-            desc.addShaderLibrary(path).csEntry("main");
-            if (mEnablePG || mEnableSHARC || mReGIREnabled)
+            auto defines = mpStageComputePass->getProgram()->getDefines();
+            defines.add("RTPT_USE_RESTIR_DI", "1");
+            mpDIComputePass = ComputePass::create(mpDevice, mpStageComputePass->getProgram()->getDesc(), defines, true);
+            auto makeScenePass = [&](const char* path)
             {
-                desc.setShaderModel(ShaderModel::SM6_6);
-                desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-            }
-            return ComputePass::create(mpDevice, desc, defines, true);
-        };
-        mpDIInitialPass = makeScenePass("RenderPasses/RTPT/ReSTIRDI/RTPTDIInitial.cs.slang");
-        mpDIShadePass = makeScenePass("RenderPasses/RTPT/ReSTIRDI/RTPTDIShade.cs.slang");
-        auto initialVar = mpDIInitialPass->getRootVar();
-        auto shadeVar = mpDIShadePass->getRootVar();
-        const uint64_t catalogStride = reflectedStride(initialVar["gDILightCatalog"]);
-        FALCOR_CHECK(catalogStride == sizeof(DILightInfo), "ReSTIR DI host catalogue layout mismatch.");
-        const uint64_t pixelStride = reflectedStride(initialVar["gDIReservoirs"]) +
-            reflectedStride(initialVar["gDISampleRecords"]) + reflectedStride(shadeVar["gDIResults"]);
-        const uint64_t bytes = pixelCount * pixelStride + std::max(uint64_t(1), lightCount) * catalogStride +
+                ProgramDesc desc;
+                desc.addShaderModules(mpScene->getShaderModules());
+                desc.addTypeConformances(mpScene->getTypeConformances());
+                desc.addShaderLibrary(path).csEntry("main");
+                if (mEnablePG || mEnableSHARC || mReGIREnabled)
+                {
+                    desc.setShaderModel(ShaderModel::SM6_6);
+                    desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+                }
+                return ComputePass::create(mpDevice, desc, defines, true);
+            };
+            mpDIInitialPass = makeScenePass("RenderPasses/RTPT/ReSTIRDI/RTPTDIInitial.cs.slang");
+            mpDIShadePass = makeScenePass("RenderPasses/RTPT/ReSTIRDI/RTPTDIShade.cs.slang");
+            const auto initialVar = mpDIInitialPass->getRootVar();
+            const auto shadeVar = mpDIShadePass->getRootVar();
+            FALCOR_CHECK(reflectedStride(initialVar["gDILightCatalog"]) == catalogStride, "ReSTIR DI host catalogue layout mismatch.");
+            const uint64_t pixelStride = reflectedStride(initialVar["gDIReservoirs"]) +
+                reflectedStride(initialVar["gDISampleRecords"]) + reflectedStride(shadeVar["gDIResults"]);
+            pixelBytes = pixelCount * pixelStride;
+        }
+        const uint64_t bytes = pixelBytes + std::max(uint64_t(1), lightCount) * catalogStride +
             uint64_t(std::max(1u, uncoveredCount)) * sizeof(uint32_t);
         const uint64_t budget = uint64_t(mRestirDIBudgetMB) << 20;
         FALCOR_CHECK(bytes <= budget, "ReSTIR DI needs {} bytes, exceeding its {} MiB budget.", bytes, mRestirDIBudgetMB);
@@ -226,17 +232,20 @@ bool RTPT::prepareDirectLighting()
         mReGIRIdToCatalogData.assign(mReGIRNextLightId, 0xffffffffu);
         for (uint32_t rank = 0u; rank < mDILightCount; ++rank)
             mReGIRIdToCatalogData[catalogue[rank].pad0] = rank;
-        mpDILightCatalog = mpDevice->createStructuredBuffer(initialVar["gDILightCatalog"], uint32_t(catalogue.size()),
+        mpDILightCatalog = mpDevice->createStructuredBuffer(catalogStride, uint32_t(catalogue.size()),
             ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, catalogue.data(), false);
         if (uncoveredIndices.empty()) uncoveredIndices.push_back(0u);
         mpDIUncoveredAnalyticIndices = mpDevice->createStructuredBuffer(sizeof(uint32_t), uint32_t(uncoveredIndices.size()),
             ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, uncoveredIndices.data(), false);
-        mpDIReservoirs = mpDevice->createStructuredBuffer(initialVar["gDIReservoirs"], uint32_t(pixelCount));
-        mpDISampleRecords = mpDevice->createStructuredBuffer(initialVar["gDISampleRecords"], uint32_t(pixelCount));
-        mpDIResults = mpDevice->createStructuredBuffer(shadeVar["gDIResults"], uint32_t(pixelCount));
-        // Resolve the consumer layout now. No estimator has been sampled if
-        // any resource/layout preparation above fails.
-        bindDIMainResources(mpDIComputePass->getRootVar());
+        if (mRestirDIEnabled)
+        {
+            const auto initialVar = mpDIInitialPass->getRootVar();
+            const auto shadeVar = mpDIShadePass->getRootVar();
+            mpDIReservoirs = mpDevice->createStructuredBuffer(initialVar["gDIReservoirs"], uint32_t(pixelCount));
+            mpDISampleRecords = mpDevice->createStructuredBuffer(initialVar["gDISampleRecords"], uint32_t(pixelCount));
+            mpDIResults = mpDevice->createStructuredBuffer(shadeVar["gDIResults"], uint32_t(pixelCount));
+            bindDIMainResources(mpDIComputePass->getRootVar());
+        }
         mDIPrepared = true; mDIActive = mRestirDIEnabled;
         mDIFallbackReason.clear();
         return true;
@@ -403,7 +412,7 @@ Properties RTPT::getDIStatistics() const
     props["historyFrameStamp"] = mDIHistoryFrameStamp;
     props["historyResetReason"] = mDIHistoryResetReason;
     props["reuseFallbackReason"] = mDIReuseFallbackReason;
-    props["bankCount"] = mDIReusePrepared ? 4u : 1u;
+    props["bankCount"] = mpDIReservoirs ? (mDIReusePrepared ? 4u : 1u) : 0u;
     props["finalInputBank"] = mDIFinalInputBank;
     props["historyInputBank"] = mDITemporalActive ? 1u : mDIFinalInputBank;
     props["bankBytes"] = (mpDIReservoirs ? mpDIReservoirs->getSize() : 0u) +

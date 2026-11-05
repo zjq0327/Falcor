@@ -1,55 +1,93 @@
-#include "RTPTGRISSpatial.slang"
+#include "RTPTGRISReuse.slang"
 #include "../ReSTIRDI/RTPTDIReprojection.slangh"
 
-struct GrisTemporalHistoryFrame
+struct GrisTemporalSettings
 {
     float4x4 previousViewProj;
     uint2 previousFrameDim;
-    uint previousFrameStamp;
-    uint historyGeneration;
-    bool historyValid;
+    uint historyValid;
 };
 
-ConstantBuffer<GrisTemporalHistoryFrame> gGRISTemporalHistory;
-StructuredBuffer<RTPTPrimarySurface> gGRISPreviousPrimarySurface;
-StructuredBuffer<GrisSpatialRecord> gGRISPreviousReservoir;
-RWStructuredBuffer<GrisSpatialRecord> gGRISTemporalOutput;
+ConstantBuffer<GrisTemporalSettings> gGRISTemporalSettings;
+StructuredBuffer<GrisTemporalFreshHistory> gGRISHistory;
+#if RTPT_GRIS_ALTERNATING
+RWStructuredBuffer<GrisDualWinner> gGRISSpatialOutput;
+#else
+StructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
+StructuredBuffer<GrisLocalPrefix> gGRISLocalPrefixes;
+RWStructuredBuffer<GrisCandidate> gGRISSpatialOutput;
+#endif
 
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-GrisSpatialRecord rtptGrisReuseHistory(uint index, uint2 pixel, GrisSpatialRecord canonical)
+bool rtptGrisLoadHistory(uint2 pixel, out GrisTemporalFreshHistory history)
 {
-    if (!canonical.candidate.prepared || !gGRISTemporalHistory.historyValid || gPrimarySettings.prepared == 0u) return canonical;
-    if (any(gGRISTemporalHistory.previousFrameDim != gParams.frameDim)) return canonical;
+    history = {};
+    if (gGRISTemporalSettings.historyValid == 0u) return false;
 
-    const RTPTPrimarySurface current = gPrimarySurfaces[index];
-    ShadingData dst;
-    if (!rtptGrisLoadRoot(current, dst)) return canonical;
-    float2 projectedPixel;
-    float projectedDepth;
-    // Scene motion is excluded by the history producer. Project the same world point.
-    if (!rtptDIProjectPreviousPixel(current.position, gGRISTemporalHistory.previousFrameDim,
-        gGRISTemporalHistory.previousViewProj, projectedPixel, projectedDepth)) return canonical;
+    RTPTPrimarySurface primary;
+    if (!rtptTryLoadPrimary(pixel, gPrimarySettings.sampleIndex, primary)) return false;
+    const uint2 previousDim = gGRISTemporalSettings.previousFrameDim;
+    float2 previousPixel;
+    float previousDepth;
+    if (!rtptDIProjectPreviousPixel(primary.position + primary.motionW, previousDim,
+        gGRISTemporalSettings.previousViewProj, previousPixel, previousDepth)) return false;
+    const int2 previousIndex = int2(round(previousPixel));
+    if (any(previousIndex < 0) || any(uint2(previousIndex) >= previousDim)) return false;
 
-    const int2 previousPixel = int2(round(projectedPixel));
-    if (any(previousPixel < 0) || any(previousPixel >= int2(gGRISTemporalHistory.previousFrameDim))) return canonical;
-    const uint previousIndex = uint(previousPixel.y) * gGRISTemporalHistory.previousFrameDim.x + uint(previousPixel.x);
-    const RTPTPrimarySurface previous = gGRISPreviousPrimarySurface[previousIndex];
-    ShadingData src;
-    if (!rtptGrisLoadRoot(previous, gGRISTemporalHistory.previousFrameStamp, src)) return canonical;
-
-    const TriangleHit currentHit = HitInfo(current.packedHit).getTriangleHit();
-    const TriangleHit previousHit = HitInfo(previous.packedHit).getTriangleHit();
-    if (currentHit.instanceID.index != previousHit.instanceID.index || current.materialID != previous.materialID) return canonical;
-    if (!isfinite(previous.viewZ) || abs(previous.viewZ - projectedDepth) > 0.02f * projectedDepth) return canonical;
-    if (!(dot(current.guideNormal, previous.guideNormal) >= 0.9f)) return canonical;
-
-    GrisSpatialRecord history = gGRISPreviousReservoir[previousIndex];
-    if (!history.candidate.prepared || !(history.M > 0.f) || !isfinite(history.M)) return canonical;
-    // Limit the historical proxy's confidence without modifying the historical UCW.
-    history.M = min(history.M, 8.f * canonical.M);
-    SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0x517cc1b7u);
-    return rtptGrisMerge(canonical, history, dst, src, rng);
+    history = gGRISHistory[uint(previousIndex.y) * previousDim.x + uint(previousIndex.x)];
+    return HitInfo(history.sourceX1).isValid();
 }
+
+void rtptGrisDecodeHistory(GrisTemporalFreshHistory history, out GrisLocalPrefix sourcePrefix, out GrisSpatialRecord source)
+{
+    sourcePrefix = {};
+    sourcePrefix.x1Hit = history.sourceX1;
+    sourcePrefix.firstDirW = history.sourceFirstDir;
+    source = {};
+    source.candidate.terminalKind = history.terminalAndFlags & ~kGrisHistoryAnalytic;
+    source.reconnectHit = history.reconnectHit;
+    source.areaPdf = history.sourceAreaPdf;
+    source.suffixDirection = history.suffixDirection;
+    source.suffixLight = history.suffixLight;
+#if RTPT_REGIR_ONLY
+    source.lightStableID = history.lightPdfOrStableID;
+#else
+    source.lightPdf = asfloat(history.lightPdfOrStableID);
+    source.lightIsAnalytic = (history.terminalAndFlags & kGrisHistoryAnalytic) != 0u;
+#endif
+}
+
+#if RTPT_GRIS_ALTERNATING
+GrisDualWinner rtptGrisReuseAlternatingHistory(uint2 pixel, GrisAlternatingFresh fresh)
+{
+    if (fresh.preparedMask == 0u) return {};
+    GrisTemporalFreshHistory history;
+    GrisAlternatingProposal source = {};
+    if (rtptGrisLoadHistory(pixel, history))
+        rtptGrisDecodeHistory(history, source.prefix, source.raw);
+
+    SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
+    return rtptGrisMergeAlternating(pixel, fresh, source, rng);
+}
+#else
+GrisCandidate rtptGrisReuseHistory(uint2 pixel, uint index, GrisSpatialRecord canonical)
+{
+    const GrisCandidate local = canonical.candidate;
+    if (gGRISTemporalSettings.historyValid == 0u || !local.prepared) return local;
+    const GrisLocalPrefix targetPrefix = gGRISLocalPrefixes[index];
+    if (!HitInfo(targetPrefix.x1Hit).isValid()) return local;
+    GrisTemporalFreshHistory history;
+    if (!rtptGrisLoadHistory(pixel, history) || history.rootLobe != local.rootLobe) return local;
+
+    GrisLocalPrefix sourcePrefix;
+    GrisSpatialRecord source;
+    rtptGrisDecodeHistory(history, sourcePrefix, source);
+    // Both inputs are raw proposals conditioned on their original prefixes.
+    // A zero source.areaPdf still leaves the reverse cross-PDF in the MIS.
+    SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
+    return rtptGrisMerge(canonical, source, targetPrefix, sourcePrefix, rng);
+}
+#endif
 #endif
 
 [numthreads(8, 8, 1)]
@@ -58,10 +96,18 @@ void main(uint3 threadID : SV_DispatchThreadID)
     const uint2 pixel = threadID.xy;
     if (any(pixel >= gParams.frameDim)) return;
     const uint index = pixel.y * gParams.frameDim.x + pixel.x;
+#if RTPT_GRIS_ALTERNATING
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+    gGRISSpatialOutput[index] = rtptGrisReuseAlternatingHistory(pixel, gGRISFresh[index]);
+#else
+    gGRISSpatialOutput[index] = {};
+#endif
+#else
     const GrisSpatialRecord canonical = gGRISSpatialInput[index];
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-    gGRISTemporalOutput[index] = rtptGrisReuseHistory(index, pixel, canonical);
+    gGRISSpatialOutput[index] = rtptGrisReuseHistory(pixel, index, canonical);
 #else
-    gGRISTemporalOutput[index] = canonical;
+    gGRISSpatialOutput[index] = canonical.candidate;
+#endif
 #endif
 }

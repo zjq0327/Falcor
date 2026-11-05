@@ -47,8 +47,10 @@ private:
     void prepareProgram(RenderContext* pRenderContext);
     void invalidateStages(bool preserveReGIR = false);
     bool prepareStages();
-    void invalidateGRIS();
-    void invalidateGRISHistory();
+    void invalidateGRIS(bool clearTemporalFailure = true);
+    void resetGRISHistory();
+    bool canUseGRISTemporal() const;
+    bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
     void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData, bool diActive);
     void bindMainParams(const ShaderVar& rootVar) const;
@@ -82,6 +84,7 @@ private:
     bool mReGIREnabled = false;
     bool mReGIRSecondaryEnabled = true;
     bool mReGIRTrainingEnabled = true;
+    bool mReGIRFreeze = false;
     bool mReGIRCullingEnabled = true;
     uint32_t mReGIRGridSize = 20u;
     uint32_t mReGIRLightsPerCell = 32u;
@@ -125,6 +128,7 @@ private:
     uint32_t mReGIRCellCapacity = 0u;
     uint32_t mReGIRBuildFrameStamp = 0u;
     uint64_t mReGIRBuildCount = 0u;
+    float3 mReGIRBuildCameraPosition = float3(0.f);
     std::string mReGIRFallbackReason;
     ref<ComputePass> mpComputePass;
     ref<ComputePass> mpStageComputePass;
@@ -133,26 +137,48 @@ private:
     ref<Buffer> mpPrimarySurfaces;
     ref<Buffer> mpSignalRecords;
     ref<ComputePass> mpGRISGeneratePass;
-    ref<ComputePass> mpGRISTemporalPass;
     ref<ComputePass> mpGRISSpatialPass;
+    ref<ComputePass> mpGRISLocalPass;
+    ref<ComputePass> mpGRISTemporalPass;
+    ref<ComputePass> mpGRISPublishHistoryPass;
     ref<ComputePass> mpGRISShadePass;
     ref<ComputePass> mpGRISMainPass;
     ref<Buffer> mpGRISCandidates;
     ref<Buffer> mpGRISSpatialInput;
-    ref<Buffer> mpGRISSpatialOutput;
-    ref<Buffer> mpGRISPreviousPrimarySurface;
-    ref<Buffer> mpGRISPreviousReservoir;
-    ref<Buffer> mpGRISTemporalOutput;
+    ref<Buffer> mpGRISLocalPrefixes;
     ref<Buffer> mpGRISShadedIndirect;
+    ref<Buffer> mpGRISHistory;
+    struct GrisTemporalSnapshot
+    {
+        float3 cameraPosition = float3(0.f);
+        uint64_t pgVersion = 0u;
+        uint32_t pgGeneration = 0u;
+        uint64_t sharcVersion = 0u;
+        uint64_t regirVersion = 0u;
+        uint32_t regirCatalogGeneration = 0u;
+
+        bool operator==(const GrisTemporalSnapshot& other) const
+        {
+            return all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
+                pgGeneration == other.pgGeneration && sharcVersion == other.sharcVersion && regirVersion == other.regirVersion &&
+                regirCatalogGeneration == other.regirCatalogGeneration;
+        }
+    };
+    struct GrisTemporalHistoryFrame
+    {
+        float4x4 previousViewProj = float4x4::identity();
+        uint2 previousFrameDim = uint2(0u);
+        uint32_t previousFrameStamp = 0u;
+        uint32_t historyGeneration = 0u;
+        bool historyValid = false;
+        GrisTemporalSnapshot snapshot;
+    } mGRISHistoryFrame;
+    uint32_t mGRISHistoryGeneration = 0u;
+    bool mGRISHistoryReadValid = false;
+    std::string mGRISTemporalFallbackReason;
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
-    bool mGRISHistoryValid = false;
-    uint32_t mGRISGeneration = 0u;
-    uint32_t mGRISHistoryGeneration = 0u;
-    uint32_t mGRISHistoryFrameStamp = 0u;
-    uint2 mGRISHistoryFrameDim = uint2(0u);
-    float4x4 mGRISPreviousViewProj = float4x4::identity();
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;
     bool mStagesActive = false;
@@ -286,6 +312,7 @@ private:
     uint32_t mSHARCStaleFrames = 128;
     uint32_t mSHARCDebugMode = 0;
     uint32_t mSHARCFrameIndex = 0;
+    uint64_t mSHARCResolveVersion = 0u;
     float mSHARCSceneScale = 64.f;
     float mSHARCMinRoughness = 0.4f;
     float3 mSHARCCameraPositionPrev = float3(0.f);
