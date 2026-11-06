@@ -19,10 +19,11 @@ uint64_t structuredStride(const ShaderVar& var)
 }
 }
 
-void RTPT::invalidateStages(bool preserveReGIR)
+void RTPT::invalidateStages()
 {
     invalidateGRIS();
-    invalidateDirectLighting(preserveReGIR);
+    invalidateDirectLighting();
+    mLightCatalog.retry();
     // Release parameter blocks as well as our own references before reallocating.
     mpStageComputePass = mpPrimarySurfacePass = mpFinalSignalResolve = nullptr;
     mpPrimarySurfaces = mpSignalRecords = nullptr;
@@ -34,7 +35,7 @@ void RTPT::invalidateStages(bool preserveReGIR)
 
 bool RTPT::prepareStages()
 {
-    if (any(mStageResourceDim != mFrameDim)) invalidateStages(mReGIREnabled);
+    if (any(mStageResourceDim != mFrameDim)) invalidateStages();
     mStageResourceDim = mFrameDim;
     if (mStagePreparationFailed) return false;
     if (mStagesActive) return true;
@@ -50,15 +51,7 @@ bool RTPT::prepareStages()
         defines.add("RTPT_SEPARATE_SIGNAL_RESOLVE", mEnableNRD ? "1" : "0");
         mpStageComputePass = ComputePass::create(mpDevice, mpComputePass->getProgram()->getDesc(), defines, true);
 
-        ProgramDesc primaryDesc;
-        primaryDesc.addShaderModules(mpScene->getShaderModules());
-        primaryDesc.addShaderLibrary("RenderPasses/RTPT/PrimarySurface/RTPTPrimarySurface.cs.slang").csEntry("main");
-        primaryDesc.addTypeConformances(mpScene->getTypeConformances());
-        if (mEnableSHARC || mEnablePG || mReGIREnabled)
-        {
-            primaryDesc.setShaderModel(ShaderModel::SM6_6);
-            primaryDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-        }
+        const auto primaryDesc = makeSceneProgramDesc("RenderPasses/RTPT/PrimarySurface/RTPTPrimarySurface.cs.slang");
         mpPrimarySurfacePass = ComputePass::create(mpDevice, primaryDesc, defines, true);
         if (mEnableNRD)
         {
@@ -104,15 +97,14 @@ bool RTPT::prepareStages()
 
 bool RTPT::canUseGRISTemporal() const
 {
-    return mGRISEnabled && mGRISTemporalEnabled && (!mGRISSpatialEnabled || canUseGRISAlternating()) &&
-        mEnableNRD && mSamplesPerPixel == 1u &&
-        !mUseRussianRoulette && mUseNEE && !mRestirDIEnabled && (!mReGIREnabled || mReGIRSecondaryEnabled);
+    return mGRISTemporalEnabled && canUseGRISAlternating();
 }
 
 bool RTPT::canUseGRISAlternating() const
 {
+    const bool compatibleReGIR = !mReGIREnabled || mRestirDIEnabled || mReGIRSecondaryEnabled;
     return mGRISEnabled && mEnableNRD && mSamplesPerPixel == 1u &&
-        !mUseRussianRoulette && mUseNEE && !mRestirDIEnabled && (!mReGIREnabled || mReGIRSecondaryEnabled);
+        !mUseRussianRoulette && mUseNEE && compatibleReGIR;
 }
 
 void RTPT::resetGRISHistory()
@@ -141,28 +133,21 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         logWarningOnce("RTPT GRIS requires Primary Surface, internal NRD signals, one sample per pixel, and RR disabled.");
         return false;
     }
-    if (mReGIREnabled && (!mReGIRActive || diActive))
+    if (mReGIREnabled && !mReGIRActive)
     {
         invalidateGRIS();
-        logWarningOnce("RTPT GRIS with ReGIR requires a prepared light catalogue and ReSTIR DI disabled.");
+        logWarningOnce("RTPT GRIS with ReGIR requires a prepared light catalogue.");
         return false;
     }
-    if (mEnablePG && diActive)
-    {
-        invalidateGRIS();
-        logWarningOnce("RTPT GRIS with PG requires ReSTIR DI disabled.");
-        return false;
-    }
-
-    const bool temporalSupported = canUseGRISTemporal() && !diActive;
+    const bool temporalSupported = canUseGRISTemporal();
     const bool temporalEnabled = temporalSupported && mGRISTemporalFallbackReason.empty();
     if (mGRISTemporalEnabled && !temporalSupported)
-        logWarningOnce("RTPT GRIS Temporal requires compatible NEE with ReSTIR DI off. Combined Spatial and Temporal requires alternating GRIS.");
-    const bool supportedLighting = !mReGIREnabled || (mReGIRSecondaryEnabled && !mRestirDIEnabled);
+        logWarningOnce("RTPT GRIS Temporal requires compatible NEE and alternating GRIS.");
+    const bool supportedLighting = !mReGIREnabled || diActive || mReGIRSecondaryEnabled;
     const bool spatialEnabled = mGRISSpatialEnabled && mUseNEE && supportedLighting;
     if (mGRISSpatialEnabled && !spatialEnabled)
-        logWarningOnce("RTPT GRIS spatial reuse at x2 requires ordinary NEE or secondary ReGIR without ReSTIR DI; using local paths.");
-    const bool alternating = canUseGRISAlternating() && !diActive;
+        logWarningOnce("RTPT GRIS spatial reuse at x2 requires compatible NEE; using local paths.");
+    const bool alternating = canUseGRISAlternating();
     const bool captureSuffix = spatialEnabled || temporalEnabled || alternating;
 
     if (mpGRISMainPass && bool(mpGRISSpatialPass) == (spatialEnabled && !temporalEnabled) &&
@@ -178,15 +163,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         if (alternating) baseDefines.add("RTPT_GRIS_ALTERNATING", "1");
         auto generateDefines = baseDefines;
         if (captureSuffix) generateDefines.add("RTPT_GRIS_SPATIAL", "1");
-        ProgramDesc generateDesc;
-        generateDesc.addShaderModules(mpScene->getShaderModules());
-        generateDesc.addTypeConformances(mpScene->getTypeConformances());
-        generateDesc.addShaderLibrary("RenderPasses/RTPT/GRIS/RTPTGRISGenerate.cs.slang").csEntry("main");
-        if (mEnablePG || mReGIREnabled || mEnableSHARC)
-        {
-            generateDesc.setShaderModel(ShaderModel::SM6_6);
-            generateDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-        }
+        const auto generateDesc = makeSceneProgramDesc("RenderPasses/RTPT/GRIS/RTPTGRISGenerate.cs.slang");
         mpGRISGeneratePass = ComputePass::create(mpDevice, generateDesc, generateDefines, true);
 
         DefineList shadeDefines;
@@ -194,7 +171,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         {
             shadeDefines.add("RTPT_GRIS_SPATIAL", "1");
             if (alternating) shadeDefines.add("RTPT_GRIS_ALTERNATING", "1");
-            if (alternating && mReGIREnabled) shadeDefines.add("RTPT_REGIR_ONLY", "1");
+            if (const auto it = baseDefines.find("RTPT_REGIR_ONLY"); it != baseDefines.end())
+                shadeDefines.add(it->first, it->second);
             if (const auto it = baseDefines.find("HIT_INFO_USE_COMPRESSION"); it != baseDefines.end())
                 shadeDefines.add(it->first, it->second);
         }
@@ -202,16 +180,9 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         {
             auto reuseDefines = baseDefines;
             if (alternating && spatialEnabled) reuseDefines.add("RTPT_GRIS_ALTERNATING_SPATIAL", "1");
-            ProgramDesc reuseDesc;
-            reuseDesc.addShaderModules(mpScene->getShaderModules());
-            reuseDesc.addTypeConformances(mpScene->getTypeConformances());
-            reuseDesc.addShaderLibrary(temporalEnabled ? "RenderPasses/RTPT/GRIS/RTPTGRISTemporal.cs.slang"
-                                                      : "RenderPasses/RTPT/GRIS/RTPTGRISSpatial.cs.slang").csEntry("main");
-            if (mEnablePG || mReGIREnabled || mEnableSHARC)
-            {
-                reuseDesc.setShaderModel(ShaderModel::SM6_6);
-                reuseDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-            }
+            const auto reuseDesc = makeSceneProgramDesc(
+                temporalEnabled ? "RenderPasses/RTPT/GRIS/RTPTGRISTemporal.cs.slang" : "RenderPasses/RTPT/GRIS/RTPTGRISSpatial.cs.slang"
+            );
             if (temporalEnabled)
             {
                 mpGRISTemporalPass = ComputePass::create(mpDevice, reuseDesc, reuseDefines, true);
@@ -312,11 +283,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
             snapshot.pgGeneration = mpPG->getGeneration();
         }
         if (sharc) snapshot.sharcVersion = mSHARCResolveVersion;
-        if (mReGIREnabled)
-        {
-            snapshot.regirVersion = mReGIRBuildCount;
-            snapshot.regirCatalogGeneration = mReGIRCatalogGeneration;
-        }
+        if (mReGIRActive && mReGIRSecondaryEnabled) snapshot.regirDomainGeneration = mReGIRDomainGeneration;
         // Both the guide lookup and SHaRC's voxel LOD depend on the camera origin.
         if (pg || sharc) snapshot.cameraPosition = mpScene->getCamera()->getPosition();
     }
@@ -362,7 +329,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
             const auto& history = mGRISHistoryFrame;
             mGRISHistoryReadValid = history.historyValid && history.historyGeneration == mGRISHistoryGeneration &&
                 history.previousFrameStamp == mPrimaryFrameStamp - 1u && all(history.previousFrameDim == mFrameDim) &&
-                history.snapshot == snapshot && (!mReGIREnabled || mReGIRFreeze);
+                history.snapshot == snapshot;
             const auto settings = reuseVar["gGRISTemporalSettings"];
             settings["previousViewProj"] = history.previousViewProj;
             settings["previousFrameDim"] = history.previousFrameDim;

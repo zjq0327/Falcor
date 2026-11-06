@@ -1,3 +1,6 @@
+#include "../DirectLighting/RTPTDICoverage.slang"
+#include "../RTPTContinuation.slang"
+
 #if RTPT_GRIS_ALTERNATING
 RWStructuredBuffer<GrisAlternatingFresh> gGRISFresh;
 #elif RTPT_GRIS_SPATIAL
@@ -50,12 +53,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             sd.mtl.setActiveLobes(uint(LobeType::Reflection));
             const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
             const uint lobes = mi.getLobeTypes(sd);
-#if RTPT_GRIS_ALTERNATING
-#if RTPT_REGIR_ONLY
-            const uint rootCoverage = rtptReGIRRootCoverage();
-#else
-            const uint rootCoverage = 0u;
+            float3 diDiffuse, diSpecular;
+            uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
+#if RTPT_REGIR_TRANSPORT
+            // Match Main when the primary DI record did not claim the light domain.
+            if (rootCoverage == 0u) rootCoverage = rtptReGIRRootCoverage();
 #endif
+#if RTPT_GRIS_ALTERNATING
             [unroll]
             for (uint slot = 0u; slot < 2u; ++slot)
             {
@@ -68,7 +72,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 GrisLocalPrefix prefix = {};
                 GrisSpatialRecord suffix = {};
                 GrisFirstHit firstHit;
-                prefix.localRadiance = rtptTraceNRDContinuation(sd, mi, activeLobe, sampling, sg,
+                prefix.localRadiance = rtptTraceContinuation(sd, mi, activeLobe, sampling, sg,
                     firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix, suffix, generateSuffix);
                 fresh.prefix[slot] = prefix;
                 fresh.preparedMask |= 1u << slot;
@@ -99,14 +103,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 sd.mtl.setActiveLobes(activeLobe);
                 const RTPTSamplingContext sampling = chooseDiffuse ? rtptMakeSamplingContext(sd, mi) : rtptBSDFSamplingContext();
 
-#if RTPT_REGIR_ONLY
-                const uint rootCoverage = rtptReGIRRootCoverage();
-#else
-                float3 diDiffuse, diSpecular;
-                const uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
-#endif
 #if RTPT_GRIS_SPATIAL
-                prefix.localRadiance = rtptTraceNRDContinuation(sd, mi, activeLobe, sampling, sg,
+                prefix.localRadiance = rtptTraceContinuation(sd, mi, activeLobe, sampling, sg,
                     candidate.firstHit.hitT, candidate.firstHit.distanceState, sharcStats, rootCoverage, rootProbability, prefix, spatial);
                 candidate.F = spatial.candidate.F;
                 candidate.terminalKind = spatial.candidate.terminalKind;
@@ -116,7 +114,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 // Keep picker draws separate from the path's scattering and light draws.
                 SampleGenerator terminalRng = SampleGenerator(pixel, sampleIndex ^ 0xa511e9b3u);
                 TerminalPicker picker = {};
-                rtptTraceNRDContinuation(sd, mi, activeLobe, sampling, sg,
+                rtptTraceContinuation(sd, mi, activeLobe, sampling, sg,
                     candidate.firstHit.hitT, candidate.firstHit.distanceState, sharcStats, rootCoverage, rootProbability, picker, terminalRng);
 
                 if (picker.winnerH > 0.f)

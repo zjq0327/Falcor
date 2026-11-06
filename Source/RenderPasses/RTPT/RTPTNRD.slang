@@ -1,58 +1,11 @@
 #pragma once
 
+#include "DirectLighting/RTPTDICoverage.slang"
+#include "RTPTContinuation.slang"
 #include "Signal/RTPTSignalResolve.slang"
 
-#if RTPT_USE_GRIS || RTPT_GRIS_GENERATE
-#include "GRIS/RTPTGRISTypes.slang"
-#include "GRIS/RTPTGRISSupport.slang"
-#endif
-
 #if RTPT_USE_GRIS
-#if RTPT_GRIS_ALTERNATING
-StructuredBuffer<GrisDualShadedIndirect> gGRISShadedIndirect;
-#else
-StructuredBuffer<GrisShadedIndirect> gGRISShadedIndirect;
-
-GrisFirstHit rtptResolveGrisFirstHit(GrisShadedIndirect gris, uint rootLobe, ShadingData sd,
-    IMaterialInstance mi, bool traceMissing, inout SampleGenerator rng)
-{
-    GrisFirstHit result = {};
-    result.distanceState = kRTPTDistanceNotSelected;
-    if (gris.state != uint(GrisRecordState::GrisUnprepared) && gris.rootLobe == rootLobe)
-    {
-        result = gris.firstHit;
-        if (result.distanceState == kRTPTDistanceHit || result.distanceState == kRTPTDistanceMiss) return result;
-    }
-    if (!traceMissing) return result;
-
-    // The caller has enabled only this lobe. Probe geometry independently of
-    // the radiance sample, including valid rays with a black BSDF weight.
-    // Retry rejected directions before issuing the single ray. RELAX 3.1
-    // cannot reconstruct a missing specular distance on its own.
-    for (uint attempt = 0; attempt < 4; ++attempt)
-    {
-        BSDFSample bs = {};
-        if (!mi.sample(sd, rng, bs) || !(bs.pdf > 0.f) || !isfinite(bs.pdf) ||
-            !all(isfinite(bs.wo)) || bs.isLobe(LobeType::Delta) || bs.isLobe(LobeType::Transmission))
-            continue;
-
-        SceneRayQuery<true> query;
-        float hitT;
-        const HitInfo hit = query.traceRay(Ray(sd.computeRayOrigin(), bs.wo), hitT);
-#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-        if (hit.getType() == HitType::Triangle)
-            hitT = length(gScene.getVertexData(hit.getTriangleHit()).posW - sd.posW);
-#endif
-        result.hitT = hit.isValid() ? min(kRTPTNRDMissDistance, max(1e-5f, hitT)) : kRTPTNRDMissDistance;
-        result.distanceState = hit.isValid() ? kRTPTDistanceHit : kRTPTDistanceMiss;
-        return result;
-    }
-
-    result.hitT = 0.f;
-    result.distanceState = kRTPTDistanceSampleRejected;
-    return result;
-}
-#endif
+#include "GRIS/RTPTGRISIndirect.slang"
 #endif
 
 #ifndef RTPT_SEPARATE_SIGNAL_RESOLVE
@@ -91,40 +44,6 @@ void rtptStoreSignalRecord(
 }
 #endif
 
-/** Establish domain ownership before sampling the original NEE/continuations.
-    Prepared is independent of whether the final reservoir is empty, black or
-    occluded. No brightness or winner-validity test may select the estimator.
-*/
-uint rtptLoadPrimaryDICoverage(uint2 pixel, uint sampleIndex, out float3 diffuse, out float3 specular)
-{
-    diffuse = specular = 0.f;
-#if RTPT_USE_RESTIR_DI
-    if (gParams.useNEE == 0u) return 0u;
-    if (gDISettings.prepared == 0u) return 0u;
-    if (any(gDISettings.frameDim != gParams.frameDim)) return 0u;
-#if RTPT_USE_PRIMARY_SURFACE
-    if (gDISettings.frameStamp != gPrimarySettings.frameStamp) return 0u;
-#endif
-    if (any(pixel >= gDISettings.frameDim)) return 0u;
-    if (sampleIndex != gDISettings.sampleIndex) return 0u;
-    uint count, stride;
-    gDIResults.GetDimensions(count, stride);
-    const uint index = pixel.y * gDISettings.frameDim.x + pixel.x;
-    if (index >= count) return 0u;
-    const RTPTDIResult result = gDIResults[index];
-    if ((result.flags & kRTPTDIResultPrepared) == 0u) return 0u;
-    if (result.generation != gDISettings.generation) return 0u;
-    if (result.sampleIndex != sampleIndex) return 0u;
-    if (result.frameStamp != gDISettings.frameStamp) return 0u;
-    if (result.coverageMask != gDISettings.coverageMask) return 0u;
-    diffuse = result.diffuse;
-    specular = result.specular;
-    return result.coverageMask;
-#else
-    return 0u;
-#endif
-}
-
 /** NRD uses regular octahedral normals, not equal-area environment coordinates.
     Preserve the projected components before folding; avoid overlapping swizzles.
 */
@@ -134,400 +53,6 @@ float2 rtptNRDPackNormal(float3 normal)
     const float x = n.z < 0.f ? (1.f - abs(n.y)) * (n.x >= 0.f ? 1.f : -1.f) : n.x;
     const float y = n.z < 0.f ? (1.f - abs(n.x)) * (n.y >= 0.f ? 1.f : -1.f) : n.y;
     return float2(x, y) * 0.5f + 0.5f;
-}
-
-#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-#include "GRIS/RTPTGRISTerminalPicker.slang"
-#endif
-
-/** Trace the selected component on the primary surface.
-    The ordinary callers select their component with probability one. Generate
-    passes its explicit root-selection probability and captures the candidate event.
-    Later vertices use the mixed reflection estimator.
-*/
-float3 rtptTraceNRDContinuation(
-    ShadingData primarySD,
-    IMaterialInstance primaryMI,
-    uint primaryLobes,
-    RTPTSamplingContext primarySampling,
-    inout SampleGenerator sg,
-    out float firstHitDistance,
-    out uint firstHitDistanceState,
-    inout RTPTSharcStats sharcStats,
-    uint rootCoverage
-#if RTPT_GRIS_GENERATE
-    , float rootProbability
-#if RTPT_GRIS_SPATIAL
-    , inout GrisLocalPrefix prefix
-    , inout GrisSpatialRecord suffix
-#if RTPT_GRIS_ALTERNATING
-    , bool generateSuffix
-#endif
-#else
-    , inout TerminalPicker terminalPicker
-    , inout SampleGenerator terminalRng
-#endif
-#endif
-)
-{
-    firstHitDistance = kRTPTNRDMissDistance;
-    firstHitDistanceState = kRTPTDistanceSampleRejected;
-    primarySD.mtl.setActiveLobes(primaryLobes);
-    BSDFSample bs = {};
-    bool previousGuideSelected = false;
-    const bool sampled = rtptSampleContinuation(primarySD, primaryMI, primarySampling, sg, bs, previousGuideSelected);
-    if (!sampled) return float3(0.f);
-    if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) return float3(0.f);
-
-    bool previousDelta = bs.isLobe(LobeType::Delta);
-    if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) return float3(0.f);
-    float3 throughput = bs.weight;
-#if RTPT_GRIS_GENERATE
-    throughput /= rootProbability;
-#endif
-#if !(RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING)
-    if (!any(throughput > 0.f)) return float3(0.f);
-#endif
-    float3 radiance = 0.f;
-    float3 previousPosition = primarySD.posW;
-    float3 previousNormal = primarySD.getOrientedFaceNormal();
-    float previousContinuationPdf = bs.pdf;
-    bool previousUsedNEE = gParams.useNEE != 0 && !previousDelta;
-#if RTPT_REGIR_TRANSPORT
-    uint previousReGIRCoverage = 0u;
-#endif
-#if ENABLE_SHARC && SHARC_QUERY
-    bool previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
-    float previousRoughness = primaryMI.getProperties(primarySD).roughness;
-#if RTPT_GRIS_GENERATE
-    RTPTSamplingContext previousSharcSampling = primaryLobes == uint(LobeType::DiffuseReflection)
-        ? primarySampling : rtptBSDFSamplingContext();
-#endif
-#endif
-    Ray ray = Ray(primarySD.computeRayOrigin(), bs.wo);
-    SceneRayQuery<true> query;
-    firstHitDistanceState = kRTPTDistanceUntraced;
-
-    // Always trace the first component ray before roulette so the distance is
-    // available even when the radiance estimator later terminates.
-    for (uint bounce = 1; bounce <= gParams.maxBounces; ++bounce)
-    {
-        float hitT;
-#if ENABLE_SHARC && SHARC_QUERY
-        ++sharcStats.radianceRays;
-#endif
-        const HitInfo hit = query.traceRay(ray, hitT);
-        if (bounce == 1)
-            firstHitDistanceState = hit.isValid() ? kRTPTDistanceHit : kRTPTDistanceMiss;
-        if (bounce == 1 && hit.isValid())
-            firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, hitT));
-
-        if (!hit.isValid())
-        {
-#if USE_ENV_LIGHT
-#if RTPT_REGIR_ONLY
-            const float misWeight = 1.f;
-#elif RTPT_REGIR_TRANSPORT
-            const float misWeight = previousUsedNEE && !previousDelta
-                ? rtptPowerHeuristic(previousContinuationPdf,
-                    rtptEnvironmentLightPdfForCoverage(ray.dir, bounce == 1u ? rootCoverage : previousReGIRCoverage))
-                : 1.f;
-#elif RTPT_USE_RESTIR_DI
-            const float misWeight = previousUsedNEE && !previousDelta
-                ? rtptPowerHeuristic(previousContinuationPdf,
-                    bounce == 1u ? rtptEnvironmentLightPdfForCoverage(ray.dir, rootCoverage) : rtptEnvironmentLightPdf(ray.dir))
-                : 1.f;
-#else
-            const float misWeight = previousUsedNEE && !previousDelta
-                ? rtptPowerHeuristic(previousContinuationPdf, rtptEnvironmentLightPdf(ray.dir))
-                : 1.f;
-#endif
-            const float3 contribution = throughput * gScene.envMap.eval(ray.dir) * misWeight;
-            if (all(isfinite(contribution)))
-            {
-#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-                rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisEnvironment);
-#endif
-                radiance += contribution;
-            }
-#endif
-            break;
-        }
-        if (hit.getType() != HitType::Triangle) break;
-#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-        const TriangleHit triangleHit = hit.getTriangleHit();
-        const VertexData vertex = gScene.getVertexData(triangleHit);
-        if (bounce == 1)
-            firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, length(vertex.posW - primarySD.posW)));
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING
-        if (!any(throughput > 0.f)) break;
-#endif
-        const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
-        ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
-        sd.mtl.setActiveLobes(uint(LobeType::Reflection));
-        const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
-        if (bounce == 1 && rtptGRISSupportsFirstVertex(sd, mi.getLobeTypes(sd)))
-        {
-            prefix.x1Hit = hit.pack();
-            prefix.firstDirW = ray.dir;
-            prefix.throughputToX1 = throughput;
-        }
-#endif
-
-#if ENABLE_SHARC && SHARC_QUERY
-        const BSDFProperties sharcProperties = mi.getProperties(sd);
-        float3 cachedRadiance;
-#if RTPT_GRIS_GENERATE
-        // The guided and BSDF techniques share one continuation on the supported diffuse edges.
-        const bool sharedDiffuse = previousSharcSampling.alpha > 0.f;
-        if (rtptTrySharcQueryOnEdge(sd, mi, sharcProperties, bounce, previousDelta,
-            previousGuideSelected && !sharedDiffuse, previousDiffuse || sharedDiffuse, previousRoughness,
-            length(sd.posW - previousPosition), previousSharcSampling, ray.dir, sharcStats, cachedRadiance))
-#else
-        if (rtptTrySharcQuery(sd, mi, sharcProperties, bounce, previousDelta, previousGuideSelected, previousDiffuse, previousRoughness,
-            length(sd.posW - previousPosition), sharcStats, cachedRadiance))
-#endif
-        {
-            const float3 contribution = throughput * cachedRadiance;
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
-            if (bounce == 1u) prefix.x1Hit = makeInvalidHit().pack();
-            if (bounce == 2u && HitInfo(prefix.x1Hit).isValid() && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
-            {
-                const float3 edge = sd.posW - ray.origin;
-                const float areaPdf = previousContinuationPdf * abs(dot(sd.faceN, ray.dir)) / dot(edge, edge);
-                if (areaPdf > 0.f && isfinite(areaPdf) && all(isfinite(contribution)))
-                {
-                    suffix.reconnectHit = hit.pack();
-                    suffix.areaPdf = areaPdf;
-                    suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisCacheTerminal);
-                    suffix.candidate.F = contribution;
-                    break;
-                }
-            }
-#endif
-            if (all(isfinite(contribution)))
-            {
-#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-                rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisCacheTerminal);
-#endif
-                radiance += contribution;
-            }
-            break;
-        }
-#endif
-
-#if USE_EMISSIVE_LIGHTS
-        float3 emission = mi.getProperties(sd).emission;
-        if (sd.frontFacing && gScene.materials.hasLightProfile(materialID))
-            emission *= gScene.materials.evalLightProfile(dot(sd.faceN, sd.V));
-        if (any(emission > 0.f))
-        {
-            bool coveredRootEvent = false;
-#if RTPT_REGIR_TRANSPORT
-            if (!previousDelta)
-                coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, bounce == 1u ? rootCoverage : previousReGIRCoverage);
-#elif RTPT_USE_RESTIR_DI
-            if (bounce == 1u && !previousDelta)
-                coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, rootCoverage);
-#endif
-            if (!coveredRootEvent)
-            {
-#if RTPT_REGIR_ONLY
-                const bool hasNeeCompetitor = false;
-                const float lightPdf = 0.f;
-#else
-                const bool hasNeeCompetitor = previousUsedNEE && !previousDelta;
-                const float lightPdf = hasNeeCompetitor ?
-#if RTPT_REGIR_TRANSPORT
-                        rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd,
-                            bounce == 1u ? rootCoverage : previousReGIRCoverage)
-#elif RTPT_USE_RESTIR_DI
-                        bounce == 1u ? rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, rootCoverage)
-                                     : rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd)
-#else
-                        rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd)
-#endif
-                    : 0.f;
-#endif
-                const float misWeight = hasNeeCompetitor ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
-                const float3 contribution = throughput * emission * misWeight;
-                if (all(isfinite(contribution)))
-                {
-#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-                    rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisEmitter);
-#endif
-                    radiance += contribution;
-                }
-            }
-            // The covered emission is one event; the hit's reflected indirect
-            // transport below remains eligible for NEE, guiding and SHaRC.
-        }
-#endif
-        if (bounce == gParams.maxBounces) break;
-#if ENABLE_PG && (RTPT_GRIS_GENERATE || RTPT_USE_GRIS)
-        const RTPTSamplingContext sampling = bounce == 1 && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd))
-            ? rtptMakeSamplingContext(sd, mi) : rtptBSDFSamplingContext();
-#else
-        const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
-#endif
-
-        const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
-        previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
-#if RTPT_REGIR_TRANSPORT
-        previousReGIRCoverage = previousUsedNEE ? rtptReGIRTransportCoverage(false) : 0u;
-#endif
-        if (previousUsedNEE)
-        {
-            float3 contribution = 0.f;
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
-            if (bounce == 2 && HitInfo(prefix.x1Hit).isValid() && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
-            {
-                RTPTLightSample light;
-#if RTPT_REGIR_ONLY
-                uint lightStableID;
-                float2 lightUV;
-                float risWeight;
-                bool sampledLight = false;
-                if (previousReGIRCoverage != 0u)
-                    sampledLight = rtptReGIRSampleTransportLight(sd, sg, light, lightStableID, lightUV, risWeight);
-#else
-                const bool sampledLight = rtptSampleLight(sd, sg, light);
-#endif
-                if (sampledLight)
-                {
-#if RTPT_REGIR_ONLY
-                    contribution = throughput * (mi.eval(sd, light.dir, sg) * light.LiOverPdf);
-                    const bool finiteLight = true;
-#else
-                    contribution = throughput * rtptEvaluateLightSample(sd, mi, sampling, light, sg, RTPT_GRIS_ALTERNATING == 0);
-                    const bool finiteLight = light.analytic || light.visibilityRay.tMax < FLT_MAX;
-#endif
-                    const float3 edge = sd.posW - ray.origin;
-                    const float areaPdf = previousContinuationPdf * abs(dot(sd.faceN, ray.dir)) / dot(edge, edge);
-                    const bool canReuse = finiteLight && areaPdf > 0.f && isfinite(areaPdf) && all(isfinite(contribution));
-                    const bool positive = all(isfinite(contribution)) && any(contribution > 0.f);
-                    if ((canReuse || positive) && query.traceVisibilityRay(light.visibilityRay))
-                    {
-                        if (canReuse)
-                        {
-                            // Keep a visible proposal even if its source BSDF gives zero.
-                            suffix.reconnectHit = hit.pack();
-                            suffix.areaPdf = areaPdf;
-#if RTPT_REGIR_ONLY
-                            suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisReGIR);
-                            suffix.lightStableID = lightStableID;
-                            suffix.suffixDirection = float3(lightUV, 0.f);
-                            suffix.suffixLight = float3(risWeight, 0.f, 0.f);
-#else
-                            suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisNee);
-                            suffix.suffixDirection = light.dir;
-                            suffix.suffixLight = light.LiOverPdf;
-                            suffix.lightPdf = light.pdf;
-                            suffix.lightIsAnalytic = light.analytic;
-#endif
-                            suffix.candidate.F = positive ? contribution : float3(0.f);
-                            contribution = 0.f;
-                        }
-                    }
-                    else contribution = 0.f;
-                }
-            }
-            else
-#endif
-            {
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING && !RTPT_REGIR_ONLY
-                RTPTLightSample light;
-                const bool continues = generateSuffix && bounce == 1u;
-                contribution = throughput * rtptEstimateDirectSample(sd, mi, sampling, sg, light, continues);
-#else
-                contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
-#endif
-            }
-            if (all(isfinite(contribution)))
-            {
-#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-#if RTPT_REGIR_ONLY
-                rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisReGIR);
-#else
-                rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisNee);
-#endif
-#endif
-                radiance += contribution;
-            }
-        }
-
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING
-        // Only the scheduled component samples x1 -> x2. At x2 the suffix
-        // ends with NEE, so there is no competing BSDF sample at that vertex.
-        if (!generateSuffix || bounce == 2u) break;
-#endif
-        bs = {};
-        if (!rtptSampleContinuation(sd, mi, sampling, sg, bs, previousGuideSelected)) break;
-        if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
-        previousDelta = bs.isLobe(LobeType::Delta);
-#if ENABLE_SHARC && SHARC_QUERY
-        previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
-        previousRoughness = sharcProperties.roughness;
-#if RTPT_GRIS_GENERATE
-        previousSharcSampling = bounce == 1u && rtptGRISSupportsFirstVertex(sd, mi.getLobeTypes(sd))
-            ? sampling : rtptBSDFSamplingContext();
-#endif
-#endif
-        if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
-        throughput *= bs.weight;
-        if (!all(isfinite(throughput)) || !any(throughput > 0.f)) break;
-        if (gParams.useRussianRoulette != 0 && bounce + 1 >= gParams.rrStartBounce)
-        {
-            const float survival = min(0.95f, max(throughput.x, max(throughput.y, throughput.z)));
-            if (sampleNext1D(sg) >= survival) break;
-            throughput /= survival;
-        }
-
-        previousPosition = sd.posW;
-        previousNormal = sd.getOrientedFaceNormal();
-        previousContinuationPdf = bs.pdf;
-        ray = Ray(sd.computeRayOrigin(), bs.wo);
-#else
-        break;
-#endif
-    }
-    return all(isfinite(radiance)) ? radiance : float3(0.f);
-}
-
-#if !RTPT_GRIS_GENERATE
-// Existing callers, including the delta residual, retain the complete old
-// contribution domain. Only the root non-delta D/S calls pass DI ownership.
-float3 rtptTraceNRDContinuation(
-    ShadingData primarySD,
-    IMaterialInstance primaryMI,
-    uint primaryLobes,
-    RTPTSamplingContext primarySampling,
-    inout SampleGenerator sg,
-    out float firstHitDistance,
-    out uint firstHitDistanceState,
-    inout RTPTSharcStats sharcStats
-)
-{
-    return rtptTraceNRDContinuation(primarySD, primaryMI, primaryLobes, primarySampling, sg,
-        firstHitDistance, firstHitDistanceState, sharcStats, 0u);
-}
-
-// Keep the original continuation interface for the inline fallback and delta
-// residual. Its unobserved event-state output is removed by shader compilation.
-float3 rtptTraceNRDContinuation(
-    ShadingData primarySD,
-    IMaterialInstance primaryMI,
-    uint primaryLobes,
-    RTPTSamplingContext primarySampling,
-    inout SampleGenerator sg,
-    out float firstHitDistance,
-    inout RTPTSharcStats sharcStats
-)
-{
-    uint unusedDistanceState;
-    return rtptTraceNRDContinuation(primarySD, primaryMI, primaryLobes, primarySampling, sg,
-        firstHitDistance, unusedDistanceState, sharcStats);
 }
 
 float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, inout RTPTSharcStats sharcStats)
@@ -690,10 +215,10 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
             specularDistanceState = gris.firstHit[1].distanceState;
         }
         if (hasDiffuse && !grisDiffusePrepared)
-            indirectDiffuse = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
+            indirectDiffuse = rtptTraceContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
                 signals.diffuseHitDistance, diffuseDistanceState, sharcStats, rootCoverage);
         if (hasSpecular && !grisSpecularPrepared)
-            indirectSpecular = rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
+            indirectSpecular = rtptTraceContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
                 signals.specularHitDistance, specularDistanceState, sharcStats, rootCoverage);
 #else
 #if RTPT_USE_GRIS
@@ -730,10 +255,10 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         {
 #endif
             if (hasDiffuse)
-                indirectDiffuse = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
+                indirectDiffuse = rtptTraceContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
                     signals.diffuseHitDistance, diffuseDistanceState, sharcStats, rootCoverage);
             if (hasSpecular)
-                indirectSpecular = rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
+                indirectSpecular = rtptTraceContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
                     signals.specularHitDistance, specularDistanceState, sharcStats, rootCoverage);
 #if RTPT_USE_GRIS
         }
@@ -742,16 +267,16 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
 #else
         uint unusedDiffuseState, unusedSpecularState;
         if (hasDiffuse)
-            signals.diffuse += rtptTraceNRDContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
+            signals.diffuse += rtptTraceContinuation(sd, mi, uint(LobeType::DiffuseReflection), diffuseSampling, sg,
                 signals.diffuseHitDistance, unusedDiffuseState, sharcStats, rootCoverage);
         if (hasSpecular)
-            signals.specular += rtptTraceNRDContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
+            signals.specular += rtptTraceContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
                 signals.specularHitDistance, unusedSpecularState, sharcStats, rootCoverage);
 #endif
         if (hasDeltaSpecular)
         {
             float unusedDistance;
-            signals.residual = rtptTraceNRDContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
+            signals.residual = rtptTraceContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
         }
 #if !RTPT_SEPARATE_SIGNAL_RESOLVE
         // NRD deliberately excludes surfaces outside its denoising range.
@@ -776,4 +301,3 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
     return signals.emission + signals.diffuse + signals.specular + signals.residual;
 #endif
 }
-#endif // !RTPT_GRIS_GENERATE

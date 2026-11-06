@@ -24,7 +24,7 @@ struct RTPTReGIRSettings
     uint candidateCapacity;
     uint listEpoch;
     uint frameStamp;
-    uint freezeSnapshot;
+    uint invalidateRIS;
 };
 
 ConstantBuffer<RTPTReGIRSettings> gReGIRSettings;
@@ -55,7 +55,12 @@ globallycoherent RWStructuredBuffer<uint64_t> gReGIRCells;
 globallycoherent RWStructuredBuffer<uint4> gReGIRCellMeta;
 globallycoherent RWStructuredBuffer<uint> gReGIRCellEpoch;
 globallycoherent RWStructuredBuffer<uint> gReGIRCandidateIDs;
-RWStructuredBuffer<uint> gReGIRCellRISFrame;
+// Maintenance decides the build state before the slot dispatch. Consumers
+// use either nonzero state after the host's build-to-consumer UAV barrier.
+static const uint kRTPTReGIRRISUnbuilt = 0u;
+static const uint kRTPTReGIRRISReused = 1u;
+static const uint kRTPTReGIRRISBuild = 2u;
+RWStructuredBuffer<uint> gReGIRCellRISState;
 RWStructuredBuffer<uint> gReGIRCellLastUsed;
 RWStructuredBuffer<uint> gReGIRState;
 RWStructuredBuffer<RTPTReGIRLightDescriptor> gReGIRLightDescriptors;

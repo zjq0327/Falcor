@@ -89,7 +89,7 @@ void updateCells(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (gReGIRCells[cell] == uint64_t(0u) || gReGIRCells[cell] == ~uint64_t(0u)) return;
     float3 center, halfExtent;
     if (!rtptReGIRCellBounds(gReGIRCells[cell], center, halfExtent)) return;
-    const RTPTReGIRCellView stored = rtptReGIRGetStoredCellView(cell);
+    RTPTReGIRCellView stored = rtptReGIRGetStoredCellView(cell);
     bool rebuild = stored.ready == 0u;
     const uint dirtyCount = min(gReGIRState[6], gReGIRSettings.stableIdCount);
     for (uint index = 0u; index < dirtyCount && !rebuild; ++index)
@@ -98,7 +98,7 @@ void updateCells(uint3 dispatchThreadID : SV_DispatchThreadID)
         if (stableID >= gReGIRSettings.stableIdCount) continue;
         // An unchanged ID remains in the list even if its intensity or
         // position changes. Only an actual membership change rewrites IDs;
-        // current-light RIS weights are refreshed separately by the build.
+        // RIS weights are rebuilt separately when light data change.
         rebuild = rtptReGIRMembershipChanged(gReGIRPreviousLightDescriptors[stableID],
             gReGIRLightDescriptors[stableID], center, halfExtent);
     }
@@ -106,8 +106,14 @@ void updateCells(uint3 dispatchThreadID : SV_DispatchThreadID)
     {
         // Exactly one update thread owns a cell before consumer dispatches.
         gReGIRCellMeta[cell].w = kRTPTReGIRListBuilding;
-        rtptReGIRBuildCellList(cell, center, halfExtent);
+        stored = rtptReGIRBuildCellList(cell, center, halfExtent);
         InterlockedAdd(gReGIRState[7], 1u);
     }
     else InterlockedAdd(gReGIRState[3], 1u);
+
+    if (stored.count == 0u) return;
+    const bool buildRIS = gReGIRSettings.invalidateRIS != 0u ||
+        gReGIRCellRISState[cell] == kRTPTReGIRRISUnbuilt;
+    gReGIRCellRISState[cell] = buildRIS ? kRTPTReGIRRISBuild : kRTPTReGIRRISReused;
+    InterlockedAdd(gReGIRState[buildRIS ? 10u : 11u], 1u);
 }

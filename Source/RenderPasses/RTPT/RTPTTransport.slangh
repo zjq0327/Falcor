@@ -1,0 +1,59 @@
+#pragma once
+
+#ifndef RTPT_USE_RESTIR_DI
+#define RTPT_USE_RESTIR_DI 0
+#endif
+#ifndef RTPT_USE_GRIS
+#define RTPT_USE_GRIS 0
+#endif
+#ifndef RTPT_GRIS_GENERATE
+#define RTPT_GRIS_GENERATE 0
+#endif
+#ifndef RTPT_GRIS_SPATIAL
+#define RTPT_GRIS_SPATIAL 0
+#endif
+#ifndef RTPT_GRIS_ALTERNATING
+#define RTPT_GRIS_ALTERNATING 0
+#endif
+#include "Scene/SceneDefines.slangh"
+#include "Utils/Math/MathConstants.slangh"
+
+import Scene.RaytracingInline;
+import Utils.Sampling.SampleGenerator;
+import Utils.Math.MathHelpers;
+import Utils.Geometry.GeometryHelpers;
+import Rendering.Lights.LightHelpers;
+import Rendering.Lights.EnvMapSampler;
+import Rendering.Lights.EmissiveUniformSampler;
+import Rendering.Lights.EmissiveLightSamplerInterface;
+import Rendering.Lights.EmissiveLightSamplerHelpers;
+
+#if ENABLE_NRD || ENABLE_SHARC
+import Rendering.Materials.IsotropicGGX;
+#endif
+
+#include "RTPTParams.slangh"
+
+ConstantBuffer<RTPTParams> gParams;
+#if USE_ENV_LIGHT
+// Keep the sampler's textures, sampler state and uniforms in their own
+// parameter block so the GFX resource layout is valid in compute dispatches.
+ParameterBlock<EnvMapSampler> gEnvMapSampler;
+#endif
+
+#if ENABLE_SHARC
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 1
+#endif
+RWTexture2D<float4> gSharcDebug;
+RWTexture2D<float4> gSharcCacheRadiance;
+RWTexture2D<float4> gSharcStats;
+#endif
+
+#if RTPT_USE_RESTIR_DI
+#include "DirectLighting/RTPTDIResources.slang"
+#endif
+#include "RTPTSampling.slang"
+#include "RTPTLighting.slang"
+#include "RTPTSharc.slang"
+#include "PrimarySurface/RTPTPrimarySurface.slang"

@@ -72,7 +72,6 @@ void RTPT::setProperties(const Properties& props)
     bool grisTemporalEnabled = mGRISTemporalEnabled;
     bool restirDIEnabled = mRestirDIEnabled;
     bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
-    bool regirFreeze = mReGIRFreeze;
     bool regirLightCullingEnabled = mReGIRCullingEnabled;
     uint32_t regirGridSize = mReGIRGridSize, regirLightsPerCell = mReGIRLightsPerCell;
     uint32_t regirBuildSamples = mReGIRBuildSamples, regirBudgetMB = mReGIRBudgetMB;
@@ -110,7 +109,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "regirEnabled") regirEnabled = value;
         else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
         else if (key == "regirTrainingEnabled") regirTrainingEnabled = value;
-        else if (key == "regirFreeze") regirFreeze = value;
+        else if (key == "regirFreeze") logWarningOnce("RTPT ignores the retired regirFreeze property. ReGIR RIS reuse is automatic.");
         else if (key == "regirLightCullingEnabled") regirLightCullingEnabled = value;
         else if (key == "regirGridSize") regirGridSize = value;
         else if (key == "regirLightsPerCell") regirLightsPerCell = value;
@@ -221,7 +220,10 @@ void RTPT::setProperties(const Properties& props)
         restirDIBudgetMB != mRestirDIBudgetMB || restirDITemporalEnabled != mRestirDITemporalEnabled ||
         restirDISpatialEnabled != mRestirDISpatialEnabled || restirDIHistoryLength != mRestirDIHistoryLength ||
         restirDISpatialSamples != mRestirDISpatialSamples || restirDISpatialRadius != mRestirDISpatialRadius;
-    const bool diEligibilityChanged = useNEE != mUseNEE || samplesPerPixel != mSamplesPerPixel;
+    const bool neeChanged = useNEE != mUseNEE;
+    const bool sampleCountChanged = samplesPerPixel != mSamplesPerPixel;
+    const bool trainingSamplingChanged = neeChanged || seed != mSeed || useRussianRoulette != mUseRussianRoulette;
+    const bool diEligibilityChanged = neeChanged || sampleCountChanged;
     const bool pgStructureChanged = enablePG != mEnablePG || pg.coarseLevels != mPGSettings.coarseLevels ||
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
         pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
@@ -235,12 +237,12 @@ void RTPT::setProperties(const Properties& props)
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
     const bool sharcQuery = enableSHARC && sharcEnabled && sharcUseCache;
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
-    mOptionsChanged |= samplesPerPixel != mSamplesPerPixel || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
-        seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette || accumulate != mAccumulate ||
-        maxAccumulationFrames != mMaxAccumulationFrames || sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged ||
-        regirChanged || regirFreeze != mReGIRFreeze;
-    mResetPG |= pgStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
-    mResetSHARCCache |= sharcStructureChanged || seed != mSeed || useNEE != mUseNEE || useRussianRoulette != mUseRussianRoulette;
+    mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
+        trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
+        sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged ||
+        regirChanged;
+    mResetPG |= pgStructureChanged || trainingSamplingChanged;
+    mResetSHARCCache |= sharcStructureChanged || trainingSamplingChanged;
     if (sharcEntries != mSHARCEntries)
         mpSHARCHashEntries = mpSHARCAccumulation = mpSHARCResolved = nullptr;
     if (modeChanged || sharcUpdateBounces != mSHARCUpdateBounces)
@@ -277,7 +279,6 @@ void RTPT::setProperties(const Properties& props)
     mReGIREnabled = regirEnabled;
     mReGIRSecondaryEnabled = regirSecondaryEnabled;
     mReGIRTrainingEnabled = regirTrainingEnabled;
-    mReGIRFreeze = regirFreeze;
     mReGIRCullingEnabled = regirLightCullingEnabled;
     mReGIRGridSize = regirGridSize;
     mReGIRLightsPerCell = regirLightsPerCell;
@@ -287,7 +288,13 @@ void RTPT::setProperties(const Properties& props)
     mReGIRSamplingJitter = regirSamplingJitter;
     mReGIRCoarsenCellDistance = regirCoarsenCellDistance;
     mReGIRBrightnessThreshold = regirBrightnessThreshold;
-    if (diChanged || diEligibilityChanged || regirChanged) invalidateDirectLighting();
+    if (diChanged || diEligibilityChanged || regirChanged)
+    {
+        invalidateDirectLighting();
+        mLightCatalog.retry();
+    }
+    if (regirChanged) invalidateReGIR();
+    if (!mRestirDIEnabled && !mReGIREnabled && (diChanged || regirChanged)) mLightCatalog.release();
     mResetPG |= regirChanged || regirCompileChanged;
     mResetSHARCCache |= regirChanged || regirCompileChanged;
     mEnableSHARC = enableSHARC;
@@ -310,7 +317,7 @@ void RTPT::setProperties(const Properties& props)
     mPGUpdateStride = pgUpdateStride;
     mPGUpdateBounces = pgUpdateBounces;
     if (mStagePreparationFailed && couldUseGRISTemporal != canUseGRISTemporal())
-        invalidateStages(mReGIREnabled);
+        invalidateStages();
     if (pgStructureChanged)
     {
         // Drop parameter-block references before rebuilding bounded PG pools.
@@ -346,7 +353,6 @@ Properties RTPT::getProperties() const
     props["regirEnabled"] = mReGIREnabled;
     props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
     props["regirTrainingEnabled"] = mReGIRTrainingEnabled;
-    props["regirFreeze"] = mReGIRFreeze;
     props["regirLightCullingEnabled"] = mReGIRCullingEnabled;
     props["regirGridSize"] = mReGIRGridSize;
     props["regirLightsPerCell"] = mReGIRLightsPerCell;
@@ -512,13 +518,9 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     drainPGAsync();
     invalidateStages();
+    invalidateReGIR();
+    mLightCatalog.reset();
     mpScene = pScene;
-    mDILightIdentities.clear();
-    mDILightIdentityOwners.clear();
-    mReGIRStableLightIds.clear();
-    mReGIRIdToCatalogData.clear();
-    mReGIRNextLightId = 0u;
-    mDINextIdentity = 1u;
     mpComputePass = nullptr;
     mpSHARCResolve = nullptr;
     mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
@@ -535,6 +537,20 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
         if (mpScene->getCamera()->getApertureRadius() > 0.f)
             logWarning("RTPT uses a pinhole camera; aperture is ignored.");
     }
+}
+
+ProgramDesc RTPT::makeSceneProgramDesc(const char* path, const char* entry) const
+{
+    ProgramDesc desc;
+    desc.addShaderModules(mpScene->getShaderModules());
+    desc.addTypeConformances(mpScene->getTypeConformances());
+    desc.addShaderLibrary(path).csEntry(entry);
+    if (mEnableSHARC || mEnablePG || mReGIREnabled)
+    {
+        desc.setShaderModel(ShaderModel::SM6_6);
+        desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+    }
+    return desc;
 }
 
 void RTPT::prepareProgram(RenderContext* pRenderContext)
@@ -565,15 +581,16 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
 
     // A new scene/type/lighting specialization also invalidates the private
     // primary producer and its consumer. Ordinary camera motion does not.
-    if (!mpComputePass) invalidateStages(mReGIREnabled);
+    if (!mpComputePass)
+    {
+        invalidateStages();
+        invalidateReGIRPrograms();
+    }
 
     if (!mpComputePass || ((mEnableSHARC || mEnablePG) && !mpSparseUpdate) ||
         (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && !mpSHARCResolve))
     {
-        ProgramDesc desc;
-        desc.addShaderModules(mpScene->getShaderModules());
-        desc.addShaderLibrary("RenderPasses/RTPT/RTPT.cs.slang").csEntry("main");
-        desc.addTypeConformances(mpScene->getTypeConformances());
+        const auto desc = makeSceneProgramDesc("RenderPasses/RTPT/RTPT.cs.slang");
         DefineList defines = mpScene->getSceneDefines();
         defines.add(mpSampleGenerator->getDefines());
         defines.add("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
@@ -587,11 +604,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         {
             defines.add("RTPT_REGIR_TRANSPORT", "1");
             if (!mRestirDIEnabled) defines.add("RTPT_REGIR_ONLY", "1");
-        }
-        if (mEnableSHARC || mEnablePG || mReGIREnabled)
-        {
-            desc.setShaderModel(ShaderModel::SM6_6);
-            desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
         }
         if (mEnableSHARC)
         {
@@ -611,12 +623,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
         if ((mEnableSHARC || mEnablePG) && !mpSparseUpdate)
         {
-            ProgramDesc updateDesc;
-            updateDesc.addShaderModules(mpScene->getShaderModules());
-            updateDesc.addShaderLibrary("RenderPasses/RTPT/RTPTSparseUpdate.cs.slang").csEntry("main");
-            updateDesc.addTypeConformances(mpScene->getTypeConformances());
-            updateDesc.setShaderModel(ShaderModel::SM6_6);
-            updateDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+            const auto updateDesc = makeSceneProgramDesc("RenderPasses/RTPT/RTPTSparseUpdate.cs.slang");
             auto updateDefines = defines;
             updateDefines.add("ENABLE_NRD", "0");
             updateDefines.add("SHARC_UPDATE", "1");
@@ -902,7 +909,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (any(frameDim != mFrameDim) || !mpAccumulation)
     {
         // Release old per-pixel records before allocating the new resolution.
-        invalidateStages(mReGIREnabled);
+        invalidateStages();
         if (mEnablePG) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
         mFrameDim = frameDim;
         mpAccumulation = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
@@ -929,15 +936,26 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         return;
     }
     bool stagesActive = false;
-    bool earlyDIPrepared = false;
+    bool diActive = false;
+    auto prepareLightCatalog = [&]()
+    {
+        return mLightCatalog.prepare(*mpScene, *mpDevice, uint64_t(mRestirDIBudgetMB) << 20u);
+    };
     if (mReGIREnabled)
     {
         // Publish one frame-local world-space light model before independent
         // training. Primary records and pixel reservoirs are not inputs here.
+        mReGIRActive = false;
         stagesActive = prepareStages();
-        earlyDIPrepared = prepareDirectLighting();
-        FALCOR_CHECK(earlyDIPrepared,
+        FALCOR_CHECK(stagesActive && mEnableNRD && mSamplesPerPixel == 1u && (!mRestirDIEnabled || mUseNEE),
             "Cell-only ReGIR requires prepared Primary Surface and supported one-sample NRD/NEE inputs; global fallback is disabled.");
+        const bool catalogReady = prepareLightCatalog();
+        FALCOR_CHECK(catalogReady, "ReGIR cell-only light catalogue preparation failed; global sampling is disabled: {}", mLightCatalog.getFailure());
+        if (mRestirDIEnabled)
+        {
+            diActive = prepareDirectLighting(catalogReady);
+            FALCOR_CHECK(diActive, "ReGIR with ReSTIR DI requires prepared DI resources; global fallback is disabled: {}", mDIFallbackReason);
+        }
         prepareReGIR(pRenderContext);
     }
     if (mEnableSHARC || mEnablePG)
@@ -959,7 +977,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
     if (!mReGIREnabled) stagesActive = prepareStages();
     if (stagesActive) executePrimarySurface(pRenderContext);
-    const bool diActive = mReGIREnabled ? (earlyDIPrepared && mRestirDIEnabled) : prepareDirectLighting();
+    if (!mReGIREnabled)
+    {
+        const bool catalogReady = mRestirDIEnabled && stagesActive && mEnableNRD && mSamplesPerPixel == 1u && mUseNEE && prepareLightCatalog();
+        diActive = prepareDirectLighting(catalogReady);
+    }
     if (diActive) executeDirectLighting(pRenderContext);
     const auto& baseMainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
     const bool grisActive = prepareGRIS(baseMainPass, diActive);
@@ -1033,51 +1055,52 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 
 void RTPT::renderUI(Gui::Widgets& widget)
 {
-    bool changed = false;
-    const bool previousNEE = mUseNEE;
-    const bool previousRR = mUseRussianRoulette;
-    const uint32_t previousSeed = mSeed;
-    const uint32_t previousSPP = mSamplesPerPixel;
+    Properties baseProps;
     if (mEnableNRD)
         widget.text("NRD: 1 primary sample, one path per active diffuse/specular lobe.");
     else
-        changed |= widget.var("Samples per pixel", mSamplesPerPixel, 1u, 1024u);
-    changed |= widget.var("Max BSDF bounces", mMaxBounces, 1u, 64u);
+    {
+        uint32_t samplesPerPixel = mSamplesPerPixel;
+        if (widget.var("Samples per pixel", samplesPerPixel, 1u, 1024u)) baseProps["samplesPerPixel"] = samplesPerPixel;
+    }
+    uint32_t maxBounces = mMaxBounces;
+    if (widget.var("Max BSDF bounces", maxBounces, 1u, 64u)) baseProps["maxBounces"] = maxBounces;
     widget.tooltip("Number of BSDF scatter events. The final ray only collects emission or environment light.", true);
-    changed |= widget.checkbox("Next-event estimation", mUseNEE);
+    bool useNEE = mUseNEE;
+    if (widget.checkbox("Next-event estimation", useNEE)) baseProps["useNEE"] = useNEE;
     widget.tooltip("Sample analytic, mesh and environment lights. Analytic lights require NEE because rays cannot hit them.", true);
-    changed |= widget.checkbox("Russian roulette", mUseRussianRoulette);
-    changed |= widget.var("RR start bounce", mRRStartBounce, 1u, 64u);
-    changed |= widget.var("Seed", mSeed);
+    bool useRussianRoulette = mUseRussianRoulette;
+    if (widget.checkbox("Russian roulette", useRussianRoulette)) baseProps["useRussianRoulette"] = useRussianRoulette;
+    uint32_t rrStartBounce = mRRStartBounce;
+    if (widget.var("RR start bounce", rrStartBounce, 1u, 64u)) baseProps["rrStartBounce"] = rrStartBounce;
+    uint32_t seed = mSeed;
+    if (widget.var("Seed", seed)) baseProps["seed"] = seed;
     if (!mEnableNRD && !mEnableSHARC && !mEnablePG)
     {
-        changed |= widget.checkbox("Progressive accumulation", mAccumulate);
-        if (mAccumulate)
+        bool accumulate = mAccumulate;
+        if (widget.checkbox("Progressive accumulation", accumulate)) baseProps["accumulate"] = accumulate;
+        if (accumulate)
         {
-            changed |= widget.var("Max frames", mMaxAccumulationFrames, 0u);
+            uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
+            if (widget.var("Max frames", maxAccumulationFrames, 0u)) baseProps["maxAccumulationFrames"] = maxAccumulationFrames;
             widget.tooltip("Maximum frames to accumulate. 0 means unlimited. At the limit, tracing stops and both outputs are held. Changing this limit restarts accumulation.", true);
-            const std::string target = mMaxAccumulationFrames != 0 ? " / " + std::to_string(mMaxAccumulationFrames) : " (unlimited)";
+            const std::string target = maxAccumulationFrames != 0 ? " / " + std::to_string(maxAccumulationFrames) : " (unlimited)";
             widget.text("Accumulated frames: " + std::to_string(mAccumulatedFrames) + target);
-            if (mMaxAccumulationFrames != 0 && mAccumulatedFrames >= mMaxAccumulationFrames && !changed && !mOptionsChanged)
+            if (maxAccumulationFrames != 0 && mAccumulatedFrames >= maxAccumulationFrames && baseProps.empty() && !mOptionsChanged)
                 widget.text("Accumulation complete.");
         }
     }
-    changed |= widget.button(mEnableNRD ? "Reset NRD history" : "Reset accumulation");
+    if (!baseProps.empty()) setProperties(baseProps);
+    if (widget.button(mEnableNRD ? "Reset NRD history" : "Reset accumulation")) mOptionsChanged = true;
     if (!mEnableNRD)
         widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
-    mOptionsChanged |= changed;
-    if (previousNEE != mUseNEE || previousSPP != mSamplesPerPixel) invalidateDirectLighting();
-    mResetSHARCCache |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
-    mResetPG |= previousNEE != mUseNEE || previousRR != mUseRussianRoulette || previousSeed != mSeed;
     if (auto regirWidget = widget.group("ReGIR"))
     {
         Properties props;
         bool enabled = mReGIREnabled, secondary = mReGIRSecondaryEnabled, training = mReGIRTrainingEnabled, culling = mReGIRCullingEnabled;
-        bool freeze = mReGIRFreeze;
         if (regirWidget.checkbox("Enabled", enabled)) props["regirEnabled"] = enabled;
         if (regirWidget.checkbox("Secondary lighting", secondary)) props["regirSecondaryEnabled"] = secondary;
         if (regirWidget.checkbox("Independent training", training)) props["regirTrainingEnabled"] = training;
-        if (regirWidget.checkbox("Freeze RIS snapshot", freeze)) props["regirFreeze"] = freeze;
         if (regirWidget.checkbox("Light culling", culling)) props["regirLightCullingEnabled"] = culling;
         uint32_t size = mReGIRGridSize, slots = mReGIRLightsPerCell, build = mReGIRBuildSamples, budget = mReGIRBudgetMB;
         if (regirWidget.var("Hash capacity cube root", size, 1u, 128u)) props["regirGridSize"] = size;
@@ -1120,7 +1143,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
             diWidget.text(mDIFallbackReason.substr(0, mDIFallbackReason.find('\n')));
         if (mRestirDIEnabled && !mDIReuseFallbackReason.empty())
             diWidget.text(mDIReuseFallbackReason.substr(0, mDIReuseFallbackReason.find('\n')));
-        diWidget.text("Supported lights: " + std::to_string(mDILightCount));
+        diWidget.text("Supported lights: " + std::to_string(mLightCatalog.getSnapshot().lightCount));
     }
     if (mEnableSHARC)
     {
@@ -1155,7 +1178,8 @@ void RTPT::renderUI(Gui::Widgets& widget)
             if (sharcWidget.var("Accumulation frames", frames, 1u, 1024u)) props["sharcAccumulationFrames"] = frames;
             frames = mSHARCStaleFrames;
             if (sharcWidget.var("Stale entry lifetime", frames, 8u, 1024u)) props["sharcStaleFrames"] = frames;
-            sharcWidget.dropdown("Visualization", kSHARCDebugModes, mSHARCDebugMode);
+            uint32_t debugMode = mSHARCDebugMode;
+            if (sharcWidget.dropdown("Visualization", kSHARCDebugModes, debugMode)) props["sharcDebugMode"] = debugMode;
             sharcWidget.text("Select RTPT.sharcDebug in the graph output menu to show this view.");
             if (!props.empty()) setProperties(props);
             if (sharcWidget.button("Clear radiance cache"))

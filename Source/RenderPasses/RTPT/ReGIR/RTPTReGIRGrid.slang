@@ -120,7 +120,6 @@ bool rtptReGIRCellVolume(uint64_t key, out float3 center, out float radius)
 uint rtptReGIRFindOrInsertCell(uint64_t key)
 {
     if (key == 0u || key == kRTPTReGIRTombstone) return kRTPTReGIRInvalidCell;
-    const bool frozen = gReGIRSettings.freezeSnapshot != 0u;
     const uint capacity = gReGIRSettings.cellCapacity;
     if (capacity >= kRTPTReGIRBucketSize)
     {
@@ -136,8 +135,7 @@ uint rtptReGIRFindOrInsertCell(uint64_t key)
             {
                 const uint index = base + probe;
                 uint64_t stored;
-                if (frozen) stored = gReGIRCells[index];
-                else InterlockedCompareExchange(gReGIRCells[index], uint64_t(0u), uint64_t(0u), stored);
+                InterlockedCompareExchange(gReGIRCells[index], uint64_t(0u), uint64_t(0u), stored);
                 if (stored == key) return index;
                 if (available == kRTPTReGIRInvalidCell && (stored == uint64_t(0u) || stored == kRTPTReGIRTombstone))
                 {
@@ -145,7 +143,6 @@ uint rtptReGIRFindOrInsertCell(uint64_t key)
                     availableValue = stored;
                 }
             }
-            if (frozen) return kRTPTReGIRInvalidCell;
             if (available == kRTPTReGIRInvalidCell) break;
             uint64_t original;
             InterlockedCompareExchange(gReGIRCells[available], availableValue, key, original);
@@ -173,7 +170,7 @@ bool rtptReGIRTryEvictCell(uint cell)
     gReGIRCellMeta[cell].y = 0u;
     gReGIRCellMeta[cell].w = 0u;
     gReGIRCellEpoch[cell] = 0u;
-    gReGIRCellRISFrame[cell] = 0u;
+    gReGIRCellRISState[cell] = kRTPTReGIRRISUnbuilt;
     gReGIRCellLastUsed[cell] = 0u;
     gReGIRCells[cell] = kRTPTReGIRTombstone;
     InterlockedAdd(gReGIRState[9], 1u);

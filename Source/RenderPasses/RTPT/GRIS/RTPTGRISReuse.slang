@@ -19,7 +19,7 @@ struct GrisConnection
 #if ENABLE_SHARC && SHARC_QUERY
     float3 cachedRadiance;
 #endif
-#if RTPT_REGIR_ONLY
+#if RTPT_REGIR_TRANSPORT
     RTPTLightSample light;
 #endif
 };
@@ -70,13 +70,24 @@ bool rtptGrisConnect(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout Sam
     const bool cacheSuffix = suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisCacheTerminal);
     if (terminates || cacheSuffix) return terminates && cacheSuffix;
 #endif
+#if RTPT_REGIR_TRANSPORT
+    if (suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisReGIR))
+    {
+        if (rtptReGIRTransportCoverage(false) == 0u) return false;
+        // Use the original RIS estimator weight. The fixed x2 vertex shares
+        // its light-domain selection in both forward and reverse MIS.
+        if (!rtptReGIRRebuildTransportSample(connection.x2, suffix.lightPdfOrStableID,
+            suffix.suffixDirection.xy, suffix.suffixLight.x, connection.light)) return false;
+        connection.light.LiOverPdf *= suffix.suffixLight.y;
+#if !RTPT_REGIR_ONLY
+        return query.traceVisibilityRay(connection.light.visibilityRay);
+#else
+        return true;
+#endif
+    }
+#endif
 #if RTPT_REGIR_ONLY
-    if (suffix.candidate.terminalKind != uint(GrisTerminalKind::GrisReGIR) || rtptReGIRTransportCoverage(false) == 0u)
-        return false;
-    // Rebuilding checks the current catalogue and receiver cutoff in both MIS
-    // directions. The front-facing x2 and its recorded light ray stay fixed.
-    return rtptReGIRRebuildTransportSample(connection.x2, suffix.lightStableID,
-        suffix.suffixDirection.xy, suffix.suffixLight.x, connection.light);
+    return false;
 #else
     return suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisNee);
 #endif
@@ -88,16 +99,16 @@ float3 rtptGrisEvaluateSuffix(GrisSpatialRecord suffix, GrisConnection connectio
     if (suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisCacheTerminal)) return connection.cachedRadiance;
 #endif
     const IMaterialInstance material = gScene.materials.getMaterialInstance(connection.x2, ExplicitLodTextureSampler(0.f));
-#if RTPT_REGIR_ONLY
-    return material.eval(connection.x2, connection.light.dir, rng) * connection.light.LiOverPdf;
-#else
+#if RTPT_REGIR_TRANSPORT
+    if (suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisReGIR))
+        return material.eval(connection.x2, connection.light.dir, rng) * connection.light.LiOverPdf;
+#endif
     RTPTLightSample light = {};
     light.dir = suffix.suffixDirection;
     light.LiOverPdf = suffix.suffixLight;
-    light.pdf = suffix.lightPdf;
+    light.pdf = asfloat(suffix.lightPdfOrStableID);
     light.analytic = suffix.lightIsAnalytic;
     return rtptEvaluateLightSample(connection.x2, material, rtptBSDFSamplingContext(), light, rng, RTPT_GRIS_ALTERNATING == 0);
-#endif
 }
 
 float rtptGrisTarget(float3 F)

@@ -23,11 +23,17 @@ uint64_t reGIRBufferBytes(const ref<Buffer>& buffer)
 }
 }
 
+void RTPT::invalidateReGIRPrograms()
+{
+    mpReGIRBuild = mpReGIRUpdateLights = mpReGIRUpdateCells = nullptr;
+}
+
 void RTPT::invalidateReGIR()
 {
-    mpReGIRBuild = mpReGIRInitial = mpReGIRUpdateLights = mpReGIRUpdateCells = nullptr;
+    invalidateReGIRPrograms();
+    mpReGIRInitial = nullptr;
     mpReGIRRIS = mpReGIRCells = mpReGIRCellRequests = mpReGIRCellMeta = nullptr;
-    mpReGIRCellEpoch = mpReGIRCellRISFrame = mpReGIRCellLastUsed = mpReGIRCandidateIds = mpReGIRState = nullptr;
+    mpReGIRCellEpoch = mpReGIRCellRISState = mpReGIRCellLastUsed = mpReGIRCandidateIds = mpReGIRState = nullptr;
     mpReGIRIdToCatalog = mpReGIRLightDescriptors = mpReGIRPreviousLightDescriptors = mpReGIRDirtyLights = nullptr;
     mReGIRInitialActive = mReGIRInitialPreparationFailed = false;
     mReGIRInitialFallbackReason.clear();
@@ -44,17 +50,19 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     mReGIRActive = false;
     if (!mReGIREnabled) return false;
     FALCOR_CHECK(!mReGIRPreparationFailed, "ReGIR cell-only resources are unavailable: {}", mReGIRFallbackReason);
-    FALCOR_CHECK(mDIPrepared && mpDILightCatalog, "ReGIR cell-only sampling requires a prepared light catalogue.");
-    FALCOR_CHECK(mRestirDIEnabled || !mUseNEE || mDIUncoveredAnalyticCount == 0u,
+    const auto& catalog = mLightCatalog.getSnapshot();
+    FALCOR_CHECK(catalog.lights, "ReGIR cell-only sampling requires a prepared light catalogue.");
+    FALCOR_CHECK(mRestirDIEnabled || !mUseNEE || catalog.uncoveredAnalyticCount == 0u,
         "ReGIR-only light sampling supports emissive triangles and point lights. The scene contains {} unsupported analytic lights.",
-        mDIUncoveredAnalyticCount);
+        catalog.uncoveredAnalyticCount);
 
     const uint64_t budgetBytes = uint64_t(mReGIRBudgetMB) << 20u;
     const uint64_t requestedCells = uint64_t(mReGIRGridSize) * mReGIRGridSize * mReGIRGridSize;
     const uint32_t cellCapacity = reGIRCapacity(std::max(uint64_t(64u), requestedCells));
     const uint64_t slots = uint64_t(cellCapacity) * mReGIRLightsPerCell;
     const uint64_t candidateCapacity = (budgetBytes / 2u) / sizeof(uint32_t);
-    const uint32_t stableCapacity = reGIRCapacity(std::max(uint64_t(16u), uint64_t(mReGIRNextLightId)));
+    const uint32_t stableIdCount = uint32_t(catalog.idToRank.size());
+    const uint32_t stableCapacity = reGIRCapacity(std::max(uint64_t(16u), uint64_t(stableIdCount)));
     FALCOR_CHECK(slots > 0u && slots <= uint64_t(65535u) * 256u && slots <= std::numeric_limits<uint32_t>::max(),
         "ReGIR RIS capacity exceeds the dispatch or 32-bit buffer range.");
     FALCOR_CHECK(candidateCapacity > 0u && candidateCapacity <= std::numeric_limits<uint32_t>::max(),
@@ -71,14 +79,21 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
 
     const bool firstAllocation = !mpReGIRRIS;
     const bool growLightIds = !mpReGIRIdToCatalog || mReGIRLightIdCapacity < stableCapacity;
-    const bool catalogueChanged = mReGIRCatalogGeneration != mDICatalogGeneration;
+    const bool catalogueChanged = mReGIRCatalogGeneration != catalog.generation;
+    const auto updates = mpScene->getUpdates();
     const auto lightUpdates = IScene::UpdateFlags::LightsMoved | IScene::UpdateFlags::LightIntensityChanged |
         IScene::UpdateFlags::LightPropertiesChanged | IScene::UpdateFlags::LightCountChanged |
-        IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::GeometryChanged | IScene::UpdateFlags::MeshesChanged |
-        IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::EmissiveMaterialsChanged;
-    const bool descriptorsChanged = firstAllocation || growLightIds || catalogueChanged ||
-        (mpScene->getUpdates() & lightUpdates) != IScene::UpdateFlags::None ||
-        (mReGIRFreeze && is_set(mpScene->getUpdates(), IScene::UpdateFlags::LightCollectionChanged));
+        IScene::UpdateFlags::LightCollectionChanged | IScene::UpdateFlags::EmissiveMaterialsChanged;
+    const auto emissiveGeometryUpdates = IScene::UpdateFlags::GeometryChanged | IScene::UpdateFlags::MeshesChanged;
+    // LightCollectionChanged includes transforms of emissive instances. An
+    // unrelated occluder transform changes visibility, not the RIS light proxy.
+    const bool invalidateRIS = firstAllocation || growLightIds || catalogueChanged ||
+        (updates & lightUpdates) != IScene::UpdateFlags::None ||
+        (catalog.emissiveCount != 0u && (updates & emissiveGeometryUpdates) != IScene::UpdateFlags::None);
+    // Material-only changes can affect cell membership (such as sidedness).
+    // A changed list invalidates its own RIS; the volume proxy uses geometry.
+    const bool descriptorsChanged = invalidateRIS ||
+        (catalog.emissiveCount != 0u && is_set(updates, IScene::UpdateFlags::MaterialsChanged));
     if (firstAllocation)
     {
         mReGIRCellCapacity = cellCapacity;
@@ -88,11 +103,11 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         mpReGIRCells = mpDevice->createStructuredBuffer(sizeof(uint64_t), mReGIRCellCapacity);
         mpReGIRCellMeta = mpDevice->createStructuredBuffer(sizeof(uint4), mReGIRCellCapacity);
         mpReGIRCellEpoch = mpDevice->createStructuredBuffer(sizeof(uint32_t), mReGIRCellCapacity);
-        mpReGIRCellRISFrame = mpDevice->createStructuredBuffer(sizeof(uint32_t), mReGIRCellCapacity);
+        mpReGIRCellRISState = mpDevice->createStructuredBuffer(sizeof(uint32_t), mReGIRCellCapacity);
         mpReGIRCellLastUsed = mpDevice->createStructuredBuffer(sizeof(uint32_t), mReGIRCellCapacity);
         mpReGIRCandidateIds = mpDevice->createStructuredBuffer(sizeof(uint32_t), mReGIRPoolCapacity);
         mpReGIRState = mpDevice->createStructuredBuffer(sizeof(uint32_t), kReGIRStateCount);
-        for (const auto& buffer : {mpReGIRRIS, mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISFrame, mpReGIRCellLastUsed, mpReGIRState})
+        for (const auto& buffer : {mpReGIRRIS, mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISState, mpReGIRCellLastUsed, mpReGIRState})
         {
             pRenderContext->clearUAV(buffer->getUAV().get(), uint4(0u));
             pRenderContext->uavBarrier(buffer.get());
@@ -124,8 +139,8 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     if (growLightIds || catalogueChanged)
     {
         std::vector<uint32_t> mapping(mReGIRLightIdCapacity, std::numeric_limits<uint32_t>::max());
-        FALCOR_CHECK(mReGIRIdToCatalogData.size() <= mapping.size(), "ReGIR stable-ID mapping exceeds its allocation.");
-        std::copy(mReGIRIdToCatalogData.begin(), mReGIRIdToCatalogData.end(), mapping.begin());
+        FALCOR_CHECK(catalog.idToRank.size() <= mapping.size(), "ReGIR stable-ID mapping exceeds its allocation.");
+        std::copy(catalog.idToRank.begin(), catalog.idToRank.end(), mapping.begin());
         pRenderContext->updateBuffer(mpReGIRIdToCatalog.get(), mapping.data(), 0u, mapping.size() * sizeof(uint32_t));
         pRenderContext->uavBarrier(mpReGIRIdToCatalog.get());
     }
@@ -136,32 +151,21 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         defines.add("RTPT_REGIR_ENABLED", "1");
         auto createPass = [&](const char* path, const char* entry)
         {
-            ProgramDesc desc;
-            desc.addShaderModules(mpScene->getShaderModules());
-            desc.addTypeConformances(mpScene->getTypeConformances());
-            desc.addShaderLibrary(path).csEntry(entry);
-            desc.setShaderModel(ShaderModel::SM6_6);
-            desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-            return ComputePass::create(mpDevice, desc, defines, true);
+            return ComputePass::create(mpDevice, makeSceneProgramDesc(path, entry), defines, true);
         };
         mpReGIRUpdateLights = createPass("RenderPasses/RTPT/ReGIR/RTPTReGIRUpdate.cs.slang", "updateLights");
         mpReGIRUpdateCells = createPass("RenderPasses/RTPT/ReGIR/RTPTReGIRUpdate.cs.slang", "updateCells");
         mpReGIRBuild = createPass("RenderPasses/RTPT/ReGIR/RTPTReGIRBuild.cs.slang", "main");
-        mReGIRCatalogGeneration = mDICatalogGeneration;
+        mReGIRCatalogGeneration = catalog.generation;
     }
 
     // Consumer dispatches can publish new cells inline. Make their persistent
     // keys and completed lists visible before this frame's maintenance passes.
-    for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISFrame, mpReGIRCellLastUsed, mpReGIRCandidateIds})
+    for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISState, mpReGIRCellLastUsed, mpReGIRCandidateIds})
         pRenderContext->uavBarrier(buffer.get());
 
     const float3 cameraPosition = mpScene->getCamera()->getPosition();
-    if (mReGIRFreeze && mReGIRPrepared && !descriptorsChanged && all(cameraPosition == mReGIRBuildCameraPosition))
-    {
-        mReGIRActive = true;
-        return true;
-    }
-
+    const bool domainChanged = descriptorsChanged || any(cameraPosition != mReGIRBuildCameraPosition);
     // Previous descriptors retain removed lights long enough to remove their
     // membership from old cells. Stable IDs and the candidate allocator persist.
     if (descriptorsChanged) std::swap(mpReGIRLightDescriptors, mpReGIRPreviousLightDescriptors);
@@ -179,17 +183,20 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         mpSampleGenerator->bindShaderData(var);
         if (var.hasMember("gDISettings"))
         {
-            bindDISettings(var);
-            var["gDISettings"]["frameStamp"] = mReGIRBuildFrameStamp;
+            // The RTXDI bridge supplies catalogue lookup and RNG to the grid builder.
+            const auto settings = var["gDISettings"];
+            bindLightCatalogSettings(settings);
+            settings["sampleIndex"] = mSampleOffset + mSeed * 0x9e3779b9u;
+            settings["frameStamp"] = mReGIRBuildFrameStamp;
         }
-        if (var.hasMember("gDILightCatalog")) var["gDILightCatalog"] = mpDILightCatalog;
-        bindReGIRInitial(var);
+        if (var.hasMember("gDILightCatalog")) var["gDILightCatalog"] = catalog.lights;
+        bindReGIRInitial(var, invalidateRIS);
     };
     if (descriptorsChanged)
     {
         FALCOR_PROFILE(pRenderContext, "ReGIRUpdateLights");
         bind(mpReGIRUpdateLights);
-        mpReGIRUpdateLights->execute(pRenderContext, uint3(std::max(1u, mReGIRNextLightId), 1u, 1u));
+        mpReGIRUpdateLights->execute(pRenderContext, uint3(std::max(1u, stableIdCount), 1u, 1u));
     }
     pRenderContext->uavBarrier(mpReGIRLightDescriptors.get());
     pRenderContext->uavBarrier(mpReGIRDirtyLights.get());
@@ -199,7 +206,7 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         bind(mpReGIRUpdateCells);
         mpReGIRUpdateCells->execute(pRenderContext, uint3(mReGIRCellCapacity, 1u, 1u));
     }
-    for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISFrame, mpReGIRCellLastUsed, mpReGIRCandidateIds, mpReGIRState})
+    for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISState, mpReGIRCellLastUsed, mpReGIRCandidateIds, mpReGIRState})
         pRenderContext->uavBarrier(buffer.get());
     {
         FALCOR_PROFILE(pRenderContext, "ReGIRBuild");
@@ -207,18 +214,21 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         mpReGIRBuild->execute(pRenderContext, uint3(mReGIRSlotCount, 1u, 1u));
     }
     pRenderContext->uavBarrier(mpReGIRRIS.get());
-    pRenderContext->uavBarrier(mpReGIRCellRISFrame.get());
     ++mReGIRBuildCount;
+    // Sampling a retained or newly discovered cell preserves the light domain.
+    if (domainChanged) ++mReGIRDomainGeneration;
     mReGIRBuildCameraPosition = cameraPosition;
     mReGIRFallbackReason.clear();
     return true;
 }
 
-void RTPT::bindReGIRInitial(const ShaderVar& var) const
+void RTPT::bindReGIRInitial(const ShaderVar& var, bool invalidateRIS) const
 {
+    const auto& catalog = mLightCatalog.getSnapshot();
     if (var.hasMember("gReGIRSettings"))
     {
         auto settings = var["gReGIRSettings"];
+        bindLightCatalogSettings(settings);
         settings["cameraPosition"] = mpScene->getCamera()->getPosition();
         settings["baseCellSize"] = mReGIRCellSize;
         settings["coarsenCellDistance"] = mReGIRCoarsenCellDistance;
@@ -229,28 +239,24 @@ void RTPT::bindReGIRInitial(const ShaderVar& var) const
         settings["buildSamples"] = mReGIRBuildSamples;
         settings["samplingJitter"] = mReGIRSamplingJitter;
         settings["active"] = mReGIRActive ? 1u : 0u;
-        settings["lightCount"] = mDILightCount;
         settings["cullingEnabled"] = mReGIRCullingEnabled ? 1u : 0u;
-        settings["generation"] = mDICatalogGeneration;
-        settings["coverageMask"] = mDICoverageMask;
-        settings["uncoveredAnalyticCount"] = mDIUncoveredAnalyticCount;
         settings["secondaryEnabled"] = mReGIRSecondaryEnabled ? 1u : 0u;
         settings["trainingEnabled"] = mReGIRTrainingEnabled ? 1u : 0u;
-        settings["stableIdCount"] = mReGIRNextLightId;
+        settings["stableIdCount"] = uint32_t(catalog.idToRank.size());
         settings["candidateCapacity"] = mReGIRPoolCapacity;
         settings["listEpoch"] = 1u;
         settings["frameStamp"] = mReGIRBuildFrameStamp;
-        settings["freezeSnapshot"] = mReGIRFreeze ? 1u : 0u;
+        settings["invalidateRIS"] = invalidateRIS ? 1u : 0u;
     }
     if (var.hasMember("gReGIRCells")) var["gReGIRCells"] = mpReGIRCells;
     if (var.hasMember("gReGIRCellMeta")) var["gReGIRCellMeta"] = mpReGIRCellMeta;
     if (var.hasMember("gReGIRCellEpoch")) var["gReGIRCellEpoch"] = mpReGIRCellEpoch;
-    if (var.hasMember("gReGIRCellRISFrame")) var["gReGIRCellRISFrame"] = mpReGIRCellRISFrame;
+    if (var.hasMember("gReGIRCellRISState")) var["gReGIRCellRISState"] = mpReGIRCellRISState;
     if (var.hasMember("gReGIRCellLastUsed")) var["gReGIRCellLastUsed"] = mpReGIRCellLastUsed;
     if (var.hasMember("gReGIRCandidateIDs")) var["gReGIRCandidateIDs"] = mpReGIRCandidateIds;
     if (var.hasMember("gReGIRState")) var["gReGIRState"] = mpReGIRState;
     if (var.hasMember("gReGIRIdToCatalog")) var["gReGIRIdToCatalog"] = mpReGIRIdToCatalog;
-    if (var.hasMember("gReGIRCatalog")) var["gReGIRCatalog"] = mpDILightCatalog;
+    if (var.hasMember("gReGIRCatalog")) var["gReGIRCatalog"] = catalog.lights;
     if (var.hasMember("gReGIRLightDescriptors")) var["gReGIRLightDescriptors"] = mpReGIRLightDescriptors;
     if (var.hasMember("gReGIRPreviousLightDescriptors")) var["gReGIRPreviousLightDescriptors"] = mpReGIRPreviousLightDescriptors;
     if (var.hasMember("gReGIRDirtyLightIDs")) var["gReGIRDirtyLightIDs"] = mpReGIRDirtyLights;
@@ -260,12 +266,16 @@ void RTPT::bindReGIRInitial(const ShaderVar& var) const
 void RTPT::bindReGIRTransport(const ShaderVar& var) const
 {
     bindReGIRInitial(var);
-    if (var.hasMember("gReGIRTransportCatalog")) var["gReGIRTransportCatalog"] = mpDILightCatalog;
-    if (var.hasMember("gReGIRTransportUncoveredAnalyticIndices")) var["gReGIRTransportUncoveredAnalyticIndices"] = mpDIUncoveredAnalyticIndices;
+    const auto& catalog = mLightCatalog.getSnapshot();
+    if (var.hasMember("gReGIRTransportCatalog")) var["gReGIRTransportCatalog"] = catalog.lights;
+    if (var.hasMember("gReGIRTransportUncoveredAnalyticIndices"))
+        var["gReGIRTransportUncoveredAnalyticIndices"] = catalog.uncoveredAnalyticIndices;
 }
 
 Properties RTPT::getReGIRStatistics() const
 {
+    const auto& catalog = mLightCatalog.getSnapshot();
+    const uint32_t stableIdCount = mLightCatalog.getStableIdCount();
     Properties props;
     props["requested"] = mReGIREnabled;
     props["prepared"] = mReGIRPrepared;
@@ -279,8 +289,9 @@ Properties RTPT::getReGIRStatistics() const
     props["coarsenCellDistance"] = mReGIRCoarsenCellDistance;
     props["brightnessThreshold"] = mReGIRBrightnessThreshold;
     props["lightCullingEnabled"] = mReGIRCullingEnabled;
-    props["stableLightIdCount"] = mReGIRNextLightId;
-    props["stableIdCount"] = mReGIRNextLightId;
+    props["stableLightIdCount"] = stableIdCount;
+    props["stableIdCount"] = stableIdCount;
+    props["catalogGeneration"] = catalog.generation;
     props["stableLightIdCapacity"] = mReGIRLightIdCapacity;
     props["candidateCapacity"] = mReGIRPoolCapacity;
     props["slotCount"] = mReGIRSlotCount;
@@ -288,7 +299,7 @@ Properties RTPT::getReGIRStatistics() const
     props["risElementCount"] = mpReGIRRIS ? mpReGIRRIS->getElementCount() : 0u;
     const uint64_t risBytes = reGIRBufferBytes(mpReGIRRIS);
     const uint64_t hashBytes = reGIRBufferBytes(mpReGIRCells) + reGIRBufferBytes(mpReGIRCellMeta) +
-        reGIRBufferBytes(mpReGIRCellEpoch) + reGIRBufferBytes(mpReGIRCellRISFrame) + reGIRBufferBytes(mpReGIRCellLastUsed);
+        reGIRBufferBytes(mpReGIRCellEpoch) + reGIRBufferBytes(mpReGIRCellRISState) + reGIRBufferBytes(mpReGIRCellLastUsed);
     const uint64_t candidateBytes = reGIRBufferBytes(mpReGIRCandidateIds);
     const uint64_t descriptorBytes = reGIRBufferBytes(mpReGIRLightDescriptors) + reGIRBufferBytes(mpReGIRPreviousLightDescriptors);
     const uint64_t auxiliaryBytes = reGIRBufferBytes(mpReGIRState) + reGIRBufferBytes(mpReGIRIdToCatalog) + reGIRBufferBytes(mpReGIRDirtyLights);
@@ -301,7 +312,7 @@ Properties RTPT::getReGIRStatistics() const
     props["budgetBytes"] = uint64_t(mReGIRBudgetMB) << 20u;
     props["buildFrameStamp"] = mReGIRBuildFrameStamp;
     props["buildCount"] = mReGIRBuildCount;
-    props["freeze"] = mReGIRFreeze;
+    props["domainGeneration"] = mReGIRDomainGeneration;
     props["buildSamples"] = mReGIRBuildSamples;
     props["lightsPerCell"] = mReGIRLightsPerCell;
     props["gridSize"] = mReGIRGridSize;
@@ -325,11 +336,13 @@ Properties RTPT::getReGIRStatistics() const
         props["dirtyCellBuilds"] = state[7];
         props["inlineBuilds"] = state[8];
         props["evictions"] = state[9];
+        props["risCellBuilds"] = state[10];
+        props["risCellReuses"] = state[11];
     }
-    std::vector<uint32_t> catalogueIds(mDILightCount, std::numeric_limits<uint32_t>::max());
-    for (uint32_t stableId = 0u; stableId < mReGIRIdToCatalogData.size(); ++stableId)
+    std::vector<uint32_t> catalogueIds(catalog.lightCount, std::numeric_limits<uint32_t>::max());
+    for (uint32_t stableId = 0u; stableId < catalog.idToRank.size(); ++stableId)
     {
-        const uint32_t rank = mReGIRIdToCatalogData[stableId];
+        const uint32_t rank = catalog.idToRank[stableId];
         if (rank < catalogueIds.size()) catalogueIds[rank] = stableId;
     }
     // Properties' scalar setter is explicitly instantiated, so attach the

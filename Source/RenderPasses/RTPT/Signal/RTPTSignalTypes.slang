@@ -1,17 +1,6 @@
 #pragma once
 
-// Keep the established finite miss convention for NRD's fp16 resources.
-static const float kRTPTNRDMissDistance = 60000.f;
-
-// These describe the continuation event, independently of its radiance.
-// In particular, a black hit is not a missing distance and a rejected sample
-// keeps the legacy numeric distance without pretending that a ray missed.
-static const uint kRTPTDistanceNoLobe = 0u;
-static const uint kRTPTDistanceSampleRejected = 1u;
-static const uint kRTPTDistanceHit = 2u;
-static const uint kRTPTDistanceMiss = 3u;
-static const uint kRTPTDistanceUntraced = 4u;
-static const uint kRTPTDistanceNotSelected = 5u;
+#include "../RTPTFirstHit.slangh"
 
 struct RTPTNRDSignals
 {

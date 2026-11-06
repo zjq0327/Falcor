@@ -111,10 +111,7 @@ bool rtptReGIRSampleTransportLight(ShadingData sd, inout SampleGenerator sg, out
     if (view.ready == 0u || view.count == 0u) return false;
     const uint cell = view.cell;
     uint lightIndex;
-    bool currentRIS = false;
-    if (cell != kRTPTReGIRInvalidCell)
-        currentRIS = gReGIRCellRISFrame[cell] == gReGIRSettings.frameStamp;
-    if (currentRIS)
+    if (rtptReGIRHasPublishedRIS(view))
     {
         const uint localSlot = min(uint(sampleNext1D(sg) * gReGIRSettings.lightsPerCell),
             gReGIRSettings.lightsPerCell - 1u);

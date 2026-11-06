@@ -1,5 +1,5 @@
 #pragma once
-#include "../Signal/RTPTSignalTypes.slang"
+#include "../RTPTFirstHit.slangh"
 
 #ifndef RTPT_GRIS_SPATIAL
 #define RTPT_GRIS_SPATIAL 0
@@ -60,16 +60,9 @@ struct GrisSpatialRecord
     PackedHitInfo reconnectHit;
     float areaPdf;          // Canonical x1 -> x2 proposal, in area measure.
     float3 suffixDirection; // ReGIR stores light-surface UV in xy.
-    float3 suffixLight;     // Ordinary NEE stores Li / PDF. ReGIR stores RIS weight in x.
-#if RTPT_REGIR_ONLY && RTPT_GRIS_ALTERNATING
-    uint lightStableID;     // Uses the ordinary NEE lightPdf slot.
-#else
-    float lightPdf;
-#endif
+    float3 suffixLight;     // Weighted Li/PDF for NEE, RIS weight and inverse domain probability in xy for ReGIR.
+    uint lightPdfOrStableID; // Interpret by terminalKind.
     bool lightIsAnalytic;
-#if RTPT_REGIR_ONLY && !RTPT_GRIS_ALTERNATING
-    uint lightStableID;
-#endif
 };
 
 #if RTPT_GRIS_ALTERNATING
@@ -97,7 +90,7 @@ struct GrisTemporalFreshHistory
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
     float3 suffixDirection; // ReGIR stores the light UV in xy.
-    float3 suffixLight;     // ReGIR stores the original RIS weight in x.
+    float3 suffixLight;     // ReGIR stores RIS weight and inverse domain probability in xy.
     uint lightPdfOrStableID;
     uint terminalAndFlags;
 #if defined(HIT_INFO_USE_COMPRESSION) && HIT_INFO_USE_COMPRESSION

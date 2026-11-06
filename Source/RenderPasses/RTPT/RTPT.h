@@ -4,13 +4,10 @@
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
+#include "RTPTLightCatalog.h"
 #include "RTPTPG.h"
 #include "RTPTNativePGTrain.h"
-#include <unordered_map>
-#include <map>
-#include <tuple>
 
-namespace Falcor { class Light; }
 struct RTPTPGTimingResources;
 using namespace Falcor;
 
@@ -39,13 +36,15 @@ public:
 
 private:
     void invalidateReGIR();
+    void invalidateReGIRPrograms();
     bool prepareReGIR(RenderContext* pRenderContext);
-    void bindReGIRInitial(const ShaderVar& rootVar) const;
+    void bindReGIRInitial(const ShaderVar& rootVar, bool invalidateRIS = false) const;
     void bindReGIRTransport(const ShaderVar& rootVar) const;
     void reset();
     void validateScene() const;
+    ProgramDesc makeSceneProgramDesc(const char* path, const char* entry = "main") const;
     void prepareProgram(RenderContext* pRenderContext);
-    void invalidateStages(bool preserveReGIR = false);
+    void invalidateStages();
     bool prepareStages();
     void invalidateGRIS(bool clearTemporalFailure = true);
     void resetGRISHistory();
@@ -58,8 +57,9 @@ private:
     void bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const;
     void executePrimarySurface(RenderContext* pRenderContext);
     void executeFinalSignalResolve(RenderContext* pRenderContext, const RenderData& renderData);
-    void invalidateDirectLighting(bool preserveReGIR = false);
-    bool prepareDirectLighting();
+    void invalidateDirectLighting();
+    bool prepareDirectLighting(bool catalogReady);
+    void bindLightCatalogSettings(const ShaderVar& settings) const;
     void bindDISettings(const ShaderVar& rootVar) const;
     void bindDIMainResources(const ShaderVar& rootVar) const;
     void executeDirectLighting(RenderContext* pRenderContext);
@@ -81,10 +81,10 @@ private:
     void writePGAsyncTimestamp(RenderContext* pContext, uint32_t index);
 
     ref<Scene> mpScene;
+    RTPTLightCatalog mLightCatalog;
     bool mReGIREnabled = false;
     bool mReGIRSecondaryEnabled = true;
     bool mReGIRTrainingEnabled = true;
-    bool mReGIRFreeze = false;
     bool mReGIRCullingEnabled = true;
     uint32_t mReGIRGridSize = 20u;
     uint32_t mReGIRLightsPerCell = 32u;
@@ -103,7 +103,7 @@ private:
     ref<Buffer> mpReGIRCellRequests;
     ref<Buffer> mpReGIRCellMeta;
     ref<Buffer> mpReGIRCellEpoch;
-    ref<Buffer> mpReGIRCellRISFrame;
+    ref<Buffer> mpReGIRCellRISState;
     ref<Buffer> mpReGIRCellLastUsed;
     ref<Buffer> mpReGIRCandidateIds;
     ref<Buffer> mpReGIRState;
@@ -111,9 +111,6 @@ private:
     ref<Buffer> mpReGIRLightDescriptors;
     ref<Buffer> mpReGIRPreviousLightDescriptors;
     ref<Buffer> mpReGIRDirtyLights;
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint32_t> mReGIRStableLightIds;
-    std::vector<uint32_t> mReGIRIdToCatalogData;
-    uint32_t mReGIRNextLightId = 0u;
     uint32_t mReGIRLightIdCapacity = 0u;
     uint32_t mReGIRPoolCapacity = 0u;
     uint32_t mReGIRCatalogGeneration = 0u;
@@ -128,6 +125,7 @@ private:
     uint32_t mReGIRCellCapacity = 0u;
     uint32_t mReGIRBuildFrameStamp = 0u;
     uint64_t mReGIRBuildCount = 0u;
+    uint64_t mReGIRDomainGeneration = 0u;
     float3 mReGIRBuildCameraPosition = float3(0.f);
     std::string mReGIRFallbackReason;
     ref<ComputePass> mpComputePass;
@@ -154,14 +152,13 @@ private:
         uint64_t pgVersion = 0u;
         uint32_t pgGeneration = 0u;
         uint64_t sharcVersion = 0u;
-        uint64_t regirVersion = 0u;
-        uint32_t regirCatalogGeneration = 0u;
+        uint64_t regirDomainGeneration = 0u;
 
         bool operator==(const GrisTemporalSnapshot& other) const
         {
             return all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
-                pgGeneration == other.pgGeneration && sharcVersion == other.sharcVersion && regirVersion == other.regirVersion &&
-                regirCatalogGeneration == other.regirCatalogGeneration;
+                pgGeneration == other.pgGeneration && sharcVersion == other.sharcVersion &&
+                regirDomainGeneration == other.regirDomainGeneration;
         }
     };
     struct GrisTemporalHistoryFrame
@@ -187,21 +184,10 @@ private:
     ref<ComputePass> mpDIComputePass;
     ref<ComputePass> mpDIInitialPass;
     ref<ComputePass> mpDIShadePass;
-    ref<Buffer> mpDILightCatalog;
-    ref<Buffer> mpDIUncoveredAnalyticIndices;
     ref<Buffer> mpDIReservoirs;
     ref<Buffer> mpDISampleRecords;
     ref<Buffer> mpDIResults;
-    std::vector<uint64_t> mDICatalogSignature;
-    std::unordered_map<const Light*, uint32_t> mDILightIdentities;
-    std::vector<ref<Light>> mDILightIdentityOwners;
-    uint32_t mDINextIdentity = 1u;
-    uint32_t mDICatalogGeneration = 1u;
-    uint32_t mDILightCount = 0u;
-    uint32_t mDIEmissiveCount = 0u;
-    uint32_t mDIPointCount = 0u;
-    uint32_t mDIUncoveredAnalyticCount = 0u;
-    uint32_t mDICoverageMask = 0u;
+    uint32_t mDIPreparedCatalogGeneration = 0u;
     bool mRestirDIEnabled = false;
     uint32_t mRestirDICandidateCount = 8u;
     uint32_t mRestirDIBudgetMB = 512u;

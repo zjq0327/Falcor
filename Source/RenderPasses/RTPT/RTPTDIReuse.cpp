@@ -45,23 +45,14 @@ bool RTPT::prepareDIReuse()
             const uint64_t pairStride = mpDIReservoirs->getStructSize() + mpDISampleRecords->getStructSize();
             const uint64_t bytes = 4u * pixels * pairStride + mpDIResults->getSize() +
                 pixels * mpPrimarySurfaces->getStructSize() + 256u * sizeof(float2) +
-                mpDILightCatalog->getSize() + mpDIUncoveredAnalyticIndices->getSize();
+                mLightCatalog.getSnapshot().getBytes();
             FALCOR_CHECK(bytes <= (uint64_t(mRestirDIBudgetMB) << 20),
                 "ReSTIR DI reuse needs {} bytes, exceeding its {} MiB budget. Initial remains available.", bytes, mRestirDIBudgetMB);
             auto defines = mpDIInitialPass->getProgram()->getDefines();
             defines.add("RTPT_DI_REUSE_ENABLED", "1");
             auto makePass = [&](const char* path)
             {
-                ProgramDesc desc;
-                desc.addShaderModules(mpScene->getShaderModules());
-                desc.addTypeConformances(mpScene->getTypeConformances());
-                desc.addShaderLibrary(path).csEntry("main");
-                if (mEnablePG || mEnableSHARC || mReGIREnabled)
-                {
-                    desc.setShaderModel(ShaderModel::SM6_6);
-                    desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-                }
-                return ComputePass::create(mpDevice, desc, defines, true);
+                return ComputePass::create(mpDevice, makeSceneProgramDesc(path), defines, true);
             };
             auto initial = makePass("RenderPasses/RTPT/ReSTIRDI/RTPTDIInitial.cs.slang");
             auto temporal = mRestirDITemporalEnabled ? makePass("RenderPasses/RTPT/ReSTIRDI/RTPTDITemporal.cs.slang") : nullptr;
@@ -113,7 +104,7 @@ bool RTPT::prepareDIReuse()
     }
     if (mDIHistoryAvailable)
     {
-        if (mDIHistoryGeneration != mDICatalogGeneration || mDIHistoryFrameStamp + 1u != mPrimaryFrameStamp)
+        if (mDIHistoryGeneration != mLightCatalog.getSnapshot().generation || mDIHistoryFrameStamp + 1u != mPrimaryFrameStamp)
             resetDIHistory("DI history generation or frame continuity changed");
         else
         {
@@ -176,7 +167,7 @@ void RTPT::publishDIHistory(RenderContext* pRenderContext)
     if (distance > 1e-5f) mDIPreviousCameraForward = direction / distance;
     mDIHistoryFrameStamp = mPrimaryFrameStamp;
     mDIHistorySampleIndex = mSampleOffset + mSeed * 0x9e3779b9u;
-    mDIHistoryGeneration = mDICatalogGeneration;
+    mDIHistoryGeneration = mLightCatalog.getSnapshot().generation;
     mDIHistoryFrames = std::min(mDIHistoryFrames + 1u, mRestirDIHistoryLength);
     mDIHistoryAvailable = true;
 }

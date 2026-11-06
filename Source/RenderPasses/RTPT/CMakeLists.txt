@@ -5,6 +5,8 @@ target_sources(RTPT PRIVATE
     RTPT.h
     RTPTStages.cpp
     RTPTDirectLighting.cpp
+    RTPTLightCatalog.cpp
+    RTPTLightCatalog.h
     RTPTReGIR.cpp
     ReGIR/RTPTReGIRResources.slang
     ReGIR/RTPTReGIRGrid.slang
@@ -27,12 +29,17 @@ target_sources(RTPT PRIVATE
     RTPTPGTrain.cs.slang
     RTPTSparseUpdate.cs.slang
     RTPTParams.slangh
+    RTPTFirstHit.slangh
+    RTPTTransport.slangh
     RTPT.cs.slang
+    RTPTContinuation.slang
     RTPTIntegrator.slang
     RTPTLighting.slang
     RTPTNRD.slang
+    GRIS/RTPTGRISCapture.slang
     GRIS/RTPTGRISGenerate.cs.slang
     GRIS/RTPTGRISGenerate.slang
+    GRIS/RTPTGRISIndirect.slang
     GRIS/RTPTGRISPublishHistory.cs.slang
     GRIS/RTPTGRISReuse.slang
     GRIS/RTPTGRISShade.cs.slang
@@ -45,12 +52,14 @@ target_sources(RTPT PRIVATE
     GRIS/RTPTGRISTerminalPicker.slang
     PrimarySurface/RTPTCamera.slang
     PrimarySurface/RTPTPrimarySurfaceTypes.slang
+    PrimarySurface/RTPTReprojection.slangh
     PrimarySurface/RTPTPrimarySurface.slang
     PrimarySurface/RTPTPrimarySurface.cs.slang
     Signal/RTPTSignalTypes.slang
     Signal/RTPTSignalResolve.slang
     Signal/RTPTFinalSignalResolve.cs.slang
     DirectLighting/RTPTDITypes.slang
+    DirectLighting/RTPTDICoverage.slang
     DirectLighting/RTPTDIResources.slang
     ReSTIRDI/RTPTDIBridge.slangh
     ReSTIRDI/RTPTDISDK.slangh

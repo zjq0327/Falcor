@@ -1,5 +1,5 @@
 #include "RTPTGRISReuse.slang"
-#include "../ReSTIRDI/RTPTDIReprojection.slangh"
+#include "../PrimarySurface/RTPTReprojection.slangh"
 
 struct GrisTemporalSettings
 {
@@ -29,7 +29,7 @@ bool rtptGrisLoadHistory(uint2 pixel, out GrisTemporalFreshHistory history)
     const uint2 previousDim = gGRISTemporalSettings.previousFrameDim;
     float2 previousPixel;
     float previousDepth;
-    if (!rtptDIProjectPreviousPixel(primary.position + primary.motionW, previousDim,
+    if (!rtptProjectPreviousPixel(primary.position + primary.motionW, previousDim,
         gGRISTemporalSettings.previousViewProj, previousPixel, previousDepth)) return false;
     const int2 previousIndex = int2(round(previousPixel));
     if (any(previousIndex < 0) || any(uint2(previousIndex) >= previousDim)) return false;
@@ -49,12 +49,8 @@ void rtptGrisDecodeHistory(GrisTemporalFreshHistory history, out GrisLocalPrefix
     source.areaPdf = history.sourceAreaPdf;
     source.suffixDirection = history.suffixDirection;
     source.suffixLight = history.suffixLight;
-#if RTPT_REGIR_ONLY
-    source.lightStableID = history.lightPdfOrStableID;
-#else
-    source.lightPdf = asfloat(history.lightPdfOrStableID);
+    source.lightPdfOrStableID = history.lightPdfOrStableID;
     source.lightIsAnalytic = (history.terminalAndFlags & kGrisHistoryAnalytic) != 0u;
-#endif
 }
 
 #if RTPT_GRIS_ALTERNATING

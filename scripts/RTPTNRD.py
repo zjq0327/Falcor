@@ -1,4 +1,9 @@
 from falcor import *
+from pathlib import Path
+import runpy
+
+
+_add_nrd_edges = runpy.run_path(str(Path(__file__).with_name("_rtpt_nrd_graph.py")))["add_nrd_edges"]
 
 
 def render_graph_RTPTNRD():
@@ -36,19 +41,7 @@ def render_graph_RTPTNRD():
         "exposureCompensation": 0.0,
     }), "ToneMapperReference")
 
-    # NRD receives independent current-frame signals rather than progressive averages.
-    graph.addEdge("RTPT.nrdDiffuseRadianceHitDist", "NRD.diffuseRadianceHitDist")
-    graph.addEdge("RTPT.nrdSpecularRadianceHitDist", "NRD.specularRadianceHitDist")
-    graph.addEdge("RTPT.normWRoughnessMaterialID", "NRD.normWRoughnessMaterialID")
-    graph.addEdge("RTPT.viewZ", "NRD.viewZ")
-    graph.addEdge("RTPT.mvecW", "NRD.mvec")
-
-    graph.addEdge("RTPT.nrdEmission", "ModulateIllumination.emission")
-    graph.addEdge("RTPT.nrdDiffuseReflectance", "ModulateIllumination.diffuseReflectance")
-    graph.addEdge("RTPT.nrdSpecularReflectance", "ModulateIllumination.specularReflectance")
-    graph.addEdge("NRD.filteredDiffuseRadianceHitDist", "ModulateIllumination.diffuseRadiance")
-    graph.addEdge("NRD.filteredSpecularRadianceHitDist", "ModulateIllumination.specularRadiance")
-    graph.addEdge("RTPT.nrdResidualRadiance", "ModulateIllumination.residualRadiance")
+    _add_nrd_edges(graph)
     graph.addEdge("ModulateIllumination.output", "ToneMapper.src")
     graph.addEdge("RTPT.noisyColor", "ToneMapperReference.src")
 

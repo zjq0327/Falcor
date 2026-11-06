@@ -19,12 +19,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     const uint slot = dispatchThreadID.x;
     if (slot >= gReGIRSettings.slotCount) return;
-    gReGIRRIS[slot] = uint2(0u);
     const uint cell = slot / gReGIRSettings.lightsPerCell;
+    if (gReGIRCellRISState[cell] != kRTPTReGIRRISBuild) return;
+
+    gReGIRRIS[slot] = uint2(0u);
     const RTPTReGIRCellView view = rtptReGIRGetStoredCellView(cell);
     if (view.ready == 0u) return;
-    if (slot % gReGIRSettings.lightsPerCell == 0u)
-        gReGIRCellRISFrame[cell] = gReGIRSettings.frameStamp;
     if (view.count == 0u || gReGIRSettings.buildSamples == 0u) return;
 
     RAB_RandomSamplerState proposals = RAB_InitRandomSampler(uint2(slot & 0xfffu, slot >> 12u), 31u);

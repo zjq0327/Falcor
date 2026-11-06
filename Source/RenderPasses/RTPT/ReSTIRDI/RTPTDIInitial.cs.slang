@@ -63,11 +63,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if RTPT_REGIR_ENABLED
             const float3 jitter = float3(RAB_GetNextRandom(rng), RAB_GetNextRandom(rng), RAB_GetNextRandom(rng));
             const RTPTReGIRCellView view = rtptReGIRGetCellView(surface.sd.posW, jitter);
-            bool currentRIS = false;
-            // Falcor's shader settings do not guarantee short-circuit loads.
-            if (view.ready != 0u && view.cell != kRTPTReGIRInvalidCell)
-                currentRIS = gReGIRCellRISFrame[view.cell] == gReGIRSettings.frameStamp;
-            if (currentRIS)
+            if (rtptReGIRHasPublishedRIS(view))
                 reservoir = RTXDI_SampleLocalLightsInternal(rng, surface, samples,
                     rtptDIInitialRuntimeParameters(), true, view.cell * gReGIRSettings.lightsPerCell,
                     gReGIRSettings.lightsPerCell, selectedSample);
