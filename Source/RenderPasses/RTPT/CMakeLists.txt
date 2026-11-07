@@ -71,6 +71,7 @@ target_sources(RTPT PRIVATE
     ReSTIRDI/RTPTDISpatial.cs.slang
     RTPTSharc.slang
     RTPTSharcResolve.cs.slang
+    RTPTSharcInvalidate.cs.slang
 )
 
 target_link_libraries(RTPT PRIVATE rtxdi)

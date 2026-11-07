@@ -29,6 +29,7 @@ public:
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getPGStatistics() const;
     Properties getPGAsyncStatistics() const;
+    Properties getSHARCMotionStatistics() const;
     Properties getStageStatistics() const;
     Properties getDIStatistics() const;
     Properties getReGIRStatistics() const;
@@ -41,6 +42,7 @@ private:
     void bindReGIRInitial(const ShaderVar& rootVar, bool invalidateRIS = false) const;
     void bindReGIRTransport(const ShaderVar& rootVar) const;
     void reset();
+    void resetAccumulation();
     void validateScene() const;
     ProgramDesc makeSceneProgramDesc(const char* path, const char* entry = "main") const;
     void prepareProgram(RenderContext* pRenderContext);
@@ -70,7 +72,8 @@ private:
     void publishDIHistory(RenderContext* pRenderContext);
     void bindSHARC(const ShaderVar& rootVar);
     void clearSHARC(RenderContext* pRenderContext);
-    void executeTraining(RenderContext* pRenderContext, bool preserveNRDHistoryOnPGReset = false);
+    void updateSHARCMotionBounds();
+    void executeTraining(RenderContext* pRenderContext);
     void dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32_t bounces, uint32_t frameIndex, bool sharc, bool pg);
     bool preparePGAsync();
     void recordPGAsyncTraining(RenderContext* pRenderContext);
@@ -226,6 +229,7 @@ private:
     std::string mDIHistoryResetReason;
     std::string mDIReuseFallbackReason;
     ref<ComputePass> mpSHARCResolve;
+    ref<ComputePass> mpSHARCInvalidate;
     ref<ComputePass> mpSparseUpdate;
     ref<ComputePass> mpPGPrepare;
     ref<ComputePass> mpPGTrain;
@@ -233,6 +237,7 @@ private:
     RTPTPG::Settings mPGSettings;
     bool mEnablePG = false;
     bool mResetPG = true;
+    bool mPGModelResetThisFrame = false;
     bool mPGTrainingThisFrame = false;
     bool mSharedTrainingThisFrame = false;
     bool mPGAsyncTraining = true;
@@ -270,6 +275,10 @@ private:
     ref<Buffer> mpSHARCHashEntries;
     ref<Buffer> mpSHARCAccumulation;
     ref<Buffer> mpSHARCResolved;
+    ref<Buffer> mpSHARCMotionBounds;
+    ref<Buffer> mpSHARCMotionStats;
+    std::vector<AABB> mSHARCPreviousInstanceBounds;
+    std::vector<float4> mSHARCMotionBoundsCPU;
     ref<SampleGenerator> mpSampleGenerator;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
     ref<Texture> mpAccumulation;
@@ -288,11 +297,14 @@ private:
     bool mResetNRDHistory = true;
     bool mNRDHistoryResetThisFrame = false;
     bool mPGTranslationPreservedNRDThisFrame = false;
+    bool mSceneMotionThisFrame = false;
     bool mEnableSHARC = false;
     bool mSHARCEnabled = true;
     bool mSHARCUseCache = true;
     bool mSHARCFreeze = false;
     bool mResetSHARCCache = true;
+    bool mSHARCCacheResetThisFrame = false;
+    uint32_t mSHARCMotionResponsiveFrames = 0;
     uint32_t mSHARCEntries = 1u << 20;
     uint32_t mSHARCUpdateStride = 5;
     uint32_t mSHARCUpdateBounces = 8;

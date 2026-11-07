@@ -37,6 +37,7 @@ struct RTPTSharcSettings
     float3 cameraPositionPrev;
     uint accumulationFrames;
     uint staleFrames;
+    uint motionResponsive;
 };
 
 ParameterBlock<SharcParameters> gSharc;

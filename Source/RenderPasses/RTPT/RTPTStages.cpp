@@ -437,6 +437,16 @@ Properties RTPT::getStageStatistics() const
     props["finalResolveActive"] = mStagesActive && mEnableNRD;
     props["nrdHistoryReset"] = mNRDHistoryResetThisFrame;
     props["pgTranslationPreservedNRD"] = mPGTranslationPreservedNRDThisFrame;
+    props["pgModelReset"] = mPGModelResetThisFrame;
+    props["sharcCacheReset"] = mSHARCCacheResetThisFrame;
+    props["sceneMotion"] = mSceneMotionThisFrame;
+    // execute() advances these counters after rendering; they identify the
+    // next sample/update phase when inspected from Python after a frame.
+    props["sampleOffset"] = mSampleOffset;
+    props["pgFrameIndex"] = mPGFrameIndex;
+    props["sharcFrameIndex"] = mSHARCFrameIndex;
+    props["sharcMotionBoundsCount"] = uint32_t(mSHARCMotionBoundsCPU.size() / 2);
+    props["sharcMotionResponsive"] = mSHARCMotionResponsiveFrames != 0u;
     const uint64_t primaryBytes = mpPrimarySurfaces ? mpPrimarySurfaces->getSize() : 0;
     const uint64_t signalBytes = mpSignalRecords ? mpSignalRecords->getSize() : 0;
     props["primaryBytes"] = primaryBytes;

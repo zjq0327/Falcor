@@ -45,6 +45,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
         pybind11::class_<RTPT, RenderPass, ref<RTPT>> pass(m, "RTPT");
         pass.def_property_readonly("pgStats", [](const RTPT& self) { return self.getPGStatistics().toPython(); });
         pass.def_property_readonly("pgAsyncStats", [](const RTPT& self) { return self.getPGAsyncStatistics().toPython(); });
+        pass.def_property_readonly("sharcMotionStats", [](const RTPT& self) { return self.getSHARCMotionStatistics().toPython(); });
         pass.def_property_readonly("stageStats", [](const RTPT& self) { return self.getStageStatistics().toPython(); });
         pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
         pass.def_property_readonly("regirStats", [](const RTPT& self) { return self.getReGIRStatistics().toPython(); });
@@ -252,6 +253,7 @@ void RTPT::setProperties(const Properties& props)
     if (modeChanged || sharcUpdateBounces != mSHARCUpdateBounces)
     {
         mpSHARCResolve = nullptr;
+        mpSHARCInvalidate = nullptr;
         mpSparseUpdate = nullptr;
     }
     mSamplesPerPixel = samplesPerPixel;
@@ -495,10 +497,15 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
 void RTPT::reset()
 {
     mSampleOffset = 0;
-    mAccumulatedSamples = 0;
-    mAccumulatedFrames = 0;
+    resetAccumulation();
     mResetNRDHistory = true;
     resetGRISHistory();
+}
+
+void RTPT::resetAccumulation()
+{
+    mAccumulatedSamples = 0;
+    mAccumulatedFrames = 0;
 }
 
 void RTPT::validateScene() const
@@ -529,12 +536,17 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mpScene = pScene;
     mpComputePass = nullptr;
     mpSHARCResolve = nullptr;
+    mpSHARCInvalidate = nullptr;
+    mSHARCPreviousInstanceBounds.clear();
+    mSHARCMotionBoundsCPU.clear();
+    mSHARCMotionResponsiveFrames = 0;
     mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
     mpEnvMapSampler = nullptr;
     mLightingMask = ~0u;
     mpCameraPattern = nullptr;
     mpJitterCamera = nullptr;
     mResetSHARCCache = true;
+    mSHARCFrameIndex = 0;
     mResetPG = true;
     reset();
     if (mpScene)
@@ -594,7 +606,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     }
 
     if (!mpComputePass || ((mEnableSHARC || mEnablePG) && !mpSparseUpdate) ||
-        (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && !mpSHARCResolve))
+        (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && (!mpSHARCResolve || !mpSHARCInvalidate)))
     {
         const auto desc = makeSceneProgramDesc("RenderPasses/RTPT/RTPT.cs.slang");
         DefineList defines = mpScene->getSceneDefines();
@@ -636,7 +648,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             updateDefines.add("SHARC_QUERY", "0");
             mpSparseUpdate = ComputePass::create(mpDevice, updateDesc, updateDefines, true);
         }
-        if (mEnableSHARC && !mpSHARCResolve)
+        if (mEnableSHARC && (!mpSHARCResolve || !mpSHARCInvalidate))
         {
             ProgramDesc resolveDesc;
             resolveDesc.addShaderLibrary("RenderPasses/RTPT/RTPTSharcResolve.cs.slang").csEntry("main");
@@ -646,7 +658,15 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
             updateDefines.add("SHARC_UPDATE", "0");
             updateDefines.add("SHARC_QUERY", "0");
             updateDefines.add("ENABLE_PG", "0");
-            mpSHARCResolve = ComputePass::create(mpDevice, resolveDesc, updateDefines, true);
+            if (!mpSHARCResolve) mpSHARCResolve = ComputePass::create(mpDevice, resolveDesc, updateDefines, true);
+            if (!mpSHARCInvalidate)
+            {
+                resolveDesc = ProgramDesc();
+                resolveDesc.addShaderLibrary("RenderPasses/RTPT/RTPTSharcInvalidate.cs.slang").csEntry("main");
+                resolveDesc.setShaderModel(ShaderModel::SM6_6);
+                resolveDesc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
+                mpSHARCInvalidate = ComputePass::create(mpDevice, resolveDesc, updateDefines, true);
+            }
         }
         if (mEnablePG)
         {
@@ -697,6 +717,55 @@ void RTPT::bindSHARC(const ShaderVar& rootVar)
     settings["cameraPositionPrev"] = mSHARCCameraPositionPrev;
     settings["accumulationFrames"] = mSHARCAccumulationFrames;
     settings["staleFrames"] = mSHARCStaleFrames;
+    settings["motionResponsive"] = mSHARCMotionResponsiveFrames != 0u ? 1u : 0u;
+}
+
+void RTPT::updateSHARCMotionBounds()
+{
+    mSHARCMotionBoundsCPU.clear();
+    if (!mEnableSHARC) return;
+    const uint32_t count = mpScene->getGeometryInstanceCount();
+    const bool previousValid = mSHARCPreviousInstanceBounds.size() == count;
+    mSHARCPreviousInstanceBounds.resize(count);
+    const auto* animation = mpScene->getAnimationController();
+    const auto& matrices = animation->getGlobalMatrices();
+    const bool deformed = is_set(mpScene->getUpdates(), IScene::UpdateFlags::MeshesChanged);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const auto& instance = mpScene->getGeometryInstance(i);
+        if (instance.getType() != GeometryType::TriangleMesh) continue;
+        const AABB current = mpScene->getMeshBounds(instance.geometryID).transform(matrices[instance.globalMatrixID]);
+        const AABB previous = mSHARCPreviousInstanceBounds[i];
+        if (previousValid && mSceneMotionThisFrame &&
+            (animation->isMatrixChanged(NodeID{instance.globalMatrixID}) || (deformed && instance.isDynamic())))
+        {
+            AABB changed = current;
+            if (previous.valid()) changed.include(previous);
+            if (changed.valid())
+            {
+                mSHARCMotionBoundsCPU.emplace_back(changed.minPoint, 0.f);
+                mSHARCMotionBoundsCPU.emplace_back(changed.maxPoint, 0.f);
+            }
+        }
+        mSHARCPreviousInstanceBounds[i] = current;
+    }
+    // Bounds cover rigid geometry occupancy. Changes to remote illumination
+    // are handled separately by observed per-entry radiance response.
+    if (mSceneMotionThisFrame) mSHARCMotionResponsiveFrames = 8u;
+}
+
+Properties RTPT::getSHARCMotionStatistics() const
+{
+    Properties props;
+    std::array<uint32_t, 4> counts = {};
+    // Explicit diagnostic readback; ordinary rendering does not wait for it.
+    if (mpSHARCMotionStats) mpSHARCMotionStats->getBlob(counts.data(), 0, sizeof(counts));
+    props["occupiedEntries"] = counts[0];
+    props["invalidatedEntries"] = counts[1];
+    props["retainedEntries"] = counts[2];
+    props["responsiveEntries"] = counts[3];
+    props["boundsCount"] = uint32_t(mSHARCMotionBoundsCPU.size() / 2);
+    return props;
 }
 
 void RTPT::clearSHARC(RenderContext* pRenderContext)
@@ -709,7 +778,9 @@ void RTPT::clearSHARC(RenderContext* pRenderContext)
     pRenderContext->uavBarrier(mpSHARCAccumulation.get());
     pRenderContext->uavBarrier(mpSHARCResolved.get());
     mSHARCCameraPositionPrev = mpScene->getCamera()->getPosition();
-    mSHARCFrameIndex = 0;
+    // Cache lifetime is independent of the sparse sampling phase. In
+    // particular, animated geometry must not restart the tile pixel cycle.
+    mSHARCCacheResetThisFrame = true;
     ++mSHARCResolveVersion;
     mResetSHARCCache = false;
 }
@@ -753,11 +824,14 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     }
 }
 
-void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistoryOnPGReset)
+void RTPT::executeTraining(RenderContext* pRenderContext)
 {
     mPGTrainingThisFrame = mSharedTrainingThisFrame = false;
     if (mEnableSHARC)
     {
+        if (!mpSHARCMotionStats) mpSHARCMotionStats = mpDevice->createStructuredBuffer(4u, 4u);
+        pRenderContext->clearUAV(mpSHARCMotionStats->getUAV().get(), uint4(0));
+        pRenderContext->uavBarrier(mpSHARCMotionStats.get());
         if (!mpSHARCHashEntries)
         {
             mpSHARCHashEntries = mpDevice->createStructuredBuffer(8u, mSHARCEntries);
@@ -766,6 +840,23 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
             mResetSHARCCache = true;
         }
         if (mResetSHARCCache) clearSHARC(pRenderContext);
+        else if (!mSHARCMotionBoundsCPU.empty())
+        {
+            const size_t bytes = mSHARCMotionBoundsCPU.size() * sizeof(float4);
+            if (!mpSHARCMotionBounds || mpSHARCMotionBounds->getSize() < bytes)
+                mpSHARCMotionBounds = mpDevice->createStructuredBuffer(sizeof(float4), uint32_t(mSHARCMotionBoundsCPU.size()));
+            mpSHARCMotionBounds->setBlob(mSHARCMotionBoundsCPU.data(), 0, bytes);
+            auto var = mpSHARCInvalidate->getRootVar();
+            bindSHARC(var);
+            var["gSHARCMotionBounds"] = mpSHARCMotionBounds;
+            var["gSHARCMotionStats"] = mpSHARCMotionStats;
+            var["gSHARCMotionSettings"]["boundsCount"] = uint32_t(mSHARCMotionBoundsCPU.size() / 2);
+            mpSHARCInvalidate->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
+            pRenderContext->uavBarrier(mpSHARCHashEntries.get());
+            pRenderContext->uavBarrier(mpSHARCAccumulation.get());
+            pRenderContext->uavBarrier(mpSHARCResolved.get());
+            pRenderContext->uavBarrier(mpSHARCMotionStats.get());
+        }
     }
     const bool sharc = mEnableSHARC && mSHARCEnabled && !mSHARCFreeze;
     bool pg = mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled;
@@ -778,12 +869,9 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
             mPGFrameIndex = 0;
             mPGCameraPosition = mpScene->getCamera()->getPosition();
             mResetPG = false;
-            // Translation only changes the direction proposal, not the radiance
-            // being estimated. Keep NRD reprojection and its sampling sequence
-            // alive while rebuilding PG. Structural or explicit resets retain
-            // the existing full-reset behavior.
-            mPGTranslationPreservedNRDThisFrame = preserveNRDHistoryOnPGReset && !rebuilt && !mResetNRDHistory;
-            if (rebuilt || !preserveNRDHistoryOnPGReset) reset();
+            mPGModelResetThisFrame = true;
+            // Rebuilding a proposal does not reset the radiance estimate or
+            // its sampling sequence. Scene/option resets are handled by execute().
         }
         pg &= mpPG->getPathCapacity() > 0;
         if (pg)
@@ -827,11 +915,13 @@ void RTPT::executeTraining(RenderContext* pRenderContext, bool preserveNRDHistor
     {
         FALCOR_PROFILE(pRenderContext, "SHARCResolve");
         bindSHARC(mpSHARCResolve->getRootVar());
+        mpSHARCResolve->getRootVar()["gSHARCMotionStats"] = mpSHARCMotionStats;
         mpSHARCResolve->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
         ++mSHARCResolveVersion;
         pRenderContext->uavBarrier(mpSHARCHashEntries.get());
         pRenderContext->uavBarrier(mpSHARCAccumulation.get());
         pRenderContext->uavBarrier(mpSHARCResolved.get());
+        pRenderContext->uavBarrier(mpSHARCMotionStats.get());
     }
 }
 
@@ -841,6 +931,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mReGIRInitialActive = false;
     mNRDHistoryResetThisFrame = false;
     mPGTranslationPreservedNRDThisFrame = false;
+    mPGModelResetThisFrame = false;
+    mSHARCCacheResetThisFrame = false;
+    mSceneMotionThisFrame = false;
     auto color = renderData.getTexture("color");
     auto noisyColor = renderData.getTexture("noisyColor");
     if (!mpScene)
@@ -886,6 +979,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // conservatively discards them when lighting, materials or geometry change.
     const auto sharcInvalidations = discontinuities & ~IScene::UpdateFlags::CameraSwitched;
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
+    mSceneMotionThisFrame = (updates & movingScene) != IScene::UpdateFlags::None;
+    updateSHARCMotionBounds();
     if ((updates & (movingScene | IScene::UpdateFlags::LightCollectionChanged)) != IScene::UpdateFlags::None)
         resetGRISHistory();
     // Previous hit/material reconstruction and temporal visibility use the
@@ -897,18 +992,21 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         resetDIHistory("Camera frustum changed");
     else if (mOptionsChanged)
         resetDIHistory("Render options or seed changed");
-    if ((updates & (sharcInvalidations | movingScene)) != IScene::UpdateFlags::None)
-    {
+    if ((updates & sharcInvalidations) != IScene::UpdateFlags::None)
         mResetSHARCCache = true;
+    // PG stores a proposal, not radiance. Keep its regions and progressively
+    // train on the current scene during ordinary geometry/light motion.
+    if ((updates & sharcInvalidations) != IScene::UpdateFlags::None)
         mResetPG = true;
-    }
     // First PG version has no LOD hysteresis or cross-LOD model retention.
     // Actual camera translation restarts PG; projection jitter changes no position.
     const bool pgCameraTranslated = mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition);
-    const bool preserveNRDHistoryOnPGReset = mEnableNRD && pgCameraTranslated && !mResetPG && !mResetNRDHistory &&
-        !mOptionsChanged && !nrdDiscontinuity && refreshFlags == RenderPassRefreshFlags::None;
     if (pgCameraTranslated) mResetPG = true;
-    if ((mEnableNRD ? nrdDiscontinuity : sceneChanged) || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
+    if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
+    else if (!mEnableNRD && sceneChanged)
+        // Progressive image accumulation cannot mix scene poses, but its
+        // invalidation does not require restarting random samples.
+        resetAccumulation();
     if (mOptionsChanged) mGRISTemporalFallbackReason.clear();
     mOptionsChanged = false;
 
@@ -967,17 +1065,15 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     }
     if (mEnableSHARC || mEnablePG)
     {
-        if ((mEnableSHARC && mResetSHARCCache) || (mEnablePG && mResetPG && !preserveNRDHistoryOnPGReset))
-            mResetNRDHistory = true;
         // Complete SHaRC resolve before GRIS and MainRender query the current frame's cache.
-        executeTraining(pRenderContext, preserveNRDHistoryOnPGReset);
+        executeTraining(pRenderContext);
     }
     if (mSampleOffset > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel ||
         mAccumulatedSamples > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel)
         reset();
 
     mNRDHistoryResetThisFrame = (mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory;
-    mPGTranslationPreservedNRDThisFrame &= !mNRDHistoryResetThisFrame;
+    mPGTranslationPreservedNRDThisFrame = mEnableNRD && pgCameraTranslated && mPGModelResetThisFrame && !mNRDHistoryResetThisFrame;
     if (mNRDHistoryResetThisFrame)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
@@ -1058,6 +1154,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         mSHARCCameraPositionPrev = mpScene->getCamera()->getPosition();
         ++mSHARCFrameIndex;
     }
+    if (mSHARCMotionResponsiveFrames) --mSHARCMotionResponsiveFrames;
 }
 
 void RTPT::renderUI(Gui::Widgets& widget)
