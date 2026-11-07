@@ -115,10 +115,18 @@ bool rtptTrySharcQueryOnEdge(
     float3 direction,
     inout RTPTSharcStats stats,
     out float3 cachedRadiance
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+    , bool probeX1 = false
+#endif
 )
 {
     cachedRadiance = 0.f;
-    if (gSharcSettings.useCache == 0 || bounce == 0 || bounce < gSharcSettings.minBounce ||
+    if (gSharcSettings.useCache == 0 || bounce == 0 ||
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+        (bounce < gSharcSettings.minBounce && !probeX1) ||
+#else
+        bounce < gSharcSettings.minBounce ||
+#endif
         bounce >= gParams.maxBounces || previousDelta || properties.roughness < gSharcSettings.minRoughness ||
         any(properties.emission > 0.f) || (mi.getLobeTypes(sd) & uint(LobeType::DeltaReflection)) != 0)
         return false;
@@ -159,6 +167,9 @@ bool rtptTrySharcQueryOnEdge(
     if (!SharcGetCachedRadiance(gSharc, cacheHit, cachedRadiance, false) ||
         !all(isfinite(cachedRadiance)) || any(cachedRadiance < 0.f))
         return false;
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+    if (probeX1) return true;
+#endif
     ++stats.cacheTerminations;
     return true;
 }

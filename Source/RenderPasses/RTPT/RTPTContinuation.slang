@@ -35,6 +35,9 @@ float3 rtptTraceContinuation(
     , inout GrisSpatialRecord suffix
 #if RTPT_GRIS_ALTERNATING
     , bool generateSuffix
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+    , out bool mixedX1Cache
+#endif
 #endif
 #else
     , inout TerminalPicker terminalPicker
@@ -45,6 +48,10 @@ float3 rtptTraceContinuation(
 {
     firstHitDistance = kRTPTNRDMissDistance;
     firstHitDistanceState = kRTPTDistanceSampleRejected;
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+    mixedX1Cache = false;
+    float3 x1CacheContribution = 0.f;
+#endif
     primarySD.mtl.setActiveLobes(primaryLobes);
     BSDFSample bs = {};
     bool previousGuideSelected = false;
@@ -141,6 +148,12 @@ float3 rtptTraceContinuation(
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
         rtptGRISCapturePrefix(bounce, sd, mi, hit, ray.dir, throughput, prefix);
+#if RTPT_GRIS_SHARC_REPLAY
+        // Keep the geometric draw even if this frame's terminal is empty.
+        if (bounce == 2u && bounce < gParams.maxBounces && HitInfo(prefix.x1Hit).isValid() &&
+            rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
+            rtptGRISCaptureRawEndpoint(sd, hit, ray, previousContinuationPdf, suffix);
+#endif
 #endif
 
 #if ENABLE_SHARC && SHARC_QUERY
@@ -149,27 +162,45 @@ float3 rtptTraceContinuation(
 #if RTPT_GRIS_GENERATE
         // The guided and BSDF techniques share one continuation on the supported diffuse edges.
         const bool sharedDiffuse = previousSharcSampling.alpha > 0.f;
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+        // A blend probe keeps the x1 prefix available for x2 reuse.
+        const bool probeX1 = bounce == 1u && HitInfo(prefix.x1Hit).isValid();
+#endif
         if (rtptTrySharcQueryOnEdge(sd, mi, sharcProperties, bounce, previousDelta,
             previousGuideSelected && !sharedDiffuse, previousDiffuse || sharedDiffuse, previousRoughness,
-            length(sd.posW - previousPosition), previousSharcSampling, ray.dir, sharcStats, cachedRadiance))
+            length(sd.posW - previousPosition), previousSharcSampling, ray.dir, sharcStats, cachedRadiance
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+            , probeX1
+#endif
+            ))
 #else
         if (rtptTrySharcQuery(sd, mi, sharcProperties, bounce, previousDelta, previousGuideSelected, previousDiffuse, previousRoughness,
             length(sd.posW - previousPosition), sharcStats, cachedRadiance))
 #endif
         {
             const float3 contribution = throughput * cachedRadiance;
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
-            if (rtptGRISCaptureCacheTerminal(bounce, sd, mi, hit, ray, previousContinuationPdf,
-                contribution, prefix, suffix)) break;
-#endif
-            if (all(isfinite(contribution)))
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+            if (probeX1)
             {
-#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-                rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisCacheTerminal);
-#endif
-                radiance += contribution;
+                mixedX1Cache = all(isfinite(contribution));
+                if (mixedX1Cache) x1CacheContribution = contribution;
             }
-            break;
+            else
+#endif
+            {
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
+                if (rtptGRISCaptureCacheTerminal(bounce, sd, mi, hit, ray, previousContinuationPdf,
+                    contribution, prefix, suffix)) break;
+#endif
+                if (all(isfinite(contribution)))
+                {
+#if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
+                    rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisCacheTerminal);
+#endif
+                    radiance += contribution;
+                }
+                break;
+            }
         }
 #endif
 
@@ -221,9 +252,9 @@ float3 rtptTraceContinuation(
         }
 #endif
         if (bounce == gParams.maxBounces) break;
-#if ENABLE_PG && (RTPT_GRIS_GENERATE || RTPT_USE_GRIS)
-        const RTPTSamplingContext sampling = bounce == 1 && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd))
-            ? rtptMakeSamplingContext(sd, mi) : rtptBSDFSamplingContext();
+#if RTPT_GRIS_GENERATE || RTPT_USE_GRIS
+        // GRIS guides only the primary edge. Reuse evaluates the x1 edge with BSDF sampling.
+        const RTPTSamplingContext sampling = rtptBSDFSamplingContext();
 #else
         const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
 #endif
@@ -240,11 +271,7 @@ float3 rtptTraceContinuation(
             if (bounce == 2 && HitInfo(prefix.x1Hit).isValid() && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
             {
                 contribution = rtptGRISCaptureDirectTerminal(sd, mi, sampling, hit, ray,
-                    previousContinuationPdf, throughput, query, sg, suffix
-#if RTPT_REGIR_TRANSPORT
-                    , previousReGIRCoverage
-#endif
-                );
+                    previousContinuationPdf, throughput, query, sg, suffix);
             }
             else
 #endif
@@ -282,8 +309,7 @@ float3 rtptTraceContinuation(
         previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
         previousRoughness = sharcProperties.roughness;
 #if RTPT_GRIS_GENERATE
-        previousSharcSampling = bounce == 1u && rtptGRISSupportsFirstVertex(sd, mi.getLobeTypes(sd))
-            ? sampling : rtptBSDFSamplingContext();
+        previousSharcSampling = sampling;
 #endif
 #endif
         if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
@@ -304,7 +330,17 @@ float3 rtptTraceContinuation(
         break;
 #endif
     }
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+    const float3 explicitRadiance = all(isfinite(radiance)) ? radiance : float3(0.f);
+    if (mixedX1Cache)
+    {
+        const float blend = gPrimarySettings.grisSharcX1Blend;
+        return blend * x1CacheContribution + (1.f - blend) * explicitRadiance;
+    }
+    return explicitRadiance;
+#else
     return all(isfinite(radiance)) ? radiance : float3(0.f);
+#endif
 }
 
 #if !RTPT_GRIS_GENERATE

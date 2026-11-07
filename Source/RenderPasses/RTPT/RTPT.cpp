@@ -29,7 +29,7 @@ const NRDOutput kNRDOutputs[] = {
 const char* kSHARCOutputs[] = {"sharcDebug", "sharcCacheRadiance", "sharcStats"};
 const Gui::DropdownList kSHARCDebugModes = {
     {0, "Voxel grid"}, {1, "Cached radiance"}, {2, "Sample count"}, {3, "Entry age"},
-    {4, "Actual cache hits"}, {5, "Traced rays"}, {6, "Update coverage"}, {7, "Hash occupancy"},
+    {4, "Cache terminations"}, {5, "Traced rays"}, {6, "Update coverage"}, {7, "Hash occupancy"},
 };
 const Gui::DropdownList kSHARCCapacities = {
     {1u << 16, "64K entries (2.5 MiB)"}, {1u << 18, "256K entries (10 MiB)"},
@@ -70,6 +70,7 @@ void RTPT::setProperties(const Properties& props)
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
+    float grisSharcX1Blend = mGRISSharcX1Blend;
     bool restirDIEnabled = mRestirDIEnabled;
     bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
     bool regirLightCullingEnabled = mReGIRCullingEnabled;
@@ -105,6 +106,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
+        else if (key == "grisSharcX1Blend") grisSharcX1Blend = value;
         else if (key == "restirDIEnabled") restirDIEnabled = value;
         else if (key == "regirEnabled") regirEnabled = value;
         else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
@@ -162,6 +164,8 @@ void RTPT::setProperties(const Properties& props)
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
+    FALCOR_CHECK(std::isfinite(grisSharcX1Blend) && grisSharcX1Blend >= 0.f && grisSharcX1Blend < 1.f,
+        "RTPT grisSharcX1Blend must be in [0, 1).");
     FALCOR_CHECK(restirDICandidateCount >= 1 && restirDICandidateCount <= 128,
         "ReSTIR DI Initial candidate count must be in [1, 128].");
     FALCOR_CHECK(restirDIBudgetMB >= 16 && restirDIBudgetMB <= 2048,
@@ -240,7 +244,7 @@ void RTPT::setProperties(const Properties& props)
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
         sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged ||
-        regirChanged;
+        regirChanged || grisSharcX1Blend != mGRISSharcX1Blend;
     mResetPG |= pgStructureChanged || trainingSamplingChanged;
     mResetSHARCCache |= sharcStructureChanged || trainingSamplingChanged;
     if (sharcEntries != mSHARCEntries)
@@ -268,6 +272,7 @@ void RTPT::setProperties(const Properties& props)
         mOptionsChanged = true;
         invalidateGRIS();
     }
+    mGRISSharcX1Blend = grisSharcX1Blend;
     mRestirDIEnabled = restirDIEnabled;
     mRestirDICandidateCount = restirDICandidateCount;
     mRestirDIBudgetMB = restirDIBudgetMB;
@@ -349,6 +354,7 @@ Properties RTPT::getProperties() const
     props["grisEnabled"] = mGRISEnabled;
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
+    props["grisSharcX1Blend"] = mGRISSharcX1Blend;
     props["restirDIEnabled"] = mRestirDIEnabled;
     props["regirEnabled"] = mReGIREnabled;
     props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
@@ -695,6 +701,7 @@ void RTPT::bindSHARC(const ShaderVar& rootVar)
 
 void RTPT::clearSHARC(RenderContext* pRenderContext)
 {
+    if (mGRISHistoryFrame.historyValid && mGRISHistoryFrame.snapshot.sharcVersion != 0u) resetGRISHistory();
     pRenderContext->clearUAV(mpSHARCHashEntries->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(mpSHARCAccumulation->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(mpSHARCResolved->getUAV().get(), uint4(0));
@@ -1172,6 +1179,13 @@ void RTPT::renderUI(Gui::Widgets& widget)
             sharcWidget.tooltip("Larger values create smaller world-space voxels.", true);
             uint32_t minBounce = mSHARCMinBounce;
             if (sharcWidget.var("First query bounce", minBounce, 1u, 64u)) props["sharcMinBounce"] = minBounce;
+            if (canUseGRISAlternating())
+            {
+                float blend = mGRISSharcX1Blend;
+                if (sharcWidget.var("GRIS x1 cache blend", blend, 0.f, std::nextafter(1.f, 0.f)))
+                    props["grisSharcX1Blend"] = blend;
+                sharcWidget.tooltip("Blend x1 cache radiance into eligible D/S paths while the scheduled path continues to x2.", true);
+            }
             float roughness = mSHARCMinRoughness;
             if (sharcWidget.var("Minimum query roughness", roughness, 0.f, 1.f)) props["sharcMinRoughness"] = roughness;
             uint32_t frames = mSHARCAccumulationFrames;

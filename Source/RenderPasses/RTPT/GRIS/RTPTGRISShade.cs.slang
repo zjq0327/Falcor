@@ -26,15 +26,24 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const GrisAlternatingFresh fresh = gGRISFresh[index];
     const uint sourceSlot = rtptGrisSourceSlot(fresh.raw.candidate.rootLobe);
     GrisDualShadedIndirect result = {};
-    result.preparedMask = fresh.preparedMask;
+    result.preparedMask = fresh.preparedMask & kGrisPreparedLobesMask;
     result.firstHit[sourceSlot] = fresh.raw.candidate.firstHit;
     result.firstHit[sourceSlot ^ 1u] = fresh.inactiveFirstHit;
     result.radiance[0] = fresh.prefix[0].localRadiance;
     result.radiance[1] = fresh.prefix[1].localRadiance;
     if (winner.hasWinner != 0u)
     {
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+        const uint mixMask = fresh.preparedMask >> kGrisX1CacheBlendShift;
+        const float explicitWeight = 1.f - gPrimarySettings.grisSharcX1Blend;
+        if ((mixMask & 1u) != 0u) result.radiance[0] += (winner.F_D * winner.W) * explicitWeight;
+        else result.radiance[0] += winner.F_D * winner.W;
+        if ((mixMask & 2u) != 0u) result.radiance[1] += (winner.F_S * winner.W) * explicitWeight;
+        else result.radiance[1] += winner.F_S * winner.W;
+#else
         result.radiance[0] += winner.F_D * winner.W;
         result.radiance[1] += winner.F_S * winner.W;
+#endif
     }
 #else
     const GrisCandidate candidate = gGRISCandidates[index];

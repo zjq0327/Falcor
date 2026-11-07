@@ -147,7 +147,6 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         RTPTSamplingContext specularSampling = rtptBSDFSamplingContext();
         if (hasDiffuse) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
         // Keep primary specular NEE and continuation on the BSDF-only density.
-        // Later vertices build their own context and remain eligible for PG.
 
         uint rootCoverage = 0u;
 #if RTPT_USE_RESTIR_DI && RTPT_USE_PRIMARY_SURFACE

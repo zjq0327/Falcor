@@ -154,10 +154,11 @@ private:
         uint64_t sharcVersion = 0u;
         uint64_t regirDomainGeneration = 0u;
 
-        bool operator==(const GrisTemporalSnapshot& other) const
+        bool isCompatible(const GrisTemporalSnapshot& other, bool replaySharc) const
         {
             return all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
-                pgGeneration == other.pgGeneration && sharcVersion == other.sharcVersion &&
+                pgGeneration == other.pgGeneration &&
+                (sharcVersion == other.sharcVersion || (replaySharc && sharcVersion != 0u && other.sharcVersion != 0u)) &&
                 regirDomainGeneration == other.regirDomainGeneration;
         }
     };
@@ -172,10 +173,12 @@ private:
     } mGRISHistoryFrame;
     uint32_t mGRISHistoryGeneration = 0u;
     bool mGRISHistoryReadValid = false;
+    bool mGRISHistoryReplayActive = false;
     std::string mGRISTemporalFallbackReason;
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
+    float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;
     bool mStagesActive = false;
@@ -293,7 +296,7 @@ private:
     uint32_t mSHARCEntries = 1u << 20;
     uint32_t mSHARCUpdateStride = 5;
     uint32_t mSHARCUpdateBounces = 8;
-    uint32_t mSHARCMinBounce = 1;
+    uint32_t mSHARCMinBounce = 2;
     uint32_t mSHARCAccumulationFrames = 32;
     uint32_t mSHARCStaleFrames = 128;
     uint32_t mSHARCDebugMode = 0;

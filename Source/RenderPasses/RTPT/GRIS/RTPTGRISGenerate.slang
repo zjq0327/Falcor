@@ -72,10 +72,20 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 GrisLocalPrefix prefix = {};
                 GrisSpatialRecord suffix = {};
                 GrisFirstHit firstHit;
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+                bool mixedX1Cache;
+#endif
                 prefix.localRadiance = rtptTraceContinuation(sd, mi, activeLobe, sampling, sg,
-                    firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix, suffix, generateSuffix);
+                    firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix, suffix, generateSuffix
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+                    , mixedX1Cache
+#endif
+                );
                 fresh.prefix[slot] = prefix;
                 fresh.preparedMask |= 1u << slot;
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+                if (mixedX1Cache) fresh.preparedMask |= 1u << (slot + kGrisX1CacheBlendShift);
+#endif
                 if (generateSuffix)
                 {
                     suffix.candidate.rootLobe = fresh.raw.candidate.rootLobe;
@@ -109,7 +119,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 candidate.F = spatial.candidate.F;
                 candidate.terminalKind = spatial.candidate.terminalKind;
                 candidate.W = 1.f;
-                candidate.hasWinner = spatial.areaPdf > 0.f;
+                candidate.hasWinner = rtptGrisHasTerminal(spatial);
 #else
                 // Keep picker draws separate from the path's scattering and light draws.
                 SampleGenerator terminalRng = SampleGenerator(pixel, sampleIndex ^ 0xa511e9b3u);

@@ -33,4 +33,5 @@ struct RTPTPrimarySettings
     uint sampleIndex; // Absolute sample index, including the existing seed stride.
     uint frameStamp;
     uint prepared;
+    float grisSharcX1Blend;
 };

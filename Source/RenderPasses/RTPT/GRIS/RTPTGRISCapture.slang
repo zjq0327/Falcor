@@ -22,6 +22,24 @@ void rtptGRISCapturePrefix(
     }
 }
 
+float rtptGRISAreaPdf(ShadingData sd, Ray ray, float continuationPdf)
+{
+    const float3 edge = sd.posW - ray.origin;
+    return continuationPdf * abs(dot(sd.faceN, ray.dir)) / dot(edge, edge);
+}
+
+#if RTPT_GRIS_SHARC_REPLAY
+void rtptGRISCaptureRawEndpoint(ShadingData sd, HitInfo hit, Ray ray, float continuationPdf, inout GrisSpatialRecord suffix)
+{
+    const float areaPdf = rtptGRISAreaPdf(sd, ray, continuationPdf);
+    if (areaPdf > 0.f && isfinite(areaPdf))
+    {
+        suffix.reconnectHit = hit.pack();
+        suffix.areaPdf = areaPdf;
+    }
+}
+#endif
+
 #if ENABLE_SHARC && SHARC_QUERY
 // A recorded cache terminal owns this contribution and ends the local path.
 [ForceInline]
@@ -40,8 +58,7 @@ bool rtptGRISCaptureCacheTerminal(
     if (bounce == 1u) prefix.x1Hit = makeInvalidHit().pack();
     if (bounce == 2u && HitInfo(prefix.x1Hit).isValid() && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
     {
-        const float3 edge = sd.posW - ray.origin;
-        const float areaPdf = previousContinuationPdf * abs(dot(sd.faceN, ray.dir)) / dot(edge, edge);
+        const float areaPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
         if (areaPdf > 0.f && isfinite(areaPdf) && all(isfinite(contribution)))
         {
             suffix.reconnectHit = hit.pack();
@@ -54,6 +71,73 @@ bool rtptGRISCaptureCacheTerminal(
     return false;
 }
 #endif
+
+struct GrisDirectLightSample
+{
+    RTPTLightSample light;
+    bool reusable;
+#if RTPT_REGIR_TRANSPORT
+    bool fromReGIR;
+    uint stableID;
+    float2 uv;
+    float risWeight;
+    float inverseDomainProbability;
+#endif
+};
+
+bool rtptGRISSampleDirectLight(ShadingData sd, inout SampleGenerator sg, out GrisDirectLightSample sample)
+{
+    sample = {};
+#if RTPT_REGIR_TRANSPORT
+    const uint coverage = rtptReGIRTransportCoverage(false);
+    sample.fromReGIR = coverage != 0u;
+    sample.inverseDomainProbability = 1.f;
+#if !RTPT_REGIR_ONLY
+    if (sample.fromReGIR && any(rtptLightCategoryProbabilitiesForCoverage(coverage) > 0.f))
+    {
+        // The light domains are disjoint. The selection probability is common
+        // to all prefixes that reconnect to this fixed x2 vertex.
+        sample.fromReGIR = sampleNext1D(sg) < 0.5f;
+        sample.inverseDomainProbability = 2.f;
+    }
+#endif
+    bool sampledLight = false;
+    if (sample.fromReGIR)
+        sampledLight = rtptReGIRSampleTransportLight(sd, sg, sample.light, sample.stableID, sample.uv, sample.risWeight);
+#if !RTPT_REGIR_ONLY
+    else
+        sampledLight = rtptSampleLightForCoverage(sd, coverage, sg, sample.light);
+#endif
+    if (!sampledLight) return false;
+    sample.light.LiOverPdf *= sample.inverseDomainProbability;
+    // At fixed, front-facing x2 the complementary environment ray retains
+    // its direction and visibility when reconnected.
+    sample.reusable = coverage != 0u;
+#else
+    if (!rtptSampleLight(sd, sg, sample.light)) return false;
+#endif
+    sample.reusable = sample.reusable || sample.light.analytic || sample.light.visibilityRay.tMax < FLT_MAX;
+    return true;
+}
+
+void rtptGRISStoreDirectTerminal(GrisDirectLightSample sample, inout GrisSpatialRecord suffix)
+{
+#if RTPT_REGIR_TRANSPORT
+    if (sample.fromReGIR)
+    {
+        suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisReGIR);
+        suffix.lightPdfOrStableID = sample.stableID;
+        suffix.suffixDirection = float3(sample.uv, 0.f);
+        suffix.suffixLight = float3(sample.risWeight, sample.inverseDomainProbability, 0.f);
+        return;
+    }
+#endif
+    suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisNee);
+    suffix.suffixDirection = sample.light.dir;
+    suffix.suffixLight = sample.light.LiOverPdf;
+    suffix.lightPdfOrStableID = asuint(sample.light.pdf);
+    suffix.lightIsAnalytic = sample.light.analytic;
+}
 
 // Record a reusable x2 light event or return its contribution to the local path.
 [ForceInline]
@@ -68,76 +152,26 @@ float3 rtptGRISCaptureDirectTerminal(
     SceneRayQuery<true> query,
     inout SampleGenerator sg,
     inout GrisSpatialRecord suffix
-#if RTPT_REGIR_TRANSPORT
-    , uint coverage
-#endif
 )
 {
-    RTPTLightSample light;
-#if RTPT_REGIR_TRANSPORT
-    uint lightStableID = 0u;
-    float2 lightUV = 0.f;
-    float risWeight = 0.f;
-    bool sampleReGIR = coverage != 0u;
-    float inverseDomainProbability = 1.f;
-#if !RTPT_REGIR_ONLY
-    if (sampleReGIR && any(rtptLightCategoryProbabilitiesForCoverage(coverage) > 0.f))
-    {
-        // The light domains are disjoint. The selection probability is common
-        // to all prefixes that reconnect to this fixed x2 vertex.
-        sampleReGIR = sampleNext1D(sg) < 0.5f;
-        inverseDomainProbability = 2.f;
-    }
-#endif
-    bool sampledLight = false;
-    if (sampleReGIR)
-        sampledLight = rtptReGIRSampleTransportLight(sd, sg, light, lightStableID, lightUV, risWeight);
-#if !RTPT_REGIR_ONLY
-    else
-        sampledLight = rtptSampleLightForCoverage(sd, coverage, sg, light);
-#endif
-#else
-    const bool sampledLight = rtptSampleLight(sd, sg, light);
-#endif
-    if (!sampledLight) return float3(0.f);
+    GrisDirectLightSample sample;
+    if (!rtptGRISSampleDirectLight(sd, sg, sample)) return float3(0.f);
 
     bool hasBSDFCompetitor = RTPT_GRIS_ALTERNATING == 0;
-    bool reusableLight = light.analytic || light.visibilityRay.tMax < FLT_MAX;
 #if RTPT_REGIR_TRANSPORT
-    hasBSDFCompetitor = hasBSDFCompetitor && !sampleReGIR;
-    light.LiOverPdf *= inverseDomainProbability;
-    // At this fixed, front-facing x2 the complementary environment ray
-    // also retains its direction and its visibility result when reconnected.
-    reusableLight = reusableLight || coverage != 0u;
+    hasBSDFCompetitor = hasBSDFCompetitor && !sample.fromReGIR;
 #endif
-    const float3 contribution = throughput * rtptEvaluateLightSample(sd, mi, sampling, light, sg, hasBSDFCompetitor);
-    const float3 edge = sd.posW - ray.origin;
-    const float areaPdf = previousContinuationPdf * abs(dot(sd.faceN, ray.dir)) / dot(edge, edge);
-    const bool canReuse = reusableLight && areaPdf > 0.f && isfinite(areaPdf) && all(isfinite(contribution));
+    const float3 contribution = throughput * rtptEvaluateLightSample(sd, mi, sampling, sample.light, sg, hasBSDFCompetitor);
+    const float areaPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
+    const bool canReuse = sample.reusable && areaPdf > 0.f && isfinite(areaPdf) && all(isfinite(contribution));
     const bool positive = all(isfinite(contribution)) && any(contribution > 0.f);
-    if (!(canReuse || positive) || !query.traceVisibilityRay(light.visibilityRay)) return float3(0.f);
+    if (!(canReuse || positive) || !query.traceVisibilityRay(sample.light.visibilityRay)) return float3(0.f);
     if (!canReuse) return contribution;
 
     // Keep a visible proposal even if its source BSDF gives zero.
     suffix.reconnectHit = hit.pack();
     suffix.areaPdf = areaPdf;
-#if RTPT_REGIR_TRANSPORT
-    if (sampleReGIR)
-    {
-        suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisReGIR);
-        suffix.lightPdfOrStableID = lightStableID;
-        suffix.suffixDirection = float3(lightUV, 0.f);
-        suffix.suffixLight = float3(risWeight, inverseDomainProbability, 0.f);
-    }
-    else
-#endif
-    {
-        suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisNee);
-        suffix.suffixDirection = light.dir;
-        suffix.suffixLight = light.LiOverPdf;
-        suffix.lightPdfOrStableID = asuint(light.pdf);
-        suffix.lightIsAnalytic = light.analytic;
-    }
+    rtptGRISStoreDirectTerminal(sample, suffix);
     suffix.candidate.F = positive ? contribution : float3(0.f);
     return float3(0.f);
 }

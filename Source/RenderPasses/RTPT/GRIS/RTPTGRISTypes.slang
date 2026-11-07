@@ -7,6 +7,9 @@
 #ifndef RTPT_GRIS_ALTERNATING
 #define RTPT_GRIS_ALTERNATING 0
 #endif
+#ifndef RTPT_GRIS_SHARC_REPLAY
+#define RTPT_GRIS_SHARC_REPLAY 0
+#endif
 #ifndef RTPT_REGIR_ONLY
 #define RTPT_REGIR_ONLY 0
 #endif
@@ -52,8 +55,7 @@ struct GrisLocalPrefix
     float3 localRadiance;
 };
 
-// Reusable events are direct-light samples or SHaRC terminations at x2.
-// A zero area PDF denotes no suffix.
+// A positive area PDF identifies a sampled x2. Its terminal may be empty.
 struct GrisSpatialRecord
 {
     GrisCandidate candidate;
@@ -65,13 +67,23 @@ struct GrisSpatialRecord
     bool lightIsAnalytic;
 };
 
+bool rtptGrisHasTerminal(GrisSpatialRecord suffix)
+{
+    const uint kind = suffix.candidate.terminalKind;
+    return suffix.areaPdf > 0.f && (kind == uint(GrisTerminalKind::GrisNee) ||
+        kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisCacheTerminal));
+}
+
 #if RTPT_GRIS_ALTERNATING
+static const uint kGrisPreparedLobesMask = 0x3u;
+static const uint kGrisX1CacheBlendShift = 2u;
+
 struct GrisAlternatingFresh
 {
     GrisLocalPrefix prefix[2]; // D, S.
     GrisSpatialRecord raw;
     GrisFirstHit inactiveFirstHit;
-    uint preparedMask;
+    uint preparedMask; // Low bits are prepared D/S; bits 2/3 are mixed x1 cache D/S.
 };
 
 uint rtptGrisSourceSlot(uint rootLobe)
@@ -80,8 +92,8 @@ uint rtptGrisSourceSlot(uint rootLobe)
 }
 #endif
 
-// One raw proposal from Generate. A missing suffix can still have a valid x1
-// prefix whose proposal must participate in the reverse MIS evaluation.
+// One raw proposal from Generate. A missing x2 or terminal can still have a
+// valid x1 prefix whose proposal participates in reverse MIS.
 struct GrisTemporalFreshHistory
 {
     PackedHitInfo sourceX1;

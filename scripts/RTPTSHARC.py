@@ -17,7 +17,7 @@ def render_graph_RTPTSHARC():
         "sharcUpdateStride": 5,
         "sharcUpdateBounces": 8,
         "sharcSceneScale": 64.0,
-        "sharcMinBounce": 1,
+        "sharcMinBounce": 2,
         "sharcMinRoughness": 0.4,
         "sharcAccumulationFrames": 32,
         "sharcStaleFrames": 128,

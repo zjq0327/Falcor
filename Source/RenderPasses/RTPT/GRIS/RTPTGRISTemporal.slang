@@ -1,11 +1,17 @@
 #include "RTPTGRISReuse.slang"
 #include "../PrimarySurface/RTPTReprojection.slangh"
+#if RTPT_GRIS_SHARC_REPLAY
+#include "RTPTGRISCapture.slang"
+#endif
 
 struct GrisTemporalSettings
 {
     float4x4 previousViewProj;
     uint2 previousFrameDim;
     uint historyValid;
+#if RTPT_GRIS_SHARC_REPLAY
+    uint replayHistory;
+#endif
 };
 
 ConstantBuffer<GrisTemporalSettings> gGRISTemporalSettings;
@@ -54,13 +60,43 @@ void rtptGrisDecodeHistory(GrisTemporalFreshHistory history, out GrisLocalPrefix
 }
 
 #if RTPT_GRIS_ALTERNATING
+#if RTPT_GRIS_SHARC_REPLAY
+void rtptGrisReplayHistory(GrisLocalPrefix sourcePrefix, inout GrisSpatialRecord source, inout SampleGenerator rng)
+{
+    source.candidate.terminalKind = uint(GrisTerminalKind::GrisNoTerminal);
+    GrisConnection connection;
+    if (!rtptGrisConnectEdge(sourcePrefix, source, rng, connection)) return;
+
+    if (connection.cacheTerminates)
+    {
+        source.candidate.terminalKind = uint(GrisTerminalKind::GrisCacheTerminal);
+        return;
+    }
+
+    GrisDirectLightSample sample;
+    if (!rtptGRISSampleDirectLight(connection.x2, rng, sample) || !sample.reusable) return;
+    SceneRayQuery<true> query;
+    if (!query.traceVisibilityRay(sample.light.visibilityRay)) return;
+    rtptGRISStoreDirectTerminal(sample, source);
+}
+#endif
+
 GrisDualWinner rtptGrisReuseAlternatingHistory(uint2 pixel, GrisAlternatingFresh fresh)
 {
     if (fresh.preparedMask == 0u) return {};
     GrisTemporalFreshHistory history;
     GrisAlternatingProposal source = {};
     if (rtptGrisLoadHistory(pixel, history))
+    {
         rtptGrisDecodeHistory(history, source.prefix, source.raw);
+#if RTPT_GRIS_SHARC_REPLAY
+        if (gGRISTemporalSettings.replayHistory != 0u)
+        {
+            SampleGenerator replayRng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0x78f48121u);
+            rtptGrisReplayHistory(source.prefix, source.raw, replayRng);
+        }
+#endif
+    }
 
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
     return rtptGrisMergeAlternating(pixel, fresh, source, rng);

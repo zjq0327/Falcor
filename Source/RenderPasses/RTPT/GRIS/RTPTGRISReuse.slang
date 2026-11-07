@@ -18,13 +18,14 @@ struct GrisConnection
     float areaPdf;
 #if ENABLE_SHARC && SHARC_QUERY
     float3 cachedRadiance;
+    bool cacheTerminates;
 #endif
 #if RTPT_REGIR_TRANSPORT
     RTPTLightSample light;
 #endif
 };
 
-bool rtptGrisConnect(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout SampleGenerator rng, out GrisConnection connection)
+bool rtptGrisConnectEdge(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout SampleGenerator rng, out GrisConnection connection)
 {
     connection = {};
     const HitInfo x1 = HitInfo(prefix.x1Hit);
@@ -52,7 +53,7 @@ bool rtptGrisConnect(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout Sam
     const float3 scatter = firstMaterial.eval(first, direction, rng);
     if (!all(isfinite(scatter)) || !any(scatter > 0.f)) return false;
     const float geometry = abs(dot(connection.x2.faceN, direction)) / distanceSquared;
-    const RTPTSamplingContext sampling = rtptMakeSamplingContext(first, firstMaterial);
+    const RTPTSamplingContext sampling = rtptBSDFSamplingContext();
     connection.areaPdf = rtptContinuationPdf(first, firstMaterial, sampling, direction) * geometry;
     if (!(connection.areaPdf > 0.f) || !isfinite(connection.areaPdf)) return false;
     connection.scatterArea = scatter * geometry;
@@ -64,11 +65,24 @@ bool rtptGrisConnect(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout Sam
     if (!query.traceVisibilityRay(Ray(origin, visibilityEdge / visibilityLength, 0.f, visibilityLength))) return false;
 #if ENABLE_SHARC && SHARC_QUERY
     RTPTSharcStats stats = {};
-    const bool terminates = rtptTrySharcQueryOnEdge(connection.x2, secondMaterial, secondMaterial.getProperties(connection.x2),
+    connection.cacheTerminates = rtptTrySharcQueryOnEdge(connection.x2, secondMaterial, secondMaterial.getProperties(connection.x2),
         2u, false, false, true, firstMaterial.getProperties(first).roughness, length(vertex.posW - first.posW),
         sampling, direction, stats, connection.cachedRadiance);
+#endif
+    return true;
+}
+
+bool rtptGrisConnect(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout SampleGenerator rng, out GrisConnection connection)
+{
+    if (!rtptGrisHasTerminal(suffix))
+    {
+        connection = {};
+        return false;
+    }
+    if (!rtptGrisConnectEdge(prefix, suffix, rng, connection)) return false;
+#if ENABLE_SHARC && SHARC_QUERY
     const bool cacheSuffix = suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisCacheTerminal);
-    if (terminates || cacheSuffix) return terminates && cacheSuffix;
+    if (connection.cacheTerminates || cacheSuffix) return connection.cacheTerminates && cacheSuffix;
 #endif
 #if RTPT_REGIR_TRANSPORT
     if (suffix.candidate.terminalKind == uint(GrisTerminalKind::GrisReGIR))
@@ -80,6 +94,7 @@ bool rtptGrisConnect(GrisLocalPrefix prefix, GrisSpatialRecord suffix, inout Sam
             suffix.suffixDirection.xy, suffix.suffixLight.x, connection.light)) return false;
         connection.light.LiOverPdf *= suffix.suffixLight.y;
 #if !RTPT_REGIR_ONLY
+        SceneRayQuery<true> query;
         return query.traceVisibilityRay(connection.light.visibilityRay);
 #else
         return true;
@@ -155,7 +170,7 @@ GrisDualWinner rtptGrisEvaluateDual(GrisAlternatingFresh fresh,
 {
     GrisDualWinner result = {};
     const GrisSpatialRecord suffix = proposals[candidateIndex].raw;
-    if (!(suffix.areaPdf > 0.f)) return result;
+    if (!rtptGrisHasTerminal(suffix)) return result;
 
     const uint sourceSlot = rtptGrisSourceSlot(fresh.raw.candidate.rootLobe);
     GrisConnection diffuse, specular;
