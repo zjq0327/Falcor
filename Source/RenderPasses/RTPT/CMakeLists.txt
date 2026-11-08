@@ -40,7 +40,9 @@ target_sources(RTPT PRIVATE
     GRIS/RTPTGRISGenerate.cs.slang
     GRIS/RTPTGRISGenerate.slang
     GRIS/RTPTGRISIndirect.slang
+    GRIS/RTPTGRISPathBuilder.slang
     GRIS/RTPTGRISPublishHistory.cs.slang
+    GRIS/RTPTGRISReference.slang
     GRIS/RTPTGRISReuse.slang
     GRIS/RTPTGRISShade.cs.slang
     GRIS/RTPTGRISSpatial.cs.slang

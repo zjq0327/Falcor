@@ -230,6 +230,8 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
             {
                 if (gris.rootLobe == uint(GrisRootComponent::GrisDiffuse)) indirectDiffuse = gris.radiance;
                 if (gris.rootLobe == uint(GrisRootComponent::GrisSpecular)) indirectSpecular = gris.radiance;
+                indirectDiffuse += gris.localDiffuse;
+                indirectSpecular += gris.localSpecular;
 
                 // Keep distance-only probes out of the transport random stream.
                 SampleGenerator distanceRng = SampleGenerator(pixel, sampleIndex ^ 0xe3723fd1u);

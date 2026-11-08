@@ -31,6 +31,12 @@ public:
     Properties getPGAsyncStatistics() const;
     Properties getSHARCMotionStatistics() const;
     Properties getStageStatistics() const;
+    // Explicit validation access only; obtaining these references performs no readback.
+    // The legacy "prefix" entry now contains local diffuse/specular RGB contributions.
+    std::vector<ref<Buffer>> getGRISValidationBuffers() const
+    {
+        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes};
+    }
     Properties getDIStatistics() const;
     Properties getReGIRStatistics() const;
     void resetPG() { mResetPG = true; mOptionsChanged = true; }
@@ -146,7 +152,7 @@ private:
     ref<ComputePass> mpGRISMainPass;
     ref<Buffer> mpGRISCandidates;
     ref<Buffer> mpGRISSpatialInput;
-    ref<Buffer> mpGRISLocalPrefixes;
+    ref<Buffer> mpGRISLocalPrefixes; // Compatibility name for local D/S contributions, not path geometry.
     ref<Buffer> mpGRISShadedIndirect;
     ref<Buffer> mpGRISHistory;
     struct GrisTemporalSnapshot
@@ -168,6 +174,7 @@ private:
     struct GrisTemporalHistoryFrame
     {
         float4x4 previousViewProj = float4x4::identity();
+        float3 previousCameraPosition = float3(0.f);
         uint2 previousFrameDim = uint2(0u);
         uint32_t previousFrameStamp = 0u;
         uint32_t historyGeneration = 0u;

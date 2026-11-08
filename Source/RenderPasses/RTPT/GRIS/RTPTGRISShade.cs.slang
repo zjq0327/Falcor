@@ -7,9 +7,13 @@ StructuredBuffer<GrisDualWinner> gGRISCandidates;
 StructuredBuffer<GrisAlternatingFresh> gGRISFresh;
 RWStructuredBuffer<GrisDualShadedIndirect> gGRISShadedIndirect;
 #else
-StructuredBuffer<GrisCandidate> gGRISCandidates;
 #if RTPT_GRIS_SPATIAL
-StructuredBuffer<GrisLocalPrefix> gGRISLocalPrefixes;
+StructuredBuffer<GrisSpatialRecord> gGRISCandidates;
+#else
+StructuredBuffer<GrisCandidate> gGRISCandidates;
+#endif
+#if RTPT_GRIS_SPATIAL
+StructuredBuffer<GrisLocalContributions> gGRISLocalPrefixes;
 #endif
 RWStructuredBuffer<GrisShadedIndirect> gGRISShadedIndirect;
 #endif
@@ -46,7 +50,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #endif
     }
 #else
+#if RTPT_GRIS_SPATIAL
+    const GrisCandidate candidate = gGRISCandidates[index].candidate;
+#else
     const GrisCandidate candidate = gGRISCandidates[index];
+#endif
     GrisShadedIndirect result = {};
     result.firstHit.distanceState = kRTPTDistanceUntraced;
     if (candidate.prepared)
@@ -56,9 +64,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         if (candidate.hasWinner)
             result.radiance = candidate.F * candidate.W;
 #if RTPT_GRIS_SPATIAL
-        result.radiance += gGRISLocalPrefixes[index].localRadiance;
+            result.localDiffuse = gGRISLocalPrefixes[index].diffuse;
+            result.localSpecular = gGRISLocalPrefixes[index].specular;
 #endif
-        result.state = any(result.radiance != 0.f)
+        result.state = any(result.radiance != 0.f) || any(result.localDiffuse != 0.f) || any(result.localSpecular != 0.f)
             ? uint(GrisRecordState::GrisPreparedWinner)
             : uint(GrisRecordState::GrisPreparedZero);
     }

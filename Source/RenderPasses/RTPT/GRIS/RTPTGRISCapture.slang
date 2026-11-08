@@ -14,7 +14,15 @@ void rtptGRISCapturePrefix(
     inout GrisLocalPrefix prefix
 )
 {
-    if (bounce == 1 && rtptGRISSupportsFirstVertex(sd, mi.getLobeTypes(sd)))
+    // New fixed-x2 generation uses full-BSDF / marginal-PDF continuation at
+    // both continuous interfaces. The legacy alternating path keeps its
+    // original single-diffuse support contract.
+#if RTPT_GRIS_ALTERNATING
+    const bool supported = rtptGRISSupportsFirstVertex(sd, mi.getLobeTypes(sd));
+#else
+    const bool supported = rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd));
+#endif
+    if (bounce == 1 && supported)
     {
         prefix.x1Hit = hit.pack();
         prefix.firstDirW = direction;
@@ -175,3 +183,7 @@ float3 rtptGRISCaptureDirectTerminal(
     suffix.candidate.F = positive ? contribution : float3(0.f);
     return float3(0.f);
 }
+
+#if !RTPT_GRIS_ALTERNATING
+#include "RTPTGRISPathBuilder.slang"
+#endif

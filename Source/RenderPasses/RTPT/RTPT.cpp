@@ -47,6 +47,16 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
         pass.def_property_readonly("pgAsyncStats", [](const RTPT& self) { return self.getPGAsyncStatistics().toPython(); });
         pass.def_property_readonly("sharcMotionStats", [](const RTPT& self) { return self.getSHARCMotionStatistics().toPython(); });
         pass.def_property_readonly("stageStats", [](const RTPT& self) { return self.getStageStatistics().toPython(); });
+        pass.def("getGRISValidationBuffers", [](const RTPT& self)
+        {
+            const auto buffers = self.getGRISValidationBuffers();
+            pybind11::dict result;
+            result["fresh"] = buffers[0];
+            result["winner"] = buffers[1];
+            result["history"] = buffers[2];
+            result["prefix"] = buffers[3];
+            return result;
+        });
         pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
         pass.def_property_readonly("regirStats", [](const RTPT& self) { return self.getReGIRStatistics().toPython(); });
         pass.def("resetPG", &RTPT::resetPG);

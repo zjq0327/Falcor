@@ -8,7 +8,6 @@ namespace
 {
 // This threshold accounts only for the per-pixel stage buffers.
 constexpr uint64_t kStageResourceBudgetBytes = 1ull << 30;
-constexpr uint64_t kGRISHistoryStride = 84u;
 
 uint64_t structuredStride(const ShaderVar& var)
 {
@@ -97,14 +96,15 @@ bool RTPT::prepareStages()
 
 bool RTPT::canUseGRISTemporal() const
 {
-    return mGRISTemporalEnabled && canUseGRISAlternating();
+    const bool compatibleReGIR = !mReGIREnabled || mRestirDIEnabled || mReGIRSecondaryEnabled;
+    return mGRISTemporalEnabled && mGRISEnabled && mEnableNRD && mSamplesPerPixel == 1u &&
+        !mUseRussianRoulette && compatibleReGIR;
 }
 
 bool RTPT::canUseGRISAlternating() const
 {
-    const bool compatibleReGIR = !mReGIREnabled || mRestirDIEnabled || mReGIRSecondaryEnabled;
-    return mGRISEnabled && mEnableNRD && mSamplesPerPixel == 1u &&
-        !mUseRussianRoulette && mUseNEE && compatibleReGIR;
+    // Complete fresh paths choose their root through BSDF sampling every frame.
+    return false;
 }
 
 void RTPT::resetGRISHistory()
@@ -142,23 +142,26 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     }
     const bool temporalSupported = canUseGRISTemporal();
     const bool temporalEnabled = temporalSupported && mGRISTemporalFallbackReason.empty();
-    const bool replaySharc = temporalEnabled && mEnableSHARC && mSHARCEnabled && mSHARCUseCache;
+    const bool replaySharc = false;
     if (mGRISTemporalEnabled && !temporalSupported)
-        logWarningOnce("RTPT GRIS Temporal requires compatible NEE and alternating GRIS.");
+        logWarningOnce("RTPT GRIS Temporal requires compatible lighting, internal NRD signals, one sample per pixel, and RR disabled.");
     const bool supportedLighting = !mReGIREnabled || diActive || mReGIRSecondaryEnabled;
-    const bool spatialEnabled = mGRISSpatialEnabled && mUseNEE && supportedLighting;
+    const bool spatialEnabled = mGRISSpatialEnabled && supportedLighting;
+    const bool referenceReuse = !mReGIREnabled && !(mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     if (mGRISSpatialEnabled && !spatialEnabled)
-        logWarningOnce("RTPT GRIS spatial reuse at x2 requires compatible NEE; using local paths.");
-    const bool alternating = canUseGRISAlternating();
-    const bool captureSuffix = spatialEnabled || temporalEnabled || alternating;
-    const bool blendX1Cache = alternating && mGRISSharcX1Blend > 0.f && mEnableSHARC && mSHARCEnabled &&
-        mSHARCUseCache && mSHARCMinBounce <= 2u && mMaxBounces > 2u;
+        logWarningOnce("RTPT GRIS spatial reuse at x2 requires compatible lighting; using local paths.");
+    const bool alternating = false;
+    // Local-only GRIS uses the same full-path record as spatial and temporal reuse.
+    const bool captureSuffix = true;
+    const bool blendX1Cache = false;
 
     if (mpGRISMainPass && bool(mpGRISSpatialPass) == (spatialEnabled && !temporalEnabled) &&
         bool(mpGRISTemporalPass) == temporalEnabled &&
         (mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_SHARC_REPLAY") != 0) == replaySharc &&
         (mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_SHARC_X1_BLEND") != 0) == blendX1Cache &&
         (mpGRISMainPass->getProgram()->getDefines().count("RTPT_GRIS_ALTERNATING") != 0) == alternating &&
+        mpGRISMainPass->getProgram()->getDefines().count("RTPT_GRIS_REFERENCE_REUSE") != 0 &&
+        mpGRISMainPass->getProgram()->getDefines().find("RTPT_GRIS_REFERENCE_REUSE")->second == (referenceReuse ? "1" : "0") &&
         (mpGRISMainPass->getProgram()->getDefines().count("RTPT_USE_RESTIR_DI") != 0) == diActive)
         return true;
 
@@ -166,6 +169,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     try
     {
         auto baseDefines = baseMainPass->getProgram()->getDefines();
+        baseDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
         if (alternating) baseDefines.add("RTPT_GRIS_ALTERNATING", "1");
         auto generateDefines = baseDefines;
         if (captureSuffix) generateDefines.add("RTPT_GRIS_SPATIAL", "1");
@@ -175,6 +179,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         mpGRISGeneratePass = ComputePass::create(mpDevice, generateDesc, generateDefines, true);
 
         DefineList shadeDefines;
+        shadeDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
         if (captureSuffix)
         {
             shadeDefines.add("RTPT_GRIS_SPATIAL", "1");
@@ -188,7 +193,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         if (captureSuffix)
         {
             auto reuseDefines = baseDefines;
-            if (alternating && spatialEnabled) reuseDefines.add("RTPT_GRIS_ALTERNATING_SPATIAL", "1");
+            if (spatialEnabled) reuseDefines.add("RTPT_GRIS_SPATIAL_REUSE", "1");
             if (replaySharc) reuseDefines.add("RTPT_GRIS_SHARC_REPLAY", "1");
             const auto reuseDesc = makeSceneProgramDesc(
                 temporalEnabled ? "RenderPasses/RTPT/GRIS/RTPTGRISTemporal.cs.slang" : "RenderPasses/RTPT/GRIS/RTPTGRISSpatial.cs.slang"
@@ -227,11 +232,25 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
             ? structuredStride(spatialInputVar) + (alternating ? 0u : structuredStride(prefixVar))
             : 0u;
         const uint64_t historyStride = temporalEnabled ? structuredStride(historyVar) : 0u;
+        const uint64_t candidateStride = structuredStride(candidateVar);
+        const uint64_t freshStride = structuredStride(spatialInputVar);
+        const uint64_t prefixStride = structuredStride(prefixVar);
+        FALCOR_CHECK(structuredStride(reusePass->getRootVar()["gGRISSpatialInput"]) == freshStride,
+            "RTPT GRIS Generate and Reuse disagree on the fresh path record layout.");
+        FALCOR_CHECK(structuredStride(mpGRISShadePass->getRootVar()["gGRISCandidates"]) == candidateStride,
+            "RTPT GRIS Reuse and Shade disagree on the selected path record layout.");
+        FALCOR_CHECK(structuredStride(mpGRISMainPass->getRootVar()["gGRISShadedIndirect"]) == structuredStride(shadedVar),
+            "RTPT GRIS Shade and Main disagree on the shaded indirect layout.");
+        FALCOR_CHECK(structuredStride(mpGRISShadePass->getRootVar()["gGRISLocalPrefixes"]) == prefixStride,
+            "RTPT GRIS Generate and Shade disagree on the local contribution layout.");
         if (temporalEnabled)
-            FALCOR_CHECK(historyStride == kGRISHistoryStride &&
-                structuredStride(mpGRISTemporalPass->getRootVar()["gGRISHistory"]) == historyStride,
-                "RTPT GRIS Temporal requires an 84-byte history record in both passes.");
-        const uint64_t grisBytes = pixelCount * (structuredStride(candidateVar) + spatialStride + structuredStride(shadedVar) + historyStride);
+        {
+            FALCOR_CHECK(structuredStride(mpGRISTemporalPass->getRootVar()["gGRISHistory"]) == historyStride,
+                "RTPT GRIS Temporal and PublishHistory disagree on the history layout.");
+            FALCOR_CHECK(structuredStride(mpGRISPublishHistoryPass->getRootVar()["gGRISSpatialInput"]) == candidateStride,
+                "RTPT GRIS PublishHistory must consume the selected path record.");
+        }
+        const uint64_t grisBytes = pixelCount * (candidateStride + spatialStride + structuredStride(shadedVar) + historyStride);
         const uint64_t stageBytes = mpPrimarySurfaces->getSize() + mpSignalRecords->getSize();
         FALCOR_CHECK(stageBytes + grisBytes <= kStageResourceBudgetBytes || temporalSupported || alternating,
             "RTPT GRIS and primary/signal buffers exceed their 1 GiB budget.");
@@ -282,6 +301,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
 {
     const auto& reusePass = mpGRISTemporalPass ? mpGRISTemporalPass : (mpGRISLocalPass ? mpGRISLocalPass : mpGRISSpatialPass);
     const bool alternating = reusePass && !mpGRISLocalPrefixes;
+    const float3 cameraPosition = mpScene->getCamera()->getPosition();
     GrisTemporalSnapshot snapshot;
     if (mpGRISTemporalPass)
     {
@@ -295,7 +315,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         if (sharc) snapshot.sharcVersion = mSHARCResolveVersion;
         if (mReGIRActive && mReGIRSecondaryEnabled) snapshot.regirDomainGeneration = mReGIRDomainGeneration;
         // Both the guide lookup and SHaRC's voxel LOD depend on the camera origin.
-        if (pg || sharc) snapshot.cameraPosition = mpScene->getCamera()->getPosition();
+        if (pg || sharc) snapshot.cameraPosition = cameraPosition;
     }
     const auto generateVar = mpGRISGeneratePass->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, generateVar["gScene"]);
@@ -328,12 +348,14 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
     if (reusePass)
     {
         pRenderContext->uavBarrier(mpGRISSpatialInput.get());
-        if (!alternating) pRenderContext->uavBarrier(mpGRISLocalPrefixes.get());
         const auto reuseVar = reusePass->getRootVar();
         mpScene->bindShaderDataForRaytracing(pRenderContext, reuseVar["gScene"]);
         mpSampleGenerator->bindShaderData(reuseVar);
         bindMainParams(reuseVar);
         bindPrimarySettings(reuseVar);
+        reuseVar["gPrimarySurfaces"] = mpPrimarySurfaces;
+        if (mpEnvMapSampler && reuseVar.hasMember("gEnvMapSampler"))
+            mpEnvMapSampler->bindShaderData(reuseVar["gEnvMapSampler"]);
         if (mpGRISTemporalPass)
         {
             const auto& history = mGRISHistoryFrame;
@@ -344,22 +366,19 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
             mGRISHistoryReplayActive = mGRISHistoryReadValid && canReplay && history.snapshot.sharcVersion != snapshot.sharcVersion;
             const auto settings = reuseVar["gGRISTemporalSettings"];
             settings["previousViewProj"] = history.previousViewProj;
+            settings["previousCameraPosition"] = history.previousCameraPosition;
             settings["previousFrameDim"] = history.previousFrameDim;
             settings["historyValid"] = mGRISHistoryReadValid ? 1u : 0u;
             if (canReplay)
             {
                 settings["replayHistory"] = mGRISHistoryReplayActive ? 1u : 0u;
-                if (mpEnvMapSampler && reuseVar.hasMember("gEnvMapSampler"))
-                    mpEnvMapSampler->bindShaderData(reuseVar["gEnvMapSampler"]);
                 if (diActive && reuseVar.hasMember("gDISettings")) bindDIMainResources(reuseVar);
             }
-            reuseVar["gPrimarySurfaces"] = mpPrimarySurfaces;
             reuseVar["gGRISHistory"] = mpGRISHistory;
         }
         if (mReGIREnabled) bindReGIRTransport(reuseVar);
         if (mEnableSHARC && reuseVar.hasMember("gSharc")) bindSHARC(reuseVar);
         reuseVar[alternating ? "gGRISFresh" : "gGRISSpatialInput"] = mpGRISSpatialInput;
-        if (!alternating) reuseVar["gGRISLocalPrefixes"] = mpGRISLocalPrefixes;
         reuseVar["gGRISSpatialOutput"] = mpGRISCandidates;
         {
             FALCOR_PROFILE(pRenderContext, mpGRISTemporalPass ? "GRISTemporal" : (mpGRISSpatialPass ? "GRISSpatial" : "GRISLocal"));
@@ -370,19 +389,20 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
     }
     if (mpGRISPublishHistoryPass)
     {
+        pRenderContext->uavBarrier(mpGRISCandidates.get());
         // The read-to-write resource transition orders this overwrite after Temporal.
         const auto publishVar = mpGRISPublishHistoryPass->getRootVar();
         bindPrimarySettings(publishVar);
-        publishVar[alternating ? "gGRISFresh" : "gGRISSpatialInput"] = mpGRISSpatialInput;
-        if (!alternating) publishVar["gGRISLocalPrefixes"] = mpGRISLocalPrefixes;
+        publishVar["gGRISSpatialInput"] = mpGRISCandidates;
         publishVar["gGRISHistory"] = mpGRISHistory;
         FALCOR_PROFILE(pRenderContext, "GRISPublishHistory");
         mpGRISPublishHistoryPass->execute(pRenderContext, uint3(mFrameDim, 1u));
         pRenderContext->uavBarrier(mpGRISHistory.get());
-        mGRISHistoryFrame = {mpScene->getCamera()->getViewProjMatrix(), mFrameDim, mPrimaryFrameStamp,
+        mGRISHistoryFrame = {mpScene->getCamera()->getViewProjMatrix(), cameraPosition, mFrameDim, mPrimaryFrameStamp,
             mGRISHistoryGeneration, true, snapshot};
     }
     pRenderContext->uavBarrier(mpGRISCandidates.get());
+    if (!alternating) pRenderContext->uavBarrier(mpGRISLocalPrefixes.get());
     shadeVar["gGRISCandidates"] = mpGRISCandidates;
     bindPrimarySettings(shadeVar);
     shadeVar["gGRISShadedIndirect"] = mpGRISShadedIndirect;
@@ -455,13 +475,29 @@ Properties RTPT::getStageStatistics() const
     for (const auto& buffer : {mpGRISCandidates, mpGRISSpatialInput, mpGRISLocalPrefixes, mpGRISShadedIndirect, mpGRISHistory})
         grisBytes += buffer ? buffer->getSize() : 0;
     props["grisSpatialActive"] = bool(mpGRISSpatialPass) ||
-        (mpGRISTemporalPass && mpGRISTemporalPass->getProgram()->getDefines().count("RTPT_GRIS_ALTERNATING_SPATIAL") != 0);
+        (mpGRISTemporalPass && mpGRISTemporalPass->getProgram()->getDefines().count("RTPT_GRIS_SPATIAL_REUSE") != 0);
     props["grisAlternatingActive"] = bool(mpGRISSpatialInput) && !mpGRISLocalPrefixes;
+    bool referenceReuse = false;
+    if (mpGRISMainPass)
+    {
+        const auto& defines = mpGRISMainPass->getProgram()->getDefines();
+        const auto mode = defines.find("RTPT_GRIS_REFERENCE_REUSE");
+        referenceReuse = mode != defines.end() && mode->second == "1";
+    }
+    props["grisReferenceReuseEnabled"] = referenceReuse;
+    props["grisReferenceReuseReason"] = referenceReuse ? std::string{} : !mpGRISMainPass
+        ? std::string("GRIS is inactive") : mReGIREnabled
+        ? std::string("ReGIR transport uses complete local paths")
+        : std::string("SHaRC cache transport uses complete local paths");
     props["grisTemporalActive"] = bool(mpGRISTemporalPass);
     props["grisHistoryReadValid"] = mGRISHistoryReadValid;
     props["grisHistoryReplayActive"] = mGRISHistoryReplayActive;
     props["grisHistoryBytes"] = mpGRISHistory ? mpGRISHistory->getSize() : 0;
     props["grisHistoryStride"] = mpGRISHistory ? mpGRISHistory->getStructSize() : 0u;
+    props["grisCandidateStride"] = mpGRISCandidates ? mpGRISCandidates->getStructSize() : 0u;
+    props["grisFreshStride"] = mpGRISSpatialInput ? mpGRISSpatialInput->getStructSize() : 0u;
+    props["grisLocalContributionStride"] = mpGRISLocalPrefixes ? mpGRISLocalPrefixes->getStructSize() : 0u;
+    props["grisShadedStride"] = mpGRISShadedIndirect ? mpGRISShadedIndirect->getStructSize() : 0u;
     props["grisTemporalFallbackReason"] = mGRISTemporalFallbackReason;
     props["grisBytes"] = grisBytes;
     props["grisPrefixBytes"] = mpGRISLocalPrefixes ? mpGRISLocalPrefixes->getSize() : 0;

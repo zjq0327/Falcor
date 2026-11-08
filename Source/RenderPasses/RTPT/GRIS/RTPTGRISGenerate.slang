@@ -1,11 +1,14 @@
 #include "../DirectLighting/RTPTDICoverage.slang"
 #include "../RTPTContinuation.slang"
+#if RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+#include "RTPTGRISReference.slang"
+#endif
 
 #if RTPT_GRIS_ALTERNATING
 RWStructuredBuffer<GrisAlternatingFresh> gGRISFresh;
 #elif RTPT_GRIS_SPATIAL
 RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
-RWStructuredBuffer<GrisLocalPrefix> gGRISLocalPrefixes;
+RWStructuredBuffer<GrisLocalContributions> gGRISLocalPrefixes;
 #else
 RWStructuredBuffer<GrisCandidate> gGRISCandidates;
 #endif
@@ -31,13 +34,18 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     candidate.firstHit.distanceState = kRTPTDistanceUntraced;
 #if RTPT_GRIS_SPATIAL
     GrisSpatialRecord spatial = {};
-    GrisLocalPrefix prefix = {};
+    spatial.candidate.firstHit.distanceState = kRTPTDistanceUntraced;
+    GrisLocalContributions local = {};
+    GrisPathBuilder pathBuilder = {};
 #endif
 #endif
 
     const uint sampleIndex = gParams.sampleOffset + gParams.seed * 0x9e3779b9u;
 #if !RTPT_GRIS_ALTERNATING
     SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
+#if RTPT_GRIS_SPATIAL
+    SampleGenerator terminalRng = SampleGenerator(pixel, sampleIndex ^ 0xa511e9b3u);
+#endif
 #endif
     RTPTPrimarySurface primary;
     if (rtptTryLoadPrimary(pixel, sampleIndex, primary))
@@ -46,6 +54,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         const HitInfo hit = HitInfo(primary.packedHit);
         if (hit.getType() == HitType::Triangle)
         {
+#if RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+            spatial.ownerPrimaryHit = primary.packedHit;
+#endif
             const TriangleHit triangleHit = hit.getTriangleHit();
             const VertexData vertex = gScene.getVertexData(triangleHit);
             const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
@@ -98,9 +109,41 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             const bool hasDiffuse = (lobes & uint(LobeType::DiffuseReflection)) != 0u;
             const bool hasSpecular = (lobes & uint(LobeType::SpecularReflection)) != 0u;
 
+#if RTPT_GRIS_SPATIAL
+            if (hasDiffuse || hasSpecular)
+            {
+                spatial.candidate.prepared = true;
+                spatial.candidate.M = 1.f;
+                [unroll]
+                for (uint slot = 0u; slot < 2u; ++slot)
+                {
+                    const uint activeLobe = slot == 0u ? uint(LobeType::DiffuseReflection) : uint(LobeType::SpecularReflection);
+                    if ((lobes & activeLobe) == 0u) continue;
+                    const uint currentRoot = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
+                    ShadingData component = sd;
+                    component.mtl.setActiveLobes(activeLobe);
+                    const RTPTSamplingContext sampling = slot == 0u ? rtptMakeSamplingContext(component, mi) : rtptBSDFSamplingContext();
+                    SampleGenerator pathRng = SampleGenerator(pixel, sampleIndex ^ (slot == 0u ? 0x87fb1a4du : 0x98d6d257u));
+                    GrisLocalPrefix prefix = {};
+                    prefix.rootLobe = currentRoot;
+                    GrisFirstHit firstHit;
+                    const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
+                        firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f,
+                        prefix, spatial, pathBuilder, terminalRng);
+                    if (slot == 0u) local.diffuse += localRadiance;
+                    else local.specular += localRadiance;
+                    if (spatial.candidate.hasWinner && spatial.candidate.rootLobe == currentRoot)
+                        spatial.candidate.firstHit = firstHit;
+                }
+                // One stratified D+S group, one shared terminal winner, M=1.
+                rtptGRISFinalizePath(pathBuilder, spatial);
+            }
+#else
+            // Legacy non-suffix capture is not selected by the fixed-x2 host.
             if (hasDiffuse || hasSpecular)
             {
                 candidate.prepared = true;
+                candidate.M = 1.f;
                 bool chooseDiffuse = hasDiffuse;
                 float rootProbability = 1.f;
                 if (hasDiffuse && hasSpecular)
@@ -113,14 +156,6 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 sd.mtl.setActiveLobes(activeLobe);
                 const RTPTSamplingContext sampling = chooseDiffuse ? rtptMakeSamplingContext(sd, mi) : rtptBSDFSamplingContext();
 
-#if RTPT_GRIS_SPATIAL
-                prefix.localRadiance = rtptTraceContinuation(sd, mi, activeLobe, sampling, sg,
-                    candidate.firstHit.hitT, candidate.firstHit.distanceState, sharcStats, rootCoverage, rootProbability, prefix, spatial);
-                candidate.F = spatial.candidate.F;
-                candidate.terminalKind = spatial.candidate.terminalKind;
-                candidate.W = 1.f;
-                candidate.hasWinner = rtptGrisHasTerminal(spatial);
-#else
                 // Keep picker draws separate from the path's scattering and light draws.
                 SampleGenerator terminalRng = SampleGenerator(pixel, sampleIndex ^ 0xa511e9b3u);
                 TerminalPicker picker = {};
@@ -138,8 +173,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                         candidate.hasWinner = true;
                     }
                 }
-#endif
             }
+#endif
 #endif
         }
 #endif
@@ -147,9 +182,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if RTPT_GRIS_ALTERNATING
     gGRISFresh[index] = fresh;
 #elif RTPT_GRIS_SPATIAL
-    spatial.candidate = candidate;
+#if !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+    GrisLocalPrefix selectedPrefix = {};
+    selectedPrefix.x1Hit = spatial.sourceX1;
+    selectedPrefix.rootLobe = spatial.candidate.rootLobe;
+    SampleGenerator normalizationRng = SampleGenerator(pixel, sampleIndex ^ 0x687f083du);
+    rtptGrisNormalizeGenerated(spatial, selectedPrefix, normalizationRng);
+#endif
     gGRISSpatialInput[index] = spatial;
-    gGRISLocalPrefixes[index] = prefix;
+    gGRISLocalPrefixes[index] = local;
 #else
     gGRISCandidates[index] = candidate;
 #endif

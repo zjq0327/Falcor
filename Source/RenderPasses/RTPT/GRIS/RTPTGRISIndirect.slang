@@ -12,15 +12,12 @@ GrisFirstHit rtptResolveGrisFirstHit(GrisShadedIndirect gris, uint rootLobe, Sha
 {
     GrisFirstHit result = {};
     result.distanceState = kRTPTDistanceNotSelected;
-    if (gris.state != uint(GrisRecordState::GrisUnprepared) && gris.rootLobe == rootLobe)
-    {
-        result = gris.firstHit;
-        if (result.distanceState == kRTPTDistanceHit || result.distanceState == kRTPTDistanceMiss) return result;
-    }
     if (!traceMissing) return result;
 
-    // The caller has enabled only this lobe. Probe geometry independently of
-    // the radiance sample, including valid rays with a black BSDF weight.
+    // Reused prefixes are drawn from an auxiliary proposal, and RIS also
+    // changes the winner's distance distribution. Obtain a distance from the
+    // requested BSDF lobe independently of the radiance winner/its weight.
+    // The caller has enabled only this lobe, including for valid black samples.
     // Retry rejected directions before issuing the single ray. RELAX 3.1
     // cannot reconstruct a missing specular distance on its own.
     for (uint attempt = 0; attempt < 4; ++attempt)

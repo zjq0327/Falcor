@@ -33,6 +33,10 @@ float3 rtptTraceContinuation(
 #if RTPT_GRIS_SPATIAL
     , inout GrisLocalPrefix prefix
     , inout GrisSpatialRecord suffix
+#if !RTPT_GRIS_ALTERNATING
+    , inout GrisPathBuilder pathBuilder
+    , inout SampleGenerator terminalRng
+#endif
 #if RTPT_GRIS_ALTERNATING
     , bool generateSuffix
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
@@ -48,6 +52,10 @@ float3 rtptTraceContinuation(
 {
     firstHitDistance = kRTPTNRDMissDistance;
     firstHitDistanceState = kRTPTDistanceSampleRejected;
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+    const uint currentRoot = prefix.rootLobe;
+    rtptGRISBeginWalk(pathBuilder);
+#endif
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
     mixedX1Cache = false;
     float3 x1CacheContribution = 0.f;
@@ -106,29 +114,40 @@ float3 rtptTraceContinuation(
         {
 #if USE_ENV_LIGHT
 #if RTPT_REGIR_ONLY
+            const float lightPdf = 0.f;
             const float misWeight = 1.f;
 #elif RTPT_REGIR_TRANSPORT
-            const float misWeight = previousUsedNEE && !previousDelta
-                ? rtptPowerHeuristic(previousContinuationPdf,
-                    rtptEnvironmentLightPdfForCoverage(ray.dir, bounce == 1u ? rootCoverage : previousReGIRCoverage))
-                : 1.f;
+            const float lightPdf = previousUsedNEE && !previousDelta
+                ? rtptEnvironmentLightPdfForCoverage(ray.dir, bounce == 1u ? rootCoverage : previousReGIRCoverage) : 0.f;
+            const float misWeight = previousUsedNEE && !previousDelta ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
 #elif RTPT_USE_RESTIR_DI
-            const float misWeight = previousUsedNEE && !previousDelta
-                ? rtptPowerHeuristic(previousContinuationPdf,
-                    bounce == 1u ? rtptEnvironmentLightPdfForCoverage(ray.dir, rootCoverage) : rtptEnvironmentLightPdf(ray.dir))
-                : 1.f;
+            const float lightPdf = previousUsedNEE && !previousDelta
+                ? (bounce == 1u ? rtptEnvironmentLightPdfForCoverage(ray.dir, rootCoverage) : rtptEnvironmentLightPdf(ray.dir)) : 0.f;
+            const float misWeight = previousUsedNEE && !previousDelta ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
 #else
-            const float misWeight = previousUsedNEE && !previousDelta
-                ? rtptPowerHeuristic(previousContinuationPdf, rtptEnvironmentLightPdf(ray.dir))
-                : 1.f;
+            const float lightPdf = previousUsedNEE && !previousDelta ? rtptEnvironmentLightPdf(ray.dir) : 0.f;
+            const float misWeight = previousUsedNEE && !previousDelta ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
 #endif
-            const float3 contribution = throughput * gScene.envMap.eval(ray.dir) * misWeight;
+            const float3 environment = gScene.envMap.eval(ray.dir);
+            const float3 contribution = throughput * environment * misWeight;
             if (all(isfinite(contribution)))
             {
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
                 rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisEnvironment);
 #endif
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+                if (pathBuilder.hasTail)
+                {
+                    const bool deepTail = bounce > 3u;
+                    const float3 incident = deepTail ? pathBuilder.tailThroughput * environment * misWeight : environment;
+                    rtptGRISAddPathTerminal(pathBuilder, terminalRng, currentRoot, prefix.x1Hit,
+                        contribution, uint(GrisTerminalKind::GrisEnvironment),
+                        deepTail, pathBuilder.rcWi, incident, lightPdf, false, suffix);
+                }
+                else radiance += contribution;
+#else
                 radiance += contribution;
+#endif
             }
 #endif
             break;
@@ -148,6 +167,11 @@ float3 rtptTraceContinuation(
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
         rtptGRISCapturePrefix(bounce, sd, mi, hit, ray.dir, throughput, prefix);
+#if !RTPT_GRIS_ALTERNATING
+        if (bounce == 1u && HitInfo(prefix.x1Hit).isValid())
+            pathBuilder.areaPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
+        rtptGRISBeginInterface(bounce, sd, mi, hit, ray, previousContinuationPdf, previousDelta, prefix, pathBuilder, suffix);
+#endif
 #if RTPT_GRIS_SHARC_REPLAY
         // Keep the geometric draw even if this frame's terminal is empty.
         if (bounce == 2u && bounce < gParams.maxBounces && HitInfo(prefix.x1Hit).isValid() &&
@@ -188,7 +212,7 @@ float3 rtptTraceContinuation(
             else
 #endif
             {
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_ALTERNATING
                 if (rtptGRISCaptureCacheTerminal(bounce, sd, mi, hit, ray, previousContinuationPdf,
                     contribution, prefix, suffix)) break;
 #endif
@@ -244,7 +268,20 @@ float3 rtptTraceContinuation(
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
                     rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisEmitter);
 #endif
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+                    // An emitter at x2 is a local endpoint without x2 scattering.
+                    if (pathBuilder.hasTail)
+                    {
+                        const bool deepTail = bounce > 3u;
+                        const float3 incident = deepTail ? pathBuilder.tailThroughput * emission * misWeight : emission;
+                        rtptGRISAddPathTerminal(pathBuilder, terminalRng, currentRoot, prefix.x1Hit,
+                            contribution, uint(GrisTerminalKind::GrisEmitter),
+                            deepTail, pathBuilder.rcWi, incident, lightPdf, false, suffix);
+                    }
+                    else radiance += contribution;
+#else
                     radiance += contribution;
+#endif
                 }
             }
             // The covered emission is one event; the hit's reflected indirect
@@ -268,6 +305,11 @@ float3 rtptTraceContinuation(
         {
             float3 contribution = 0.f;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
+#if !RTPT_GRIS_ALTERNATING
+            contribution = rtptGRISCapturePathNEE(bounce, sd, mi, sampling, throughput, query,
+                currentRoot, prefix.x1Hit, sg,
+                terminalRng, pathBuilder, suffix);
+#else
             if (bounce == 2 && HitInfo(prefix.x1Hit).isValid() && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
             {
                 contribution = rtptGRISCaptureDirectTerminal(sd, mi, sampling, hit, ray,
@@ -275,6 +317,8 @@ float3 rtptTraceContinuation(
             }
             else
 #endif
+#endif
+#if !(RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING)
             {
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING
                 const bool continues = generateSuffix && bounce == 1u;
@@ -283,6 +327,7 @@ float3 rtptTraceContinuation(
                 contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
 #endif
             }
+#endif
             if (all(isfinite(contribution)))
             {
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
@@ -304,6 +349,18 @@ float3 rtptTraceContinuation(
         bs = {};
         if (!rtptSampleContinuation(sd, mi, sampling, sg, bs, previousGuideSelected)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        if (rtptGRISPathReuseEnabled() && bounce <= 2u && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
+        {
+            // Sample the existing direction mixture, but use its matching full
+            // numerator at the two interfaces whose directions can change.
+            const float marginalPdf = rtptContinuationPdf(sd, mi, sampling, bs.wo);
+            if (!(marginalPdf > 0.f) || !isfinite(marginalPdf)) break;
+            bs.pdf = marginalPdf;
+            bs.weight = mi.eval(sd, bs.wo, sg) / marginalPdf;
+            if (!all(isfinite(bs.weight))) break;
+        }
+#endif
         previousDelta = bs.isLobe(LobeType::Delta);
 #if ENABLE_SHARC && SHARC_QUERY
         previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
@@ -313,6 +370,29 @@ float3 rtptTraceContinuation(
 #endif
 #endif
         if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        if (bounce == 2u && pathBuilder.hasInterface)
+        {
+            // Use the PDF from the actual x2 sample, after the interface's
+            // marginal-PDF override. A previous x2 NEE winner keeps R_head.
+            const float tailRatio = pathBuilder.areaPdf * (bs.pdf / kGrisReferenceDirectionPdf);
+            if (tailRatio > 0.f && isfinite(tailRatio))
+            {
+                pathBuilder.areaPdf = tailRatio;
+                pathBuilder.rcWi = bs.wo;
+                pathBuilder.tailThroughput = float3(1.f);
+                pathBuilder.hasTail = true;
+            }
+            else
+            {
+                // Keep the remaining complete estimate local if its reference
+                // representation cannot be stored. Do not discard radiance.
+                pathBuilder.hasInterface = false;
+                pathBuilder.hasTail = false;
+            }
+        }
+        else if (pathBuilder.hasTail) pathBuilder.tailThroughput *= bs.weight;
+#endif
         throughput *= bs.weight;
         if (!all(isfinite(throughput)) || !any(throughput > 0.f)) break;
         if (gParams.useRussianRoulette != 0 && bounce + 1 >= gParams.rrStartBounce)
@@ -320,6 +400,9 @@ float3 rtptTraceContinuation(
             const float survival = min(0.95f, max(throughput.x, max(throughput.y, throughput.z)));
             if (sampleNext1D(sg) >= survival) break;
             throughput /= survival;
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+            if (pathBuilder.hasTail) pathBuilder.tailThroughput /= survival;
+#endif
         }
 
         previousPosition = sd.posW;
@@ -330,6 +413,9 @@ float3 rtptTraceContinuation(
         break;
 #endif
     }
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+    rtptGRISFinalizePath(pathBuilder, suffix);
+#endif
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
     const float3 explicitRadiance = all(isfinite(radiance)) ? radiance : float3(0.f);
     if (mixedX1Cache)

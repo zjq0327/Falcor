@@ -39,6 +39,7 @@ struct GrisCandidate
 {
     float3 F;
     float W;
+    float M;
     uint rootLobe;
     uint terminalKind;
     bool prepared;
@@ -47,31 +48,59 @@ struct GrisCandidate
 };
 
 #if RTPT_GRIS_SPATIAL
+static const float kGrisReferenceDirectionPdf = 0.079577471545947667f; // 1/(4*pi)
+
 struct GrisLocalPrefix
 {
     PackedHitInfo x1Hit;
     float3 firstDirW;
     float3 throughputToX1;
     float3 localRadiance;
+    uint rootLobe; // Route local terms independently of the selected suffix.
+};
+
+// Pixel-local estimates from both full root walks. Geometry belongs to the
+// selected path record; each walk's GrisLocalPrefix remains invocation-local.
+struct GrisLocalContributions
+{
+    float3 diffuse;
+    float3 specular;
 };
 
 // A positive area PDF identifies a sampled x2. Its terminal may be empty.
 struct GrisSpatialRecord
 {
     GrisCandidate candidate;
+    PackedHitInfo ownerPrimaryHit;
+    PackedHitInfo sourceX1;
     PackedHitInfo reconnectHit;
-    float areaPdf;          // Canonical x1 -> x2 proposal, in area measure.
-    float3 suffixDirection; // ReGIR stores light-surface UV in xy.
-    float3 suffixLight;     // Weighted Li/PDF for NEE, RIS weight and inverse domain probability in xy for ReGIR.
+    float areaPdf;          // Owner proposal/reference ratio R after Generate normalization.
+    float3 suffixDirection; // Fixed direction leaving x2; legacy ReGIR records use UV in xy.
+    float3 suffixLight;     // Selected tail factor, excluding the x2 scatter and terminal-picker weight.
     uint lightPdfOrStableID; // Interpret by terminalKind.
     bool lightIsAnalytic;
 };
 
+// Extend the existing terminal word, rather than storing a second flags field.
+static const uint kGrisTerminalKindMask = 0xffu;
+static const uint kGrisDeepTail = 0x100u;
+
+uint rtptGrisTerminalKind(uint terminalAndFlags)
+{
+    return terminalAndFlags & kGrisTerminalKindMask;
+}
+
+bool rtptGrisIsDeepTail(GrisSpatialRecord suffix)
+{
+    return (suffix.candidate.terminalKind & kGrisDeepTail) != 0u;
+}
+
 bool rtptGrisHasTerminal(GrisSpatialRecord suffix)
 {
-    const uint kind = suffix.candidate.terminalKind;
+    const uint kind = rtptGrisTerminalKind(suffix.candidate.terminalKind);
     return suffix.areaPdf > 0.f && (kind == uint(GrisTerminalKind::GrisNee) ||
-        kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisCacheTerminal));
+        kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisCacheTerminal) ||
+        kind == uint(GrisTerminalKind::GrisEmitter) || kind == uint(GrisTerminalKind::GrisEnvironment));
 }
 
 #if RTPT_GRIS_ALTERNATING
@@ -92,12 +121,12 @@ uint rtptGrisSourceSlot(uint rootLobe)
 }
 #endif
 
-// One raw proposal from Generate. A missing x2 or terminal can still have a
-// valid x1 prefix whose proposal participates in reverse MIS.
+// The selected reservoir in its current owner's domain. The prefix and path
+// payload must be published together with the normalized F/W/M state.
 struct GrisTemporalFreshHistory
 {
     PackedHitInfo sourceX1;
-    float3 sourceFirstDir;
+    PackedHitInfo ownerPrimaryHit; // Replaces the reconstructible first-edge direction.
     uint rootLobe;
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
@@ -105,9 +134,9 @@ struct GrisTemporalFreshHistory
     float3 suffixLight;     // ReGIR stores RIS weight and inverse domain probability in xy.
     uint lightPdfOrStableID;
     uint terminalAndFlags;
-#if defined(HIT_INFO_USE_COMPRESSION) && HIT_INFO_USE_COMPRESSION
-    uint4 padding; // Keep the history stride fixed when each packed hit is 8 bytes.
-#endif
+    float3 F;
+    float W;
+    float M;
 };
 
 static const uint kGrisHistoryAnalytic = 0x80000000u;
@@ -125,6 +154,8 @@ struct GrisShadedIndirect
 {
     float3 radiance;
     uint rootLobe;
+    float3 localDiffuse;
+    float3 localSpecular;
     uint state;
     GrisFirstHit firstHit;
 };
