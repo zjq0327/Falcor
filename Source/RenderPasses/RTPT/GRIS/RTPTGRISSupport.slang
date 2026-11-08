@@ -20,7 +20,7 @@ bool rtptGRISSupportsFirstVertex(ShadingData sd, uint lobes)
 
 bool rtptGRISPathReuseEnabled()
 {
-#if RTPT_REGIR_TRANSPORT
+#if RTPT_REGIR_TRANSPORT && (!RTPT_REGIR_ONLY || !RTPT_GRIS_REFERENCE_REUSE)
     return false;
 #else
 #if ENABLE_SHARC && SHARC_QUERY

@@ -142,6 +142,8 @@ void rtptGRISStoreDirectTerminal(GrisDirectLightSample sample, inout GrisSpatial
 #if RTPT_REGIR_TRANSPORT
     if (sample.fromReGIR)
     {
+        // Legacy terminal reconstruction only. Complete fixed-x2 paths use
+        // GrisReGIRPath and keep real direction/weighted incident factors.
         suffix.candidate.terminalKind = uint(GrisTerminalKind::GrisReGIR);
         suffix.lightPdfOrStableID = sample.stableID;
         suffix.suffixDirection = float3(sample.uv, 0.f);

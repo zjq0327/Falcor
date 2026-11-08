@@ -12,6 +12,16 @@ ReGIR 使用与 SHaRC 同类的世界空间对数 LOD，尺寸独立设置：`re
 
 静态光源不重复构建描述和候选列表；光源增删、移动、朝向或强度变化时，只重建旧/新候选归属不同的 cell。稳定 ID 与当前目录位置分离，压缩重排不串灯；RIS 使用当前光源每帧刷新，归一化分母为本 cell 候选数量。120 帧未查询的 cell 回收并复用候选存储段。64 MiB 专用预算计入所有新增缓存、描述、映射和临时资源；默认 32 RIS 槽/每槽 8 候选。`regirStats` 报告实际字节、列表构建/复用、程序化视图、容量压力、回收与稳定 ID。测试代码已清理，历史验证结果见 [验证汇总](../../../build/regir-cell-validation/summary.json)，VeachAjar 开关对比见 [场景报告](../../../build/regir-veach-comparison/summary.json)。
 
+## 固定 x2 GRIS 的 ReGIR 尾段采灯
+
+[RTPTGRISReGIR 测试图](../../../scripts/RTPTGRISReGIR.py) 将已有 cell-only ReGIR 接入新版多跳 GRIS：x0 直接光和 x1 本地贡献独立累计，x2 及深处的 ReGIR 项进入共享 terminal picker，再参与空间/时间重采样。图中关闭屏幕 ReSTIR DI、SHaRC 查询和 RR，开启 ReGIR 次级与独立训练；`useNEE` 保持 true，以启用直接光入口。默认 `grisPGPrefixDepth=1` 只引导 D root 首段，0 关闭 GRIS guiding，x1 及更深方向仍为 BSDF。弱光距离截断设为 0。
+
+新 `GrisReGIRPath` kind 使用现有方向/尾因子槽保存已含内层 RIS 补偿的静态尾段，与旧 `GrisReGIR` 的 UV/权重重建编码区分。x2 直接项不套普通灯/BSDF MIS，也不含 x2 continuation 比率；深尾继续保留 q2/reference 转换。被 ReGIR 覆盖的非 delta 命灯 emission 按已有规则去重，delta 及直接可见 emission 保留。
+
+reference-tail 目前仅对 ReGIR-only、次级采灯开启、SHaRC 查询关闭的组合启用；混合屏幕 DI 等组合保留完整本地估计。`stageStats.grisReGIRPathReuseEnabled` 报告实际编译生效状态。持久结构不新增字段，历史仍按场景、参数、PG 与 ReGIR 域代际规则失效，不支持动态尾段回放。ReGIR 自身共享缓存仍单独占用显存。
+
+光路图、MIS/PDF 契约、实施范围及验证结果见 [接入计划](GRIS_REGIR_NEE_PLAN.md)。构建、245,631 条严格重建路径、功能和独立 10 seed 均值确认通过，PG0 四模式与 PG1 joint 共 45/45 通道满足预定 ±2% / 95% 区间门槛。PG1 精确关闭回归和初轮 5 seed 均值对照的未通过结果仍分别保留，最终汇总不标为全部验收通过。本场景 640×360 完整图 GPU 均值为 off 4.556 ms、on 5.424 ms；ReGIR 缓存约 34.283 MiB，GRIS 持久记录净增 0 B。具体范围见 [最终汇总](../../../build/gris-regir-validation/summary.json)。本轮隔离验证保存在 `build/gris-regir-validation/`，不恢复已归档的旧测试构建。
+
 ## 首表面 ReSTIR DI 与 NRD 及后续 ReGIR 接入方案
 
 [实施方案与参考代码](REGIR_RESTIR_DI_NRD_PLAN.md) 以当前 PG、SHaRC、NRD 版本为基线，按用户指定顺序先完成首表面 ReSTIR DI 与 NRD：全局候选 → 最终灯样本 → RayQuery 阴影 → 分别评价 D/S → 与原间接信号合成并送入 NRD，完整验收后再增加 ReGIR。首批保留当前 D/S 双续接，概率式根通道单路径单独评估。阶段 1 的结构拆分、阶段 2 的全局 Initial RIS 和阶段 3 的 Temporal/Spatial 已接入；ReGIR 留在阶段 5。

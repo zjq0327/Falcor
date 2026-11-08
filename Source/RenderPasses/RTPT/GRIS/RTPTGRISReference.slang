@@ -10,9 +10,10 @@
 // Fixed-x2 reference implementation. The auxiliary prefix exchange is performed
 // in a common surface-prefix/reference-tail domain, not with the legacy sum of
 // connection-area PDFs. RR must be disabled, and proposals from x2 onward
-// must be BSDF-only. Only the generated primary diffuse edge may use
-// PG; the actual proposal densities are captured in R. ReGIR/cache terminals
-// are outside this explicit-path domain.
+// must be BSDF-only. The configured primary diffuse edge may use PG; the
+// actual proposal densities are captured in R. Cell-only ReGIR paths flatten
+// their inner sampling factor at the fixed x2/tail. Legacy ReGIR reconstruction
+// and cache terminals remain outside this explicit-path domain.
 //
 // areaPdf stores R = Q_owner / sigma_reference after NormalizeGenerated().
 // The public record keeps the established MC convention: F_nu=F*R, W_nu=W/R.
@@ -129,7 +130,11 @@ bool rtptGrisRefKindSupported(GrisSpatialRecord record)
 {
     const uint kind = rtptGrisTerminalKind(record.candidate.terminalKind);
     return kind == uint(GrisTerminalKind::GrisNee) || kind == uint(GrisTerminalKind::GrisEmitter) ||
-        kind == uint(GrisTerminalKind::GrisEnvironment);
+        kind == uint(GrisTerminalKind::GrisEnvironment)
+#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
+        || kind == uint(GrisTerminalKind::GrisReGIRPath)
+#endif
+        ;
 }
 
 bool rtptGrisRefDomainValid(GrisSpatialRecord record)
@@ -212,13 +217,21 @@ float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
         if (!tail.lightIsAnalytic && 2u < gParams.maxBounces)
             endpoint *= rtptPowerHeuristic(lightPdf, scatterPdf);
     }
+    else if (!rtptGrisIsDeepTail(tail) && kind == uint(GrisTerminalKind::GrisReGIRPath))
+    {
+        // Direct x2 -> light: its inner RIS compensation is already in
+        // endpoint, and the covered emission has no BSDF competitor. This
+        // sample did not draw an x2 continuation, so do not add q2/q_ref.
+    }
     else
     {
         if (!(scatterPdf > 0.f)) return 0.f;
         ownerRatio *= scatterPdf / kGrisReferenceDirectionPdf;
         endpoint /= kGrisReferenceDirectionPdf;
+#if !RTPT_REGIR_ONLY
         if (!rtptGrisIsDeepTail(tail) && gParams.useNEE != 0u && !tail.lightIsAnalytic)
             endpoint *= rtptPowerHeuristic(scatterPdf, asfloat(tail.lightPdfOrStableID));
+#endif
     }
     const float3 value = prefixFactor * scatter * endpoint;
     if (!(ownerRatio > 0.f) || !isfinite(ownerRatio) || !all(isfinite(value))) { ownerRatio = 0.f; return 0.f; }

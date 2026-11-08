@@ -84,8 +84,29 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     inout GrisPathBuilder builder, inout GrisSpatialRecord suffix)
 {
 #if RTPT_REGIR_TRANSPORT
-    // Preserve the existing complete, disjoint ReGIR/light domains locally.
+    // The explicit-path adapter currently supports the cell-only domain.
+    // Mixed remaining-light domains retain the complete local estimator.
+#if !RTPT_REGIR_ONLY
     return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
+#else
+    if (!rtptGRISPathReuseEnabled()) return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
+    if (rtptReGIRTransportCoverage(false) == 0u) return float3(0.f);
+    RTPTLightSample light;
+    if (!rtptReGIRSampleTransportLight(sd, sg, light)) return float3(0.f);
+    // LiOverPdf already contains the cell/RIS and conditional-light sampling
+    // compensation. ReGIR owns this non-delta direct-light domain, so there
+    // is no ordinary light/BSDF MIS or usable marginal light PDF here.
+    const float3 value = rtptEvaluateLightSample(sd, mi, sampling, light, sg, false);
+    const float3 contribution = throughput * value;
+    if (!all(isfinite(contribution)) || !query.traceVisibilityRay(light.visibilityRay)) return float3(0.f);
+    if (!builder.hasInterface) return contribution;
+    const bool deepTail = bounce > 2u;
+    const float3 incident = deepTail ? builder.tailThroughput * value : light.LiOverPdf;
+    const float3 direction = deepTail ? builder.rcWi : light.dir;
+    rtptGRISAddPathTerminal(builder, terminalRng, currentRoot, currentX1, contribution,
+        uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, 0.f, light.analytic, suffix);
+    return float3(0.f);
+#endif
 #else
     if (!rtptGRISPathReuseEnabled()) return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
     RTPTLightSample light;

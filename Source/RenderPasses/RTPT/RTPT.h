@@ -56,6 +56,7 @@ private:
     bool prepareStages();
     void invalidateGRIS(bool clearTemporalFailure = true);
     void resetGRISHistory();
+    bool canUseGRISReferenceReuse() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);

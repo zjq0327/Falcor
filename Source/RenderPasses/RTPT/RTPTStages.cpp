@@ -94,6 +94,15 @@ bool RTPT::prepareStages()
     }
 }
 
+bool RTPT::canUseGRISReferenceReuse() const
+{
+    // The flattened ReGIR tail owns the complete cell-only local-light domain.
+    // Mixed screen-DI/remaining-light transport keeps its existing local path
+    // until its endpoint and complementary MIS contracts are implemented.
+    const bool compatibleReGIR = !mReGIREnabled || (!mRestirDIEnabled && mReGIRSecondaryEnabled);
+    return compatibleReGIR && !(mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
+}
+
 bool RTPT::canUseGRISTemporal() const
 {
     const bool compatibleReGIR = !mReGIREnabled || mRestirDIEnabled || mReGIRSecondaryEnabled;
@@ -147,7 +156,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         logWarningOnce("RTPT GRIS Temporal requires compatible lighting, internal NRD signals, one sample per pixel, and RR disabled.");
     const bool supportedLighting = !mReGIREnabled || diActive || mReGIRSecondaryEnabled;
     const bool spatialEnabled = mGRISSpatialEnabled && supportedLighting;
-    const bool referenceReuse = !mReGIREnabled && !(mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
+    const bool referenceReuse = canUseGRISReferenceReuse();
     if (mGRISSpatialEnabled && !spatialEnabled)
         logWarningOnce("RTPT GRIS spatial reuse at x2 requires compatible lighting; using local paths.");
     const bool alternating = false;
@@ -484,17 +493,23 @@ Properties RTPT::getStageStatistics() const
     props["grisPGSnapshotDependent"] = bool(mpGRISTemporalPass) && mGRISPGPrefixDepth > 0u &&
         mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding;
     bool referenceReuse = false;
+    bool regirOnly = false;
     if (mpGRISMainPass)
     {
         const auto& defines = mpGRISMainPass->getProgram()->getDefines();
         const auto mode = defines.find("RTPT_GRIS_REFERENCE_REUSE");
         referenceReuse = mode != defines.end() && mode->second == "1";
+        const auto regirMode = defines.find("RTPT_REGIR_ONLY");
+        regirOnly = regirMode != defines.end() && regirMode->second == "1";
     }
     props["grisReferenceReuseEnabled"] = referenceReuse;
+    props["grisReGIRPathReuseEnabled"] = referenceReuse && regirOnly;
     props["grisReferenceReuseReason"] = referenceReuse ? std::string{} : !mpGRISMainPass
-        ? std::string("GRIS is inactive") : mReGIREnabled
-        ? std::string("ReGIR transport uses complete local paths")
-        : std::string("SHaRC cache transport uses complete local paths");
+        ? std::string("GRIS is inactive") : mEnableSHARC && mSHARCEnabled && mSHARCUseCache
+        ? std::string("SHaRC cache transport uses complete local paths") : mReGIREnabled && !regirOnly
+        ? std::string("ReGIR mixed direct-light transport uses complete local paths") : mReGIREnabled && !mReGIRSecondaryEnabled
+        ? std::string("ReGIR reference reuse requires secondary light sampling")
+        : std::string("Reference-tail reuse is unavailable");
     props["grisTemporalActive"] = bool(mpGRISTemporalPass);
     props["grisHistoryReadValid"] = mGRISHistoryReadValid;
     props["grisHistoryReplayActive"] = mGRISHistoryReplayActive;

@@ -29,6 +29,9 @@ enum GrisTerminalKind : uint
     GrisEnvironment,
     GrisReGIR,
     GrisCacheTerminal,
+    // Fixed-x2 explicit paths store a weighted incident factor, never the
+    // legacy GrisReGIR UV/RIS reconstruction payload.
+    GrisReGIRPath,
 };
 enum GrisRecordState : uint { GrisUnprepared, GrisPreparedZero, GrisPreparedWinner };
 
@@ -80,7 +83,7 @@ struct GrisSpatialRecord
     float areaPdf;          // Owner proposal/reference ratio R after Generate normalization.
     float3 suffixDirection; // Fixed direction leaving x2; legacy ReGIR records use UV in xy.
     float3 suffixLight;     // Selected tail factor, excluding the x2 scatter and terminal-picker weight.
-    uint lightPdfOrStableID; // Interpret by terminalKind.
+    uint lightPdfOrStableID; // Ordinary light PDF / legacy stable ID; zero for GrisReGIRPath.
     bool lightIsAnalytic;
 };
 
@@ -102,7 +105,8 @@ bool rtptGrisHasTerminal(GrisSpatialRecord suffix)
 {
     const uint kind = rtptGrisTerminalKind(suffix.candidate.terminalKind);
     return suffix.areaPdf > 0.f && (kind == uint(GrisTerminalKind::GrisNee) ||
-        kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisCacheTerminal) ||
+        kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisReGIRPath) ||
+        kind == uint(GrisTerminalKind::GrisCacheTerminal) ||
         kind == uint(GrisTerminalKind::GrisEmitter) || kind == uint(GrisTerminalKind::GrisEnvironment));
 }
 
@@ -133,8 +137,8 @@ struct GrisTemporalFreshHistory
     uint rootLobe;
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
-    float3 suffixDirection; // ReGIR stores the light UV in xy.
-    float3 suffixLight;     // ReGIR stores RIS weight and inverse domain probability in xy.
+    float3 suffixDirection; // Fixed x2 direction; only legacy GrisReGIR stores UV in xy.
+    float3 suffixLight;     // Weighted tail factor; only legacy GrisReGIR stores RIS/domain weights.
     uint lightPdfOrStableID;
     uint terminalAndFlags;
     float3 F;
