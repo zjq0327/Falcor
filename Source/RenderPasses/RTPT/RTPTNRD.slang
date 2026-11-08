@@ -114,8 +114,8 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
         ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -rayDirection);
         sd.mtl.setActiveLobes(uint(LobeType::Reflection));
-        const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
-        const BSDFProperties properties = mi.getProperties(sd);
+        const IMaterialInstance guideMI = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+        const BSDFProperties properties = guideMI.getProperties(sd);
 #if ENABLE_SHARC && SHARC_QUERY
         rtptCaptureSharcPrimary(sd, properties, sharcStats);
 #endif
@@ -135,6 +135,15 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         signals.viewZ = mul(gScene.camera.data.viewProjMatNoJitter, float4(sd.posW, 1.f)).w;
         signals.motionW = gScene.getPrevPosW(triangleHit) - sd.posW;
 
+#if RTPT_USE_GRIS && !RTPT_GRIS_ALTERNATING
+        // Primary NEE competes with Generate's root proposal. Match its
+        // represented camera view for transport, retaining the original NRD
+        // guide construction above.
+        ShadingData representedPrimary;
+        if (rtptGRISPathReuseEnabled() && rtptGrisRefPrimary(hit.pack(), gScene.camera.getPosition(), representedPrimary))
+            sd = representedPrimary;
+#endif
+        const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
         const uint lobes = mi.getLobeTypes(sd);
         const bool hasDiffuse = (lobes & uint(LobeType::DiffuseReflection)) != 0;
         const bool hasSpecular = (lobes & uint(LobeType::SpecularReflection)) != 0;
@@ -145,7 +154,13 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         specularSD.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
         RTPTSamplingContext diffuseSampling = rtptBSDFSamplingContext();
         RTPTSamplingContext specularSampling = rtptBSDFSamplingContext();
+#if RTPT_USE_GRIS && !RTPT_GRIS_ALTERNATING
+        // Primary NEE must compete with Generate's actual root proposal.
+        // Apply the same context to a local fallback continuation as well.
+        if (hasDiffuse && RTPT_GRIS_PG_PREFIX_DEPTH >= 1) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
+#else
         if (hasDiffuse) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
+#endif
         // Keep primary specular NEE and continuation on the BSDF-only density.
 
         uint rootCoverage = 0u;

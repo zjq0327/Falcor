@@ -157,6 +157,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
 
     if (mpGRISMainPass && bool(mpGRISSpatialPass) == (spatialEnabled && !temporalEnabled) &&
         bool(mpGRISTemporalPass) == temporalEnabled &&
+        mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_PG_PREFIX_DEPTH") != 0 &&
+        mpGRISGeneratePass->getProgram()->getDefines().find("RTPT_GRIS_PG_PREFIX_DEPTH")->second == std::to_string(mGRISPGPrefixDepth) &&
         (mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_SHARC_REPLAY") != 0) == replaySharc &&
         (mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_SHARC_X1_BLEND") != 0) == blendX1Cache &&
         (mpGRISMainPass->getProgram()->getDefines().count("RTPT_GRIS_ALTERNATING") != 0) == alternating &&
@@ -170,6 +172,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     {
         auto baseDefines = baseMainPass->getProgram()->getDefines();
         baseDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
+        baseDefines.add("RTPT_GRIS_PG_PREFIX_DEPTH", std::to_string(mGRISPGPrefixDepth));
         if (alternating) baseDefines.add("RTPT_GRIS_ALTERNATING", "1");
         auto generateDefines = baseDefines;
         if (captureSuffix) generateDefines.add("RTPT_GRIS_SPATIAL", "1");
@@ -305,7 +308,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
     GrisTemporalSnapshot snapshot;
     if (mpGRISTemporalPass)
     {
-        const bool pg = mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding;
+        const bool pg = mGRISPGPrefixDepth > 0u && mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding;
         const bool sharc = mEnableSHARC && mSHARCEnabled && mSHARCUseCache;
         if (pg)
         {
@@ -477,6 +480,9 @@ Properties RTPT::getStageStatistics() const
     props["grisSpatialActive"] = bool(mpGRISSpatialPass) ||
         (mpGRISTemporalPass && mpGRISTemporalPass->getProgram()->getDefines().count("RTPT_GRIS_SPATIAL_REUSE") != 0);
     props["grisAlternatingActive"] = bool(mpGRISSpatialInput) && !mpGRISLocalPrefixes;
+    props["grisPGPrefixDepth"] = mGRISPGPrefixDepth;
+    props["grisPGSnapshotDependent"] = bool(mpGRISTemporalPass) && mGRISPGPrefixDepth > 0u &&
+        mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding;
     bool referenceReuse = false;
     if (mpGRISMainPass)
     {

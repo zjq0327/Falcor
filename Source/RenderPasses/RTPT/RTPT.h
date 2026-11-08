@@ -188,6 +188,7 @@ private:
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
+    uint32_t mGRISPGPrefixDepth = 1u;
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;

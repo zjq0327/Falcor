@@ -62,6 +62,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
             ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -primary.rayDirection);
             sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+#if RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+            // Match the camera view used to evaluate a represented prefix.
+            ShadingData representedPrimary;
+            if (rtptGRISPathReuseEnabled() && rtptGrisRefPrimary(primary.packedHit, gScene.camera.getPosition(), representedPrimary))
+                sd = representedPrimary;
+#endif
             const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
             const uint lobes = mi.getLobeTypes(sd);
             float3 diDiffuse, diSpecular;
@@ -122,7 +128,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     const uint currentRoot = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
                     ShadingData component = sd;
                     component.mtl.setActiveLobes(activeLobe);
-                    const RTPTSamplingContext sampling = slot == 0u ? rtptMakeSamplingContext(component, mi) : rtptBSDFSamplingContext();
+                    const RTPTSamplingContext sampling = slot == 0u && RTPT_GRIS_PG_PREFIX_DEPTH >= 1
+                        ? rtptMakeSamplingContext(component, mi) : rtptBSDFSamplingContext();
                     SampleGenerator pathRng = SampleGenerator(pixel, sampleIndex ^ (slot == 0u ? 0x87fb1a4du : 0x98d6d257u));
                     GrisLocalPrefix prefix = {};
                     prefix.rootLobe = currentRoot;

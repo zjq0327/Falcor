@@ -9,8 +9,10 @@
 
 // Fixed-x2 reference implementation. The auxiliary prefix exchange is performed
 // in a common surface-prefix/reference-tail domain, not with the legacy sum of
-// connection-area PDFs. RR must be disabled, and all proposals below the root
-// must be BSDF-only. ReGIR/cache terminals are outside this explicit-path domain.
+// connection-area PDFs. RR must be disabled, and proposals from x2 onward
+// must be BSDF-only. Only the generated primary diffuse edge may use
+// PG; the actual proposal densities are captured in R. ReGIR/cache terminals
+// are outside this explicit-path domain.
 //
 // areaPdf stores R = Q_owner / sigma_reference after NormalizeGenerated().
 // The public record keeps the established MC convention: F_nu=F*R, W_nu=W/R.
@@ -31,29 +33,6 @@ float rtptGrisRefTarget(float3 value)
     return dot(abs(value), float3(0.2126f, 0.7152f, 0.0722f));
 }
 
-bool rtptGrisRefPosition(PackedHitInfo packed, out float3 position)
-{
-    position = 0.f;
-    const HitInfo hit = HitInfo(packed);
-    if (hit.getType() != HitType::Triangle) return false;
-    position = gScene.getVertexData(hit.getTriangleHit()).posW;
-    return all(isfinite(position));
-}
-
-bool rtptGrisRefLoad(PackedHitInfo packed, float3 view, out ShadingData sd)
-{
-    sd = {};
-    const HitInfo hit = HitInfo(packed);
-    if (hit.getType() != HitType::Triangle || !all(isfinite(view))) return false;
-    const float viewLengthSquared = dot(view, view);
-    if (!(viewLengthSquared > 0.f)) return false;
-    const TriangleHit triangle = hit.getTriangleHit();
-    sd = gScene.materials.prepareShadingData(gScene.getVertexData(triangle),
-        gScene.getMaterialID(triangle.instanceID), view * rsqrt(viewLengthSquared));
-    sd.mtl.setActiveLobes(uint(LobeType::Reflection));
-    return true;
-}
-
 uint rtptGrisRefRootMask(uint rootLobe)
 {
     if (rootLobe == uint(GrisRootComponent::GrisDiffuse)) return uint(LobeType::DiffuseReflection);
@@ -66,20 +45,13 @@ float rtptGrisRefRootProbability(ShadingData primary, uint rootLobe)
     primary.mtl.setActiveLobes(uint(LobeType::Reflection));
     const IMaterialInstance material = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
     const uint lobes = material.getLobeTypes(primary);
+    if (!rtptGRISSupportsSurface(primary, lobes & rtptGrisRefRootMask(rootLobe))) return 0.f;
     const bool diffuse = (lobes & uint(LobeType::DiffuseReflection)) != 0u;
     const bool specular = (lobes & uint(LobeType::SpecularReflection)) != 0u;
     if ((rootLobe == uint(GrisRootComponent::GrisDiffuse) && !diffuse) ||
         (rootLobe == uint(GrisRootComponent::GrisSpecular) && !specular) ||
         rtptGrisRefRootMask(rootLobe) == 0u) return 0.f;
     return diffuse && specular ? 0.5f : 1.f;
-}
-
-bool rtptGrisRefPrimary(PackedHitInfo primaryHit, float3 cameraPosition, out ShadingData primary)
-{
-    float3 position;
-    primary = {};
-    return rtptGrisRefPosition(primaryHit, position) &&
-        rtptGrisRefLoad(primaryHit, cameraPosition - position, primary);
 }
 
 bool rtptGrisRefVisible(ShadingData from, ShadingData to)
@@ -195,20 +167,18 @@ float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
     if (!(rootProbability > 0.f)) return 0.f;
     primary.mtl.setActiveLobes(rtptGrisRefRootMask(prefix.rootLobe));
     const IMaterialInstance rootMaterial = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
-    const float3 rootEdge = x1Position - primary.computeRayOrigin();
-    const float rootDistanceSquared = dot(rootEdge, rootEdge);
-    if (!(rootDistanceSquared > 0.f) || !isfinite(rootDistanceSquared)) return 0.f;
+    float3 firstDirection;
+    float rootDistanceSquared;
+    if (!rtptGrisPrefixDirection(primary.computeRayOrigin(), x1Position, firstDirection, rootDistanceSquared)) return 0.f;
     firstDistance = sqrt(rootDistanceSquared);
-    const float3 firstDirection = rootEdge / firstDistance;
     ShadingData first;
     if (!rtptGrisRefLoad(prefix.x1, -firstDirection, first)) return 0.f;
     const IMaterialInstance firstMaterial = gScene.materials.getMaterialInstance(first, ExplicitLodTextureSampler(0.f));
     if (!rtptGRISSupportsSurface(first, firstMaterial.getLobeTypes(first))) return 0.f;
     const float rootGeometry = abs(dot(first.faceN, firstDirection)) / rootDistanceSquared;
-    const float3 connectionEdge = x2Position - first.computeRayOrigin();
-    const float connectionDistanceSquared = dot(connectionEdge, connectionEdge);
-    if (!(connectionDistanceSquared > 0.f) || !isfinite(connectionDistanceSquared)) return 0.f;
-    const float3 connectionDirection = connectionEdge * rsqrt(connectionDistanceSquared);
+    float3 connectionDirection;
+    float connectionDistanceSquared;
+    if (!rtptGrisPrefixDirection(first.computeRayOrigin(), x2Position, connectionDirection, connectionDistanceSquared)) return 0.f;
     ShadingData reconnect;
     if (!rtptGrisRefLoad(tail.reconnectHit, -connectionDirection, reconnect)) return 0.f;
     const IMaterialInstance reconnectMaterial = gScene.materials.getMaterialInstance(reconnect, ExplicitLodTextureSampler(0.f));

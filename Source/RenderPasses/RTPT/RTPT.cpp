@@ -35,6 +35,9 @@ const Gui::DropdownList kSHARCCapacities = {
     {1u << 16, "64K entries (2.5 MiB)"}, {1u << 18, "256K entries (10 MiB)"},
     {1u << 20, "1M entries (40 MiB)"}, {1u << 22, "4M entries (160 MiB)"},
 };
+const Gui::DropdownList kGRISPGPrefixDepths = {
+    {0u, "Disabled"}, {1u, "D root: x0 to x1"},
+};
 }
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
@@ -81,6 +84,7 @@ void RTPT::setProperties(const Properties& props)
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
+    uint32_t grisPGPrefixDepth = mGRISPGPrefixDepth;
     float grisSharcX1Blend = mGRISSharcX1Blend;
     bool restirDIEnabled = mRestirDIEnabled;
     bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
@@ -117,6 +121,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
+        else if (key == "grisPGPrefixDepth") grisPGPrefixDepth = value;
         else if (key == "grisSharcX1Blend") grisSharcX1Blend = value;
         else if (key == "restirDIEnabled") restirDIEnabled = value;
         else if (key == "regirEnabled") regirEnabled = value;
@@ -175,6 +180,7 @@ void RTPT::setProperties(const Properties& props)
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
+    FALCOR_CHECK(grisPGPrefixDepth <= 1u, "RTPT grisPGPrefixDepth must be 0 or 1.");
     FALCOR_CHECK(std::isfinite(grisSharcX1Blend) && grisSharcX1Blend >= 0.f && grisSharcX1Blend < 1.f,
         "RTPT grisSharcX1Blend must be in [0, 1).");
     FALCOR_CHECK(restirDICandidateCount >= 1 && restirDICandidateCount <= 128,
@@ -285,6 +291,13 @@ void RTPT::setProperties(const Properties& props)
         invalidateGRIS();
     }
     mGRISSharcX1Blend = grisSharcX1Blend;
+    if (grisPGPrefixDepth != mGRISPGPrefixDepth)
+    {
+        mGRISPGPrefixDepth = grisPGPrefixDepth;
+        // This changes only GRIS proposals. Preserve the guide model, sample
+        // sequence and the independent SHaRC/NRD histories.
+        invalidateGRIS();
+    }
     mRestirDIEnabled = restirDIEnabled;
     mRestirDICandidateCount = restirDICandidateCount;
     mRestirDIBudgetMB = restirDIBudgetMB;
@@ -366,6 +379,7 @@ Properties RTPT::getProperties() const
     props["grisEnabled"] = mGRISEnabled;
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
+    props["grisPGPrefixDepth"] = mGRISPGPrefixDepth;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;
     props["restirDIEnabled"] = mRestirDIEnabled;
     props["regirEnabled"] = mReGIREnabled;
@@ -1321,6 +1335,12 @@ void RTPT::renderUI(Gui::Widgets& widget)
             pgWidget.tooltip("Enable guiding and training independently of SHaRC. Switching resets NRD and final accumulation.", true);
             value = mPGSettings.useGuiding;
             if (pgWidget.checkbox("Use guiding", value)) props["pgUseGuiding"] = value;
+            if (mGRISEnabled)
+            {
+                uint32_t depth = mGRISPGPrefixDepth;
+                if (pgWidget.dropdown("GRIS guided prefix", kGRISPGPrefixDepths, depth)) props["grisPGPrefixDepth"] = depth;
+                pgWidget.tooltip("Guide only the primary diffuse edge x0 to x1. x1 and deeper directions use BSDF sampling. Switching discards only GRIS history.", true);
+            }
             value = !mPGSettings.trainingEnabled;
             if (pgWidget.checkbox("Freeze training", value)) props["pgFreeze"] = value;
             value = mPGAsyncTraining;

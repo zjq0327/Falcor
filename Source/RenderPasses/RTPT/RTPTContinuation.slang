@@ -73,8 +73,18 @@ float3 rtptTraceContinuation(
 #if RTPT_GRIS_GENERATE
     throughput /= rootProbability;
 #endif
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+    bool representedPrefix = rtptGRISPathReuseEnabled() && !previousDelta &&
+        rtptGRISSupportsSurface(primarySD, primaryMI.getLobeTypes(primarySD) & primaryLobes);
+    ShadingData prefixFrom = primarySD;
+    float3 prefixThroughput = float3(1.f / rootProbability);
+#endif
 #if !(RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING)
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
+    if (!representedPrefix && !any(throughput > 0.f)) return float3(0.f);
+#else
     if (!any(throughput > 0.f)) return float3(0.f);
+#endif
 #endif
     float3 radiance = 0.f;
     float3 previousPosition = primarySD.posW;
@@ -155,7 +165,10 @@ float3 rtptTraceContinuation(
         if (hit.getType() != HitType::Triangle) break;
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
         const TriangleHit triangleHit = hit.getTriangleHit();
-        const VertexData vertex = gScene.getVertexData(triangleHit);
+        VertexData vertex = gScene.getVertexData(triangleHit);
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        if (representedPrefix && bounce <= 2u) vertex = rtptGrisPrefixVertex(triangleHit);
+#endif
         if (bounce == 1)
             firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, length(vertex.posW - primarySD.posW)));
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING
@@ -164,8 +177,38 @@ float3 rtptTraceContinuation(
         const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
         ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
         sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        if (representedPrefix && bounce <= 2u)
+        {
+            float3 direction;
+            float distanceSquared;
+            ShadingData represented;
+            if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
+                rtptGrisRefLoad(hit.pack(), -direction, represented))
+            {
+                const IMaterialInstance representedMI = gScene.materials.getMaterialInstance(represented, ExplicitLodTextureSampler(0.f));
+                if (rtptGRISSupportsSurface(represented, representedMI.getLobeTypes(represented)))
+                {
+                    // Evaluate before emission, NEE and terminal selection.
+                    // Retain q from the real draw, including its guide leaf;
+                    // never ask the guide to evaluate the reconstructed ray.
+                    const IMaterialInstance fromMI = gScene.materials.getMaterialInstance(prefixFrom, ExplicitLodTextureSampler(0.f));
+                    throughput = prefixThroughput * fromMI.eval(prefixFrom, direction, sg) / previousContinuationPdf;
+                    sd = represented;
+                }
+                else representedPrefix = false;
+            }
+            else representedPrefix = false;
+        }
+#endif
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
+#if !RTPT_GRIS_ALTERNATING
+        // A failed represented edge or unsupported root stays fully local.
+        // Never publish its sampled-ray numerator into the packed-hit domain.
+        if (!representedPrefix && bounce <= 2u) prefix.x1Hit = makeInvalidHit().pack();
+        if (representedPrefix)
+#endif
         rtptGRISCapturePrefix(bounce, sd, mi, hit, ray.dir, throughput, prefix);
 #if !RTPT_GRIS_ALTERNATING
         if (bounce == 1u && HitInfo(prefix.x1Hit).isValid())
@@ -290,7 +333,8 @@ float3 rtptTraceContinuation(
 #endif
         if (bounce == gParams.maxBounces) break;
 #if RTPT_GRIS_GENERATE || RTPT_USE_GRIS
-        // GRIS guides only the primary edge. Reuse evaluates the x1 edge with BSDF sampling.
+        // GRIS guides only the primary diffuse edge. x1 and every later
+        // vertex retain BSDF-only proposals for both root walks.
         const RTPTSamplingContext sampling = rtptBSDFSamplingContext();
 #else
         const RTPTSamplingContext sampling = rtptMakeSamplingContext(sd, mi);
@@ -352,8 +396,9 @@ float3 rtptTraceContinuation(
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
         if (rtptGRISPathReuseEnabled() && bounce <= 2u && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
         {
-            // Sample the existing direction mixture, but use its matching full
-            // numerator at the two interfaces whose directions can change.
+            // Both interfaces after the root are BSDF-only. Reconnection
+            // requires the full numerator and marginal direction density,
+            // rather than a BSDF-selected lobe's individual weight.
             const float marginalPdf = rtptContinuationPdf(sd, mi, sampling, bs.wo);
             if (!(marginalPdf > 0.f) || !isfinite(marginalPdf)) break;
             bs.pdf = marginalPdf;
@@ -393,8 +438,23 @@ float3 rtptTraceContinuation(
         }
         else if (pathBuilder.hasTail) pathBuilder.tailThroughput *= bs.weight;
 #endif
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        if (representedPrefix && bounce == 1u)
+        {
+            prefixFrom = sd;
+            prefixThroughput = throughput;
+        }
+#endif
         throughput *= bs.weight;
-        if (!all(isfinite(throughput)) || !any(throughput > 0.f)) break;
+        if (!all(isfinite(throughput))) break;
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        // A sampled zero can become positive at the represented endpoint.
+        // Trace that endpoint before deciding support, rather than losing it
+        // before the canonical numerator has been evaluated.
+        if (!(representedPrefix && bounce == 1u) && !any(throughput > 0.f)) break;
+#else
+        if (!any(throughput > 0.f)) break;
+#endif
         if (gParams.useRussianRoulette != 0 && bounce + 1 >= gParams.rrStartBounce)
         {
             const float survival = min(0.95f, max(throughput.x, max(throughput.y, throughput.z)));

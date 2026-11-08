@@ -10,6 +10,9 @@
 #ifndef RTPT_GRIS_SHARC_REPLAY
 #define RTPT_GRIS_SHARC_REPLAY 0
 #endif
+#ifndef RTPT_GRIS_PG_PREFIX_DEPTH
+#define RTPT_GRIS_PG_PREFIX_DEPTH 1
+#endif
 #ifndef RTPT_REGIR_ONLY
 #define RTPT_REGIR_ONLY 0
 #endif

@@ -32,8 +32,17 @@ void rtptGRISCapturePrefix(
 
 float rtptGRISAreaPdf(ShadingData sd, Ray ray, float continuationPdf)
 {
+#if !RTPT_GRIS_ALTERNATING
+    // q is the actual sampled density. Only its geometric Jacobian uses the
+    // same represented edge as the physical numerator and cross evaluation.
+    float3 direction;
+    float distanceSquared;
+    if (!rtptGrisPrefixDirection(ray.origin, sd.posW, direction, distanceSquared)) return 0.f;
+    return continuationPdf * abs(dot(sd.faceN, direction)) / distanceSquared;
+#else
     const float3 edge = sd.posW - ray.origin;
     return continuationPdf * abs(dot(sd.faceN, ray.dir)) / dot(edge, edge);
+#endif
 }
 
 #if RTPT_GRIS_SHARC_REPLAY

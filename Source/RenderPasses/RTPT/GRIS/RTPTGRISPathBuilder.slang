@@ -25,18 +25,6 @@ void rtptGRISBeginWalk(inout GrisPathBuilder builder)
     builder.hasTail = false;
 }
 
-bool rtptGRISPathReuseEnabled()
-{
-#if RTPT_REGIR_TRANSPORT
-    return false;
-#else
-#if ENABLE_SHARC && SHARC_QUERY
-    if (gSharcSettings.useCache != 0u) return false;
-#endif
-    return true;
-#endif
-}
-
 void rtptGRISBeginInterface(uint bounce, ShadingData sd, IMaterialInstance mi, HitInfo hit,
     Ray ray, float previousContinuationPdf, bool previousDelta, GrisLocalPrefix prefix,
     inout GrisPathBuilder builder, inout GrisSpatialRecord suffix)
