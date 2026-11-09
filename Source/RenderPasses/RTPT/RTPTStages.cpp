@@ -103,7 +103,13 @@ bool RTPT::canUseGRISReferenceReuse() const
     // Mixed screen-DI/remaining-light transport keeps its existing local path
     // until its endpoint and complementary MIS contracts are implemented.
     const bool compatibleReGIR = !mReGIREnabled || (!mRestirDIEnabled && mReGIRSecondaryEnabled);
-    return compatibleReGIR && !(mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
+    const bool cacheActive = mEnableSHARC && mSHARCEnabled && mSHARCUseCache;
+    return compatibleReGIR && (!cacheActive || useGRISCacheTail());
+}
+
+bool RTPT::useGRISCacheTail() const
+{
+    return mGRISEnabled && mEnableSHARC && mSHARCEnabled && mSHARCUseCache && !mReGIREnabled;
 }
 
 bool RTPT::canUseGRISTemporal() const
@@ -174,15 +180,26 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     const bool supportedLighting = !mReGIREnabled || diActive || mReGIRSecondaryEnabled;
     const bool spatialEnabled = mGRISSpatialEnabled && supportedLighting;
     const bool referenceReuse = canUseGRISReferenceReuse();
+    const bool cacheTail = useGRISCacheTail();
     if (mGRISSpatialEnabled && !spatialEnabled)
         logWarningOnce("RTPT GRIS spatial reuse at x2 requires compatible lighting; using local paths.");
     const bool alternating = false;
     // Local-only GRIS uses the same full-path record as spatial and temporal reuse.
     const bool captureSuffix = true;
     const bool blendX1Cache = false;
+    const auto matchesCacheTailDefine = [cacheTail](const ref<ComputePass>& pass)
+    {
+        if (!pass) return true;
+        const auto& defines = pass->getProgram()->getDefines();
+        const auto it = defines.find("RTPT_GRIS_CACHE_TAIL");
+        return it != defines.end() && it->second == (cacheTail ? "1" : "0");
+    };
+    const auto& cachedReusePass = mpGRISTemporalPass ? mpGRISTemporalPass : (mpGRISLocalPass ? mpGRISLocalPass : mpGRISSpatialPass);
 
     if (mpGRISMainPass && bool(mpGRISSpatialPass) == (spatialEnabled && !temporalEnabled) &&
         bool(mpGRISTemporalPass) == temporalEnabled &&
+        matchesCacheTailDefine(mpGRISGeneratePass) && matchesCacheTailDefine(cachedReusePass) &&
+        matchesCacheTailDefine(mpGRISShadePass) && matchesCacheTailDefine(mpGRISPublishHistoryPass) && matchesCacheTailDefine(mpGRISMainPass) &&
         mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_PG_PREFIX_DEPTH") != 0 &&
         mpGRISGeneratePass->getProgram()->getDefines().find("RTPT_GRIS_PG_PREFIX_DEPTH")->second == std::to_string(mGRISPGPrefixDepth) &&
         (mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_SHARC_REPLAY") != 0) == replaySharc &&
@@ -201,6 +218,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         auto baseDefines = baseMainPass->getProgram()->getDefines();
         baseDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
         baseDefines.add("RTPT_GRIS_PG_PREFIX_DEPTH", std::to_string(mGRISPGPrefixDepth));
+        baseDefines.add("RTPT_GRIS_CACHE_TAIL", cacheTail ? "1" : "0");
         if (alternating) baseDefines.add("RTPT_GRIS_ALTERNATING", "1");
         auto generateDefines = baseDefines;
         if (captureSuffix) generateDefines.add("RTPT_GRIS_SPATIAL", "1");
@@ -211,6 +229,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
 
         DefineList shadeDefines;
         shadeDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
+        shadeDefines.add("RTPT_GRIS_CACHE_TAIL", cacheTail ? "1" : "0");
         if (captureSuffix)
         {
             shadeDefines.add("RTPT_GRIS_SPATIAL", "1");
@@ -409,11 +428,13 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
             const auto& history = mGRISHistoryFrame;
             const auto& defines = reusePass->getProgram()->getDefines();
             const bool canReplay = defines.count("RTPT_GRIS_SHARC_REPLAY") != 0;
+            const auto cacheMode = defines.find("RTPT_GRIS_CACHE_TAIL");
+            const bool cacheTail = cacheMode != defines.end() && cacheMode->second == "1";
             const auto referenceMode = defines.find("RTPT_GRIS_REFERENCE_REUSE");
             const bool referenceReuse = referenceMode != defines.end() && referenceMode->second == "1";
             mGRISHistoryReadValid = history.historyValid && history.historyGeneration == mGRISHistoryGeneration &&
                 history.previousFrameStamp == mPrimaryFrameStamp - 1u && all(history.previousFrameDim == mFrameDim) &&
-                history.snapshot.isCompatible(snapshot, canReplay, referenceReuse);
+                history.snapshot.isCompatible(snapshot, canReplay || cacheTail, referenceReuse);
             mGRISHistoryReadLightEpoch = history.snapshot.lightEpoch;
             mGRISLightHistoryPreservedThisFrame = mGRISHistoryReadValid && snapshot.selectiveLightDomain &&
                 history.snapshot.lightEpoch != snapshot.lightEpoch;
@@ -522,6 +543,13 @@ Properties RTPT::getStageStatistics() const
     props["sampleOffset"] = mSampleOffset;
     props["pgFrameIndex"] = mPGFrameIndex;
     props["sharcFrameIndex"] = mSHARCFrameIndex;
+    props["sharcSnapshotVersion"] = mSHARCResolveVersion;
+    props["sharcHistorySnapshotVersion"] = uint64_t(0u);
+    props["sharcHistorySnapshotValid"] = false;
+    props["sharcHistorySnapshotFrameStamp"] = 0u;
+    props["sharcHistorySnapshotBytes"] = uint64_t(0u);
+    props["sharcQuerySnapshotBytes"] = (mpSHARCHashEntries ? mpSHARCHashEntries->getSize() : 0u) +
+        (mpSHARCResolved ? mpSHARCResolved->getSize() : 0u);
     props["sharcMotionBoundsCount"] = uint32_t(mSHARCMotionBoundsCPU.size() / 2);
     props["sharcMotionResponsive"] = mSHARCMotionResponsiveFrames != 0u;
     const uint64_t primaryBytes = mpPrimarySurfaces ? mpPrimarySurfaces->getSize() : 0;
@@ -539,6 +567,7 @@ Properties RTPT::getStageStatistics() const
     props["grisPGProposalActive"] = pgProposalActive;
     bool referenceReuse = false;
     bool regirOnly = false;
+    bool cacheTail = false;
     if (mpGRISMainPass)
     {
         const auto& defines = mpGRISMainPass->getProgram()->getDefines();
@@ -546,13 +575,17 @@ Properties RTPT::getStageStatistics() const
         referenceReuse = mode != defines.end() && mode->second == "1";
         const auto regirMode = defines.find("RTPT_REGIR_ONLY");
         regirOnly = regirMode != defines.end() && regirMode->second == "1";
+        const auto cacheMode = defines.find("RTPT_GRIS_CACHE_TAIL");
+        cacheTail = cacheMode != defines.end() && cacheMode->second == "1";
     }
     props["grisReferenceReuseEnabled"] = referenceReuse;
     props["grisPGSnapshotDependent"] = bool(mpGRISTemporalPass) && pgProposalActive && !referenceReuse;
     props["grisReGIRPathReuseEnabled"] = referenceReuse && regirOnly;
+    props["grisCachedTailEnabled"] = referenceReuse && cacheTail;
+    props["grisTraceTailEnabled"] = false;
     props["grisReferenceReuseReason"] = referenceReuse ? std::string{} : !mpGRISMainPass
         ? std::string("GRIS is inactive") : mEnableSHARC && mSHARCEnabled && mSHARCUseCache
-        ? std::string("SHaRC cache transport uses complete local paths") : mReGIREnabled && !regirOnly
+        ? std::string("SHaRC with ReGIR uses complete local paths; cached-tail reuse requires ReGIR disabled") : mReGIREnabled && !regirOnly
         ? std::string("ReGIR mixed direct-light transport uses complete local paths") : mReGIREnabled && !mReGIRSecondaryEnabled
         ? std::string("ReGIR reference reuse requires secondary light sampling")
         : std::string("Reference-tail reuse is unavailable");

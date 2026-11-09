@@ -10,6 +10,9 @@
 #ifndef RTPT_GRIS_SHARC_REPLAY
 #define RTPT_GRIS_SHARC_REPLAY 0
 #endif
+#ifndef RTPT_GRIS_CACHE_TAIL
+#define RTPT_GRIS_CACHE_TAIL 0
+#endif
 #ifndef RTPT_GRIS_PG_PREFIX_DEPTH
 #define RTPT_GRIS_PG_PREFIX_DEPTH 1
 #endif
@@ -32,6 +35,8 @@ enum GrisTerminalKind : uint
     // Fixed-x2 explicit paths store a weighted incident factor, never the
     // legacy GrisReGIR UV/RIS reconstruction payload.
     GrisReGIRPath,
+    // Fixed incident factor from a generation-time SHaRC query (deep only).
+    GrisSharcTail,
 };
 enum GrisRecordState : uint { GrisUnprepared, GrisPreparedZero, GrisPreparedWinner };
 
@@ -82,7 +87,7 @@ struct GrisSpatialRecord
     PackedHitInfo reconnectHit;
     float areaPdf;          // Owner proposal/reference ratio R after Generate normalization.
     float3 suffixDirection; // Fixed direction leaving x2; legacy ReGIR records use UV in xy.
-    float3 suffixLight;     // Selected tail factor, excluding the x2 scatter and terminal-picker weight.
+    float3 suffixLight;     // Selected tail factor, excluding x2 scatter and terminal-picker weight.
     uint lightPdfOrStableID; // Ordinary light PDF bits, or stable light ID for ReGIR terminals.
     bool lightIsAnalytic;
 };
@@ -107,6 +112,9 @@ bool rtptGrisHasTerminal(GrisSpatialRecord suffix)
     return suffix.areaPdf > 0.f && (kind == uint(GrisTerminalKind::GrisNee) ||
         kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisReGIRPath) ||
         kind == uint(GrisTerminalKind::GrisCacheTerminal) ||
+#if RTPT_GRIS_CACHE_TAIL
+        (kind == uint(GrisTerminalKind::GrisSharcTail) && rtptGrisIsDeepTail(suffix)) ||
+#endif
         kind == uint(GrisTerminalKind::GrisEmitter) || kind == uint(GrisTerminalKind::GrisEnvironment));
 }
 

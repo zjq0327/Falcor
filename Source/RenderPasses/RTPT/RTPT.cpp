@@ -61,6 +61,17 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             return result;
         });
         pass.def("getGRISLightHistoryMetadataBuffer", &RTPT::getGRISLightHistoryMetadataBuffer);
+        pass.def("getSHARCValidationBuffers", [](const RTPT& self)
+        {
+            const auto buffers = self.getSHARCValidationBuffers();
+            pybind11::dict result;
+            result["hash"] = buffers[0];
+            result["accumulation"] = buffers[1];
+            result["resolved"] = buffers[2];
+            result["historyHash"] = pybind11::none();
+            result["historyResolved"] = pybind11::none();
+            return result;
+        });
         pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
         pass.def_property_readonly("regirStats", [](const RTPT& self) { return self.getReGIRStatistics().toPython(); });
         pass.def("resetPG", &RTPT::resetPG);
@@ -262,6 +273,7 @@ void RTPT::setProperties(const Properties& props)
     const bool sharcQuery = enableSHARC && sharcEnabled && sharcUseCache;
     const bool sharcTransportChanged = sharcSignalChanged && (sharcQuery || (mEnableSHARC && mSHARCEnabled && mSHARCUseCache));
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
+    const bool cacheTailChanged = (grisEnabled && sharcQuery && !regirEnabled) != useGRISCacheTail();
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
         sharcEnabled != mSHARCEnabled || transportModeChanged || sharcTransportChanged || diChanged ||
@@ -293,7 +305,7 @@ void RTPT::setProperties(const Properties& props)
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
     if (grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
-        grisTemporalEnabled != mGRISTemporalEnabled || (grisEnabled && grisSharcReuseChanged))
+        grisTemporalEnabled != mGRISTemporalEnabled || (grisEnabled && grisSharcReuseChanged) || cacheTailChanged)
     {
         mGRISEnabled = grisEnabled;
         mGRISSpatialEnabled = grisSpatialEnabled;

@@ -255,6 +255,18 @@ float3 rtptTraceContinuation(
             else
 #endif
             {
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_CACHE_TAIL
+                if (pathBuilder.hasTail)
+                {
+                    // Store only this cache terminal. Its incoming fixed tail
+                    // retains the scattering sampled after x2; reuse freezes
+                    // that RGB while reevaluating the represented prefix/x2.
+                    rtptGRISAddPathTerminal(pathBuilder, terminalRng, currentRoot, prefix.x1Hit,
+                        contribution, uint(GrisTerminalKind::GrisSharcTail), true,
+                        pathBuilder.rcWi, pathBuilder.tailThroughput * cachedRadiance, 0.f, false, suffix);
+                    break;
+                }
+#endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_ALTERNATING
                 if (rtptGRISCaptureCacheTerminal(bounce, sd, mi, hit, ray, previousContinuationPdf,
                     contribution, prefix, suffix)) break;

@@ -15,6 +15,9 @@
 #ifndef RTPT_GRIS_ALTERNATING
 #define RTPT_GRIS_ALTERNATING 0
 #endif
+#ifndef RTPT_GRIS_CACHE_TAIL
+#define RTPT_GRIS_CACHE_TAIL 0
+#endif
 #include "Scene/SceneDefines.slangh"
 #include "Utils/Math/MathConstants.slangh"
 

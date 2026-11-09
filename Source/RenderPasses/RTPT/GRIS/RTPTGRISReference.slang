@@ -13,7 +13,7 @@
 // must be BSDF-only. The configured primary diffuse edge may use PG; the
 // actual proposal densities are captured in R. Cell-only ReGIR paths flatten
 // their inner sampling factor at the fixed x2/tail. Legacy ReGIR reconstruction
-// and cache terminals remain outside this explicit-path domain.
+// and legacy cache terminals remain outside this explicit-path domain.
 //
 // areaPdf stores R = Q_owner / sigma_reference after NormalizeGenerated().
 // The public record keeps the established MC convention: F_nu=F*R, W_nu=W/R.
@@ -21,6 +21,10 @@
 // factors after x2. Thus R only needs two prefix-area factors and one local ratio.
 // History may span ordinary root-PG publications: retain each record's stored R
 // and W. Cross evaluation and auxiliary densities never query the current guide.
+// A GrisSharcTail retains its generation-time incident factor in suffixLight.
+// Prefix/x2 factors are reevaluated, but the tail is never retraced or queried.
+// This intentionally mixes historical cache estimates; it does not refresh
+// old samples to, or promise unbiasedness for, the current SHaRC field.
 
 #if RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
 
@@ -185,6 +189,9 @@ bool rtptGrisRefKindSupported(GrisSpatialRecord record)
     const uint kind = rtptGrisTerminalKind(record.candidate.terminalKind);
     return kind == uint(GrisTerminalKind::GrisNee) || kind == uint(GrisTerminalKind::GrisEmitter) ||
         kind == uint(GrisTerminalKind::GrisEnvironment)
+#if RTPT_GRIS_CACHE_TAIL
+        || (kind == uint(GrisTerminalKind::GrisSharcTail) && rtptGrisIsDeepTail(record))
+#endif
 #if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
         || kind == uint(GrisTerminalKind::GrisReGIRPath)
 #endif

@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef RTPT_GRIS_CACHE_TAIL
+#define RTPT_GRIS_CACHE_TAIL 0
+#endif
+
 // One record is shared by all samples and NRD continuations of a pixel.
 struct RTPTSharcStats
 {
@@ -122,6 +126,17 @@ bool rtptTrySharcQueryOnEdge(
 )
 {
     cachedRadiance = 0.f;
+#if RTPT_GRIS_CACHE_TAIL
+    // x2 uses the full mixed BSDF, so its selected-lobe label cannot gate a
+    // reusable cache endpoint at x3. From x4 the ordinary fixed tail owns
+    // the incoming diffuse label, independently of the reconnected prefix.
+    if (bounce < 4u || !previousDiffuse) return false;
+    const uint lobes = mi.getLobeTypes(sd);
+    const uint continuous = uint(LobeType::NonDeltaReflection);
+    const MaterialType material = sd.mtl.getMaterialType();
+    if (!sd.frontFacing || (material != MaterialType::PBRTDiffuse && material != MaterialType::Standard) ||
+        lobes == 0u || (lobes & ~continuous) != 0u) return false;
+#endif
     if (gSharcSettings.useCache == 0 || bounce == 0 ||
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
         (bounce < gSharcSettings.minBounce && !probeX1) ||

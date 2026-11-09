@@ -37,6 +37,11 @@ public:
     {
         return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes};
     }
+    // Explicit diagnostic access to existing resources only; no GPU readback.
+    std::vector<ref<Buffer>> getSHARCValidationBuffers() const
+    {
+        return {mpSHARCHashEntries, mpSHARCAccumulation, mpSHARCResolved};
+    }
     ref<Buffer> getGRISLightHistoryMetadataBuffer() const { return mLightCatalog.getSnapshot().lightHistoryMetadata; }
     Properties getDIStatistics() const;
     Properties getReGIRStatistics() const;
@@ -63,6 +68,7 @@ private:
     void invalidateGRIS(bool clearTemporalFailure = true, bool preserveHistory = false);
     void resetGRISHistory();
     bool canUseGRISReferenceReuse() const;
+    bool useGRISCacheTail() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
@@ -172,13 +178,13 @@ private:
         uint32_t lightEpoch = 0u;
         bool selectiveLightDomain = false;
 
-        bool isCompatible(const GrisTemporalSnapshot& other, bool replaySharc, bool referenceReuse) const
+        bool isCompatible(const GrisTemporalSnapshot& other, bool allowSharcVersionChange, bool referenceReuse) const
         {
             // Reference records carry their own proposal correction. Neither the PG
             // resource identity nor its camera/LOD lookup anchor defines their domain.
             return (referenceReuse || (all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
                 pgGeneration == other.pgGeneration)) &&
-                (sharcVersion == other.sharcVersion || (replaySharc && sharcVersion != 0u && other.sharcVersion != 0u)) &&
+                (sharcVersion == other.sharcVersion || (allowSharcVersionChange && sharcVersion != 0u && other.sharcVersion != 0u)) &&
                 regirDomainGeneration == other.regirDomainGeneration && selectiveLightDomain == other.selectiveLightDomain;
         }
     };

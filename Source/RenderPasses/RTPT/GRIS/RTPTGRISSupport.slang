@@ -23,7 +23,7 @@ bool rtptGRISPathReuseEnabled()
 #if RTPT_REGIR_TRANSPORT && (!RTPT_REGIR_ONLY || !RTPT_GRIS_REFERENCE_REUSE)
     return false;
 #else
-#if ENABLE_SHARC && SHARC_QUERY
+#if ENABLE_SHARC && SHARC_QUERY && !RTPT_GRIS_CACHE_TAIL
     if (gSharcSettings.useCache != 0u) return false;
 #endif
     return true;
