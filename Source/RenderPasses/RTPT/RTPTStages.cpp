@@ -59,7 +59,9 @@ bool RTPT::prepareStages()
         {
             ProgramDesc resolveDesc;
             resolveDesc.addShaderLibrary("RenderPasses/RTPT/Signal/RTPTFinalSignalResolve.cs.slang").csEntry("main");
-            mpFinalSignalResolve = ComputePass::create(mpDevice, resolveDesc, {}, true);
+            DefineList resolveDefines;
+            resolveDefines.add("RTPT_DELTA_NRD", mEnableDeltaReflectionNRD ? "1" : "0");
+            mpFinalSignalResolve = ComputePass::create(mpDevice, resolveDesc, resolveDefines, true);
         }
         const auto primaryVar = mpPrimarySurfacePass->getRootVar()["gPrimarySurfaceOutput"];
         const uint64_t primaryStride = structuredStride(primaryVar);
@@ -517,6 +519,8 @@ void RTPT::executePrimarySurface(RenderContext* pRenderContext)
 void RTPT::executeFinalSignalResolve(RenderContext* pRenderContext, const RenderData& renderData)
 {
     pRenderContext->uavBarrier(mpSignalRecords.get());
+    if (mEnableDeltaReflectionNRD)
+        pRenderContext->uavBarrier(renderData.getTexture("nrdDeltaReflectionRaw").get());
     auto var = mpFinalSignalResolve->getRootVar();
     var["gResolveParams"]["frameDim"] = mFrameDim;
     var["gSignalRecords"] = mpSignalRecords;

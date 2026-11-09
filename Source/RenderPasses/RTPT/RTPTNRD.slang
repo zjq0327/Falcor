@@ -62,6 +62,16 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
     signals.specularReflectance = 1.f;
     signals.normalRoughness = float4(0.5f, 0.5f, 0.f, 0.f);
     signals.viewZ = kRTPTNRDMissDistance;
+#if RTPT_DELTA_NRD
+    // Every invocation clears its lane, including primary misses/no delta.
+    gDeltaRadiance[pixel] = 0.f;
+    gDeltaReflectance[pixel] = 0.f;
+    gDeltaEmission[pixel] = 0.f;
+    gDeltaNormal[pixel] = float4(0.5f, 0.5f, 1.f, 0.f);
+    gDeltaViewZ[pixel] = kRTPTNRDMissDistance;
+    gDeltaMotion[pixel] = 0.f;
+    gDeltaRaw[pixel] = 0.f;
+#endif
 #if RTPT_SEPARATE_SIGNAL_RESOLVE
     float3 indirectDiffuse = 0.f;
     float3 indirectSpecular = 0.f;
@@ -292,7 +302,31 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         if (hasDeltaSpecular)
         {
             float unusedDistance;
+#if RTPT_DELTA_NRD
+            uint unusedState;
+            RTPTDeltaGuide guide = {};
+            guide.mirrorPosition = sd.posW;
+            guide.mirrorNormal = sd.getOrientedFaceNormal();
+            guide.mirrorPreviousPosition = gScene.getPrevPosW(hit);
+            // Curved/normal-mapped/moving mirrors need a different mapping.
+            guide.enabled = dot(properties.guideNormal, guide.mirrorNormal) > 0.9999f &&
+                length(guide.mirrorPreviousPosition - sd.posW) < 1e-5f;
+            guide.state = guide.enabled ? 2u : 3u;
+            signals.residual = rtptTraceContinuationWithGuide(sd, mi, uint(LobeType::DeltaReflection),
+                rtptBSDFSamplingContext(), sg, unusedDistance, unusedState, sharcStats, 0u, guide);
+            gDeltaRaw[pixel] = float4(signals.residual, float(guide.state));
+            if (guide.state == 1u)
+            {
+                gDeltaRadiance[pixel] = float4(max(0.f, signals.residual - guide.emission) / guide.reflectance, 0.f);
+                gDeltaReflectance[pixel] = float4(guide.reflectance, 0.f);
+                gDeltaEmission[pixel] = float4(guide.emission, 0.f);
+                gDeltaNormal[pixel] = float4(rtptNRDPackNormal(guide.normal), guide.roughness, 0.f);
+                gDeltaViewZ[pixel] = guide.viewZ;
+                gDeltaMotion[pixel] = float4(guide.motion, 0.f);
+            }
+#else
             signals.residual = rtptTraceContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
+#endif
         }
 #if !RTPT_SEPARATE_SIGNAL_RESOLVE
         // NRD deliberately excludes surfaces outside its denoising range.
@@ -313,7 +347,11 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
     rtptStoreSignalRecord(pixel, signals, indirectDiffuse, indirectSpecular, diffuseDistanceState, specularDistanceState);
     return 0.f;
 #else
+    const float3 fullRadiance = signals.emission + signals.diffuse + signals.specular + signals.residual;
+#if RTPT_DELTA_NRD
+    if (gDeltaRaw[pixel].a == 1.f) signals.residual -= gDeltaRaw[pixel].rgb;
+#endif
     rtptWriteNRDSignals(pixel, signals);
-    return signals.emission + signals.diffuse + signals.specular + signals.residual;
+    return fullRadiance;
 #endif
 }

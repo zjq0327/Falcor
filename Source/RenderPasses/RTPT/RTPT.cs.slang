@@ -22,6 +22,15 @@ RWTexture2D<float4> gNRDResidualRadiance;
 RWTexture2D<float4> gNRDNormalRoughness;
 RWTexture2D<float> gNRDViewZ;
 RWTexture2D<float4> gNRDMotionW;
+#if RTPT_DELTA_NRD
+RWTexture2D<float4> gDeltaRadiance;
+RWTexture2D<float4> gDeltaReflectance;
+RWTexture2D<float4> gDeltaEmission;
+RWTexture2D<float4> gDeltaNormal;
+RWTexture2D<float> gDeltaViewZ;
+RWTexture2D<float4> gDeltaMotion;
+RWTexture2D<float4> gDeltaRaw;
+#endif
 #endif
 
 #include "RTPTIntegrator.slang"

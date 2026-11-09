@@ -1,6 +1,13 @@
 #pragma once
 
 #include "RTPTFirstHit.slangh"
+#include "RTPTDeltaReflection.slang"
+
+#if RTPT_DELTA_NRD && !RTPT_GRIS_GENERATE
+#define RTPT_CONTINUATION_NAME rtptTraceContinuationWithGuide
+#else
+#define RTPT_CONTINUATION_NAME rtptTraceContinuation
+#endif
 
 #if RTPT_GRIS_GENERATE || RTPT_USE_GRIS
 #include "GRIS/RTPTGRISSupport.slang"
@@ -18,7 +25,7 @@
     passes its explicit root-selection probability and captures the candidate event.
     Later vertices use the mixed reflection estimator.
 */
-float3 rtptTraceContinuation(
+float3 RTPT_CONTINUATION_NAME(
     ShadingData primarySD,
     IMaterialInstance primaryMI,
     uint primaryLobes,
@@ -28,6 +35,9 @@ float3 rtptTraceContinuation(
     out uint firstHitDistanceState,
     inout RTPTSharcStats sharcStats,
     uint rootCoverage
+#if RTPT_DELTA_NRD && !RTPT_GRIS_GENERATE
+    , inout RTPTDeltaGuide deltaGuide
+#endif
 #if RTPT_GRIS_GENERATE
     , float rootProbability
 #if RTPT_GRIS_SPATIAL
@@ -202,6 +212,10 @@ float3 rtptTraceContinuation(
         }
 #endif
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+#if RTPT_DELTA_NRD && !RTPT_GRIS_GENERATE
+        if (deltaGuide.enabled && bounce == 1u)
+            rtptCaptureDeltaGuide(sd, mi, mi.getProperties(sd), triangleHit, throughput, deltaGuide);
+#endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
 #if !RTPT_GRIS_ALTERNATING
         // A failed represented edge or unsupported root stays fully local.
@@ -502,6 +516,19 @@ float3 rtptTraceContinuation(
 }
 
 #if !RTPT_GRIS_GENERATE
+#if RTPT_DELTA_NRD
+// Compatibility wrapper: ordinary D/S transport and its RNG are unchanged.
+float3 rtptTraceContinuation(
+    ShadingData primarySD, IMaterialInstance primaryMI, uint primaryLobes,
+    RTPTSamplingContext primarySampling, inout SampleGenerator sg,
+    out float firstHitDistance, out uint firstHitDistanceState,
+    inout RTPTSharcStats sharcStats, uint rootCoverage)
+{
+    RTPTDeltaGuide unused = {};
+    return rtptTraceContinuationWithGuide(primarySD, primaryMI, primaryLobes, primarySampling, sg,
+        firstHitDistance, firstHitDistanceState, sharcStats, rootCoverage, unused);
+}
+#endif
 // Existing callers, including the delta residual, retain the complete old
 // contribution domain. Only the root non-delta D/S calls pass DI ownership.
 float3 rtptTraceContinuation(

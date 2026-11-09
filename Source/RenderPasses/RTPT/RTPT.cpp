@@ -27,6 +27,16 @@ const NRDOutput kNRDOutputs[] = {
     {"mvecW", "gNRDMotionW", ResourceFormat::RGBA32Float},
 };
 const char* kSHARCOutputs[] = {"sharcDebug", "sharcCacheRadiance", "sharcStats"};
+const NRDOutput kDeltaNRDOutputs[] = {
+    {"nrdDeltaReflectionRadianceHitDist", "gDeltaRadiance", ResourceFormat::RGBA32Float},
+    {"nrdDeltaReflectionReflectance", "gDeltaReflectance", ResourceFormat::RGBA16Float},
+    {"nrdDeltaReflectionEmission", "gDeltaEmission", ResourceFormat::RGBA32Float},
+    {"nrdDeltaReflectionNormWRoughMaterialID", "gDeltaNormal", ResourceFormat::RGB10A2Unorm},
+    {"nrdDeltaReflectionViewZ", "gDeltaViewZ", ResourceFormat::R32Float},
+    {"nrdDeltaReflectionMotionW", "gDeltaMotion", ResourceFormat::RGBA32Float},
+    // RGB is the unchanged traced contribution; A is an explicit guide state.
+    {"nrdDeltaReflectionRaw", "gDeltaRaw", ResourceFormat::RGBA32Float},
+};
 const Gui::DropdownList kSHARCDebugModes = {
     {0, "Voxel grid"}, {1, "Cached radiance"}, {2, "Sample count"}, {3, "Entry age"},
     {4, "Cache terminations"}, {5, "Traced rays"}, {6, "Update coverage"}, {7, "Hash occupancy"},
@@ -94,6 +104,7 @@ void RTPT::setProperties(const Properties& props)
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
     bool grisReGIRSelectiveHistory = mGRISReGIRSelectiveHistory;
     bool enableNRD = mEnableNRD;
+    bool enableDeltaReflectionNRD = mEnableDeltaReflectionNRD;
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
@@ -131,6 +142,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "accumulate") accumulate = value;
         else if (key == "maxAccumulationFrames") maxAccumulationFrames = value;
         else if (key == "enableNRD") enableNRD = value;
+        else if (key == "enableDeltaReflectionNRD") enableDeltaReflectionNRD = value;
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
@@ -250,7 +262,8 @@ void RTPT::setProperties(const Properties& props)
         regirLightCullingEnabled != mReGIRCullingEnabled || regirCoarsenCellDistance != mReGIRCoarsenCellDistance ||
         regirBrightnessThreshold != mReGIRBrightnessThreshold;
     const bool regirCompileChanged = regirEnabled != mReGIREnabled || (regirEnabled && restirDIEnabled != mRestirDIEnabled);
-    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || regirCompileChanged;
+    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || regirCompileChanged ||
+        enableDeltaReflectionNRD != mEnableDeltaReflectionNRD;
     const bool pgCompileChanged = enablePG != mEnablePG;
     const bool modeChanged = transportModeChanged || pgCompileChanged;
     const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
@@ -304,6 +317,7 @@ void RTPT::setProperties(const Properties& props)
     mAccumulate = accumulate;
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
+    mEnableDeltaReflectionNRD = enableDeltaReflectionNRD;
     if (grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
         grisTemporalEnabled != mGRISTemporalEnabled || (grisEnabled && grisSharcReuseChanged) || cacheTailChanged)
     {
@@ -399,6 +413,7 @@ Properties RTPT::getProperties() const
     props["accumulate"] = mAccumulate;
     props["maxAccumulationFrames"] = mMaxAccumulationFrames;
     props["enableNRD"] = mEnableNRD;
+    props["enableDeltaReflectionNRD"] = mEnableDeltaReflectionNRD;
     props["grisEnabled"] = mGRISEnabled;
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
@@ -542,6 +557,11 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
             reflection.addOutput(output.name, "Current-frame NRD signal or primary-hit guide")
                 .format(output.format)
                 .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+        if (mEnableDeltaReflectionNRD)
+            for (const auto& output : kDeltaNRDOutputs)
+                reflection.addOutput(output.name, "Independent delta reflection signal / virtual-surface guide")
+                    .format(output.format)
+                    .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
     }
     if (mEnableSHARC)
         for (const auto* output : kSHARCOutputs)
@@ -733,6 +753,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
+        defines.add("RTPT_DELTA_NRD", mEnableNRD && mEnableDeltaReflectionNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
         defines.add("ENABLE_PG", mEnablePG ? "1" : "0");
         if (mReGIREnabled)
@@ -805,7 +826,12 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
 void RTPT::bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const
 {
     for (const auto& output : kNRDOutputs)
-        rootVar[output.shaderName] = renderData.getTexture(output.name);
+        if (rootVar.findMember(output.shaderName).isValid())
+            rootVar[output.shaderName] = renderData.getTexture(output.name);
+    if (mEnableDeltaReflectionNRD)
+        for (const auto& output : kDeltaNRDOutputs)
+            if (rootVar.findMember(output.shaderName).isValid())
+                rootVar[output.shaderName] = renderData.getTexture(output.name);
 }
 
 void RTPT::bindSHARC(const ShaderVar& rootVar)
@@ -1244,7 +1270,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         var["gNoisyColor"] = noisyColor;
         var["gAccumulation"] = mpAccumulation;
     }
-    if (mEnableNRD && !stagesActive) bindNRDOutputs(var, renderData);
+    if (mEnableNRD) bindNRDOutputs(var, renderData);
     if (stagesActive)
     {
         bindPrimarySettings(var);
