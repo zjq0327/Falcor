@@ -37,6 +37,7 @@ public:
     {
         return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes};
     }
+    ref<Buffer> getGRISLightHistoryMetadataBuffer() const { return mLightCatalog.getSnapshot().lightHistoryMetadata; }
     Properties getDIStatistics() const;
     Properties getReGIRStatistics() const;
     // Explicit model clear only. A proposal reset does not reset radiance or RNG history.
@@ -50,6 +51,9 @@ private:
     void bindReGIRTransport(const ShaderVar& rootVar) const;
     void reset();
     void resetAccumulation();
+    void resetForSelectiveLightChange();
+    bool canUseGRISSelectiveLightHistory() const;
+    bool canPreserveGRISForPointLightChange() const;
     void validateScene() const;
     ProgramDesc makeSceneProgramDesc(const char* path, const char* entry = "main") const;
     void prepareProgram(RenderContext* pRenderContext);
@@ -165,6 +169,8 @@ private:
         uint32_t pgGeneration = 0u;
         uint64_t sharcVersion = 0u;
         uint64_t regirDomainGeneration = 0u;
+        uint32_t lightEpoch = 0u;
+        bool selectiveLightDomain = false;
 
         bool isCompatible(const GrisTemporalSnapshot& other, bool replaySharc, bool referenceReuse) const
         {
@@ -173,7 +179,7 @@ private:
             return (referenceReuse || (all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
                 pgGeneration == other.pgGeneration)) &&
                 (sharcVersion == other.sharcVersion || (replaySharc && sharcVersion != 0u && other.sharcVersion != 0u)) &&
-                regirDomainGeneration == other.regirDomainGeneration;
+                regirDomainGeneration == other.regirDomainGeneration && selectiveLightDomain == other.selectiveLightDomain;
         }
     };
     struct GrisTemporalHistoryFrame
@@ -190,6 +196,12 @@ private:
     bool mGRISHistoryReadValid = false;
     bool mGRISHistoryReferenceDomain = false;
     bool mGRISHistoryReplayActive = false;
+    bool mGRISReGIRSelectiveHistory = true;
+    bool mGRISSelectiveLightHistoryEnabled = false;
+    bool mGRISLightHistoryPreserveRequested = false;
+    bool mGRISLightHistoryPreservedThisFrame = false;
+    uint32_t mGRISHistoryReadLightEpoch = 0u;
+    std::string mGRISLightHistoryResetReason;
     std::string mGRISTemporalFallbackReason;
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;

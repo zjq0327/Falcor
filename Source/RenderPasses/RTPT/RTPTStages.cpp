@@ -355,7 +355,13 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
             snapshot.pgGeneration = mpPG->getGeneration();
         }
         if (sharc) snapshot.sharcVersion = mSHARCResolveVersion;
-        if (mReGIRActive && mReGIRSecondaryEnabled) snapshot.regirDomainGeneration = mReGIRDomainGeneration;
+        if (mReGIRActive && mReGIRSecondaryEnabled)
+        {
+            snapshot.selectiveLightDomain = mGRISSelectiveLightHistoryEnabled;
+            snapshot.lightEpoch = mLightCatalog.getLightHistoryEpoch();
+            snapshot.regirDomainGeneration = snapshot.selectiveLightDomain
+                ? mLightCatalog.getLightHistoryGeneration() : mReGIRDomainGeneration;
+        }
         // Both the guide lookup and SHaRC's voxel LOD depend on the camera origin.
         if (pg || sharc) snapshot.cameraPosition = cameraPosition;
     }
@@ -408,6 +414,9 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
             mGRISHistoryReadValid = history.historyValid && history.historyGeneration == mGRISHistoryGeneration &&
                 history.previousFrameStamp == mPrimaryFrameStamp - 1u && all(history.previousFrameDim == mFrameDim) &&
                 history.snapshot.isCompatible(snapshot, canReplay, referenceReuse);
+            mGRISHistoryReadLightEpoch = history.snapshot.lightEpoch;
+            mGRISLightHistoryPreservedThisFrame = mGRISHistoryReadValid && snapshot.selectiveLightDomain &&
+                history.snapshot.lightEpoch != snapshot.lightEpoch;
             mGRISHistoryReplayActive = mGRISHistoryReadValid && canReplay && history.snapshot.sharcVersion != snapshot.sharcVersion;
             const auto settings = reuseVar["gGRISTemporalSettings"];
             settings["previousViewProj"] = history.previousViewProj;
@@ -555,6 +564,11 @@ Properties RTPT::getStageStatistics() const
     props["grisHistoryStoredFrameStamp"] = mGRISHistoryFrame.previousFrameStamp;
     props["grisHistoryReferenceDomain"] = mGRISHistoryReferenceDomain;
     props["grisHistoryReplayActive"] = mGRISHistoryReplayActive;
+    props["grisLightHistorySelectiveEnabled"] = mGRISSelectiveLightHistoryEnabled;
+    props["grisLightHistoryPreservedThisFrame"] = mGRISLightHistoryPreservedThisFrame;
+    props["grisLightEpoch"] = mLightCatalog.getLightHistoryEpoch();
+    props["grisHistoryLightEpoch"] = mGRISHistoryReadLightEpoch;
+    props["grisLightHistoryResetReason"] = mGRISLightHistoryResetReason;
     props["grisHistoryBytes"] = mpGRISHistory ? mpGRISHistory->getSize() : 0;
     props["grisHistoryStride"] = mpGRISHistory ? mpGRISHistory->getStructSize() : 0u;
     props["grisCandidateStride"] = mpGRISCandidates ? mpGRISCandidates->getStructSize() : 0u;

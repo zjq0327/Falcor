@@ -31,6 +31,58 @@ struct GrisReferencePrefix
     bool valid;
 };
 
+#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
+struct GrisLightHistorySettings
+{
+    uint enabled;
+    uint currentEpoch;
+    uint historyEpoch;
+    uint stableIdCount;
+};
+ConstantBuffer<GrisLightHistorySettings> gGRISLightHistorySettings;
+// birth epoch, last physical change epoch, alive, light kind. Unlike the
+// ReGIR culling descriptor this tracks RGB/spot changes, not only a proxy.
+StructuredBuffer<uint4> gGRISLightHistoryMetadata;
+#endif
+
+uint rtptGrisCurrentLightEpoch()
+{
+#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
+    return gGRISLightHistorySettings.currentEpoch;
+#else
+    return 0u;
+#endif
+}
+
+uint rtptGrisPreviousLightEpoch()
+{
+#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
+    return gGRISLightHistorySettings.historyEpoch;
+#else
+    return 0u;
+#endif
+}
+
+bool rtptGrisSourceAllowsTail(GrisSpatialRecord tail, uint sourceLightEpoch)
+{
+#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
+    if (gGRISLightHistorySettings.enabled == 0u || sourceLightEpoch == gGRISLightHistorySettings.currentEpoch)
+        return true;
+    // Phase one changes only analytic point/spot lights. Geometry, materials,
+    // emissive sources and environment changes retain structural invalidation.
+    if (rtptGrisTerminalKind(tail.candidate.terminalKind) != uint(GrisTerminalKind::GrisReGIRPath) ||
+        !tail.lightIsAnalytic) return true;
+    const uint stableID = tail.lightPdfOrStableID;
+    if (sourceLightEpoch == 0u || sourceLightEpoch > gGRISLightHistorySettings.currentEpoch ||
+        stableID >= gGRISLightHistorySettings.stableIdCount) return false;
+    const uint4 state = gGRISLightHistoryMetadata[stableID];
+    return state.z != 0u && state.w == kRTPTDILightPoint &&
+        state.x <= sourceLightEpoch && state.y <= sourceLightEpoch;
+#else
+    return true;
+#endif
+}
+
 float rtptGrisRefTarget(float3 value)
 {
     return dot(abs(value), float3(0.2126f, 0.7152f, 0.0722f));
@@ -265,8 +317,12 @@ void rtptGrisNormalizeGenerated(inout GrisSpatialRecord record, GrisLocalPrefix 
 // source function value. Use it consistently for own and duplicate inputs;
 // other prefixes/tails still require the full physical cross evaluation.
 float3 rtptGrisRefEvaluateSource(GrisSpatialRecord source, float3 cameraPosition,
-    GrisReferencePrefix prefix, GrisSpatialRecord tail, inout SampleGenerator rng)
+    GrisReferencePrefix prefix, GrisSpatialRecord tail, uint sourceLightEpoch, inout SampleGenerator rng)
 {
+    // Gate the evaluated tail's light, not the source reservoir's realized
+    // winner. This also removes old-history density from a new light's fresh
+    // MIS denominator. An ineligible source still retains its domain and M.
+    if (!rtptGrisSourceAllowsTail(tail, sourceLightEpoch)) return 0.f;
     const bool sameSample = rtptGrisRefSampleValid(source) && prefix.valid &&
         prefix.rootLobe == source.candidate.rootLobe && all(prefix.x1 == source.sourceX1) &&
         all(tail.reconnectHit == source.reconnectHit) &&
@@ -280,7 +336,7 @@ float3 rtptGrisRefEvaluateSource(GrisSpatialRecord source, float3 cameraPosition
 }
 
 GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatialRecord inputs[2],
-    float3 sourceCameras[2], uint inputCount, uint2 pixel, inout SampleGenerator rng)
+    float3 sourceCameras[2], uint sourceLightEpochs[2], uint inputCount, uint2 pixel, inout SampleGenerator rng)
 {
 #if !RTPT_GRIS_REFERENCE_REUSE
     return canonical;
@@ -326,7 +382,8 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             [unroll] for (uint j = 0u; j < 2u; ++j)
             {
                 if (!domainValid[j]) continue;
-                const float3 cross = rtptGrisRefEvaluateSource(inputs[j], sourceCameras[j], auxiliary, canonical, rng);
+                const float3 cross = rtptGrisRefEvaluateSource(inputs[j], sourceCameras[j], auxiliary, canonical,
+                    sourceLightEpochs[j], rng);
                 denominator += inputs[j].candidate.M * rtptGrisRefTarget(cross) * canonicalPrefixPdf;
             }
             mis = denominator > 0.f ? canonicalDensity / denominator : 0.f;
@@ -342,7 +399,8 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
     }
     [unroll] for (uint i = 0u; i < 2u; ++i)
     {
-        if (!domainValid[i] || !rtptGrisRefSampleValid(inputs[i]) || !(activePdf > 0.f)) continue;
+        if (!domainValid[i] || !rtptGrisRefSampleValid(inputs[i]) ||
+            !rtptGrisSourceAllowsTail(inputs[i], sourceLightEpochs[i]) || !(activePdf > 0.f)) continue;
         const GrisReferencePrefix sourcePrefix = rtptGrisRefRecordPrefix(inputs[i]);
         const float sourceAuxiliaryPdf = rtptGrisRefPrefixPdf(canonical.ownerPrimaryHit, targetCamera, sourcePrefix);
         if (!(sourceAuxiliaryPdf > 0.f)) continue;
@@ -355,7 +413,8 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
         [unroll] for (uint j = 0u; j < 2u; ++j)
         {
             if (!domainValid[j]) continue;
-            const float3 cross = rtptGrisRefEvaluateSource(inputs[j], sourceCameras[j], sourcePrefix, inputs[i], rng);
+            const float3 cross = rtptGrisRefEvaluateSource(inputs[j], sourceCameras[j], sourcePrefix, inputs[i],
+                sourceLightEpochs[j], rng);
             const float density = inputs[j].candidate.M * rtptGrisRefTarget(cross) * activePdf;
             denominator += density;
             if (j == i) ownDensity = density;

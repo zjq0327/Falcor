@@ -17,6 +17,17 @@ constexpr uint32_t kPoint = 2u;
 constexpr uint32_t kInvalidRank = std::numeric_limits<uint32_t>::max();
 constexpr uint64_t kMaxSdkLightIndex = 0x7fffffffu;
 
+bool samePointLight(const LightData& a, const LightData& b)
+{
+    // Compare physical values, not struct padding or a max-channel proxy.
+    return a.type == b.type && all(a.posW == b.posW) && all(a.dirW == b.dirW) &&
+        all(a.intensity == b.intensity) && a.openingAngle == b.openingAngle &&
+        a.cosOpeningAngle == b.cosOpeningAngle && a.penumbraAngle == b.penumbraAngle &&
+        a.cosSubtendedAngle == b.cosSubtendedAngle && all(a.tangent == b.tangent) &&
+        all(a.bitangent == b.bitangent) && a.surfaceArea == b.surfaceArea &&
+        a.transMat == b.transMat && a.transMatIT == b.transMatIT;
+}
+
 struct LightInfo
 {
     uint32_t kind = 0u;
@@ -33,14 +44,16 @@ static_assert(sizeof(LightInfo) == RTPTLightCatalog::kLightStride);
 
 uint64_t RTPTLightCatalog::Snapshot::getBytes() const
 {
-    return (lights ? lights->getSize() : 0u) + (uncoveredAnalyticIndices ? uncoveredAnalyticIndices->getSize() : 0u);
+    return (lights ? lights->getSize() : 0u) + (uncoveredAnalyticIndices ? uncoveredAnalyticIndices->getSize() : 0u) +
+        (lightHistoryMetadata ? lightHistoryMetadata->getSize() : 0u);
 }
 
-bool RTPTLightCatalog::prepare(Scene& scene, Device& device, uint64_t budgetBytes)
+bool RTPTLightCatalog::prepare(Scene& scene, Device& device, uint64_t budgetBytes, bool trackLightHistory)
 {
     std::vector<uint64_t> signature;
     Snapshot next;
     next.generation = mSnapshot.generation;
+    next.lightHistoryMetadata = mSnapshot.lightHistoryMetadata;
 
     try
     {
@@ -105,7 +118,11 @@ bool RTPTLightCatalog::prepare(Scene& scene, Device& device, uint64_t budgetByte
         const uint32_t uncoveredCapacity = std::max(1u, next.uncoveredAnalyticCount);
         const uint64_t bytes = uint64_t(lightCapacity) * sizeof(LightInfo) + uint64_t(uncoveredCapacity) * sizeof(uint32_t);
         FALCOR_CHECK(bytes <= budgetBytes, "RTPT light catalogue needs {} bytes, exceeding its {} MiB budget.", bytes, budgetBytes >> 20);
-        if (sameLayout && mSnapshot.lights) return true;
+        if (sameLayout && mSnapshot.lights)
+        {
+            if (trackLightHistory) updateLightHistory(scene, device, budgetBytes);
+            return true;
+        }
 
         if (++next.generation == 0u) ++next.generation;
         std::vector<LightInfo> lights(lightCapacity);
@@ -151,6 +168,7 @@ bool RTPTLightCatalog::prepare(Scene& scene, Device& device, uint64_t budgetByte
         mSnapshot = std::move(next);
         mSignature = std::move(signature);
         mFailure.clear();
+        if (trackLightHistory) updateLightHistory(scene, device, budgetBytes);
         return true;
     }
     catch (const std::exception& error)
@@ -170,6 +188,111 @@ bool RTPTLightCatalog::prepare(Scene& scene, Device& device, uint64_t budgetByte
     }
 }
 
+void RTPTLightCatalog::updateLightHistory(Scene& scene, Device& device, uint64_t budgetBytes)
+{
+    std::unordered_map<uint32_t, LightData> points;
+    // Match catalogue eligibility. Active scene objects are deliberately absent
+    // from the catalogue when analytic lighting is disabled; their previous
+    // stable IDs become tombstones via idToRank below.
+    if (scene.getRenderSettings().useAnalyticLights)
+    {
+        for (const auto& light : scene.getActiveAnalyticLights())
+        {
+            if (light->getType() != LightType::Point) continue;
+            const auto identity = mAnalyticIdentities.find(light.get());
+            FALCOR_CHECK(identity != mAnalyticIdentities.end(), "Point-light history has no catalogue identity.");
+            const auto stable = mStableIds.find(std::make_tuple(kPoint, identity->second, 0u));
+            FALCOR_CHECK(stable != mStableIds.end(), "Point-light history has no stable ID.");
+            points.emplace(stable->second, light->getData());
+        }
+    }
+
+    std::vector<uint64_t> emissiveSignature;
+    if (scene.getRenderSettings().useEmissiveLights)
+    {
+        const auto collection = scene.getLightCollection(device.getRenderContext());
+        for (const auto& mesh : collection->getMeshLights())
+        {
+            emissiveSignature.push_back((uint64_t(mesh.instanceID) << 32) | mesh.triangleOffset);
+            emissiveSignature.push_back((uint64_t(mesh.materialID) << 32) | mesh.triangleCount);
+        }
+    }
+    const auto structuralUpdates = IScene::UpdateFlags::GeometryChanged | IScene::UpdateFlags::GeometryMoved |
+        IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::MaterialsChanged |
+        IScene::UpdateFlags::EmissiveMaterialsChanged | IScene::UpdateFlags::LightCollectionChanged |
+        IScene::UpdateFlags::EnvMapChanged | IScene::UpdateFlags::EnvMapPropertiesChanged |
+        IScene::UpdateFlags::RenderSettingsChanged;
+    if (mLightHistoryInitialized &&
+        (emissiveSignature != mLightHistoryEmissiveSignature || (scene.getUpdates() & structuralUpdates) != IScene::UpdateFlags::None))
+        ++mLightHistoryGeneration;
+    mLightHistoryEmissiveSignature = std::move(emissiveSignature);
+
+    const size_t oldSize = mLightHistoryMetadata.size();
+    mLightHistoryMetadata.resize(mNextStableId, uint4(0u));
+    mLightHistoryChangedIds.clear();
+    for (const auto& [key, stableID] : mStableIds)
+    {
+        const uint32_t kind = std::get<0>(key);
+        const bool alive = stableID < mSnapshot.idToRank.size() && mSnapshot.idToRank[stableID] != kInvalidRank;
+        const auto& old = mLightHistoryMetadata[stableID];
+        bool changed = stableID >= oldSize || old.z != uint32_t(alive) || old.w != kind;
+        if (alive && kind == kPoint)
+        {
+            const auto current = points.find(stableID);
+            const auto previous = mPointHistoryData.find(stableID);
+            FALCOR_CHECK(current != points.end(), "Active point light is missing physical history data.");
+            changed |= previous == mPointHistoryData.end() || !samePointLight(current->second, previous->second);
+        }
+        if (changed) mLightHistoryChangedIds.push_back(stableID);
+    }
+    const bool rebase = !mLightHistoryChangedIds.empty() && mLightHistoryEpoch == std::numeric_limits<uint32_t>::max();
+    if (rebase)
+    {
+        // Never compare wrapped epochs against retained history.
+        ++mLightHistoryGeneration;
+        mLightHistoryEpoch = 1u;
+        for (auto& meta : mLightHistoryMetadata) meta.x = meta.y = 1u;
+    }
+    else if (!mLightHistoryChangedIds.empty()) ++mLightHistoryEpoch;
+    for (const auto& [key, stableID] : mStableIds)
+    {
+        auto& meta = mLightHistoryMetadata[stableID];
+        if (meta.x == 0u) meta.x = mLightHistoryEpoch;
+        meta.z = stableID < mSnapshot.idToRank.size() && mSnapshot.idToRank[stableID] != kInvalidRank ? 1u : 0u;
+        meta.w = std::get<0>(key);
+    }
+    for (const uint32_t stableID : mLightHistoryChangedIds)
+        mLightHistoryMetadata[stableID].y = mLightHistoryEpoch;
+    mLightHistoryUploadDirty |= !mLightHistoryChangedIds.empty() || rebase;
+    std::sort(mLightHistoryChangedIds.begin(), mLightHistoryChangedIds.end());
+    mPointHistoryData = std::move(points);
+    mLightHistoryInitialized = true;
+
+    uint32_t capacity = 16u;
+    while (capacity < mNextStableId)
+    {
+        FALCOR_CHECK(capacity <= std::numeric_limits<uint32_t>::max() / 2u, "Light-history metadata capacity exhausted.");
+        capacity <<= 1u;
+    }
+    const bool allocate = !mSnapshot.lightHistoryMetadata || mLightHistoryCapacity < capacity;
+    const uint64_t oldBytes = mSnapshot.lightHistoryMetadata ? mSnapshot.lightHistoryMetadata->getSize() : 0u;
+    const uint64_t nextBytes = allocate ? uint64_t(capacity) * sizeof(uint4) : oldBytes;
+    FALCOR_CHECK(mSnapshot.getBytes() - oldBytes + nextBytes <= budgetBytes,
+        "Light-history metadata exceeds the light catalogue budget.");
+    if (allocate)
+    {
+        std::vector<uint4> values(capacity, uint4(0u));
+        std::copy(mLightHistoryMetadata.begin(), mLightHistoryMetadata.end(), values.begin());
+        mSnapshot.lightHistoryMetadata = device.createStructuredBuffer(sizeof(uint4), capacity,
+            ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, values.data(), false);
+        mLightHistoryCapacity = capacity;
+    }
+    else if (mLightHistoryUploadDirty)
+        device.getRenderContext()->updateBuffer(mSnapshot.lightHistoryMetadata.get(), mLightHistoryMetadata.data(), 0u,
+            mLightHistoryMetadata.size() * sizeof(uint4));
+    mLightHistoryUploadDirty = false;
+}
+
 void RTPTLightCatalog::release()
 {
     const uint32_t generation = mSnapshot.generation;
@@ -187,4 +310,13 @@ void RTPTLightCatalog::reset()
     mNextAnalyticIdentity = 1u;
     mStableIds.clear();
     mNextStableId = 0u;
+    mLightHistoryMetadata.clear();
+    mPointHistoryData.clear();
+    mLightHistoryEmissiveSignature.clear();
+    mLightHistoryChangedIds.clear();
+    mLightHistoryEpoch = 1u;
+    mLightHistoryCapacity = 0u;
+    ++mLightHistoryGeneration;
+    mLightHistoryInitialized = false;
+    mLightHistoryUploadDirty = false;
 }

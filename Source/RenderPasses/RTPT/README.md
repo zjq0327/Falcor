@@ -30,7 +30,11 @@ ReGIR 使用与 SHaRC 同类的世界空间对数 LOD，尺寸独立设置：`re
 
 新 `GrisReGIRPath` kind 使用现有方向/尾因子槽保存已含内层 RIS 补偿的静态尾段，与旧 `GrisReGIR` 的 UV/权重重建编码区分。x2 直接项不套普通灯/BSDF MIS，也不含 x2 continuation 比率；深尾继续保留 q2/reference 转换。被 ReGIR 覆盖的非 delta 命灯 emission 按已有规则去重，delta 及直接可见 emission 保留。
 
-reference-tail 目前仅对 ReGIR-only、次级采灯开启、SHaRC 查询关闭的组合启用；混合屏幕 DI 等组合保留完整本地估计。`stageStats.grisReGIRPathReuseEnabled` 报告实际编译生效状态。持久结构不新增字段，历史按场景、运输参数及独立光照域规则失效，不依赖 PG reset generation；不支持动态尾段回放。ReGIR 自身共享缓存仍单独占用显存。
+reference-tail 目前仅对 ReGIR-only、次级采灯开启、SHaRC 查询关闭的组合启用；混合屏幕 DI 等组合保留完整本地估计。`stageStats.grisReGIRPathReuseEnabled` 报告实际编译生效状态。持久结构不新增字段，历史按场景、运输参数及独立光照域规则失效，不依赖 PG reset generation。ReGIR 自身共享缓存仍单独占用显存。
+
+`grisReGIRSelectiveHistory=true` 默认启用按光源分域的动态历史：静态几何、反射材质及环境下，点/聚光灯新增、停用、移动、改色或修改 spot 参数，只排除相关光源域的旧时间技术，未变化灯的历史继续参与。当前 fresh/空间技术覆盖全部当前光源，交叉评价/MIS 同步检查被评价终端的光源身份，保留旧源 `R/W/M`。范围要求 NRD、1 spp、时间复用开启、RR 关闭及 `brightnessThreshold=0`；PG 可同时开启。每像素记录仍为 128/108 B，另有 16 B/稳定光源 ID 的共享版本表（容量向上取二次幂，最少 16 项）。将该属性设为 false 可保留旧全局失效对照。几何/材质/环境及未覆盖变化继续拒绝历史；本阶段不重放变化灯自身的旧尾段。实现与验收范围见 [计划第 12–13 节](GRIS_REGIR_NEE_PLAN.md#12-按光源划分-gris-动态历史复用)。
+
+该动态扩展完整重建通过；18 组/268 项精确检查、310 功能检查帧与持续 PG 联合测试通过。PG0 固定 10 seed、三臂各 1,024 移动帧的原始 D/S/RGB 对照完成 30,720 帧，旧/新策略各 9/9 通道满足预先锁定的 ±2% 均值等价门槛；40 帧关闭 ReGIR 回归的原始/NRD/记录字节与修改前完全一致。实际未变化灯旧尾段导入、元数据、版本、RNG 连续性、失败保留和范围限制见 [动态验证汇总](../../../build/gris-regir-dynamic-validation/summary.json)。该组结果不作性能或任意动态场景无偏性结论。
 
 固定 x2 的 reference-domain GRIS（普通采灯及上述 ReGIR-only 模式）保留每条历史记录配套的 `F/W/M` 和表示比例 `R=areaPdf/sourceAreaPdf`。fresh 记录的 R 来自实际生成密度，重连赢家则保存新 owner 下配套的 R 与归一化权重。交叉评价使用物理 BSDF 和固定辅助前缀分布，不使用新版 guide 重算旧记录的 R。连续帧、尺寸、记录语义和真实运输/光照域检查继续有效，PG 数据身份不再参与这条路径的历史门控，无需新增逐像素字段或保存旧 PG 树。
 

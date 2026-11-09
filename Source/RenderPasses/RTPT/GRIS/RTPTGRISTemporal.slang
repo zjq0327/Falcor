@@ -61,19 +61,24 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
     GrisSpatialRecord inputs[2];
     float3 sourceCameras[2];
+    uint sourceLightEpochs[2];
     uint inputCount = 0u;
     if (rtptGrisLoadSelectedHistory(pixel, inputs[inputCount]))
+    {
+        sourceLightEpochs[inputCount] = rtptGrisPreviousLightEpoch();
         sourceCameras[inputCount++] = gGRISTemporalSettings.previousCameraPosition;
+    }
 #if RTPT_GRIS_SPATIAL_REUSE
     const uint neighborX = pixel.x ^ 1u;
     if (neighborX < gPrimarySettings.frameDim.x)
     {
         inputs[inputCount] = gGRISSpatialInput[pixel.y * gPrimarySettings.frameDim.x + neighborX];
+        sourceLightEpochs[inputCount] = rtptGrisCurrentLightEpoch();
         sourceCameras[inputCount++] = gScene.camera.getPosition();
     }
 #endif
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
-    result = rtptGrisMergeReference(canonical, inputs, sourceCameras, inputCount, pixel, rng);
+    result = rtptGrisMergeReference(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, pixel, rng);
 #endif
     gGRISSpatialOutput[index] = result;
 }

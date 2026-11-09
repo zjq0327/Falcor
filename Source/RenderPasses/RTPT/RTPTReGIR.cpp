@@ -52,6 +52,7 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     FALCOR_CHECK(!mReGIRPreparationFailed, "ReGIR cell-only resources are unavailable: {}", mReGIRFallbackReason);
     const auto& catalog = mLightCatalog.getSnapshot();
     FALCOR_CHECK(catalog.lights, "ReGIR cell-only sampling requires a prepared light catalogue.");
+    mGRISSelectiveLightHistoryEnabled = canUseGRISSelectiveLightHistory() && mLightCatalog.hasLightHistoryMetadata();
     FALCOR_CHECK(mRestirDIEnabled || !mUseNEE || catalog.uncoveredAnalyticCount == 0u,
         "ReGIR-only light sampling supports emissive triangles and point lights. The scene contains {} unsupported analytic lights.",
         catalog.uncoveredAnalyticCount);
@@ -277,6 +278,15 @@ void RTPT::bindReGIRTransport(const ShaderVar& var) const
     if (var.hasMember("gReGIRTransportCatalog")) var["gReGIRTransportCatalog"] = catalog.lights;
     if (var.hasMember("gReGIRTransportUncoveredAnalyticIndices"))
         var["gReGIRTransportUncoveredAnalyticIndices"] = catalog.uncoveredAnalyticIndices;
+    if (var.hasMember("gGRISLightHistoryMetadata")) var["gGRISLightHistoryMetadata"] = catalog.lightHistoryMetadata;
+    if (var.hasMember("gGRISLightHistorySettings"))
+    {
+        const auto settings = var["gGRISLightHistorySettings"];
+        settings["enabled"] = mGRISSelectiveLightHistoryEnabled ? 1u : 0u;
+        settings["currentEpoch"] = mLightCatalog.getLightHistoryEpoch();
+        settings["historyEpoch"] = mGRISHistoryFrame.snapshot.lightEpoch;
+        settings["stableIdCount"] = uint32_t(mLightCatalog.getLightHistoryMetadata().size());
+    }
 }
 
 Properties RTPT::getReGIRStatistics() const
@@ -321,6 +331,9 @@ Properties RTPT::getReGIRStatistics() const
     props["buildFrameStamp"] = mReGIRBuildFrameStamp;
     props["buildCount"] = mReGIRBuildCount;
     props["domainGeneration"] = mReGIRDomainGeneration;
+    props["lightHistoryEpoch"] = mLightCatalog.getLightHistoryEpoch();
+    props["lightHistoryGeneration"] = mLightCatalog.getLightHistoryGeneration();
+    props["lightHistoryMetadataBytes"] = reGIRBufferBytes(catalog.lightHistoryMetadata);
     props["buildSamples"] = mReGIRBuildSamples;
     props["lightsPerCell"] = mReGIRLightsPerCell;
     props["gridSize"] = mReGIRGridSize;
@@ -358,5 +371,15 @@ Properties RTPT::getReGIRStatistics() const
     auto json = props.toJson();
     json["catalogStableIds"] = catalogueIds;
     json["activeStableIds"] = catalogueIds;
+    json["lightHistoryChangedIds"] = mLightCatalog.getLightHistoryChangedIds();
+    auto historyMetadata = nlohmann::json::array();
+    const auto& metadata = mLightCatalog.getLightHistoryMetadata();
+    for (uint32_t stableID = 0u; stableID < metadata.size(); ++stableID)
+    {
+        const auto& entry = metadata[stableID];
+        historyMetadata.push_back({{"stableID", stableID}, {"birthEpoch", entry.x}, {"lastChangeEpoch", entry.y},
+            {"alive", entry.z != 0u}, {"kind", entry.w}});
+    }
+    json["lightHistoryMetadata"] = std::move(historyMetadata);
     return Properties(std::move(json));
 }

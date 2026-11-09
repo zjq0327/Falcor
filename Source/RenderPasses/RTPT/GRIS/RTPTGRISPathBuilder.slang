@@ -43,10 +43,10 @@ void rtptGRISBeginInterface(uint bounce, ShadingData sd, IMaterialInstance mi, H
     // A new walk's interface must not overwrite a previously selected term.
 }
 
-void rtptGRISAddPathTerminal(inout GrisPathBuilder builder, inout SampleGenerator terminalRng,
+void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleGenerator terminalRng,
     uint currentRoot, PackedHitInfo currentX1,
     float3 contribution, uint kind, bool deepTail, float3 direction, float3 incident,
-    float lightPdf, bool analytic, inout GrisSpatialRecord suffix)
+    uint lightPayload, bool analytic, inout GrisSpatialRecord suffix)
 {
     const float h = dot(abs(contribution), float3(0.2126f, 0.7152f, 0.0722f));
     if (!(h > 0.f) || !isfinite(h) || !all(isfinite(incident))) return;
@@ -59,10 +59,19 @@ void rtptGRISAddPathTerminal(inout GrisPathBuilder builder, inout SampleGenerato
     suffix.areaPdf = builder.areaPdf;
     suffix.suffixDirection = direction;
     suffix.suffixLight = incident;
-    suffix.lightPdfOrStableID = asuint(lightPdf);
+    suffix.lightPdfOrStableID = lightPayload;
     suffix.lightIsAnalytic = analytic;
     suffix.candidate.F = contribution;
     suffix.candidate.terminalKind = kind | (deepTail ? kGrisDeepTail : 0u);
+}
+
+void rtptGRISAddPathTerminal(inout GrisPathBuilder builder, inout SampleGenerator terminalRng,
+    uint currentRoot, PackedHitInfo currentX1,
+    float3 contribution, uint kind, bool deepTail, float3 direction, float3 incident,
+    float lightPdf, bool analytic, inout GrisSpatialRecord suffix)
+{
+    rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
+        kind, deepTail, direction, incident, asuint(lightPdf), analytic, suffix);
 }
 
 void rtptGRISFinalizePath(GrisPathBuilder builder, inout GrisSpatialRecord suffix)
@@ -92,7 +101,10 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     if (!rtptGRISPathReuseEnabled()) return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
     if (rtptReGIRTransportCoverage(false) == 0u) return float3(0.f);
     RTPTLightSample light;
-    if (!rtptReGIRSampleTransportLight(sd, sg, light)) return float3(0.f);
+    uint stableID;
+    float2 lightUV;
+    float innerRISWeight;
+    if (!rtptReGIRSampleTransportLight(sd, sg, light, stableID, lightUV, innerRISWeight)) return float3(0.f);
     // LiOverPdf already contains the cell/RIS and conditional-light sampling
     // compensation. ReGIR owns this non-delta direct-light domain, so there
     // is no ordinary light/BSDF MIS or usable marginal light PDF here.
@@ -103,8 +115,11 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     const bool deepTail = bounce > 2u;
     const float3 incident = deepTail ? builder.tailThroughput * value : light.LiOverPdf;
     const float3 direction = deepTail ? builder.rcWi : light.dir;
-    rtptGRISAddPathTerminal(builder, terminalRng, currentRoot, currentX1, contribution,
-        uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, 0.f, light.analytic, suffix);
+    // Identity changes with the selected terminal, including deep-tail terms.
+    // The historical RIS compensation remains inside incident; current table
+    // weights must never replace it when an unrelated light changes.
+    rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
+        uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, stableID, light.analytic, suffix);
     return float3(0.f);
 #endif
 #else

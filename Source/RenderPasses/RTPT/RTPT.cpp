@@ -60,6 +60,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             result["prefix"] = buffers[3];
             return result;
         });
+        pass.def("getGRISLightHistoryMetadataBuffer", &RTPT::getGRISLightHistoryMetadataBuffer);
         pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
         pass.def_property_readonly("regirStats", [](const RTPT& self) { return self.getReGIRStatistics().toPython(); });
         pass.def("resetPG", &RTPT::resetPG);
@@ -80,6 +81,7 @@ void RTPT::setProperties(const Properties& props)
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
+    bool grisReGIRSelectiveHistory = mGRISReGIRSelectiveHistory;
     bool enableNRD = mEnableNRD;
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
@@ -123,6 +125,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
         else if (key == "grisPGPrefixDepth") grisPGPrefixDepth = value;
         else if (key == "grisSharcX1Blend") grisSharcX1Blend = value;
+        else if (key == "grisReGIRSelectiveHistory") grisReGIRSelectiveHistory = value;
         else if (key == "restirDIEnabled") restirDIEnabled = value;
         else if (key == "regirEnabled") regirEnabled = value;
         else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
@@ -262,7 +265,7 @@ void RTPT::setProperties(const Properties& props)
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
         sharcEnabled != mSHARCEnabled || transportModeChanged || sharcTransportChanged || diChanged ||
-        regirChanged || grisSharcX1Blend != mGRISSharcX1Blend;
+        regirChanged || grisSharcX1Blend != mGRISSharcX1Blend || grisReGIRSelectiveHistory != mGRISReGIRSelectiveHistory;
     // PG learns a proposal: changing its sampling/configuration or training
     // target does not require discarding the accumulated spatial model.
     if (pgStructureChanged || pgRecordsChanged || pgAsyncTraining != mPGAsyncTraining)
@@ -299,6 +302,7 @@ void RTPT::setProperties(const Properties& props)
         invalidateGRIS();
     }
     mGRISSharcX1Blend = grisSharcX1Blend;
+    mGRISReGIRSelectiveHistory = grisReGIRSelectiveHistory;
     if (grisPGPrefixDepth != mGRISPGPrefixDepth)
     {
         mGRISPGPrefixDepth = grisPGPrefixDepth;
@@ -388,6 +392,7 @@ Properties RTPT::getProperties() const
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
     props["grisPGPrefixDepth"] = mGRISPGPrefixDepth;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;
+    props["grisReGIRSelectiveHistory"] = mGRISReGIRSelectiveHistory;
     props["restirDIEnabled"] = mRestirDIEnabled;
     props["regirEnabled"] = mReGIREnabled;
     props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
@@ -548,6 +553,44 @@ void RTPT::resetAccumulation()
     mAccumulatedFrames = 0;
 }
 
+void RTPT::resetForSelectiveLightChange()
+{
+    // Keep the sample sequence independent of retained history/auxiliary draws.
+    // NRD and progressive image accumulation still discard obsolete radiance.
+    resetAccumulation();
+    mResetNRDHistory = true;
+}
+
+bool RTPT::canUseGRISSelectiveLightHistory() const
+{
+    return mpScene && mGRISReGIRSelectiveHistory && mGRISEnabled && mGRISTemporalEnabled &&
+        mReGIREnabled && mReGIRSecondaryEnabled && !mRestirDIEnabled && mEnableNRD &&
+        mSamplesPerPixel == 1u && mUseNEE && !mUseRussianRoulette && mReGIRBrightnessThreshold == 0.f &&
+        canUseGRISReferenceReuse();
+}
+
+bool RTPT::canPreserveGRISForPointLightChange() const
+{
+    if (!canUseGRISSelectiveLightHistory() || !mLightCatalog.hasLightHistoryMetadata() ||
+        !mGRISHistoryFrame.historyValid || !mGRISHistoryReferenceDomain || mOptionsChanged ||
+        !mGRISHistoryFrame.snapshot.selectiveLightDomain ||
+        mGRISHistoryFrame.snapshot.regirDomainGeneration != mLightCatalog.getLightHistoryGeneration()) return false;
+    const auto updates = mpScene->getUpdates();
+    const auto pointChanges = IScene::UpdateFlags::LightsMoved | IScene::UpdateFlags::LightIntensityChanged |
+        IScene::UpdateFlags::LightPropertiesChanged | IScene::UpdateFlags::LightCountChanged;
+    const auto incompatible = IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::GeometryChanged |
+        IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::MaterialsChanged |
+        IScene::UpdateFlags::EmissiveMaterialsChanged | IScene::UpdateFlags::LightCollectionChanged |
+        IScene::UpdateFlags::EnvMapChanged | IScene::UpdateFlags::EnvMapPropertiesChanged |
+        IScene::UpdateFlags::RenderSettingsChanged | IScene::UpdateFlags::RecompileNeeded;
+    if ((updates & pointChanges) == IScene::UpdateFlags::None || (updates & incompatible) != IScene::UpdateFlags::None ||
+        is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum) ||
+        mLightCatalog.getSnapshot().uncoveredAnalyticCount != 0u) return false;
+    for (const auto& light : mpScene->getActiveAnalyticLights())
+        if (light->getType() != LightType::Point) return false;
+    return true;
+}
+
 void RTPT::validateScene() const
 {
     FALCOR_CHECK(mpScene->getGridVolumes().empty(), "RTPT currently supports surface transport only, without volumes.");
@@ -641,11 +684,16 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         (mpScene->useAnalyticLights() ? 8u : 0u);
     if (lightingMask != mLightingMask)
     {
+        const uint32_t previousLightingMask = mLightingMask;
         mLightingMask = lightingMask;
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
         mResetSHARCCache = true;
-        reset();
+        // A last-point removal can change USE_ANALYTIC_LIGHTS without changing
+        // the reference path layout or any surviving light's contribution.
+        if (mGRISLightHistoryPreserveRequested && ((lightingMask ^ previousLightingMask) & ~8u) == 0u)
+            resetForSelectiveLightChange();
+        else reset();
     }
     if (mpScene->useEnvLight())
     {
@@ -994,6 +1042,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mPGModelResetThisFrame = false;
     mSHARCCacheResetThisFrame = false;
     mSceneMotionThisFrame = false;
+    mGRISSelectiveLightHistoryEnabled = false;
+    mGRISLightHistoryPreserveRequested = false;
+    mGRISLightHistoryPreservedThisFrame = false;
+    mGRISHistoryReadLightEpoch = 0u;
+    mGRISLightHistoryResetReason.clear();
     auto color = renderData.getTexture("color");
     auto noisyColor = renderData.getTexture("noisyColor");
     if (!mpScene)
@@ -1025,6 +1078,10 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         sceneChanged |= (mpScene->getCamera()->getChanges() & ~(Camera::Changes::Jitter | Camera::Changes::History)) != Camera::Changes::None;
     auto& dict = renderData.getDictionary();
     const auto refreshFlags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
+    mGRISLightHistoryPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && canPreserveGRISForPointLightChange();
+    // A completed progressive image must resume for point-light motion too,
+    // even when NRD's motion policy does not call for a history reset.
+    if (mGRISLightHistoryPreserveRequested) resetAccumulation();
     // Motion is reprojected by NRD. Only discontinuities discard its history.
     const auto discontinuities = IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::GeometryChanged |
         IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::EmissiveMaterialsChanged |
@@ -1041,8 +1098,12 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const auto movingScene = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::LightsMoved;
     mSceneMotionThisFrame = (updates & movingScene) != IScene::UpdateFlags::None;
     updateSHARCMotionBounds();
-    if ((updates & (movingScene | IScene::UpdateFlags::LightCollectionChanged)) != IScene::UpdateFlags::None)
+    if ((updates & (movingScene | IScene::UpdateFlags::LightCollectionChanged)) != IScene::UpdateFlags::None &&
+        !mGRISLightHistoryPreserveRequested)
+    {
+        mGRISLightHistoryResetReason = "Geometry, light collection or unsupported light motion";
         resetGRISHistory();
+    }
     // Previous hit/material reconstruction and temporal visibility use the
     // current scene only while its physical state is unchanged. Camera motion
     // is handled by reprojection, independently of PG/NRD history resets.
@@ -1058,7 +1119,16 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     // radiance above, while fresh independent observations adapt the PG model.
     const bool pgCameraTranslated = mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition);
     if (mEnablePG) mPGCameraPosition = mpScene->getCamera()->getPosition();
-    if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
+    if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None)
+    {
+        if (mGRISLightHistoryPreserveRequested) resetForSelectiveLightChange();
+        else
+        {
+            if (mGRISLightHistoryResetReason.empty())
+                mGRISLightHistoryResetReason = "Scene, render options or unsupported lighting change";
+            reset();
+        }
+    }
     else if (!mEnableNRD && sceneChanged)
         // Progressive image accumulation cannot mix scene poses, but its
         // invalidation does not require restarting random samples.
@@ -1102,7 +1172,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     bool diActive = false;
     auto prepareLightCatalog = [&]()
     {
-        return mLightCatalog.prepare(*mpScene, *mpDevice, uint64_t(mRestirDIBudgetMB) << 20u);
+        return mLightCatalog.prepare(*mpScene, *mpDevice, uint64_t(mRestirDIBudgetMB) << 20u,
+            mReGIREnabled);
     };
     if (mReGIREnabled)
     {

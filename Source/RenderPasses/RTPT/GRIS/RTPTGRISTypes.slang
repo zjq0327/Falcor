@@ -83,7 +83,7 @@ struct GrisSpatialRecord
     float areaPdf;          // Owner proposal/reference ratio R after Generate normalization.
     float3 suffixDirection; // Fixed direction leaving x2; legacy ReGIR records use UV in xy.
     float3 suffixLight;     // Selected tail factor, excluding the x2 scatter and terminal-picker weight.
-    uint lightPdfOrStableID; // Ordinary light PDF / legacy stable ID; zero for GrisReGIRPath.
+    uint lightPdfOrStableID; // Ordinary light PDF bits, or stable light ID for ReGIR terminals.
     bool lightIsAnalytic;
 };
 
@@ -139,7 +139,7 @@ struct GrisTemporalFreshHistory
     float sourceAreaPdf;
     float3 suffixDirection; // Fixed x2 direction; only legacy GrisReGIR stores UV in xy.
     float3 suffixLight;     // Weighted tail factor; only legacy GrisReGIR stores RIS/domain weights.
-    uint lightPdfOrStableID;
+    uint lightPdfOrStableID; // Preserve the winning terminal's PDF bits / stable ReGIR light ID.
     uint terminalAndFlags;
     float3 F;
     float W;
