@@ -23,6 +23,8 @@ public:
         uint32_t beginTimestamp = 0, uint32_t endTimestamp = 1);
     void submit(Falcor::Fence* inputsReady, uint64_t inputsValue, Falcor::Fence* trainingDone, uint64_t doneValue);
     void drain();
+    // Release retired buffer references before a bounded PG pool migration.
+    void releaseCompletedBindings();
     ID3D12CommandQueue* queue() const;
 
 private:

@@ -19,6 +19,8 @@
 // The public record keeps the established MC convention: F_nu=F*R, W_nu=W/R.
 // sigma_reference uses a fixed sphere density at x2 and the shared sampling
 // factors after x2. Thus R only needs two prefix-area factors and one local ratio.
+// History may span ordinary root-PG publications: retain each record's stored R
+// and W. Cross evaluation and auxiliary densities never query the current guide.
 
 #if RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
 

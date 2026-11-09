@@ -165,7 +165,14 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
         pRenderContext->uavBarrier(buffer.get());
 
     const float3 cameraPosition = mpScene->getCamera()->getPosition();
-    const bool domainChanged = descriptorsChanged || any(cameraPosition != mReGIRBuildCameraPosition);
+    // With zero weak-light cutoff, changing the camera/LOD only changes the
+    // proposal's cell partition. Every cell still conservatively covers its
+    // full physical light domain, and the flattened old tail keeps its own RIS
+    // compensation. A positive cutoff changes that approximate domain with
+    // the camera, so retain the conservative history invalidation there.
+    const bool cameraDomainChanged = mReGIRBrightnessThreshold > 0.f &&
+        any(cameraPosition != mReGIRBuildCameraPosition);
+    const bool domainChanged = descriptorsChanged || cameraDomainChanged;
     // Previous descriptors retain removed lights long enough to remove their
     // membership from old cells. Stable IDs and the candidate allocator persist.
     if (descriptorsChanged) std::swap(mpReGIRLightDescriptors, mpReGIRPreviousLightDescriptors);
@@ -288,6 +295,7 @@ Properties RTPT::getReGIRStatistics() const
     props["baseCellSize"] = mReGIRCellSize;
     props["coarsenCellDistance"] = mReGIRCoarsenCellDistance;
     props["brightnessThreshold"] = mReGIRBrightnessThreshold;
+    props["cameraMotionPreservesDomain"] = mReGIRBrightnessThreshold == 0.f;
     props["lightCullingEnabled"] = mReGIRCullingEnabled;
     props["stableLightIdCount"] = stableIdCount;
     props["stableIdCount"] = stableIdCount;

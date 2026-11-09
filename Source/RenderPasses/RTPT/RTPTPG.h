@@ -42,6 +42,14 @@ struct Statistics
     uint32_t accumulationOverflow = 0;
     uint32_t rejectedTrainingWindows = 0;
     uint32_t admissionRejected = 0;
+    uint64_t initializations = 0;
+    uint64_t resetCalls = 0;
+    uint64_t modelMigrations = 0;
+    uint64_t migratedRegions = 0;
+    uint32_t lastMigrationPreservedRegions = 0;
+    uint64_t evictedRegions = 0;
+    uint64_t namespaceChanges = 0;
+    uint32_t activeRegions = 0;
     uint64_t modelBytes = 0;
     uint64_t modelReservedBytes = 0;
     uint64_t recordBytes = 0;
@@ -90,7 +98,9 @@ public:
     };
 
     explicit Manager(ref<Device> pDevice);
-    bool prepare(RenderContext* pContext, const Settings& settings, uint2 frameDim, uint32_t updateBounces, uint32_t preferredStride);
+    // Returns whether model GPU resources changed, never a request to reset the model.
+    bool prepare(RenderContext* pContext, const Settings& settings, uint2 frameDim, uint32_t updateBounces, uint32_t preferredStride,
+        float sceneScale = 1.f);
     void reset(RenderContext* pContext);
     void beginFrame(RenderContext* pContext);
     void barrierTraining(RenderContext* pContext, bool separateDiagnostics = false) const;
@@ -105,6 +115,7 @@ public:
     uint32_t getPathCapacity() const { return mPathCapacity; }
     uint32_t getGeneration() const { return mSceneGeneration; }
     uint64_t getReadSnapshotVersion() const { return mReadSnapshotVersion; }
+    uint64_t getReadModelFingerprint() const;
 
 private:
     struct Node
@@ -134,6 +145,8 @@ private:
         uint32_t generation = 1;
         uint32_t flags = 0;
         uint32_t observationCount = 0;
+        uint32_t scaleBits = 0;
+        uint64_t lastTouchedFrame = 0;
         bool readMapped = false;
         bool buildMapped = false;
         std::vector<Node> read;
@@ -141,7 +154,17 @@ private:
         std::vector<NodeStats> statistics;
     };
 
-    void allocateModel(RenderContext* pContext);
+    struct ModelLayout
+    {
+        uint32_t regionCapacity, mapCapacity, requestCapacity, nodeCapacity;
+        uint64_t modelBytes, reservedBytes;
+    };
+    static ModelLayout getModelLayout(const Settings& settings);
+    void allocateModel(RenderContext* pContext, const std::vector<MapEntry>& pendingRequests, uint32_t requestScaleBits);
+    void captureModelState(RenderContext* pContext);
+    void rebuildMaps();
+    void trimToCapacity();
+    bool admitRequests(const std::vector<MapEntry>& requests, uint32_t scaleBits, bool allowEviction = true);
     void uploadModel(RenderContext* pContext);
     bool publish(RenderContext* pContext);
     std::vector<Node> makeInitialTree() const;
@@ -164,12 +187,14 @@ private:
     std::vector<Region> mRegions;
     std::unordered_set<uint64_t> mKnownKeys;
     std::vector<MapEntry> mReadMapCPU, mBuildMapCPU, mRequestsCPU;
+    std::vector<MapEntry> mPendingRequestsCPU;
     std::vector<RegionDesc> mReadRegionsCPU, mBuildRegionsCPU;
     std::vector<Node> mReadNodesCPU, mBuildNodesCPU, mNormalizedCPU;
     std::vector<NodeStats> mReadbackStatsCPU, mUploadStatsCPU;
     std::vector<std::array<double, 4>> mMassCPU;
     std::vector<ReadbackPiece> mReadbackPieces;
     std::array<uint32_t, 16> mTrainingDiagnosticsCPU = {};
+    std::array<uint32_t, 16> mDiagnosticsCPU = {};
     bool mReadMapDirty = false;
     bool mBuildMapDirty = false;
     bool mBuildLayoutDirty = true;
@@ -185,5 +210,10 @@ private:
     uint64_t mReadSnapshotVersion = 0;
     uint32_t mRecordGeneration = 1;
     uint32_t mFramesSincePoll = 0;
+    uint32_t mSceneScaleBits = 0x3f800000u;
+    uint64_t mTrainingEpoch = 0;
+    uint32_t mAllocatedTreeBudgetMiB = 0;
+    uint32_t mPendingRequestScaleBits = 0x3f800000u;
+    bool mModelResourcesValid = false;
 };
 }

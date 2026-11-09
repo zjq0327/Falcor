@@ -193,6 +193,20 @@ void RTPTNativePGTrain::drain()
 #endif
 }
 
+void RTPTNativePGTrain::releaseCompletedBindings()
+{
+#if FALCOR_HAS_D3D12
+    FALCOR_CHECK(mpImpl->recordedSlot == std::numeric_limits<uint32_t>::max(),
+        "Cannot release PGTrain bindings while unsubmitted work is recorded.");
+    drain();
+    for (auto& slot : mpImpl->slots)
+    {
+        slot.resources = {};
+        slot.timestamps.Reset();
+    }
+#endif
+}
+
 ID3D12CommandQueue* RTPTNativePGTrain::queue() const
 {
 #if FALCOR_HAS_D3D12

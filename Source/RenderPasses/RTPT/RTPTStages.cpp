@@ -18,15 +18,18 @@ uint64_t structuredStride(const ShaderVar& var)
 }
 }
 
-void RTPT::invalidateStages()
+void RTPT::invalidateStages(bool preserveGRISHistory)
 {
-    invalidateGRIS();
+    invalidateGRIS(true, preserveGRISHistory);
     invalidateDirectLighting();
     mLightCatalog.retry();
     // Release parameter blocks as well as our own references before reallocating.
     mpStageComputePass = mpPrimarySurfacePass = mpFinalSignalResolve = nullptr;
     mpPrimarySurfaces = mpSignalRecords = nullptr;
-    mStageResourceDim = uint2(0u);
+    // A proposal-only program rebuild keeps the same pixel domain. Marking
+    // its dimensions unknown would make prepareStages() discard the history
+    // a second time before it can bind the replacement programs.
+    mStageResourceDim = preserveGRISHistory ? mFrameDim : uint2(0u);
     mStagesActive = false;
     mStagePreparationFailed = false;
     mStageFallbackReason.clear();
@@ -122,15 +125,29 @@ void RTPT::resetGRISHistory()
     mGRISHistoryFrame.historyValid = false;
     mGRISHistoryReadValid = false;
     mGRISHistoryReplayActive = false;
+    mGRISHistoryReferenceDomain = false;
 }
 
-void RTPT::invalidateGRIS(bool clearTemporalFailure)
+void RTPT::invalidateGRIS(bool clearTemporalFailure, bool preserveHistory)
 {
+    // Only the fixed-x2 reference representation can outlive a proposal-only
+    // specialization change. Frame dimensions and the reflected layout are
+    // checked again when the replacement programs are prepared.
+    const bool keepHistory = preserveHistory && mpGRISHistory && mGRISHistoryReferenceDomain &&
+        all(mGRISHistoryFrame.previousFrameDim == mFrameDim);
     mpGRISGeneratePass = mpGRISSpatialPass = mpGRISShadePass = mpGRISMainPass = nullptr;
     mpGRISTemporalPass = mpGRISPublishHistoryPass = mpGRISLocalPass = nullptr;
     mpGRISCandidates = mpGRISSpatialInput = mpGRISLocalPrefixes = mpGRISShadedIndirect = nullptr;
-    mpGRISHistory = nullptr;
-    resetGRISHistory();
+    if (!keepHistory)
+    {
+        mpGRISHistory = nullptr;
+        resetGRISHistory();
+    }
+    else
+    {
+        // This flag reports the current dispatch, not merely a retained buffer.
+        mGRISHistoryReadValid = mGRISHistoryReplayActive = false;
+    }
     if (clearTemporalFailure) mGRISTemporalFallbackReason.clear();
 }
 
@@ -176,7 +193,9 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         (mpGRISMainPass->getProgram()->getDefines().count("RTPT_USE_RESTIR_DI") != 0) == diActive)
         return true;
 
-    invalidateGRIS(false);
+    const bool preserveHistory = temporalEnabled && referenceReuse && mGRISHistoryReferenceDomain &&
+        mpGRISHistory && all(mGRISHistoryFrame.previousFrameDim == mFrameDim);
+    invalidateGRIS(false, preserveHistory);
     try
     {
         auto baseDefines = baseMainPass->getProgram()->getDefines();
@@ -276,7 +295,18 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
             if (!alternating) mpGRISLocalPrefixes = mpDevice->createStructuredBuffer(prefixVar, uint32_t(pixelCount));
         }
         mpGRISShadedIndirect = mpDevice->createStructuredBuffer(shadedVar, uint32_t(pixelCount));
-        if (temporalEnabled) mpGRISHistory = mpDevice->createStructuredBuffer(historyVar, uint32_t(pixelCount));
+        if (temporalEnabled)
+        {
+            if (mpGRISHistory && (mpGRISHistory->getStructSize() != historyStride ||
+                mpGRISHistory->getElementCount() != pixelCount))
+            {
+                // Matching allocation size alone is not a layout contract.
+                // Never reinterpret a retained reservoir with another stride.
+                mpGRISHistory = nullptr;
+                resetGRISHistory();
+            }
+            if (!mpGRISHistory) mpGRISHistory = mpDevice->createStructuredBuffer(historyVar, uint32_t(pixelCount));
+        }
         mpGRISMainPass->getRootVar()["gGRISShadedIndirect"] = mpGRISShadedIndirect;
         return true;
     }
@@ -371,10 +401,13 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         if (mpGRISTemporalPass)
         {
             const auto& history = mGRISHistoryFrame;
-            const bool canReplay = reusePass->getProgram()->getDefines().count("RTPT_GRIS_SHARC_REPLAY") != 0;
+            const auto& defines = reusePass->getProgram()->getDefines();
+            const bool canReplay = defines.count("RTPT_GRIS_SHARC_REPLAY") != 0;
+            const auto referenceMode = defines.find("RTPT_GRIS_REFERENCE_REUSE");
+            const bool referenceReuse = referenceMode != defines.end() && referenceMode->second == "1";
             mGRISHistoryReadValid = history.historyValid && history.historyGeneration == mGRISHistoryGeneration &&
                 history.previousFrameStamp == mPrimaryFrameStamp - 1u && all(history.previousFrameDim == mFrameDim) &&
-                history.snapshot.isCompatible(snapshot, canReplay);
+                history.snapshot.isCompatible(snapshot, canReplay, referenceReuse);
             mGRISHistoryReplayActive = mGRISHistoryReadValid && canReplay && history.snapshot.sharcVersion != snapshot.sharcVersion;
             const auto settings = reuseVar["gGRISTemporalSettings"];
             settings["previousViewProj"] = history.previousViewProj;
@@ -412,6 +445,9 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         pRenderContext->uavBarrier(mpGRISHistory.get());
         mGRISHistoryFrame = {mpScene->getCamera()->getViewProjMatrix(), cameraPosition, mFrameDim, mPrimaryFrameStamp,
             mGRISHistoryGeneration, true, snapshot};
+        const auto& historyDefines = mpGRISTemporalPass->getProgram()->getDefines();
+        const auto historyMode = historyDefines.find("RTPT_GRIS_REFERENCE_REUSE");
+        mGRISHistoryReferenceDomain = historyMode != historyDefines.end() && historyMode->second == "1";
     }
     pRenderContext->uavBarrier(mpGRISCandidates.get());
     if (!alternating) pRenderContext->uavBarrier(mpGRISLocalPrefixes.get());
@@ -490,8 +526,8 @@ Properties RTPT::getStageStatistics() const
         (mpGRISTemporalPass && mpGRISTemporalPass->getProgram()->getDefines().count("RTPT_GRIS_SPATIAL_REUSE") != 0);
     props["grisAlternatingActive"] = bool(mpGRISSpatialInput) && !mpGRISLocalPrefixes;
     props["grisPGPrefixDepth"] = mGRISPGPrefixDepth;
-    props["grisPGSnapshotDependent"] = bool(mpGRISTemporalPass) && mGRISPGPrefixDepth > 0u &&
-        mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding;
+    const bool pgProposalActive = mGRISPGPrefixDepth > 0u && mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding;
+    props["grisPGProposalActive"] = pgProposalActive;
     bool referenceReuse = false;
     bool regirOnly = false;
     if (mpGRISMainPass)
@@ -503,6 +539,7 @@ Properties RTPT::getStageStatistics() const
         regirOnly = regirMode != defines.end() && regirMode->second == "1";
     }
     props["grisReferenceReuseEnabled"] = referenceReuse;
+    props["grisPGSnapshotDependent"] = bool(mpGRISTemporalPass) && pgProposalActive && !referenceReuse;
     props["grisReGIRPathReuseEnabled"] = referenceReuse && regirOnly;
     props["grisReferenceReuseReason"] = referenceReuse ? std::string{} : !mpGRISMainPass
         ? std::string("GRIS is inactive") : mEnableSHARC && mSHARCEnabled && mSHARCUseCache
@@ -512,6 +549,11 @@ Properties RTPT::getStageStatistics() const
         : std::string("Reference-tail reuse is unavailable");
     props["grisTemporalActive"] = bool(mpGRISTemporalPass);
     props["grisHistoryReadValid"] = mGRISHistoryReadValid;
+    props["grisHistoryPublishedValid"] = mGRISHistoryFrame.historyValid;
+    props["grisHistoryGeneration"] = mGRISHistoryGeneration;
+    props["grisHistoryStoredGeneration"] = mGRISHistoryFrame.historyGeneration;
+    props["grisHistoryStoredFrameStamp"] = mGRISHistoryFrame.previousFrameStamp;
+    props["grisHistoryReferenceDomain"] = mGRISHistoryReferenceDomain;
     props["grisHistoryReplayActive"] = mGRISHistoryReplayActive;
     props["grisHistoryBytes"] = mpGRISHistory ? mpGRISHistory->getSize() : 0;
     props["grisHistoryStride"] = mpGRISHistory ? mpGRISHistory->getStructSize() : 0u;

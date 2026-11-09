@@ -82,7 +82,23 @@ Manager::Manager(ref<Device> pDevice) : mpDevice(std::move(pDevice))
     static_assert(sizeof(RegionDesc) == 32);
 }
 
-bool Manager::prepare(RenderContext* pContext, const Settings& settings, uint2 frameDim, uint32_t updateBounces, uint32_t preferredStride)
+Manager::ModelLayout Manager::getModelLayout(const Settings& settings)
+{
+    const uint32_t regionCapacity = settings.maxRegions;
+    const uint32_t mapCapacity = nextPowerOfTwo(std::max(16u, regionCapacity * 4u));
+    const uint64_t auxiliary = uint64_t(mapCapacity) * sizeof(MapEntry) * 2 +
+        uint64_t(regionCapacity) * sizeof(RegionDesc) * 2 + uint64_t(mapCapacity) * 16 + 32 * sizeof(uint32_t);
+    const uint64_t budget = uint64_t(settings.treeBudgetMiB) * kMiB;
+    FALCOR_CHECK(auxiliary + kTransferReserve + uint64_t(regionCapacity) * 88 < budget,
+        "PG tree budget cannot contain the requested region table and one node per region.");
+    const uint32_t nodeCapacity = std::min(uint32_t((budget - auxiliary - kTransferReserve) / 88), regionCapacity);
+    return {regionCapacity, mapCapacity, mapCapacity, nodeCapacity,
+        auxiliary + uint64_t(nodeCapacity) * 88 + kUploadStageBytes + kReadbackStageBytes,
+        auxiliary + uint64_t(nodeCapacity) * 88 + kTransferReserve};
+}
+
+bool Manager::prepare(RenderContext* pContext, const Settings& settings, uint2 frameDim, uint32_t updateBounces,
+    uint32_t preferredStride, float sceneScale)
 {
     FALCOR_CHECK(settings.treeBudgetMiB >= 16 && settings.treeBudgetMiB <= 1024, "PG tree budget must be 16..1024 MiB.");
     FALCOR_CHECK(settings.recordBudgetMiB >= 1 && settings.recordBudgetMiB <= 4096, "PG record budget must be 1..4096 MiB.");
@@ -90,11 +106,71 @@ bool Manager::prepare(RenderContext* pContext, const Settings& settings, uint2 f
     FALCOR_CHECK(std::isfinite(settings.weightScale) && settings.weightScale > 0.f, "PG weight scale must be positive and finite.");
     FALCOR_CHECK(settings.maxRegions >= 1 && settings.maxRegions <= 65536, "PG maxRegions must be 1..65536.");
     FALCOR_CHECK(updateBounces <= 64, "PG record depth exceeds the supported 64-bounce bound.");
-    const bool structural = !mpReadMap || settings.treeBudgetMiB != mSettings.treeBudgetMiB ||
-        settings.maxRegions != mSettings.maxRegions || settings.coarseLevels != mSettings.coarseLevels ||
-        settings.weightScale != mSettings.weightScale;
+    FALCOR_CHECK(std::isfinite(sceneScale) && sceneScale > 0.f, "PG scene scale must be positive and finite.");
+    // Reject impossible combinations before changing any settings, touching
+    // learned regions, or releasing the currently valid GPU pools.
+    getModelLayout(settings);
+    uint32_t scaleBits;
+    std::memcpy(&scaleBits, &sceneScale, sizeof(scaleBits));
+    const bool initialized = mModelResourcesValid;
+    const bool structural = !initialized || settings.treeBudgetMiB != mAllocatedTreeBudgetMiB ||
+        settings.maxRegions != mRegionCapacity;
+    const bool namespaceChanged = initialized && scaleBits != mSceneScaleBits;
+    const bool weightScaleChanged = initialized && settings.weightScale != mSettings.weightScale;
+    // Coarse levels select an existing world-space LOD key. They do not change
+    // the meaning of that key or require discarding any learned regions.
+    uint32_t requestScaleBits = mPendingRequestScaleBits;
+    std::vector<MapEntry> pendingRequests = mPendingRequestsCPU;
+    if (initialized && (structural || namespaceChanged || weightScaleChanged))
+    {
+        captureModelState(pContext);
+        pendingRequests = mRequestsCPU;
+        requestScaleBits = mSceneScaleBits;
+        mPendingRequestsCPU = pendingRequests;
+        mPendingRequestScaleBits = requestScaleBits;
+    }
+    if (weightScaleChanged)
+    {
+        const double ratio = double(settings.weightScale) / mSettings.weightScale;
+        for (auto& region : mRegions)
+        {
+            bool valid = true;
+            for (auto& stats : region.statistics)
+                for (uint32_t q = 0; q < 4; ++q)
+                {
+                    const float weight = float(double(asFloat(stats.weightBits[q])) * ratio);
+                    const float square = float(double(asFloat(stats.squareBits[q])) * ratio * ratio);
+                    valid &= std::isfinite(weight) && std::isfinite(square);
+                    std::memcpy(&stats.weightBits[q], &weight, sizeof(weight));
+                    std::memcpy(&stats.squareBits[q], &square, sizeof(square));
+                }
+            if (!valid)
+            {
+                region.statistics.assign(region.build.size(), {});
+                ++mStatistics.rejectedTrainingWindows;
+                ++mStatistics.invalidSamples;
+            }
+        }
+    }
     mSettings = settings;
-    if (structural) allocateModel(pContext);
+    mSceneScaleBits = scaleBits;
+    if (namespaceChanged) ++mStatistics.namespaceChanges;
+    if (structural) allocateModel(pContext, pendingRequests, requestScaleBits);
+    else if (namespaceChanged || weightScaleChanged)
+    {
+        mModelResourcesValid = false;
+        rebuildMaps();
+        // Captured requests belong to the capture-time spatial namespace.
+        // A namespace/configuration change must not evict existing models just
+        // to admit those formerly missing regions.
+        admitRequests(pendingRequests, requestScaleBits, false);
+        uploadModel(pContext);
+        pContext->clearUAV(mpRequests->getUAV().get(), uint4(0));
+        pContext->uavBarrier(mpRequests.get());
+        ++mReadSnapshotVersion;
+        mModelResourcesValid = true;
+    }
+    mPendingRequestsCPU.clear();
 
     const uint32_t verticesPerPath = updateBounces + 2;
     const uint64_t bytesPerPath = 32ull + 80ull * verticesPerPath;
@@ -109,7 +185,7 @@ bool Manager::prepare(RenderContext* pContext, const Settings& settings, uint2 f
         stride = std::max(stride, uint32_t(std::ceil(std::sqrt(double(frameDim.x) * frameDim.y / double(maxPaths)))));
     while (capacityAt(stride) > maxPaths) ++stride;
     const uint32_t capacity = uint32_t(std::max<uint64_t>(1, capacityAt(stride)));
-    if (!mpPathHeaders || capacity != mPathCapacity || verticesPerPath != mVerticesPerPath)
+    if (!mpPathHeaders || !mpVertices || capacity != mPathCapacity || verticesPerPath != mVerticesPerPath)
     {
         pContext->submit(true);
         mpPathHeaders = mpVertices = nullptr;
@@ -129,24 +205,24 @@ bool Manager::prepare(RenderContext* pContext, const Settings& settings, uint2 f
     return structural;
 }
 
-void Manager::allocateModel(RenderContext* pContext)
+void Manager::allocateModel(RenderContext* pContext, const std::vector<MapEntry>& pendingRequests, uint32_t requestScaleBits)
 {
+    const bool migrating = mStatistics.initializations != 0;
+    // Capture already drained the old read/training users into bounded CPU
+    // arrays. Release GPU pools before allocating their replacements, rather
+    // than silently reserving two complete model budgets at once.
+    const auto layout = getModelLayout(mSettings);
     pContext->submit(true);
+    mModelResourcesValid = false;
     mpReadMap = mpReadRegions = mpReadNodes = nullptr;
     mpBuildMap = mpBuildRegions = mpBuildNodes = mpBuildStats = nullptr;
     mpRequests = mpDiagnostics = mpTrainingDiagnostics = nullptr;
     mpUploadStage = mpReadbackStage = nullptr;
     mpDevice->wait();
-    mRegionCapacity = mSettings.maxRegions;
-    mMapCapacity = nextPowerOfTwo(std::max(16u, mRegionCapacity * 4u));
-    mRequestCapacity = mMapCapacity;
-    const uint64_t auxiliary = uint64_t(mMapCapacity) * sizeof(MapEntry) * 2 +
-        uint64_t(mRegionCapacity) * sizeof(RegionDesc) * 2 + uint64_t(mRequestCapacity) * 16 + 32 * sizeof(uint32_t);
-    const uint64_t budget = uint64_t(mSettings.treeBudgetMiB) * kMiB;
-    FALCOR_CHECK(auxiliary + kTransferReserve + uint64_t(mRegionCapacity) * 88 < budget,
-        "PG tree budget cannot contain the requested region table and one node per region.");
-    mNodeCapacity = uint32_t((budget - auxiliary - kTransferReserve) / 88);
-    mNodeCapacity = std::min(mNodeCapacity, mRegionCapacity);
+    mRegionCapacity = layout.regionCapacity;
+    mMapCapacity = layout.mapCapacity;
+    mRequestCapacity = layout.requestCapacity;
+    mNodeCapacity = layout.nodeCapacity;
     mpReadMap = mpDevice->createStructuredBuffer(16u, mMapCapacity);
     mpBuildMap = mpDevice->createStructuredBuffer(16u, mMapCapacity);
     mpReadRegions = mpDevice->createStructuredBuffer(32u, mRegionCapacity);
@@ -161,11 +237,40 @@ void Manager::allocateModel(RenderContext* pContext)
     mpTrainingDiagnostics = mpDevice->createStructuredBuffer(4u, 16u);
     mpUploadStage = mpDevice->createBuffer(kUploadStageBytes, ResourceBindFlags::None, MemoryType::Upload);
     mpReadbackStage = mpDevice->createBuffer(kReadbackStageBytes, ResourceBindFlags::None, MemoryType::ReadBack);
-    mStatistics.modelBytes = auxiliary + uint64_t(mNodeCapacity) * 88 + kUploadStageBytes + kReadbackStageBytes;
-    mStatistics.modelReservedBytes = auxiliary + uint64_t(mNodeCapacity) * 88 + kTransferReserve;
+    mStatistics.modelBytes = layout.modelBytes;
+    mStatistics.modelReservedBytes = layout.reservedBytes;
     mStatistics.nodeCapacity = mNodeCapacity;
     mStatistics.regionCapacity = mRegionCapacity;
-    reset(pContext);
+    trimToCapacity();
+    const uint32_t preservedRegions = uint32_t(mRegions.size());
+    rebuildMaps();
+    // Capacity is now the NEW capacity. Growing a pool must never evict a
+    // learned region under the old limit before admitting pending requests.
+    admitRequests(pendingRequests, requestScaleBits, false);
+    mRequestsCPU.assign(mRequestCapacity, {});
+    for (auto& buffer : {mpReadMap, mpReadRegions, mpReadNodes, mpBuildMap, mpBuildRegions, mpBuildNodes,
+                         mpBuildStats, mpRequests, mpDiagnostics, mpTrainingDiagnostics})
+    {
+        pContext->clearUAV(buffer->getUAV().get(), uint4(0));
+        pContext->uavBarrier(buffer.get());
+    }
+    uploadModel(pContext);
+    uploadBatch(pContext, {
+        {mpDiagnostics, mDiagnosticsCPU.data(), sizeof(mDiagnosticsCPU)},
+        {mpTrainingDiagnostics, mTrainingDiagnosticsCPU.data(), sizeof(mTrainingDiagnosticsCPU)},
+    });
+    pContext->uavBarrier(mpDiagnostics.get());
+    pContext->uavBarrier(mpTrainingDiagnostics.get());
+    ++mReadSnapshotVersion;
+    mAllocatedTreeBudgetMiB = mSettings.treeBudgetMiB;
+    mModelResourcesValid = true;
+    if (migrating)
+    {
+        ++mStatistics.modelMigrations;
+        mStatistics.lastMigrationPreservedRegions = preservedRegions;
+        mStatistics.migratedRegions += preservedRegions;
+    }
+    else ++mStatistics.initializations;
 }
 
 void Manager::reset(RenderContext* pContext)
@@ -176,7 +281,9 @@ void Manager::reset(RenderContext* pContext)
     if (!mSceneGeneration) ++mSceneGeneration;
     mRecordGeneration = 1;
     mFramesSincePoll = 0;
+    mTrainingEpoch = 0;
     mRegions.clear();
+    mPendingRequestsCPU.clear();
     mKnownKeys.clear();
     mKnownKeys.reserve(mRegionCapacity);
     mReadMapCPU.assign(mMapCapacity, {});
@@ -188,7 +295,20 @@ void Manager::reset(RenderContext* pContext)
     const auto reserved = mStatistics.modelReservedBytes;
     const auto records = mStatistics.recordBytes;
     const auto recordReserved = mStatistics.recordReservedBytes;
+    const auto initializations = mStatistics.initializations;
+    const auto resetCalls = mStatistics.resetCalls + 1;
+    const auto migrations = mStatistics.modelMigrations;
+    const auto migratedRegions = mStatistics.migratedRegions;
+    const auto evictedRegions = mStatistics.evictedRegions;
+    const auto namespaceChanges = mStatistics.namespaceChanges;
     mStatistics = {};
+    mStatistics.initializations = initializations;
+    mStatistics.resetCalls = resetCalls;
+    mStatistics.modelMigrations = migrations;
+    mStatistics.migratedRegions = migratedRegions;
+    mStatistics.evictedRegions = evictedRegions;
+    mStatistics.namespaceChanges = namespaceChanges;
+    mDiagnosticsCPU.fill(0u);
     mTrainingDiagnosticsCPU.fill(0u);
     mStatistics.modelBytes = bytes;
     mStatistics.modelReservedBytes = reserved;
@@ -224,6 +344,7 @@ void Manager::barrierTraining(RenderContext* pContext, bool separateDiagnostics)
 void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive,
     bool separateDiagnostics, bool readOnlyResources) const
 {
+    FALCOR_CHECK(mModelResourcesValid, "PG model allocation is incomplete; cannot bind partial resources.");
     setIfPresent(rootVar, "gPGReadMap", mpReadMap);
     setIfPresent(rootVar, "gPGReadRegions", mpReadRegions);
     setIfPresent(rootVar, "gPGReadNodes", mpReadNodes);
@@ -267,6 +388,7 @@ void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneS
 Manager::NativeTrainingData Manager::getNativeTrainingData(
     float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive) const
 {
+    FALCOR_CHECK(mModelResourcesValid, "PG model allocation is incomplete; cannot train with partial resources.");
     NativeTrainingData data;
     data.buffers = {mpBuildMap, mpBuildRegions, mpBuildNodes, mpBuildStats,
         mpRequests, mpTrainingDiagnostics, mpPathHeaders, mpVertices};
@@ -303,6 +425,7 @@ Manager::NativeTrainingData Manager::getNativeTrainingData(
 
 void Manager::prepareNativeTraining(RenderContext* pContext) const
 {
+    FALCOR_CHECK(mModelResourcesValid, "PG model allocation is incomplete; cannot prepare partial resources.");
     // Run transitions on the default direct queue before signaling input readiness.
     // The native compute list then only accesses resources in these established states.
     for (auto& buffer : {mpBuildMap, mpBuildRegions, mpBuildNodes})
@@ -338,6 +461,195 @@ float Manager::asFloat(uint32_t bits)
     float value;
     std::memcpy(&value, &bits, sizeof(value));
     return value;
+}
+
+void Manager::captureModelState(RenderContext* pContext)
+{
+    FALCOR_CHECK(mModelResourcesValid, "PG model allocation is incomplete; cannot read partial resources.");
+    mReadbackStatsCPU.resize(mStatistics.buildNodes);
+    mRequestsCPU.resize(mRequestCapacity);
+    readBatch(pContext, {
+        {mpBuildStats, mReadbackStatsCPU.data(), mReadbackStatsCPU.size() * sizeof(NodeStats)},
+        {mpRequests, mRequestsCPU.data(), mRequestsCPU.size() * sizeof(MapEntry)},
+        {mpDiagnostics, mDiagnosticsCPU.data(), sizeof(mDiagnosticsCPU)},
+        {mpTrainingDiagnostics, mTrainingDiagnosticsCPU.data(), sizeof(mTrainingDiagnosticsCPU)},
+    });
+    size_t offset = 0;
+    for (auto& region : mRegions)
+    {
+        FALCOR_CHECK(offset + region.build.size() <= mReadbackStatsCPU.size(), "PG statistics layout is inconsistent.");
+        region.statistics.assign(mReadbackStatsCPU.begin() + offset, mReadbackStatsCPU.begin() + offset + region.build.size());
+        offset += region.build.size();
+        bool observed = false;
+        for (const auto& node : region.statistics)
+            for (const auto count : node.count) observed |= count != 0u;
+        if (observed) region.lastTouchedFrame = mTrainingEpoch;
+    }
+    FALCOR_CHECK(offset == mReadbackStatsCPU.size(), "PG statistics layout has trailing nodes.");
+}
+
+void Manager::rebuildMaps()
+{
+    mReadMapCPU.assign(mMapCapacity, {});
+    mBuildMapCPU.assign(mMapCapacity, {});
+    mKnownKeys.clear();
+    mKnownKeys.reserve(mRegionCapacity);
+    for (auto& region : mRegions)
+    {
+        region.readMapped = region.buildMapped = false;
+        if (region.scaleBits == mSceneScaleBits) mKnownKeys.insert(region.key);
+    }
+    mReadMapDirty = mBuildMapDirty = mBuildLayoutDirty = true;
+}
+
+void Manager::trimToCapacity()
+{
+    std::vector<size_t> priority(mRegions.size());
+    for (size_t i = 0; i < priority.size(); ++i) priority[i] = i;
+    std::stable_sort(priority.begin(), priority.end(), [&](size_t a, size_t b)
+    {
+        const auto& x = mRegions[a];
+        const auto& y = mRegions[b];
+        const bool activeX = x.scaleBits == mSceneScaleBits;
+        const bool activeY = y.scaleBits == mSceneScaleBits;
+        if (activeX != activeY) return activeX;
+        if (x.lastTouchedFrame != y.lastTouchedFrame) return x.lastTouchedFrame > y.lastTouchedFrame;
+        return (x.flags & kReady) > (y.flags & kReady);
+    });
+    std::vector<bool> keep(mRegions.size(), false);
+    size_t readNodes = 0, buildNodes = 0, regions = 0;
+    for (const auto i : priority)
+    {
+        const auto& region = mRegions[i];
+        if (regions >= mRegionCapacity || readNodes + region.read.size() > mNodeCapacity ||
+            buildNodes + region.build.size() > mNodeCapacity) continue;
+        keep[i] = true;
+        ++regions;
+        readNodes += region.read.size();
+        buildNodes += region.build.size();
+    }
+    size_t output = 0;
+    for (size_t i = 0; i < mRegions.size(); ++i)
+        if (keep[i])
+        {
+            if (output != i) mRegions[output] = std::move(mRegions[i]);
+            ++output;
+        }
+    mStatistics.evictedRegions += mRegions.size() - output;
+    mRegions.resize(output);
+}
+
+bool Manager::admitRequests(const std::vector<MapEntry>& requests, uint32_t scaleBits, bool allowEviction)
+{
+    // Requests captured before a scene-scale switch keep their original key
+    // interpretation even when the active maps now expose another namespace.
+    std::unordered_set<uint64_t> requestKeys;
+    auto* knownKeys = &mKnownKeys;
+    if (scaleBits != mSceneScaleBits)
+    {
+        for (const auto& region : mRegions)
+            if (region.scaleBits == scaleBits) requestKeys.insert(region.key);
+        knownKeys = &requestKeys;
+    }
+    uint64_t plannedNodes = 0;
+    for (const auto& region : mRegions) plannedNodes += region.build.size();
+    std::vector<size_t> victims;
+    for (size_t i = 0; i < mRegions.size(); ++i)
+        if (mRegions[i].scaleBits != scaleBits || mRegions[i].lastTouchedFrame < mTrainingEpoch)
+            victims.push_back(i);
+    std::stable_sort(victims.begin(), victims.end(), [&](size_t a, size_t b)
+    {
+        const auto& x = mRegions[a];
+        const auto& y = mRegions[b];
+        const bool inactiveX = x.scaleBits != scaleBits;
+        const bool inactiveY = y.scaleBits != scaleBits;
+        if (inactiveX != inactiveY) return inactiveX;
+        return x.lastTouchedFrame < y.lastTouchedFrame;
+    });
+    size_t victimCursor = 0;
+    uint32_t evictions = 0;
+    // A moving camera can discover many regions in one window. Replace only a
+    // bounded fraction of old regions per publication, never flush the pool.
+    const uint32_t maxEvictions = std::max(1u, mRegionCapacity / 8u);
+    bool layoutChanged = false;
+    bool readChanged = false;
+    for (const auto& request : requests)
+    {
+        const uint64_t key = uint64_t(request.keyLo) | (uint64_t(request.keyHi) << 32);
+        if (!key || knownKeys->find(key) != knownKeys->end()) continue;
+        auto initial = makeInitialTree();
+        size_t id = mRegions.size();
+        uint32_t generation = mSceneGeneration;
+        if (mRegions.size() >= mRegionCapacity || plannedNodes + initial.size() > mNodeCapacity)
+        {
+            if (!allowEviction || victimCursor == victims.size() || evictions >= maxEvictions)
+            {
+                ++mStatistics.admissionRejected;
+                continue;
+            }
+            id = victims[victimCursor++];
+            auto& victim = mRegions[id];
+            if (plannedNodes - victim.build.size() + initial.size() > mNodeCapacity)
+            {
+                ++mStatistics.admissionRejected;
+                continue;
+            }
+            if (victim.scaleBits == scaleBits) knownKeys->erase(victim.key);
+            readChanged = readChanged || !victim.read.empty();
+            plannedNodes -= victim.build.size();
+            generation = victim.generation + 1u;
+            if (!generation) ++generation;
+            ++evictions;
+            ++mStatistics.evictedRegions;
+        }
+        Region region;
+        region.key = key;
+        region.generation = generation;
+        region.scaleBits = scaleBits;
+        region.lastTouchedFrame = mTrainingEpoch;
+        region.build = std::move(initial);
+        region.statistics.resize(region.build.size());
+        plannedNodes += region.build.size();
+        if (id == mRegions.size()) mRegions.push_back(std::move(region));
+        else mRegions[id] = std::move(region);
+        knownKeys->insert(key);
+        layoutChanged = true;
+    }
+    if (layoutChanged) rebuildMaps();
+    return readChanged;
+}
+
+uint64_t Manager::getReadModelFingerprint() const
+{
+    uint64_t hash = 1469598103934665603ull;
+    const auto add = [&](uint32_t value)
+    {
+        for (uint32_t byte = 0; byte < 4; ++byte)
+        {
+            hash ^= (value >> (byte * 8)) & 0xffu;
+            hash *= 1099511628211ull;
+        }
+    };
+    for (const auto& region : mRegions)
+    {
+        if (region.scaleBits != mSceneScaleBits || region.read.empty()) continue;
+        add(uint32_t(region.key));
+        add(uint32_t(region.key >> 32));
+        add(region.scaleBits);
+        add(region.flags);
+        add(uint32_t(region.read.size()));
+        for (const auto& node : region.read)
+        {
+            add(node.topology);
+            for (const auto mass : node.mass)
+            {
+                uint32_t bits;
+                std::memcpy(&bits, &mass, sizeof(bits));
+                add(bits);
+            }
+        }
+    }
+    return hash;
 }
 
 void Manager::readBatch(RenderContext* pContext, std::initializer_list<ReadTransfer> transfers)
@@ -448,10 +760,11 @@ void Manager::uploadModel(RenderContext* pContext)
         }
         return offset;
     };
-    mStatistics.readyRegions = mStatistics.observedZeroRegions = 0;
+    mStatistics.readyRegions = mStatistics.observedZeroRegions = mStatistics.activeRegions = 0;
     for (uint32_t id = 0; id < mRegions.size(); ++id)
     {
         auto& region = mRegions[id];
+        FALCOR_CHECK(region.statistics.size() == region.build.size(), "PG region statistics do not match its topology.");
         const auto readRoot = append(readNodes, region.read);
         readRegions.push_back({uint32_t(region.key), uint32_t(region.key >> 32), readRoot, uint32_t(region.read.size()),
             region.generation, region.flags, region.observationCount, 0.f});
@@ -462,19 +775,21 @@ void Manager::uploadModel(RenderContext* pContext)
                 region.generation, 0u, 0u, 0.f});
         }
         statistics.insert(statistics.end(), region.statistics.begin(), region.statistics.end());
-        if (!region.read.empty() && !region.readMapped)
+        const bool active = region.scaleBits == mSceneScaleBits;
+        if (active) ++mStatistics.activeRegions;
+        if (active && !region.read.empty() && !region.readMapped)
         {
             region.readMapped = true;
             mReadMapDirty = true;
         }
-        if (!region.buildMapped)
+        if (active && !region.buildMapped)
         {
             insert(mBuildMapCPU, region, id);
             region.buildMapped = true;
             mBuildMapDirty = true;
         }
-        if (region.flags & kReady) ++mStatistics.readyRegions;
-        if (region.flags & kObservedZero) ++mStatistics.observedZeroRegions;
+        if (active && (region.flags & kReady)) ++mStatistics.readyRegions;
+        if (active && (region.flags & kObservedZero)) ++mStatistics.observedZeroRegions;
     }
     if (mReadMapDirty)
     {
@@ -483,7 +798,7 @@ void Manager::uploadModel(RenderContext* pContext)
         // this work and the GPU map upload.
         std::fill(mReadMapCPU.begin(), mReadMapCPU.end(), MapEntry{});
         for (uint32_t id = 0; id < mRegions.size(); ++id)
-            if (!mRegions[id].read.empty()) insert(mReadMapCPU, mRegions[id], id);
+            if (mRegions[id].scaleBits == mSceneScaleBits && !mRegions[id].read.empty()) insert(mReadMapCPU, mRegions[id], id);
     }
     FALCOR_CHECK(readNodes.size() <= mNodeCapacity && buildNodes.size() <= mNodeCapacity, "PG node pool exceeded its fixed capacity.");
     const auto uploadStart = std::chrono::steady_clock::now();
@@ -509,6 +824,7 @@ void Manager::uploadModel(RenderContext* pContext)
 bool Manager::finishTrainingFrame(RenderContext* pContext)
 {
     ++mStatistics.trainingFrames;
+    ++mTrainingEpoch;
     if (++mFramesSincePoll < std::max(1u, mSettings.pollFrames)) return false;
     mFramesSincePoll = 0;
     return publish(pContext);
@@ -533,11 +849,12 @@ bool Manager::publish(RenderContext* pContext)
     readBatch(pContext, {
         {mpBuildStats, statistics.data(), statistics.size() * sizeof(NodeStats)},
         {mpRequests, requests.data(), requests.size() * sizeof(MapEntry)},
-        {mpDiagnostics, mStatistics.diagnostics.data(), sizeof(mStatistics.diagnostics)},
+        {mpDiagnostics, mDiagnosticsCPU.data(), sizeof(mDiagnosticsCPU)},
         {mpTrainingDiagnostics, mTrainingDiagnosticsCPU.data(), sizeof(mTrainingDiagnosticsCPU)},
     });
     // The caller joins the training queue before publication. Both buffers are cumulative;
     // reread each source before adding so mode changes preserve the original counter semantics.
+    mStatistics.diagnostics = mDiagnosticsCPU;
     for (size_t i = 0; i < mStatistics.diagnostics.size(); ++i)
         mStatistics.diagnostics[i] += mTrainingDiagnosticsCPU[i];
     mStatistics.lastReadbackMs = elapsedMs(readbackStart);
@@ -549,7 +866,6 @@ bool Manager::publish(RenderContext* pContext)
     mStatistics.accumulationOverflow = mStatistics.diagnostics[3];
     bool changed = false;
     size_t offset = 0;
-    uint64_t plannedNodes = mStatistics.buildNodes;
     for (auto& region : mRegions)
     {
         // Inspect the readback in place. Consumed windows are cleared below, so
@@ -577,6 +893,7 @@ bool Manager::publish(RenderContext* pContext)
                     positiveMass |= value > 0.;
                     observations += regionStats[i].count[q];
                 }
+        if (observations) region.lastTouchedFrame = mTrainingEpoch;
         if (!observations)
         {
             // Preserve all bytes, including nonleaf statistics, just as before.
@@ -640,31 +957,7 @@ bool Manager::publish(RenderContext* pContext)
         region.statistics.assign(region.build.size(), {});
         changed = true;
     }
-    for (const auto& request : requests)
-    {
-        const uint64_t key = uint64_t(request.keyLo) | (uint64_t(request.keyHi) << 32);
-        if (!key || mKnownKeys.find(key) != mKnownKeys.end()) continue;
-        if (mRegions.size() >= mRegionCapacity)
-        {
-            ++mStatistics.admissionRejected;
-            continue;
-        }
-        auto initial = makeInitialTree();
-        if (plannedNodes + initial.size() > mNodeCapacity)
-        {
-            ++mStatistics.admissionRejected;
-            continue;
-        }
-        Region region;
-        region.key = key;
-        region.generation = mSceneGeneration;
-        region.build = std::move(initial);
-        region.statistics.resize(region.build.size());
-        plannedNodes += region.build.size();
-        mRegions.push_back(std::move(region));
-        mBuildLayoutDirty = true;
-        mKnownKeys.insert(key);
-    }
+    changed = admitRequests(requests, mSceneScaleBits) || changed;
     uploadModel(pContext);
     const auto finalizeStart = std::chrono::steady_clock::now();
     pContext->clearUAV(mpRequests->getUAV().get(), uint4(0));

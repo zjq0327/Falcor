@@ -236,7 +236,9 @@ void RTPT::setProperties(const Properties& props)
         regirLightCullingEnabled != mReGIRCullingEnabled || regirCoarsenCellDistance != mReGIRCoarsenCellDistance ||
         regirBrightnessThreshold != mReGIRBrightnessThreshold;
     const bool regirCompileChanged = regirEnabled != mReGIREnabled || (regirEnabled && restirDIEnabled != mRestirDIEnabled);
-    const bool modeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || enablePG != mEnablePG || regirCompileChanged;
+    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || regirCompileChanged;
+    const bool pgCompileChanged = enablePG != mEnablePG;
+    const bool modeChanged = transportModeChanged || pgCompileChanged;
     const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
         restirDIBudgetMB != mRestirDIBudgetMB || restirDITemporalEnabled != mRestirDITemporalEnabled ||
         restirDISpatialEnabled != mRestirDISpatialEnabled || restirDIHistoryLength != mRestirDIHistoryLength ||
@@ -249,20 +251,26 @@ void RTPT::setProperties(const Properties& props)
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
         pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
     const bool pgRecordsChanged = pg.recordBudgetMiB != mPGSettings.recordBudgetMiB || pgUpdateStride != mPGUpdateStride;
-    const bool pgSignalChanged = pgStructureChanged || pg.enabled != mPGSettings.enabled || pg.useGuiding != mPGSettings.useGuiding ||
-        pg.guideFraction != mPGSettings.guideFraction;
     const bool sharcStructureChanged = enableSHARC != mEnableSHARC || sharcEntries != mSHARCEntries ||
         sharcSceneScale != mSHARCSceneScale || sharcUpdateBounces != mSHARCUpdateBounces;
     const bool sharcSignalChanged = sharcStructureChanged || sharcUseCache != mSHARCUseCache ||
         sharcUpdateStride != mSHARCUpdateStride || sharcMinBounce != mSHARCMinBounce || sharcMinRoughness != mSHARCMinRoughness ||
         sharcAccumulationFrames != mSHARCAccumulationFrames || sharcStaleFrames != mSHARCStaleFrames;
     const bool sharcQuery = enableSHARC && sharcEnabled && sharcUseCache;
+    const bool sharcTransportChanged = sharcSignalChanged && (sharcQuery || (mEnableSHARC && mSHARCEnabled && mSHARCUseCache));
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
-        sharcEnabled != mSHARCEnabled || modeChanged || sharcSignalChanged || pgSignalChanged || diChanged ||
+        sharcEnabled != mSHARCEnabled || transportModeChanged || sharcTransportChanged || diChanged ||
         regirChanged || grisSharcX1Blend != mGRISSharcX1Blend;
-    mResetPG |= pgStructureChanged || trainingSamplingChanged;
+    // PG learns a proposal: changing its sampling/configuration or training
+    // target does not require discarding the accumulated spatial model.
+    if (pgStructureChanged || pgRecordsChanged || pgAsyncTraining != mPGAsyncTraining)
+    {
+        drainPGAsync();
+        if (mpPGAsyncTrainer) mpPGAsyncTrainer->releaseCompletedBindings();
+        releasePGProgramBindings();
+    }
     mResetSHARCCache |= sharcStructureChanged || trainingSamplingChanged;
     if (sharcEntries != mSHARCEntries)
         mpSHARCHashEntries = mpSHARCAccumulation = mpSHARCResolved = nullptr;
@@ -294,9 +302,8 @@ void RTPT::setProperties(const Properties& props)
     if (grisPGPrefixDepth != mGRISPGPrefixDepth)
     {
         mGRISPGPrefixDepth = grisPGPrefixDepth;
-        // This changes only GRIS proposals. Preserve the guide model, sample
-        // sequence and the independent SHaRC/NRD histories.
-        invalidateGRIS();
+        // Only the proposal changes; the record's reference-domain contract is identical.
+        invalidateGRIS(true, true);
     }
     mRestirDIEnabled = restirDIEnabled;
     mRestirDICandidateCount = restirDICandidateCount;
@@ -325,7 +332,6 @@ void RTPT::setProperties(const Properties& props)
     }
     if (regirChanged) invalidateReGIR();
     if (!mRestirDIEnabled && !mReGIREnabled && (diChanged || regirChanged)) mLightCatalog.release();
-    mResetPG |= regirChanged || regirCompileChanged;
     mResetSHARCCache |= regirChanged || regirCompileChanged;
     mEnableSHARC = enableSHARC;
     mSHARCEnabled = sharcEnabled;
@@ -348,19 +354,20 @@ void RTPT::setProperties(const Properties& props)
     mPGUpdateBounces = pgUpdateBounces;
     if (mStagePreparationFailed && couldUseGRISTemporal != canUseGRISTemporal())
         invalidateStages();
-    if (pgStructureChanged)
-    {
-        // Drop parameter-block references before rebuilding bounded PG pools.
-        mpComputePass = mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
-    }
-    else if (pgRecordsChanged) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
+    // Pool sizes and training depth are runtime data. Releasing their resource
+    // bindings is enough; only a compile-time mode change needs new programs.
     if (modeChanged)
     {
         mpComputePass = nullptr;
         mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
-        mpCameraPattern = nullptr;
-        mpJitterCamera = nullptr;
-        requestRecompile();
+        // ENABLE_PG only changes shader specialization, not render-graph I/O.
+        // Do not turn that program rebuild into an external graph-history reset.
+        if (transportModeChanged)
+        {
+            mpCameraPattern = nullptr;
+            mpJitterCamera = nullptr;
+            requestRecompile();
+        }
     }
 }
 
@@ -451,6 +458,15 @@ Properties RTPT::getPGStatistics() const
     props["nodeCapacity"] = s.nodeCapacity;
     props["trainingFrames"] = s.trainingFrames;
     props["publications"] = s.publications;
+    props["initializations"] = s.initializations;
+    props["resetCalls"] = s.resetCalls;
+    props["modelMigrations"] = s.modelMigrations;
+    props["migratedRegions"] = s.migratedRegions;
+    props["lastMigrationPreservedRegions"] = s.lastMigrationPreservedRegions;
+    props["evictedRegions"] = s.evictedRegions;
+    props["namespaceChanges"] = s.namespaceChanges;
+    props["activeRegions"] = s.activeRegions;
+    props["readModelFingerprint"] = mpPG->getReadModelFingerprint();
     props["modelBytes"] = s.modelBytes;
     props["modelReservedBytes"] = s.modelReservedBytes;
     props["recordBytes"] = s.recordBytes;
@@ -595,6 +611,24 @@ ProgramDesc RTPT::makeSceneProgramDesc(const char* path, const char* entry) cons
     return desc;
 }
 
+void RTPT::releasePGProgramBindings()
+{
+    // Manager still owns the buffers until its migration fence completes.
+    // Drop all pass references without throwing away compiled programs or history.
+    for (const auto& pass : {mpComputePass, mpStageComputePass, mpDIComputePass, mpGRISMainPass,
+                            mpGRISGeneratePass, mpSparseUpdate, mpPGPrepare, mpPGTrain})
+    {
+        if (!pass) continue;
+        const auto root = pass->getRootVar();
+        for (const char* name : {"gPGReadMap", "gPGReadRegions", "gPGReadNodes", "gPGBuildMap", "gPGBuildRegions",
+                                 "gPGBuildNodes", "gPGBuildStats", "gPGRequests", "gPGDiagnostics", "gPGPathHeaders", "gPGVertices"})
+        {
+            auto member = root.findMember(name);
+            if (member.isValid()) member = ref<Buffer>{};
+        }
+    }
+}
+
 void RTPT::prepareProgram(RenderContext* pRenderContext)
 {
     // Request the mesh light collection before querying useEmissiveLights().
@@ -611,7 +645,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
         mResetSHARCCache = true;
-        mResetPG = true;
         reset();
     }
     if (mpScene->useEnvLight())
@@ -625,7 +658,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     // primary producer and its consumer. Ordinary camera motion does not.
     if (!mpComputePass)
     {
-        invalidateStages();
+        invalidateStages(true);
         invalidateReGIRPrograms();
     }
 
@@ -886,10 +919,13 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
     bool pg = mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled;
     if (mEnablePG)
     {
-        const bool rebuilt = mpPG->prepare(pRenderContext, mPGSettings, mFrameDim, mPGUpdateBounces, mPGUpdateStride);
-        if (mResetPG || rebuilt)
+        const bool hadModel = mpPG->getStatistics().modelReservedBytes != 0u;
+        mpPG->prepare(pRenderContext, mPGSettings, mFrameDim, mPGUpdateBounces, mPGUpdateStride, mSHARCSceneScale);
+        if (mResetPG)
         {
-            mpPG->reset(pRenderContext);
+            // Allocation initializes a first model. Existing models are cleared
+            // only for an explicit user request or a newly assigned scene.
+            if (hadModel) mpPG->reset(pRenderContext);
             mPGFrameIndex = 0;
             mPGCameraPosition = mpScene->getCamera()->getPosition();
             mResetPG = false;
@@ -1018,14 +1054,10 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         resetDIHistory("Render options or seed changed");
     if ((updates & sharcInvalidations) != IScene::UpdateFlags::None)
         mResetSHARCCache = true;
-    // PG stores a proposal, not radiance. Keep its regions and progressively
-    // train on the current scene during ordinary geometry/light motion.
-    if ((updates & sharcInvalidations) != IScene::UpdateFlags::None)
-        mResetPG = true;
-    // First PG version has no LOD hysteresis or cross-LOD model retention.
-    // Actual camera translation restarts PG; projection jitter changes no position.
+    // Keep the proposal and its old LOD regions. Scene changes invalidate stored
+    // radiance above, while fresh independent observations adapt the PG model.
     const bool pgCameraTranslated = mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition);
-    if (pgCameraTranslated) mResetPG = true;
+    if (mEnablePG) mPGCameraPosition = mpScene->getCamera()->getPosition();
     if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None) reset();
     else if (!mEnableNRD && sceneChanged)
         // Progressive image accumulation cannot mix scene poses, but its
@@ -1037,6 +1069,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const uint2 frameDim(color->getWidth(), color->getHeight());
     if (any(frameDim != mFrameDim) || !mpAccumulation)
     {
+        drainPGAsync();
+        if (mpPGAsyncTrainer) mpPGAsyncTrainer->releaseCompletedBindings();
         // Release old per-pixel records before allocating the new resolution.
         invalidateStages();
         if (mEnablePG) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
@@ -1097,7 +1131,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         reset();
 
     mNRDHistoryResetThisFrame = (mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory;
-    mPGTranslationPreservedNRDThisFrame = mEnableNRD && pgCameraTranslated && mPGModelResetThisFrame && !mNRDHistoryResetThisFrame;
+    mPGTranslationPreservedNRDThisFrame = mEnableNRD && pgCameraTranslated && !mNRDHistoryResetThisFrame;
     if (mNRDHistoryResetThisFrame)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
@@ -1332,14 +1366,14 @@ void RTPT::renderUI(Gui::Widgets& widget)
             Properties props;
             bool value = mPGSettings.enabled;
             if (pgWidget.checkbox("Enabled", value)) props["pgEnabled"] = value;
-            pgWidget.tooltip("Enable guiding and training independently of SHaRC. Switching resets NRD and final accumulation.", true);
+            pgWidget.tooltip("Enable guiding and training independently of SHaRC. Switching retains the model, sampling sequence and image histories.", true);
             value = mPGSettings.useGuiding;
             if (pgWidget.checkbox("Use guiding", value)) props["pgUseGuiding"] = value;
             if (mGRISEnabled)
             {
                 uint32_t depth = mGRISPGPrefixDepth;
                 if (pgWidget.dropdown("GRIS guided prefix", kGRISPGPrefixDepths, depth)) props["grisPGPrefixDepth"] = depth;
-                pgWidget.tooltip("Guide only the primary diffuse edge x0 to x1. x1 and deeper directions use BSDF sampling. Switching discards only GRIS history.", true);
+                pgWidget.tooltip("Guide only the primary diffuse edge x0 to x1. x1 and deeper directions use BSDF sampling. Switching preserves reference-domain GRIS history.", true);
             }
             value = !mPGSettings.trainingEnabled;
             if (pgWidget.checkbox("Freeze training", value)) props["pgFreeze"] = value;
@@ -1384,7 +1418,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
                 std::to_string(stats.recordOverflow) + " / " + std::to_string(stats.accumulationOverflow));
             pgWidget.text(mSharedTrainingThisFrame ? "Sparse training shared with SHaRC." : "Separate sparse update settings or inactive consumer.");
             pgWidget.text("PG-selected edges trace on; SHaRC termination remains on BSDF-selected edges.");
-            pgWidget.text("Camera translation resets PG. LOD hysteresis, old LOD retention and maturity fallback are deferred.");
+            pgWidget.text("Camera motion retains PG regions. New observations update the model; capacity pressure reclaims individual regions.");
         }
     }
 }

@@ -39,7 +39,8 @@ public:
     }
     Properties getDIStatistics() const;
     Properties getReGIRStatistics() const;
-    void resetPG() { mResetPG = true; mOptionsChanged = true; }
+    // Explicit model clear only. A proposal reset does not reset radiance or RNG history.
+    void resetPG() { mResetPG = true; }
 
 private:
     void invalidateReGIR();
@@ -52,9 +53,10 @@ private:
     void validateScene() const;
     ProgramDesc makeSceneProgramDesc(const char* path, const char* entry = "main") const;
     void prepareProgram(RenderContext* pRenderContext);
-    void invalidateStages();
+    void releasePGProgramBindings();
+    void invalidateStages(bool preserveGRISHistory = false);
     bool prepareStages();
-    void invalidateGRIS(bool clearTemporalFailure = true);
+    void invalidateGRIS(bool clearTemporalFailure = true, bool preserveHistory = false);
     void resetGRISHistory();
     bool canUseGRISReferenceReuse() const;
     bool canUseGRISTemporal() const;
@@ -164,10 +166,12 @@ private:
         uint64_t sharcVersion = 0u;
         uint64_t regirDomainGeneration = 0u;
 
-        bool isCompatible(const GrisTemporalSnapshot& other, bool replaySharc) const
+        bool isCompatible(const GrisTemporalSnapshot& other, bool replaySharc, bool referenceReuse) const
         {
-            return all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
-                pgGeneration == other.pgGeneration &&
+            // Reference records carry their own proposal correction. Neither the PG
+            // resource identity nor its camera/LOD lookup anchor defines their domain.
+            return (referenceReuse || (all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
+                pgGeneration == other.pgGeneration)) &&
                 (sharcVersion == other.sharcVersion || (replaySharc && sharcVersion != 0u && other.sharcVersion != 0u)) &&
                 regirDomainGeneration == other.regirDomainGeneration;
         }
@@ -184,6 +188,7 @@ private:
     } mGRISHistoryFrame;
     uint32_t mGRISHistoryGeneration = 0u;
     bool mGRISHistoryReadValid = false;
+    bool mGRISHistoryReferenceDomain = false;
     bool mGRISHistoryReplayActive = false;
     std::string mGRISTemporalFallbackReason;
     bool mGRISEnabled = false;

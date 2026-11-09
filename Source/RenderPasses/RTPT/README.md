@@ -2,6 +2,18 @@
 
 > RTPT 实验测试代码、场景及验证说明已归档到 `build/rtpt-experiment-tests-backup-20261101/`，并从当前测试构建中移除。下文的阶段验证链接指向历史归档；已有性能报告和图像仍保留在 `build/`。
 
+## PG 持续更新与 GRIS 历史保留
+
+PG 现在保留已学习区域并按新的独立观测持续更新。相机移动、PG Enabled/Use guiding、混合比例、prefix 0/1、训练参数或预算变化不再自动清空 PG；Freeze 暂停训练，恢复后接续原进度。首次分配初始化模型，显式 Reset PG 和更换整个 Scene 仍可清空模型，但不再因为单独 Reset PG 而重启主采样序列或清 GRIS/NRD 历史。材质、光照、几何等真实运输变化仍独立使 GRIS 辐射历史失效，PG proposal 则用后续观测逐步适应。
+
+模型池扩缩容保留已有 Read/Build、未消费统计和诊断后重新绑定，不重编译仅因容量变化而不变的 shader。相机选择不同 LOD 时保留原 level 的区域；sceneScale 切换用 CPU 命名空间区分同数值 key 对应的不同世界范围。容量压力每批最多替换容量 1/8 的陈旧区域，预算缩小时保留有界子集，不承诺永久保留所有访问过的区域。Read 在本帧采样/PDF 评价期间保持不变，训练写独立 Build，发布仍在本帧及训练完成后进行。
+
+固定 x2 reference-domain GRIS 不再以 PG version、generation 或 lookup 相机锚点判断历史有效性。PG 引起的程序重编译保留符合尺寸、反射布局及 reference 语义的 GRIS 历史，重新建立程序绑定和工作资源；旧 owner 使用保存的上一帧相机评价，目标 owner 使用当前相机。其他阶段按自身规则重建，例如 ENABLE_PG 重编译仍清首表面 ReSTIR DI 历史。cell-only ReGIR 在 brightnessThreshold=0 时，相机/LOD 改变不再单独触发域失效；正弱光截断保留其独立域检查。旧 F/W/M/R 始终配套使用，不按新 PG 重算源 R。GPU 记录仍为 fresh/candidate 128 B、history 108 B/像素。
+
+`pgStats` 新增 initializations、resetCalls、modelMigrations、lastMigrationPreservedRegions、evictedRegions、namespaceChanges、activeRegions 和 readModelFingerprint；后者描述当前 namespace 的 Read 内容。`stageStats` 提供历史代际/已发布帧及 reference 语义标记；grisPGSnapshotDependent 在 reference 模式为 false，实际引导状态由 grisPGProposalActive 报告。实施契约和验证范围见 [持续更新计划](GRIS_PG_HISTORY_DECOUPLING_PLAN.md)。下文首版和性能实验中的“相机平移重置 PG”“跨 LOD 区域保留暂缓”属于当时行为，当前以上述实现为准。
+
+本次 Release 构建通过；最终 GPU 生命周期验收为 821 帧、43,879 项检查，覆盖普通采灯、ReGIR、实际独立队列训练、容量压力及预检失败恢复。两种采灯模式各 10 独立种子的 PT/local/joint 原始 HDR 均值验收均通过，local/joint 的 D/S/RGB 共 36/36 通道满足预定 ±2% / 95% 区间门槛，包含连续 alpha 更新和 16/32 MiB 模型池迁移。精确枚举和实际 shader 抽样压力检查也通过；完整协议、数值边界限制、二进制指纹和结果见 [最终验证汇总](../../../build/gris-pg-continuous-validation/summary.json)。这些结果不作等时画质或性能结论。
+
 ## ReGIR：3D LOD cell 候选光源列表
 
 ReGIR 使用与 SHaRC 同类的世界空间对数 LOD，尺寸独立设置：`regirCellSize=2.0`，`regirCoarsenCellDistance=16.0`。相机欧氏距离达到 16 个当前层 cell 边长时变粗一级，默认距离 32、64、128 分别换为边长 4、8、16；改变 `sharcSceneScale` 不改变 ReGIR。`regirGridSize=20` 是兼容容量提示，向上取二次幂后分配 8192 个持久哈希槽，不表示空间边长。
@@ -18,7 +30,11 @@ ReGIR 使用与 SHaRC 同类的世界空间对数 LOD，尺寸独立设置：`re
 
 新 `GrisReGIRPath` kind 使用现有方向/尾因子槽保存已含内层 RIS 补偿的静态尾段，与旧 `GrisReGIR` 的 UV/权重重建编码区分。x2 直接项不套普通灯/BSDF MIS，也不含 x2 continuation 比率；深尾继续保留 q2/reference 转换。被 ReGIR 覆盖的非 delta 命灯 emission 按已有规则去重，delta 及直接可见 emission 保留。
 
-reference-tail 目前仅对 ReGIR-only、次级采灯开启、SHaRC 查询关闭的组合启用；混合屏幕 DI 等组合保留完整本地估计。`stageStats.grisReGIRPathReuseEnabled` 报告实际编译生效状态。持久结构不新增字段，历史仍按场景、参数、PG 与 ReGIR 域代际规则失效，不支持动态尾段回放。ReGIR 自身共享缓存仍单独占用显存。
+reference-tail 目前仅对 ReGIR-only、次级采灯开启、SHaRC 查询关闭的组合启用；混合屏幕 DI 等组合保留完整本地估计。`stageStats.grisReGIRPathReuseEnabled` 报告实际编译生效状态。持久结构不新增字段，历史按场景、运输参数及独立光照域规则失效，不依赖 PG reset generation；不支持动态尾段回放。ReGIR 自身共享缓存仍单独占用显存。
+
+固定 x2 的 reference-domain GRIS（普通采灯及上述 ReGIR-only 模式）保留每条历史记录配套的 `F/W/M` 和表示比例 `R=areaPdf/sourceAreaPdf`。fresh 记录的 R 来自实际生成密度，重连赢家则保存新 owner 下配套的 R 与归一化权重。交叉评价使用物理 BSDF 和固定辅助前缀分布，不使用新版 guide 重算旧记录的 R。连续帧、尺寸、记录语义和真实运输/光照域检查继续有效，PG 数据身份不再参与这条路径的历史门控，无需新增逐像素字段或保存旧 PG 树。
+
+此前仅放宽普通 publication 的验证：Release 构建通过；独立有理数枚举的 7 项用例、33,363 个状态和 56 项 indicator 检查通过。普通采灯及 ReGIR-only 的 temporal/joint 共 272 帧、4,068 项生命周期/有限值检查通过；其中 prefix 切换、Reset PG 和相机平移沿用旧失效预期。该历史验证仅检查可读标志，不代表本节持续更新实现或实际历史赢家的验收。记录见 [旧验证汇总](../../../build/gris-pg-history-validation/summary.json)。
 
 光路图、MIS/PDF 契约、实施范围及验证结果见 [接入计划](GRIS_REGIR_NEE_PLAN.md)。构建、245,631 条严格重建路径、功能和独立 10 seed 均值确认通过，PG0 四模式与 PG1 joint 共 45/45 通道满足预定 ±2% / 95% 区间门槛。PG1 精确关闭回归和初轮 5 seed 均值对照的未通过结果仍分别保留，最终汇总不标为全部验收通过。本场景 640×360 完整图 GPU 均值为 off 4.556 ms、on 5.424 ms；ReGIR 缓存约 34.283 MiB，GRIS 持久记录净增 0 B。具体范围见 [最终汇总](../../../build/gris-regir-validation/summary.json)。本轮隔离验证保存在 `build/gris-regir-validation/`，不恢复已归档的旧测试构建。
 
@@ -98,13 +114,13 @@ SHaRC 和 PG 的实际更新 tile、反弹数相同时共享一次稀疏追踪�
 
 默认 `pgTreeBudgetMB=64` 包含 Read/Build 节点、48 B/Build 节点的训练统计、区域索引、请求表及有界传输/对齐预留。方向 Read/Build 节点各 20 B，合计每对节点 88 B。固定池按容量占用显存，池内按需分配区域与方向节点；达到预算不再增长。`pgRecordBudgetMB=128` 独立管理完整路径记录，8 跳时每槽约 832 B；预算不足增大实际训练 tile，而不截断单条路径。现有 SHaRC、NRD 和图像资源不计入这两个 PG 预算。
 
-`RTPT.pgStats` 提供区域数、有效模型、节点数、训练帧、发布次数、实际/预留字节、实际 tile、代次、发布耗时和诊断计数。诊断下标：0 请求溢出、1 记录溢出、2 无效数据、3 累计溢出、4 查询、5 guide 分支、6 基础 BSDF 回退、7 guide 边跳过 SHaRC、8 实际训练顶点、9 零权重观测、10 新区域请求、11 完整训练路径、12 无效 PDF。正常模型发布不反复清空 NRD/最终累积；Enabled、采样模式、场景失效或显式 Reset 会重置相关历史。最终累积达到 128 帧后，上游训练继续；Freeze 后可手动 Reset FrameAccumulation 观察固定模型。
+`RTPT.pgStats` 提供区域数、有效模型、节点数、训练帧、发布次数、实际/预留字节、实际 tile、代次、发布耗时和诊断计数。诊断下标：0 请求溢出、1 记录溢出、2 无效数据、3 累计溢出、4 查询、5 guide 分支、6 基础 BSDF 回退、7 guide 边跳过 SHaRC、8 实际训练顶点、9 零权重观测、10 新区域请求、11 完整训练路径、12 无效 PDF。当前普通发布、纯 PG Enabled/采样参数变化及单独 Reset PG 都不清空 GRIS/NRD/最终累积；场景、实际运输设置和显式全渲染重置独立处理。最终累积达到 128 帧后，上游训练继续；Freeze 后可手动 Reset FrameAccumulation 观察固定模型。
 
 高频活动计数 4–11 由 `pgDetailedDiagnostics` 控制，默认关闭；`RTPR_START.cmd` 的 `RTPT_PG_DIAGNOSTICS_ENABLED=1/0` 和窗口 **PG → Detailed diagnostics enabled** 可独立切换。关闭时保留已有活动计数，后续不再增加，不能把这些值解释为当前没有查询或训练。错误计数 0–3、12 始终启用，训练质量、平方和、真实观测数和区域请求写入不受此开关影响。纯诊断切换保留模型、NRD 历史和最终累积。
 
 发布计时以 `publishCalls` 为分母，区别于实际更新 Read 的 `publications`。`totalPublishMs`/`maxPublishMs`/`lastPublishMs` 及 `totalDrainMs`、`totalReadbackMs`、`totalCpuRebuildMs`、`totalUploadMs` 记录 CPU 墙钟时间；传输阶段包含已有 GPU 等待，不额外引入同步。对应 `total*Bytes` 和 `total*Waits` 记录真实传输量和显式等待次数。Falcor Profiler 中另有 `SparseTrace`、`PGPrepare`、`PGTrain`、`SHARCResolve`、`MainRender`、`PGPublishCPU` 分项；发布范围的 GPU 时间包含跨提交的空闲间隔，不能当成纯计算核耗时。性能对照脚本在独立区间采集 profile，避免计时器开销混入吞吐测量。
 
-**明确暂缓，首版完成后需要提醒的三项：LOD 切换迟滞、跨 LOD 旧区域保留、按模型成熟度选择回退模型。** 当前相机位置实际变化会清空 PG 并重训，投影采样抖动不触发。当前只做空/零质量分布的合法 BSDF 路径，不做成熟度评分、父模型选择或成熟度驱动的引导比例。材质、光照、几何变化保守重置 PG。
+首版暂缓的三项中，本次已经实现有界的跨 LOD 旧区域保留；**LOD 切换迟滞、按模型成熟度选择回退模型仍暂缓**。相机移动以及同一场景内材质、光照、几何变化不再全量清空 PG，旧 proposal 用后续独立观测适应；真实运输变化仍独立使 GRIS 辐射历史失效。空/零质量分布沿用合法 BSDF 路径，不做成熟度评分、父模型选择或成熟度驱动的引导比例。
 
 原 FalcorTest `RTPTPG*` 数值测试和 `tests/RTPT` Python 验证脚本均已按用户要求删除，日常启动使用 `RTPR_START.cmd`。以下是首版的历史记录：2026-10-17 在 RTX 5070 / D3D12 上，Release 构建、四项 GPU 数值回归和统一主图 86 项生命周期检查通过。160×90、两组种子、每组约 2 秒且包含训练/发布的短时对照没有显示收益：PG 开启后的归一化误差约高 1.6%–1.7%，完成帧数约为关闭时的 62%–64%。这只是低分辨率 smoke，参考图本身也有噪声，不是生产分辨率或普遍性能结论；本轮交付是可独立开关的功能首版。
 
@@ -125,7 +141,7 @@ CPU 复用工作数组、已知键集合和哈希表；区域集合稳定时跳�
 
 原始结果位于 `build/pg-perf-before-01/report.json`、`build/pg-perf-after-01/report.json`，配对汇总为 `build/pg-perf-comparison.json`；诊断隔离汇总为 `build/pg-perf-diagnostic-comparison.json`。`build/pg-perf-quality-comparison.png` 展示稳态种子 29 的原始/最终 HDR；预览统一使用 Reinhard+sRGB，误差在线性 HDR 中计算。对应的复现与离线比较脚本、使用说明现已删除，旧报告保留供参考。
 
-优化版 Release 构建、D3D12 debug layer 下 **5 项 GPU 数值测试与 106 项生命周期检查（216 帧）**通过；覆盖诊断开关/错误保留、训练和请求等价、模块恢复、预算重建、Stop 累积保持，以及 65536 区域配置的多批传输。大表验证实际读回 3 批、上传 3 批，未发生无效样本或记录/累计溢出，预留仍在 64 MiB 内。日志分别为 `build/pg-perf-gpu-tests.xml` 和 `build/pg-perf-validation-02/report.json`。本次未实现 LOD 迟滞、跨 LOD 区域保留或未成熟模型回退。
+该次优化版 Release 构建、D3D12 debug layer 下 **5 项 GPU 数值测试与 106 项生命周期检查（216 帧）**通过；覆盖诊断开关/错误保留、训练和请求等价、模块恢复、预算重建、Stop 累积保持，以及 65536 区域配置的多批传输。大表验证实际读回 3 批、上传 3 批，未发生无效样本或记录/累计溢出，预留仍在 64 MiB 内。日志分别为 `build/pg-perf-gpu-tests.xml` 和 `build/pg-perf-validation-02/report.json`。当时未实现 LOD 迟滞、跨 LOD 区域保留或未成熟模型回退；当前跨 LOD 保留行为见本文开头的持续更新说明。
 
 ## PG 剩余成本定位（2026-10-17）
 
@@ -160,7 +176,7 @@ Nsight UI 选定同一 Main shader 后导出全部 HLSL 行统计。严格只累
 
 路径增长的重要机制在 `RTPTSharc.slang:128–133`：**当前到达边由 guide 选出时，跳过这一次 SHaRC 终止**，之后 BSDF 选出的边仍可查询；这不是整条路径永久禁用缓存。ABBA 末帧 attempted queries **407,443 → 353,802**，成功终止 **324,710 → 282,562**，进入查询后的成功率 **79.69% → 79.86%**，所以不能称缓存内容的命中质量变差。guide 拒绝发生在 footprint 和真正查表之前，拒绝计数不等于本来能成功命中的数量。PG 也改变方向、混合权重、RR 与随机流；这些机制分别造成多少净增射线尚不能从汇总分开，但实际更多后续路径、NEE/BSDF 工作及 shadow calls 已经确认。
 
-后续优化优先验证**保持运输语义的重复工作复用**：采样返回与实际生成方向一致的 PG 密度，减少紧邻的反向映射/重走树；复用同顶点 BSDF 构造及可证明等价的 PDF 中间量；再检查 map/region/root/node 的依赖读取和布局。指令缓存、PG 与 BSDF 代码共同造成的 stall 不能拆成互斥因果份额，不能直接宣称某个改动能省去 19% 或 22%。改变 guide 边 SHaRC 终止条件需要另行设计和验证其角分布足迹，本轮没有修改。RayQuery 架构、统一入口和模块独立开关均保留；LOD 迟滞、跨 LOD 旧区域保留、未成熟模型回退仍暂缓。
+后续优化优先验证**保持运输语义的重复工作复用**：采样返回与实际生成方向一致的 PG 密度，减少紧邻的反向映射/重走树；复用同顶点 BSDF 构造及可证明等价的 PDF 中间量；再检查 map/region/root/node 的依赖读取和布局。指令缓存、PG 与 BSDF 代码共同造成的 stall 不能拆成互斥因果份额，不能直接宣称某个改动能省去 19% 或 22%。改变 guide 边 SHaRC 终止条件需要另行设计和验证其角分布足迹，本轮没有修改。RayQuery 架构、统一入口和模块独立开关均保留；LOD 迟滞、未成熟模型回退仍暂缓，跨 LOD 旧区域现已按有限容量保留。
 
 ## 主采样重复工作复用与缓存复核（2026-10-17）
 
