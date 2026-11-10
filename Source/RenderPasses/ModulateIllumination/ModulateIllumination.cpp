@@ -27,6 +27,7 @@
  **************************************************************************/
 #include "ModulateIllumination.h"
 #include "RenderGraph/RenderPassHelpers.h"
+#include <cmath>
 
 namespace
 {
@@ -65,6 +66,8 @@ const char kUseDeltaTransmissionReflectance[] = "useDeltaTransmissionReflectance
 const char kUseDeltaTransmissionRadiance[] = "useDeltaTransmissionRadiance";
 const char kUseResidualRadiance[] = "useResidualRadiance";
 const char kOutputSize[] = "outputSize";
+const char kDiffuseRadianceScale[] = "diffuseRadianceScale";
+const char kSpecularRadianceScale[] = "specularRadianceScale";
 } // namespace
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
@@ -105,11 +108,19 @@ ModulateIllumination::ModulateIllumination(ref<Device> pDevice, const Properties
             mUseResidualRadiance = value;
         else if (key == kOutputSize)
             mOutputSizeSelection = value;
+        else if (key == kDiffuseRadianceScale)
+            mDiffuseRadianceScale = value;
+        else if (key == kSpecularRadianceScale)
+            mSpecularRadianceScale = value;
         else
         {
             logWarning("Unknown property '{}' in ModulateIllumination properties.", key);
         }
     }
+    FALCOR_CHECK(std::isfinite(mDiffuseRadianceScale) && mDiffuseRadianceScale > 0.f,
+        "ModulateIllumination diffuseRadianceScale must be finite and positive.");
+    FALCOR_CHECK(std::isfinite(mSpecularRadianceScale) && mSpecularRadianceScale > 0.f,
+        "ModulateIllumination specularRadianceScale must be finite and positive.");
 }
 
 Falcor::Properties ModulateIllumination::getProperties() const
@@ -128,6 +139,8 @@ Falcor::Properties ModulateIllumination::getProperties() const
     props[kUseDeltaTransmissionRadiance] = mUseDeltaTransmissionRadiance;
     props[kUseResidualRadiance] = mUseResidualRadiance;
     props[kOutputSize] = mOutputSizeSelection;
+    props[kDiffuseRadianceScale] = mDiffuseRadianceScale;
+    props[kSpecularRadianceScale] = mSpecularRadianceScale;
     return props;
 }
 
@@ -190,6 +203,8 @@ void ModulateIllumination::execute(RenderContext* pRenderContext, const RenderDa
 
     auto var = mpModulateIlluminationPass->getRootVar();
     var["CB"]["frameDim"] = mFrameDim;
+    var["CB"]["diffuseRadianceScale"] = mDiffuseRadianceScale;
+    var["CB"]["specularRadianceScale"] = mSpecularRadianceScale;
 
     auto bind = [&](const ChannelDesc& desc)
     {

@@ -88,6 +88,7 @@ private:
     void createPipelines();
     void createResources();
     void executeInternal(RenderContext* pRenderContext, const RenderData& renderData);
+    void blitRadiance(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, float scale);
     void dispatch(RenderContext* pRenderContext, const RenderData& renderData, const nrd::DispatchDesc& dispatchDesc);
 
     nrd::Denoiser* mpDenoiser = nullptr;
@@ -99,6 +100,10 @@ private:
     bool mResetHistory = true;
     bool mWorldSpaceMotion = true;
     float mMaxIntensity = 1000.f;
+    // Output RGB stays in these scaled units, including when NRD is disabled.
+    // The downstream modulation pass must apply the reciprocal scales.
+    float mDiffuseRadianceScale = 1.f;
+    float mSpecularRadianceScale = 1.f;
     float mDisocclusionThreshold = 2.f;
     nrd::CommonSettings mCommonSettings = {};
     nrd::RelaxDiffuseSpecularSettings mRelaxDiffuseSpecularSettings = {};
@@ -122,6 +127,7 @@ private:
     // Additional classic Falcor compute pass and resources for packing radiance and hitT for NRD.
     ref<ComputePass> mpPackRadiancePassRelax;
     ref<ComputePass> mpPackRadiancePassReblur;
+    ref<ComputePass> mpScaleRadiancePass;
 };
 
 FALCOR_ENUM_REGISTER(NRDPass::DenoisingMethod);

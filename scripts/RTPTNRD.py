@@ -24,9 +24,14 @@ def render_graph_RTPTNRD():
         "worldSpaceMotion": True,
         # Keep ReLAX's FP16 moments finite; the independent raw color remains unclamped.
         "maxIntensity": 250.0,
+        "diffuseRadianceScale": 1.0 / 256.0,
+        "specularRadianceScale": 1.0 / 512.0,
+        "specularVarianceBoost": 1.0 / (512.0 * 512.0),
     }), "NRD")
     graph.addPass(createPass("ModulateIllumination", {
         "useResidualRadiance": True,
+        "diffuseRadianceScale": 256.0,
+        "specularRadianceScale": 512.0,
     }), "ModulateIllumination")
     graph.addPass(createPass("ToneMapper", {
         "useSceneMetadata": False,

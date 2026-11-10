@@ -31,10 +31,12 @@
 #include "NRDPass.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "RenderPasses/Shared/Denoising/NRDConstants.slang"
+#include <cmath>
 
 namespace
 {
 const char kShaderPackRadiance[] = "RenderPasses/NRDPass/PackRadiance.cs.slang";
+const char kShaderScaleRadiance[] = "RenderPasses/NRDPass/ScaleRadiance.cs.slang";
 
 // Input buffer names.
 const char kInputDiffuseRadianceHitDist[] = "diffuseRadianceHitDist";
@@ -61,9 +63,14 @@ const char kOutputSize[] = "outputSize";
 // Common settings.
 const char kWorldSpaceMotion[] = "worldSpaceMotion";
 const char kDisocclusionThreshold[] = "disocclusionThreshold";
+// Optional fixed time step for reproducible offline captures. Zero lets NRD
+// measure elapsed time, preserving the interactive rendering behavior.
+const char kTimeDeltaBetweenFrames[] = "timeDeltaBetweenFrames";
 
 // Pack radiance settings.
 const char kMaxIntensity[] = "maxIntensity";
+const char kDiffuseRadianceScale[] = "diffuseRadianceScale";
+const char kSpecularRadianceScale[] = "specularRadianceScale";
 
 // ReLAX diffuse/specular settings.
 const char kDiffusePrepassBlurRadius[] = "diffusePrepassBlurRadius";
@@ -104,11 +111,29 @@ const Gui::DropdownList kDenoisingMethod = {
     {(uint32_t)NRDPass::DenoisingMethod::RelaxDiffuseSpecular, "ReLAX"},
     {(uint32_t)NRDPass::DenoisingMethod::ReblurDiffuseSpecular, "ReBLUR"},
 };
+
 } // namespace
+
+// Use texture loads/UAV writes to avoid sampler precision loss in the bypass.
+// Scale before FP16 conversion; hit distance is never scaled or clamped.
+void NRDPass::blitRadiance(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, float scale)
+{
+    if (scale == 1.f)
+    {
+        pRenderContext->blit(pSrc->getSRV(), pDst->getRTV());
+        return;
+    }
+    auto var = mpScaleRadiancePass->getRootVar();
+    var["gInput"] = pSrc;
+    var["gOutput"] = pDst;
+    var["PerImageCB"]["gRadianceScale"] = scale;
+    mpScaleRadiancePass->execute(pRenderContext, uint3(pDst->getWidth(), pDst->getHeight(), 1));
+}
 
 NRDPass::NRDPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
     mpDevice->requireD3D12();
+    mpScaleRadiancePass = ComputePass::create(mpDevice, kShaderScaleRadiance, "main");
 
     DefineList definesRelax;
     definesRelax.add("NRD_USE_OCT_NORMAL_ENCODING", "1");
@@ -162,10 +187,16 @@ NRDPass::NRDPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
             mWorldSpaceMotion = value;
         else if (key == kDisocclusionThreshold)
             mDisocclusionThreshold = value;
+        else if (key == kTimeDeltaBetweenFrames)
+            mCommonSettings.timeDeltaBetweenFrames = value;
 
         // Pack radiance settings.
         else if (key == kMaxIntensity)
             mMaxIntensity = value;
+        else if (key == kDiffuseRadianceScale)
+            mDiffuseRadianceScale = value;
+        else if (key == kSpecularRadianceScale)
+            mSpecularRadianceScale = value;
 
         // ReLAX diffuse/specular settings.
         else if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
@@ -283,6 +314,12 @@ NRDPass::NRDPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
             logWarning("Unknown property '{}' in NRD properties.", key);
         }
     }
+    FALCOR_CHECK(std::isfinite(mDiffuseRadianceScale) && mDiffuseRadianceScale > 0.f && mDiffuseRadianceScale <= 1.f,
+        "NRD diffuseRadianceScale must be finite and in (0, 1].");
+    FALCOR_CHECK(std::isfinite(mSpecularRadianceScale) && mSpecularRadianceScale > 0.f && mSpecularRadianceScale <= 1.f,
+        "NRD specularRadianceScale must be finite and in (0, 1].");
+    FALCOR_CHECK(std::isfinite(mCommonSettings.timeDeltaBetweenFrames) && mCommonSettings.timeDeltaBetweenFrames >= 0.f,
+        "NRD timeDeltaBetweenFrames must be finite and non-negative (milliseconds).");
 }
 
 NRDPass::~NRDPass()
@@ -302,9 +339,12 @@ Properties NRDPass::getProperties() const
     // Common settings.
     props[kWorldSpaceMotion] = mWorldSpaceMotion;
     props[kDisocclusionThreshold] = mDisocclusionThreshold;
+    props[kTimeDeltaBetweenFrames] = mCommonSettings.timeDeltaBetweenFrames;
 
     // Pack radiance settings.
     props[kMaxIntensity] = mMaxIntensity;
+    props[kDiffuseRadianceScale] = mDiffuseRadianceScale;
+    props[kSpecularRadianceScale] = mSpecularRadianceScale;
 
     // ReLAX diffuse/specular settings.
     if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
@@ -486,20 +526,20 @@ void NRDPass::execute(RenderContext* pRenderContext, const RenderData& renderDat
         mResetHistory = true;
         if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
         {
-            pRenderContext->blit(
-                renderData.getTexture(kInputDiffuseRadianceHitDist)->getSRV(),
-                renderData.getTexture(kOutputFilteredDiffuseRadianceHitDist)->getRTV()
+            blitRadiance(
+                pRenderContext, renderData.getTexture(kInputDiffuseRadianceHitDist),
+                renderData.getTexture(kOutputFilteredDiffuseRadianceHitDist), mDiffuseRadianceScale
             );
-            pRenderContext->blit(
-                renderData.getTexture(kInputSpecularRadianceHitDist)->getSRV(),
-                renderData.getTexture(kOutputFilteredSpecularRadianceHitDist)->getRTV()
+            blitRadiance(
+                pRenderContext, renderData.getTexture(kInputSpecularRadianceHitDist),
+                renderData.getTexture(kOutputFilteredSpecularRadianceHitDist), mSpecularRadianceScale
             );
         }
         else if (mDenoisingMethod == DenoisingMethod::RelaxDiffuse)
         {
-            pRenderContext->blit(
-                renderData.getTexture(kInputDiffuseRadianceHitDist)->getSRV(),
-                renderData.getTexture(kOutputFilteredDiffuseRadianceHitDist)->getRTV()
+            blitRadiance(
+                pRenderContext, renderData.getTexture(kInputDiffuseRadianceHitDist),
+                renderData.getTexture(kOutputFilteredDiffuseRadianceHitDist), mDiffuseRadianceScale
             );
         }
         else if (mDenoisingMethod == DenoisingMethod::SpecularReflectionMv)
@@ -1080,6 +1120,8 @@ void NRDPass::executeInternal(RenderContext* pRenderContext, const RenderData& r
             auto perImageCB = mpPackRadiancePassRelax->getRootVar()["PerImageCB"];
 
             perImageCB["gMaxIntensity"] = mMaxIntensity;
+            perImageCB["gDiffuseRadianceScale"] = mDiffuseRadianceScale;
+            perImageCB["gSpecularRadianceScale"] = mSpecularRadianceScale;
             perImageCB["gDiffuseRadianceHitDist"] = renderData.getTexture(kInputDiffuseRadianceHitDist);
             perImageCB["gSpecularRadianceHitDist"] = renderData.getTexture(kInputSpecularRadianceHitDist);
             mpPackRadiancePassRelax->execute(pRenderContext, uint3(mScreenSize.x, mScreenSize.y, 1u));
@@ -1095,6 +1137,8 @@ void NRDPass::executeInternal(RenderContext* pRenderContext, const RenderData& r
             auto perImageCB = mpPackRadiancePassRelax->getRootVar()["PerImageCB"];
 
             perImageCB["gMaxIntensity"] = mMaxIntensity;
+            perImageCB["gDiffuseRadianceScale"] = mDiffuseRadianceScale;
+            perImageCB["gSpecularRadianceScale"] = mSpecularRadianceScale;
             perImageCB["gDiffuseRadianceHitDist"] = renderData.getTexture(kInputDiffuseRadianceHitDist);
             mpPackRadiancePassRelax->execute(pRenderContext, uint3(mScreenSize.x, mScreenSize.y, 1u));
         }
@@ -1110,6 +1154,8 @@ void NRDPass::executeInternal(RenderContext* pRenderContext, const RenderData& r
 
             perImageCB["gHitDistParams"].setBlob(mReblurSettings.hitDistanceParameters);
             perImageCB["gMaxIntensity"] = mMaxIntensity;
+            perImageCB["gDiffuseRadianceScale"] = mDiffuseRadianceScale;
+            perImageCB["gSpecularRadianceScale"] = mSpecularRadianceScale;
             perImageCB["gDiffuseRadianceHitDist"] = renderData.getTexture(kInputDiffuseRadianceHitDist);
             perImageCB["gSpecularRadianceHitDist"] = renderData.getTexture(kInputSpecularRadianceHitDist);
             perImageCB["gNormalRoughness"] = renderData.getTexture(kInputNormalRoughnessMaterialID);

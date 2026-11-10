@@ -180,9 +180,6 @@ target_sources(FalcorTest PRIVATE
 
 target_link_libraries(FalcorTest PRIVATE args)
 
-# RTPT fixtures dispatch production shaders copied by the plugin target.
-add_dependencies(FalcorTest RTPT)
-
 target_copy_shaders(FalcorTest .)
 
 target_source_group(FalcorTest "Tools")

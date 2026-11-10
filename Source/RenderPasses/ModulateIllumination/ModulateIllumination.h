@@ -56,6 +56,10 @@ private:
 
     ref<ComputePass> mpModulateIlluminationPass;
 
+    // Restore NRD's scaled RGB before material modulation in FP32.
+    float mDiffuseRadianceScale = 1.f;
+    float mSpecularRadianceScale = 1.f;
+
     bool mUseEmission = true;
     bool mUseDiffuseReflectance = true;
     bool mUseDiffuseRadiance = true;

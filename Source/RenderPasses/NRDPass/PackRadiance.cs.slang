@@ -40,6 +40,8 @@ cbuffer PerImageCB
 {
     float4 gHitDistParams;
     float gMaxIntensity;
+    float gDiffuseRadianceScale;
+    float gSpecularRadianceScale;
 
     Texture2D<float> gViewZ;
     Texture2D<float4> gNormalRoughness;
@@ -76,9 +78,17 @@ void clampRadiance(inout float3 diffuseRadiance, inout float3 specularRadiance)
 void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
     int2 ipos = dispatchThreadId.xy;
+    uint width, height;
+    gDiffuseRadianceHitDist.GetDimensions(width, height);
+    if (any(dispatchThreadId.xy >= uint2(width, height))) return;
 
     float4 diffuseRadianceHitDist = gDiffuseRadianceHitDist[ipos];
     float4 specularRadianceHitDist = gSpecularRadianceHitDist[ipos];
+
+    // Only RGB changes units. Keep guides and hit distances in world units.
+    // Scale before clamping and before NRD writes FP16 luminance moments.
+    diffuseRadianceHitDist.rgb *= gDiffuseRadianceScale;
+    specularRadianceHitDist.rgb *= gSpecularRadianceScale;
 
     clampRadiance(diffuseRadianceHitDist.rgb, specularRadianceHitDist.rgb);
 

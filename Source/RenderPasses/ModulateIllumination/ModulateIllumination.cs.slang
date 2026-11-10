@@ -32,6 +32,8 @@
 cbuffer CB
 {
     uint2 frameDim;
+    float diffuseRadianceScale;
+    float specularRadianceScale;
 }
 
 Texture2D gEmission;
@@ -65,7 +67,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 
     if (is_valid(gDiffuseRadiance))
     {
-        float3 diffuseColor = gDiffuseRadiance[pixel].rgb;
+        float3 diffuseColor = gDiffuseRadiance[pixel].rgb * diffuseRadianceScale;
 
         if (is_valid(gDiffuseReflectance))
         {
@@ -76,7 +78,7 @@ void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 
     if (is_valid(gSpecularRadiance))
     {
-        float3 specularColor = gSpecularRadiance[pixel].rgb;
+        float3 specularColor = gSpecularRadiance[pixel].rgb * specularRadianceScale;
 
         if (is_valid(gSpecularReflectance))
         {
