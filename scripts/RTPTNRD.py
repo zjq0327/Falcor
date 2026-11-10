@@ -22,6 +22,11 @@ def render_graph_RTPTNRD():
     graph.addPass(createPass("NRD", {
         "method": "RelaxDiffuseSpecular",
         "worldSpaceMotion": True,
+        # Preserve sparse diffuse samples without lengthening the fast lighting response.
+        "diffuseMaxAccumulatedFrameNum": 16,
+        "diffuseMaxFastAccumulatedFrameNum": 2,
+        "diffuseHistoryClampingSigmaScale": 4.0,
+        "diffuseHistoryClampingDarkThreshold": 0.0002,
         # Keep ReLAX's FP16 moments finite; the independent raw color remains unclamped.
         "maxIntensity": 250.0,
         "diffuseRadianceScale": 1.0 / 256.0,

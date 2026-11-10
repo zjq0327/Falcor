@@ -91,6 +91,8 @@ const char kDisocclusionFixEdgeStoppingNormalPower[] = "disocclusionFixEdgeStopp
 const char kDisocclusionFixMaxRadius[] = "disocclusionFixMaxRadius";
 const char kDisocclusionFixNumFramesToFix[] = "disocclusionFixNumFramesToFix";
 const char kHistoryClampingColorBoxSigmaScale[] = "historyClampingColorBoxSigmaScale";
+const char kDiffuseHistoryClampingSigmaScale[] = "diffuseHistoryClampingSigmaScale";
+const char kDiffuseHistoryClampingDarkThreshold[] = "diffuseHistoryClampingDarkThreshold";
 const char kSpatialVarianceEstimationHistoryThreshold[] = "spatialVarianceEstimationHistoryThreshold";
 const char kAtrousIterationNum[] = "atrousIterationNum";
 const char kMinLuminanceWeight[] = "minLuminanceWeight";
@@ -189,6 +191,10 @@ NRDPass::NRDPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
             mDisocclusionThreshold = value;
         else if (key == kTimeDeltaBetweenFrames)
             mCommonSettings.timeDeltaBetweenFrames = value;
+        else if (key == kDiffuseHistoryClampingSigmaScale)
+            mDiffuseHistoryClampingSigmaScale = value;
+        else if (key == kDiffuseHistoryClampingDarkThreshold)
+            mDiffuseHistoryClampingDarkThreshold = value;
 
         // Pack radiance settings.
         else if (key == kMaxIntensity)
@@ -320,6 +326,14 @@ NRDPass::NRDPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
         "NRD specularRadianceScale must be finite and in (0, 1].");
     FALCOR_CHECK(std::isfinite(mCommonSettings.timeDeltaBetweenFrames) && mCommonSettings.timeDeltaBetweenFrames >= 0.f,
         "NRD timeDeltaBetweenFrames must be finite and non-negative (milliseconds).");
+    FALCOR_CHECK(std::isfinite(mDiffuseHistoryClampingSigmaScale) && mDiffuseHistoryClampingSigmaScale >= 0.f &&
+        mDiffuseHistoryClampingSigmaScale <= 10.f, "NRD diffuseHistoryClampingSigmaScale must be in [0, 10].");
+    FALCOR_CHECK(std::isfinite(mDiffuseHistoryClampingDarkThreshold) && mDiffuseHistoryClampingDarkThreshold >= 0.f,
+        "NRD diffuseHistoryClampingDarkThreshold must be finite and non-negative.");
+    const float scaledDarkThreshold = mDiffuseHistoryClampingDarkThreshold * mDiffuseRadianceScale;
+    FALCOR_CHECK(mDiffuseHistoryClampingDarkThreshold == 0.f ||
+        (scaledDarkThreshold >= std::numeric_limits<float>::min() && std::isfinite(4.f * scaledDarkThreshold)),
+        "NRD scaled diffuse history dark threshold must have finite, positive transition bounds.");
 }
 
 NRDPass::~NRDPass()
@@ -340,6 +354,8 @@ Properties NRDPass::getProperties() const
     props[kWorldSpaceMotion] = mWorldSpaceMotion;
     props[kDisocclusionThreshold] = mDisocclusionThreshold;
     props[kTimeDeltaBetweenFrames] = mCommonSettings.timeDeltaBetweenFrames;
+    props[kDiffuseHistoryClampingSigmaScale] = mDiffuseHistoryClampingSigmaScale;
+    props[kDiffuseHistoryClampingDarkThreshold] = mDiffuseHistoryClampingDarkThreshold;
 
     // Pack radiance settings.
     props[kMaxIntensity] = mMaxIntensity;
@@ -598,7 +614,7 @@ void NRDPass::renderUI(Gui::Widgets& widget)
 
     if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular || mDenoisingMethod == DenoisingMethod::ReblurDiffuseSpecular)
     {
-        mRecreateDenoiser = widget.dropdown("Denoising method", kDenoisingMethod, reinterpret_cast<uint32_t&>(mDenoisingMethod));
+        mRecreateDenoiser |= widget.dropdown("Denoising method", kDenoisingMethod, reinterpret_cast<uint32_t&>(mDenoisingMethod));
     }
 
     if (mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular)
@@ -632,6 +648,17 @@ void NRDPass::renderUI(Gui::Widgets& widget)
             group.slider("Frames to fix", (uint32_t&)mRelaxDiffuseSpecularSettings.disocclusionFixNumFramesToFix, 0u, 100u);
             group.text("History clamping & antilag:");
             group.slider("Color clamping sigma", mRelaxDiffuseSpecularSettings.historyClampingColorBoxSigmaScale, 0.0f, 10.0f, false, "%.1f");
+            if (group.slider("Diffuse clamping sigma override (0 = shared)", mDiffuseHistoryClampingSigmaScale, 0.f, 10.f, false, "%.1f"))
+            {
+                mRecreateDenoiser = true;
+                mOptionsChanged = true;
+            }
+            if (mDiffuseHistoryClampingSigmaScale > 0.f &&
+                group.slider("Diffuse dark threshold (0 = off)", mDiffuseHistoryClampingDarkThreshold, 0.f, 0.01f, false, "%.5f"))
+            {
+                mRecreateDenoiser = true;
+                mOptionsChanged = true;
+            }
             group.text("Spatial variance estimation:");
             group.slider("History threshold", (uint32_t&)mRelaxDiffuseSpecularSettings.spatialVarianceEstimationHistoryThreshold, 0u, 10u);
             group.text("Firefly filter:");
@@ -954,6 +981,16 @@ void NRDPass::createPipelines()
     // Get denoiser desc for currently initialized denoiser implementation.
     const nrd::DenoiserDesc& denoiserDesc = nrd::GetDenoiserDesc(*mpDenoiser);
 
+    const bool overrideDiffuseClamp = mDenoisingMethod == DenoisingMethod::RelaxDiffuseSpecular &&
+        mDiffuseHistoryClampingSigmaScale > 0.f;
+    if (overrideDiffuseClamp)
+    {
+        const auto& library = nrd::GetLibraryDesc();
+        FALCOR_CHECK(library.versionMajor == 3 && library.versionMinor == 1,
+            "The diffuse history clamp adapter requires NRD 3.1.");
+    }
+    bool foundDiffuseClampPipeline = false;
+
     // Create samplers descriptor layout and set.
     D3D12DescriptorSetLayout SamplersDescriptorSetLayout;
 
@@ -1009,6 +1046,13 @@ void NRDPass::createPipelines()
         // Create Compute PSO for the NRD pass.
         {
             std::string shaderFileName = "nrd/Shaders/Source/" + std::string(nrdPipelineDesc.shaderFileName) + ".hlsl";
+            const bool customDiffuseClamp = overrideDiffuseClamp &&
+                std::string(nrdPipelineDesc.shaderFileName) == "RELAX_DiffuseSpecular_HistoryClamping.cs";
+            if (customDiffuseClamp)
+            {
+                shaderFileName = "RenderPasses/NRDPass/DiffuseHistoryClamping.cs.slang";
+                foundDiffuseClampPipeline = true;
+            }
 
             ProgramDesc programDesc;
             programDesc.addShaderLibrary(shaderFileName).csEntry(nrdPipelineDesc.shaderEntryPointName);
@@ -1017,6 +1061,12 @@ void NRDPass::createPipelines()
             programDesc.setCompilerArguments({"-Wno-30056"});
             DefineList defines;
             defines.add("NRD_COMPILER_DXC");
+            if (customDiffuseClamp)
+            {
+                defines.add("RTPT_DIFFUSE_CLAMP_SIGMA", fmt::format("{:.9g}", mDiffuseHistoryClampingSigmaScale));
+                defines.add("RTPT_DIFFUSE_DARK_THRESHOLD", fmt::format("{:.9g}",
+                    mDiffuseHistoryClampingDarkThreshold * mDiffuseRadianceScale));
+            }
             defines.add("NRD_USE_OCT_NORMAL_ENCODING", "1");
             defines.add("NRD_USE_MATERIAL_ID", "0");
             ref<ComputePass> pPass = ComputePass::create(mpDevice, programDesc, defines);
@@ -1035,6 +1085,7 @@ void NRDPass::createPipelines()
             mpCSOs.push_back(pCSO);
         }
     }
+    FALCOR_CHECK(!overrideDiffuseClamp || foundDiffuseClampPipeline, "NRD diffuse history clamp pipeline was not found.");
 }
 
 void NRDPass::createResources()

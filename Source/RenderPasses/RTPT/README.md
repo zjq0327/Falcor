@@ -1,5 +1,13 @@
 # RTPT、PG、SHaRC 与 NRD
 
+## 稀疏漫反射的桌腿暗斑
+
+`RTPTNRD.py` 与 `RTPTSHARCNRD.py` 的普通 RELAX 使用 D 常规历史上限 16、快速历史上限 2，以及独立的 `diffuseHistoryClampingSigmaScale=4`。较宽的漫反射色盒减少稀疏亮样本被短历史反复截断；`diffuseHistoryClampingDarkThreshold=0.0002` 使用快速历史的 5×5 平均亮度，在接近黑时平滑恢复原来的共享 sigma，避免延长微弱关暗残留。阈值采用去材质化、缩放前的 BT.601 漫反射辐射单位，并与 NRD 输入缩放配对。
+
+该适配仅作用于 NRD 3.1 的普通 D/S 方法；镜面、独立 delta 降噪、FP16 缓存和原有空间权重保留。两个新属性的底层默认值均为 0，其他渲染图沿用 SDK 路径。材质、1 spp 和原始路径估计器不因本修复改变。
+
+同输入逐阶段对照确认历史钳制的长期截断是主要压暗来源，直接关闭亮度权重、仅缩短历史或提高内部精度没有得到同等平衡的结果。新的独立种子在两个静态门位的桌腿局部 RMSE 下降约 15%–16%；亮度波动略增，原有动态光照滞后仍存在，60 fps 还可测到一帧极弱残留差异。完整的收支、15/60 fps 响应、边界检查与验证限制见[修复报告](../../../build/relax-sparse-fix/report.html)。
+
 ## 独立 delta 反射降噪
 
 `RTPTSHARCNRD.py` 默认启用独立反射 NRD；设置 `RTPT_DELTA_REFLECTION_NRD_ENABLED=0` 可回到原来的 residual 合成。底层 RTPT 属性为 `enableDeltaReflectionNRD`，默认关闭以兼容既有渲染图。`RTPT_NRD_ENABLED=0` 同时旁路普通和反射降噪，保留材质恢复。

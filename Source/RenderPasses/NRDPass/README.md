@@ -24,3 +24,31 @@ No logarithmic transform, FP32 NRD pools or additional filter tuning is included
 The optional NRD property `timeDeltaBetweenFrames` is in milliseconds. It
 defaults to `0` (SDK wall-clock timing). The experiment's fixed 15 fps replay
 sets it to `1000/15` for validation; neither RTPT graph overrides this default.
+
+# Sparse diffuse history
+
+The two RTPT graphs use a diffuse regular-history cap of 16 and retain the
+fast-history cap of 2. Their `diffuseHistoryClampingSigmaScale=4` widens only
+the diffuse color box, reducing repeated clipping of rare positive samples.
+Specular continues to use the SDK's shared clamping sigma. Spatial luminance,
+normal, depth and material weights keep their existing settings.
+
+`diffuseHistoryClampingDarkThreshold=0.0002` is in unscaled, demodulated BT.601
+diffuse radiance units. The adapter converts it with `diffuseRadianceScale`
+and uses the existing 5x5 fast-history mean. From the threshold to four times
+the threshold, it smoothly changes from the SDK's shared sigma to the diffuse
+override. Near black this restores tighter clamping and avoids extending the
+weak residual after illumination disappears. It does not classify one noisy
+zero-valued sample as a lighting change.
+
+Both properties default to zero. A zero sigma override keeps the original SDK
+shader; a zero dark threshold disables the transition. The transition is active
+only with a positive sigma override. The adapter applies to NRD 3.1
+`RelaxDiffuseSpecular`; other methods keep their original pipeline. Changing
+either UI value rebuilds the denoiser and resets history. The local shader
+preserves the SDK's constants, resource bindings, history layout and FP16 pools.
+
+The Veach door-scene investigation and same-input validation are retained in
+[`build/relax-sparse-fix/`](../../../build/relax-sparse-fix/). The profile was
+selected with 1 spp and unchanged materials; static bias, temporal variation
+and dynamic residuals are measured separately.

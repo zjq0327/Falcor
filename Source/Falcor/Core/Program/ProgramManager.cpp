@@ -743,6 +743,9 @@ SlangCompileRequest* ProgramManager::createSlangCompileRequest(const Program& pr
     // Column major option can be useful when compiling external shader sources that don't depend
     // on anything Falcor.
     bool useColumnMajor = is_set(compilerFlags, SlangCompilerFlags::MatrixLayoutColumnMajor);
+    // The session default takes precedence over matrix layout compiler options.
+    // Keep reflection and generated code consistent with the requested layout (e.g. NRD).
+    sessionDesc.defaultMatrixLayoutMode = useColumnMajor ? SLANG_MATRIX_LAYOUT_COLUMN_MAJOR : SLANG_MATRIX_LAYOUT_ROW_MAJOR;
     addIntOption(useColumnMajor ? slang::CompilerOptionName::MatrixLayoutColumn : slang::CompilerOptionName::MatrixLayoutRow, 1);
 
     // New versions of slang default to short-circuiting for logical and/or operators.

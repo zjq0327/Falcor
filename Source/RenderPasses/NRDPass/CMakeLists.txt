@@ -9,6 +9,7 @@ target_sources(NRDPass PRIVATE
     NRDPass.h
     PackRadiance.cs.slang
     ScaleRadiance.cs.slang
+    DiffuseHistoryClamping.cs.slang
 )
 
 target_link_libraries(NRDPass PRIVATE nrd)

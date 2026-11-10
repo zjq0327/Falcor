@@ -104,6 +104,10 @@ private:
     // The downstream modulation pass must apply the reciprocal scales.
     float mDiffuseRadianceScale = 1.f;
     float mSpecularRadianceScale = 1.f;
+    // Zero uses the SDK's shared color box; positive values override only RELAX D/S diffuse clamping.
+    float mDiffuseHistoryClampingSigmaScale = 0.f;
+    // Unscaled BT.601 diffuse radiance; zero disables the near-black transition to the shared sigma.
+    float mDiffuseHistoryClampingDarkThreshold = 0.f;
     float mDisocclusionThreshold = 2.f;
     nrd::CommonSettings mCommonSettings = {};
     nrd::RelaxDiffuseSpecularSettings mRelaxDiffuseSpecularSettings = {};

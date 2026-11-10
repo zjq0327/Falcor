@@ -79,6 +79,11 @@ def render_graph_RTPTSHARCNRD():
         "enabled": _module_enabled("RTPT_NRD_ENABLED"),
         "method": "RelaxDiffuseSpecular",
         "worldSpaceMotion": True,
+        # Preserve sparse diffuse samples without lengthening the fast lighting response.
+        "diffuseMaxAccumulatedFrameNum": 16,
+        "diffuseMaxFastAccumulatedFrameNum": 2,
+        "diffuseHistoryClampingSigmaScale": 4.0,
+        "diffuseHistoryClampingDarkThreshold": 0.0002,
         "maxIntensity": 250.0,
         "diffuseRadianceScale": 1.0 / 256.0,
         "specularRadianceScale": 1.0 / 512.0,
