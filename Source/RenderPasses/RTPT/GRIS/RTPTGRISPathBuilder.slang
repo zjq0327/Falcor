@@ -58,7 +58,7 @@ void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleG
 #if RTPT_GRIS_SUFFIX_REPLAY
     , uint4 directNeeRngState = 0u
 #endif
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
     , float innerRISWeight = 0.f
 #endif
 #if RTPT_GRIS_SHARC_REPLAY
@@ -89,11 +89,11 @@ void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleG
 #if RTPT_GRIS_SHARC_REPLAY
     suffix.sharcKey = sharcKey;
     suffix.sharcGain = sharcGain;
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
     if (rtptGrisTerminalKind(kind) == uint(GrisTerminalKind::GrisReGIRPath))
         suffix.sharcGain.x = innerRISWeight;
 #endif
-#elif RTPT_GRIS_REGIR_REPLAY_MODE
+#elif RTPT_GRIS_REGIR_REPLAY
     suffix.innerRISWeight = innerRISWeight;
 #endif
 }
@@ -113,7 +113,7 @@ void rtptGRISAddPathTerminal(inout GrisPathBuilder builder, inout SampleGenerato
 #if RTPT_GRIS_SUFFIX_REPLAY
         , 0u
 #endif
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
         , 0.f
 #endif
         , sharcKey, sharcGain
@@ -151,7 +151,7 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     uint stableID;
     float2 lightUV;
     float innerRISWeight;
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
     const uint4 directRngState = bounce == 2u ? rtptGrisCaptureReplayRng(sg) : 0u;
     SampleGenerator cellRng;
     lightUV = rtptGrisSplitReGIRReplayRng(sg, bounce, cellRng);
@@ -177,7 +177,7 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     // weights must never replace it when an unrelated light changes.
     rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
         uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, stableID, light.analytic,
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
         bounce, suffix, directRngState, innerRISWeight);
 #else
         0u, suffix);

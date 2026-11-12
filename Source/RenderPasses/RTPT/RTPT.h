@@ -35,7 +35,7 @@ public:
     // The legacy "prefix" entry now contains local diffuse/specular RGB contributions.
     std::vector<ref<Buffer>> getGRISValidationBuffers() const
     {
-        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes};
+        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput};
     }
     // Explicit diagnostic access to existing resources only; no GPU readback.
     std::vector<ref<Buffer>> getSHARCValidationBuffers() const
@@ -73,6 +73,7 @@ private:
     void resetGRISHistory();
     bool canUseGRISReferenceReuse() const;
     bool useGRISCacheTail() const;
+    bool canUseGRIS() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
@@ -169,6 +170,8 @@ private:
     ref<ComputePass> mpGRISMainPass;
     ref<Buffer> mpGRISCandidates;
     ref<Buffer> mpGRISSpatialInput;
+    ref<Buffer> mpGRISTemporalOutput;
+    ref<Texture> mpGRISNeighborOffsets;
     ref<Buffer> mpGRISLocalPrefixes; // Compatibility name for local D/S contributions, not path geometry.
     ref<Buffer> mpGRISShadedIndirect;
     ref<Buffer> mpGRISHistory;
@@ -210,7 +213,6 @@ private:
     bool mGRISHistoryReplayActive = false;
     bool mGRISSuffixReplayEnabled = false;
     bool mGRISSuffixReplayValidateUnchanged = false;
-    uint32_t mGRISReGIRReplayMode = 0u; // 0: off, 2: RNG UV replay.
     bool mGRISSuffixReplayPreserveRequested = false;
     bool mGRISSuffixReplayLightChange = false;
     bool mGRISSuffixReplayGeometryPreserveRequested = false;
@@ -221,7 +223,6 @@ private:
     std::vector<float4x4> mGRISReplayPreviousInstanceTransforms;
     std::vector<uint32_t> mGRISReplayMovedInstances;
     ref<Buffer> mpGRISReplayMovedInstances;
-    bool mGRISReGIRSelectiveHistory = true;
     bool mGRISSelectiveLightHistoryEnabled = false;
     bool mGRISLightHistoryPreserveRequested = false;
     bool mGRISLightHistoryPreservedThisFrame = false;
@@ -231,7 +232,6 @@ private:
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
-    uint32_t mGRISPGPrefixDepth = 1u;
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;
@@ -287,6 +287,8 @@ private:
     std::unique_ptr<RTPTPG::Manager> mpPG;
     RTPTPG::Settings mPGSettings;
     bool mEnablePG = false;
+    bool needsPG() const { return mEnablePG || canUseGRIS(); }
+    bool isPGEnabled() const { return canUseGRIS() || (mEnablePG && mPGSettings.enabled); }
     bool mResetPG = true;
     bool mPGModelResetThisFrame = false;
     bool mPGTrainingThisFrame = false;

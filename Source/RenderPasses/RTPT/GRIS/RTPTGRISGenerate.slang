@@ -128,7 +128,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     const uint currentRoot = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
                     ShadingData component = sd;
                     component.mtl.setActiveLobes(activeLobe);
-                    const RTPTSamplingContext sampling = slot == 0u && RTPT_GRIS_PG_PREFIX_DEPTH >= 1
+                    const RTPTSamplingContext sampling = slot == 0u
                         ? rtptMakeSamplingContext(component, mi) : rtptBSDFSamplingContext();
                     SampleGenerator pathRng = SampleGenerator(pixel, sampleIndex ^ (slot == 0u ? 0x87fb1a4du : 0x98d6d257u));
                     GrisLocalPrefix prefix = {};

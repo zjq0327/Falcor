@@ -105,7 +105,7 @@ public:
     void beginFrame(RenderContext* pContext);
     void barrierTraining(RenderContext* pContext, bool separateDiagnostics = false) const;
     void bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive,
-        bool separateDiagnostics = false, bool readOnlyResources = false) const;
+        bool separateDiagnostics = false, bool readOnlyResources = false, bool useGuiding = true) const;
     NativeTrainingData getNativeTrainingData(float3 cameraPosition, float sceneScale, uint32_t frameIndex,
         bool trainingActive = true) const;
     void prepareNativeTraining(RenderContext* pContext) const;

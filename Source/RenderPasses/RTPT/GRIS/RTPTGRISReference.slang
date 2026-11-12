@@ -1,9 +1,8 @@
 #pragma once
 
-#include "RTPTGRISTypes.slang"
-#include "RTPTGRISSupport.slang"
+#include "RTPTGRISReuse.slang"
 
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
 #include "RTPTGRISSuffixReplay.slang"
 #endif
 
@@ -217,7 +216,7 @@ bool rtptGrisRefSampleValid(GrisSpatialRecord record)
         HitInfo(record.reconnectHit).getType() == HitType::Triangle;
 }
 
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
 struct GrisSuffixReplaySettings
 {
     uint historyIndex;
@@ -232,7 +231,7 @@ struct GrisSuffixReplaySettings
 
 bool rtptGrisIsReGIRReplayTail(GrisSpatialRecord tail)
 {
-    return RTPT_GRIS_REGIR_REPLAY_MODE != 0 &&
+    return RTPT_GRIS_REGIR_REPLAY &&
         rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisReGIRPath);
 }
 
@@ -418,8 +417,9 @@ float3 rtptGrisRefEvaluateSource(GrisSpatialRecord source, float3 cameraPosition
         all(tail.postX2RngState == source.postX2RngState)
 #endif
 #if RTPT_GRIS_SHARC_REPLAY
-        && (!rtptGrisIsSharcTail(tail) || (all(tail.sharcKey == source.sharcKey) &&
-            all(asuint(tail.sharcGain) == asuint(source.sharcGain))))
+        && (rtptGrisTerminalKind(tail.candidate.terminalKind) != uint(GrisTerminalKind::GrisSharcTail) ||
+            (all(tail.sharcKey == source.sharcKey) &&
+                all(asuint(tail.sharcGain) == asuint(source.sharcGain))))
 #endif
         ;
     if (sameSample) return source.candidate.F * source.areaPdf;
@@ -428,9 +428,10 @@ float3 rtptGrisRefEvaluateSource(GrisSpatialRecord source, float3 cameraPosition
         recheckVisibility);
 }
 
-GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatialRecord inputs[2],
-    float3 sourceCameras[2], uint sourceLightEpochs[2], uint inputCount, uint2 pixel, inout SampleGenerator rng
-#if RTPT_GRIS_SUFFIX_REPLAY
+GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatialRecord inputs[kGrisMaxReuseInputs],
+    float3 sourceCameras[kGrisMaxReuseInputs], uint sourceLightEpochs[kGrisMaxReuseInputs],
+    uint inputCount, uint2 pixel, inout SampleGenerator rng
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
     , GrisSuffixReplaySettings replay
 #endif
     )
@@ -442,24 +443,24 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
     // complete local estimate. They do not enter a mismatched resampling domain.
     if (gParams.useRussianRoulette != 0u || !rtptGrisRefDomainValid(canonical) ||
         (canonical.candidate.hasWinner && !rtptGrisRefSampleValid(canonical))) return canonical;
-    inputCount = min(inputCount, 2u);
+    inputCount = min(inputCount, kGrisMaxReuseInputs);
     if (inputCount == 0u) return canonical;
     const float3 targetCamera = gScene.camera.getPosition();
-    bool domainValid[2];
+    bool domainValid[kGrisMaxReuseInputs];
     bool anyInputDomain = false;
     float totalM = canonical.candidate.M;
-    [unroll] for (uint j = 0u; j < 2u; ++j)
+    [loop] for (uint j = 0u; j < inputCount; ++j)
     {
-        domainValid[j] = j < inputCount && rtptGrisRefDomainValid(inputs[j]) &&
+        domainValid[j] = rtptGrisRefDomainValid(inputs[j]) &&
             (!inputs[j].candidate.hasWinner || rtptGrisRefSampleValid(inputs[j]));
     }
 
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
     GrisReplayTailValue historyInCurrent = {};
     GrisReplayTailValue canonicalInHistory = {};
-    GrisReplayTailValue neighborInHistory = {};
+    GrisReplayTailValue inputsInHistory[kGrisMaxReuseInputs];
     bool useReplay = false;
-    const bool geometryHistory = (RTPT_GRIS_REGIR_REPLAY_MODE == 0 || RTPT_GRIS_SHARC_REPLAY) &&
+    const bool geometryHistory = (!RTPT_GRIS_REGIR_REPLAY || RTPT_GRIS_SHARC_REPLAY) &&
         replay.geometryChanged && replay.historyIndex < inputCount;
     if (geometryHistory)
     {
@@ -469,10 +470,9 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             rtptGrisReplayStaticSurface(canonical.ownerPrimaryHit) &&
             rtptGrisReplayStaticSurface(inputs[replay.historyIndex].ownerPrimaryHit);
     }
-    if (RTPT_GRIS_REGIR_REPLAY_MODE == 0 && replay.historyIndex < inputCount && (replay.lightChanged || replay.validateUnchanged))
+    if (!RTPT_GRIS_REGIR_REPLAY && replay.historyIndex < inputCount && (replay.lightChanged || replay.validateUnchanged))
     {
         const uint historyIndex = replay.historyIndex;
-        const uint neighborIndex = historyIndex ^ 1u;
         if (domainValid[historyIndex])
         {
             bool supported = rtptGrisRefReplayTail(inputs[historyIndex], false, replay.lightChanged,
@@ -480,8 +480,11 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             if (supported && replay.lightChanged)
             {
                 supported = rtptGrisRefReplayTail(canonical, true, true, false, canonicalInHistory);
-                if (supported && domainValid[neighborIndex])
-                    supported = rtptGrisRefReplayTail(inputs[neighborIndex], true, true, false, neighborInHistory);
+                [loop] for (uint i = 0u; supported && i < inputCount; ++i)
+                {
+                    if (i != historyIndex && domainValid[i])
+                        supported = rtptGrisRefReplayTail(inputs[i], true, true, false, inputsInHistory[i]);
+                }
             }
             // Without a complete cross evaluation, remove this source from
             // the entire MIS calculation, including M and the fresh term.
@@ -490,7 +493,7 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
         }
     }
 #endif
-    [unroll] for (uint j = 0u; j < 2u; ++j)
+    [loop] for (uint j = 0u; j < inputCount; ++j)
     {
         if (domainValid[j]) totalM += inputs[j].candidate.M;
         anyInputDomain = anyInputDomain || domainValid[j];
@@ -516,12 +519,12 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             const float canonicalDensity = canonical.candidate.M * h * auxiliaryPdf;
             float denominator = canonicalDensity;
             const float canonicalPrefixPdf = rtptGrisRefPrefixPdf(canonical.ownerPrimaryHit, targetCamera, rtptGrisRefRecordPrefix(canonical));
-            [unroll] for (uint j = 0u; j < 2u; ++j)
+            [loop] for (uint j = 0u; j < inputCount; ++j)
             {
                 if (!domainValid[j]) continue;
                 GrisSpatialRecord crossTail = canonical;
                 bool recheckVisibility = false;
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
                 recheckVisibility = geometryHistory && j == replay.historyIndex && !rtptGrisIsReGIRReplayTail(crossTail);
                 if (recheckVisibility && (!rtptGrisReplayStaticSurface(canonical.sourceX1) ||
                     !rtptGrisReplayStaticSurface(auxiliary.x1) ||
@@ -543,7 +546,7 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             winnerRatio = canonical.areaPdf;
         }
     }
-    [unroll] for (uint i = 0u; i < 2u; ++i)
+    [loop] for (uint i = 0u; i < inputCount; ++i)
     {
         if (!domainValid[i] || !rtptGrisRefSampleValid(inputs[i]) ||
             !rtptGrisSourceAllowsTail(inputs[i], sourceLightEpochs[i]) || !(activePdf > 0.f)) continue;
@@ -553,7 +556,7 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
         float ratio, firstDistance;
         GrisSpatialRecord targetTail = inputs[i];
         bool geometryForward = false;
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
         const bool regirTail = rtptGrisIsReGIRReplayTail(targetTail);
         if (i == replay.historyIndex)
         {
@@ -599,10 +602,10 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
         if (!(h > 0.f) || !(ratio > 0.f)) continue;
         float denominator = canonical.candidate.M * h * sourceAuxiliaryPdf;
         float ownDensity = 0.f;
-        [unroll] for (uint j = 0u; j < 2u; ++j)
+        [loop] for (uint j = 0u; j < inputCount; ++j)
         {
             if (!domainValid[j]) continue;
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE) && RTPT_GRIS_REGIR_REPLAY
             // ReGIR replay changes only the destination suffix. Its source
             // terms use the selected light and compensation from generation.
             GrisSpatialRecord crossTail = regirTail ? inputs[i] : targetTail;
@@ -610,7 +613,7 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             GrisSpatialRecord crossTail = targetTail;
 #endif
             bool recheckVisibility = false;
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
             // Evaluate cross terms with the current TLAS. The old source's
             // self term alone still uses the unchanged historical record.
             const bool geometryReverse = geometryHistory && j == replay.historyIndex && i != j && !regirTail;
@@ -622,7 +625,7 @@ GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatia
             if (useReplay && j == replay.historyIndex)
             {
                 if (i == j) crossTail = inputs[i];
-                else if (replay.lightChanged) neighborInHistory.apply(crossTail);
+                else if (replay.lightChanged) inputsInHistory[i].apply(crossTail);
             }
 #if RTPT_GRIS_SHARC_REPLAY
             if (i == replay.historyIndex && i == j && rtptGrisIsSharcTail(inputs[i])) crossTail = inputs[i];

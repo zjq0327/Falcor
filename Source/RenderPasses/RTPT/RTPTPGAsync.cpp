@@ -73,7 +73,7 @@ Properties RTPT::getPGAsyncStatistics() const
 {
     Properties result = mPGLastAsyncTiming;
     result["requestedEnabled"] = mPGAsyncTraining;
-    result["active"] = mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled &&
+    result["active"] = isPGEnabled() && mPGSettings.trainingEnabled &&
         mPGAsyncTraining && mpPGAsyncTrainer != nullptr && !mPGAsyncFailed;
     bool independentQueues = false;
 #if FALCOR_HAS_D3D12

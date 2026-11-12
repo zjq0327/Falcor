@@ -35,7 +35,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #if RTPT_GRIS_SHARC_REPLAY
     history.sharcKey = source.sharcKey;
     history.sharcGain = source.sharcGain;
-#elif RTPT_GRIS_REGIR_REPLAY_MODE
+#elif RTPT_GRIS_REGIR_REPLAY
     history.innerRISWeight = source.innerRISWeight;
 #endif
     gGRISHistory[index] = history;

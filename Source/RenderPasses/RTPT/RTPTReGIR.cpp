@@ -340,7 +340,7 @@ Properties RTPT::getReGIRStatistics() const
     props["gridCenter"] = mpScene ? mpScene->getCamera()->getPosition() : float3(0.f);
     props["secondaryActive"] = mReGIRActive && mUseNEE && mReGIRSecondaryEnabled;
     props["trainingActive"] = mReGIRActive && mUseNEE && mReGIRTrainingEnabled &&
-        ((mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled) || (mEnableSHARC && mSHARCEnabled && !mSHARCFreeze));
+        ((isPGEnabled() && mPGSettings.trainingEnabled) || (mEnableSHARC && mSHARCEnabled && !mSHARCFreeze));
     props["fallbackReason"] = mReGIRFallbackReason;
     if (mpReGIRState)
     {

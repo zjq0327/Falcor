@@ -225,7 +225,7 @@ bool rtptValidLightSample(ShadingData sd, RTPTLightSample light)
         all(isfinite(light.LiOverPdf)) && any(light.LiOverPdf > 0.f);
 }
 
-#if RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
 #if USE_ANALYTIC_LIGHTS
 StructuredBuffer<LightData> gGRISReplayPreviousLights;
 #endif

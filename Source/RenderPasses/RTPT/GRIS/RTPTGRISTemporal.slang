@@ -55,7 +55,7 @@ bool rtptGrisLoadSelectedHistory(uint2 pixel, out GrisSpatialRecord source)
 #if RTPT_GRIS_SHARC_REPLAY
     source.sharcKey = h.sharcKey;
     source.sharcGain = h.sharcGain;
-#elif RTPT_GRIS_REGIR_REPLAY_MODE
+#elif RTPT_GRIS_REGIR_REPLAY
     source.innerRISWeight = h.innerRISWeight;
 #endif
     source.lightIsAnalytic = (h.terminalAndFlags & kGrisHistoryAnalytic) != 0u;
@@ -79,13 +79,13 @@ void main(uint3 threadID : SV_DispatchThreadID)
     GrisSpatialRecord canonical = gGRISSpatialInput[index];
     GrisSpatialRecord result = canonical;
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-    GrisSpatialRecord inputs[2];
-    float3 sourceCameras[2];
-    uint sourceLightEpochs[2];
+    GrisSpatialRecord inputs[kGrisMaxReuseInputs];
+    float3 sourceCameras[kGrisMaxReuseInputs];
+    uint sourceLightEpochs[kGrisMaxReuseInputs];
     uint inputCount = 0u;
 #if RTPT_GRIS_SUFFIX_REPLAY
     GrisSuffixReplaySettings replay;
-    replay.historyIndex = 2u;
+    replay.historyIndex = kGrisMaxReuseInputs;
     replay.lightChanged = gGRISTemporalSettings.suffixReplayLightChange != 0u;
     replay.geometryChanged = gGRISTemporalSettings.suffixReplayGeometryChange != 0u;
     replay.movedInstanceBits = gGRISTemporalSettings.suffixReplayMovedInstanceBits;
@@ -103,15 +103,6 @@ void main(uint3 threadID : SV_DispatchThreadID)
         sourceLightEpochs[inputCount] = rtptGrisPreviousLightEpoch();
         sourceCameras[inputCount++] = gGRISTemporalSettings.previousCameraPosition;
     }
-#if RTPT_GRIS_SPATIAL_REUSE
-    const uint neighborX = pixel.x ^ 1u;
-    if (neighborX < gPrimarySettings.frameDim.x)
-    {
-        inputs[inputCount] = gGRISSpatialInput[pixel.y * gPrimarySettings.frameDim.x + neighborX];
-        sourceLightEpochs[inputCount] = rtptGrisCurrentLightEpoch();
-        sourceCameras[inputCount++] = gScene.camera.getPosition();
-    }
-#endif
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
     result = rtptGrisMergeReference(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, pixel, rng
 #if RTPT_GRIS_SUFFIX_REPLAY

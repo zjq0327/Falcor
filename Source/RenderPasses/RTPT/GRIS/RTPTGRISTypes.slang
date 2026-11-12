@@ -13,14 +13,11 @@
 #ifndef RTPT_GRIS_SUFFIX_REPLAY
 #define RTPT_GRIS_SUFFIX_REPLAY 0
 #endif
-#ifndef RTPT_GRIS_REGIR_REPLAY_MODE
-#define RTPT_GRIS_REGIR_REPLAY_MODE 0
+#ifndef RTPT_GRIS_REGIR_REPLAY
+#define RTPT_GRIS_REGIR_REPLAY 0
 #endif
 #ifndef RTPT_GRIS_CACHE_TAIL
 #define RTPT_GRIS_CACHE_TAIL 0
-#endif
-#ifndef RTPT_GRIS_PG_PREFIX_DEPTH
-#define RTPT_GRIS_PG_PREFIX_DEPTH 1
 #endif
 #ifndef RTPT_REGIR_ONLY
 #define RTPT_REGIR_ONLY 0
@@ -101,7 +98,7 @@ UniformSampleGenerator rtptGrisForkReplayNEERng(inout UniformSampleGenerator sg,
     const uint second = sg.next();
     return UniformSampleGenerator(uint2(first, second), bounce);
 }
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
 float2 rtptGrisSplitReGIRReplayRng(inout UniformSampleGenerator directRng, uint bounce,
     out UniformSampleGenerator cellRng)
 {
@@ -149,7 +146,7 @@ struct GrisSpatialRecord
 #if RTPT_GRIS_SHARC_REPLAY
     uint2 sharcKey;
     float3 sharcGain; // SHaRC gain, or the ReGIR inner RIS weight in x when both are enabled.
-#elif RTPT_GRIS_REGIR_REPLAY_MODE
+#elif RTPT_GRIS_REGIR_REPLAY
     float innerRISWeight;
 #endif
 };
@@ -188,7 +185,7 @@ uint rtptGrisTerminalKind(uint terminalAndFlags)
     return terminalAndFlags & kGrisTerminalKindMask;
 }
 
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
 float rtptGrisGetInnerRISWeight(GrisSpatialRecord suffix)
 {
 #if RTPT_GRIS_SHARC_REPLAY
@@ -259,7 +256,7 @@ struct GrisTemporalFreshHistory
 #if RTPT_GRIS_SHARC_REPLAY
     uint2 sharcKey;
     float3 sharcGain;
-#elif RTPT_GRIS_REGIR_REPLAY_MODE
+#elif RTPT_GRIS_REGIR_REPLAY
     float innerRISWeight;
 #endif
 };

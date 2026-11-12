@@ -342,7 +342,7 @@ void Manager::barrierTraining(RenderContext* pContext, bool separateDiagnostics)
 }
 
 void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneScale, uint32_t frameIndex, bool trainingActive,
-    bool separateDiagnostics, bool readOnlyResources) const
+    bool separateDiagnostics, bool readOnlyResources, bool useGuiding) const
 {
     FALCOR_CHECK(mModelResourcesValid, "PG model allocation is incomplete; cannot bind partial resources.");
     setIfPresent(rootVar, "gPGReadMap", mpReadMap);
@@ -372,7 +372,7 @@ void Manager::bind(const ShaderVar& rootVar, float3 cameraPosition, float sceneS
     setIfPresent(var, "buildMapCapacity", mMapCapacity);
     setIfPresent(var, "requestCapacity", mRequestCapacity);
     setIfPresent(var, "coarseLevels", mSettings.coarseLevels);
-    setIfPresent(var, "enabled", mSettings.enabled && mSettings.useGuiding ? 1u : 0u);
+    setIfPresent(var, "enabled", useGuiding && mSettings.enabled && mSettings.useGuiding ? 1u : 0u);
     setIfPresent(var, "trainingEnabled", mSettings.enabled && mSettings.trainingEnabled && trainingActive ? 1u : 0u);
     setIfPresent(var, "detailedDiagnostics", mSettings.detailedDiagnostics ? 1u : 0u);
     setIfPresent(var, "guideFraction", mSettings.guideFraction);

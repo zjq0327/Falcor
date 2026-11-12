@@ -45,9 +45,6 @@ const Gui::DropdownList kSHARCCapacities = {
     {1u << 16, "64K entries (2.5 MiB)"}, {1u << 18, "256K entries (10 MiB)"},
     {1u << 20, "1M entries (40 MiB)"}, {1u << 22, "4M entries (160 MiB)"},
 };
-const Gui::DropdownList kGRISPGPrefixDepths = {
-    {0u, "Disabled"}, {1u, "D root: x0 to x1"},
-};
 }
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
@@ -68,6 +65,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             result["winner"] = buffers[1];
             result["history"] = buffers[2];
             result["prefix"] = buffers[3];
+            if (buffers[4]) result["temporal"] = buffers[4];
             return result;
         });
         pass.def("getGRISLightHistoryMetadataBuffer", &RTPT::getGRISLightHistoryMetadataBuffer);
@@ -103,7 +101,6 @@ void RTPT::setProperties(const Properties& props)
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
-    bool grisReGIRSelectiveHistory = mGRISReGIRSelectiveHistory;
     bool enableNRD = mEnableNRD;
     bool enableDeltaReflectionNRD = mEnableDeltaReflectionNRD;
     bool grisEnabled = mGRISEnabled;
@@ -111,8 +108,6 @@ void RTPT::setProperties(const Properties& props)
     bool grisTemporalEnabled = mGRISTemporalEnabled;
     bool grisSuffixReplayEnabled = mGRISSuffixReplayEnabled;
     bool grisSuffixReplayValidateUnchanged = mGRISSuffixReplayValidateUnchanged;
-    uint32_t grisReGIRReplayMode = mGRISReGIRReplayMode;
-    uint32_t grisPGPrefixDepth = mGRISPGPrefixDepth;
     float grisSharcX1Blend = mGRISSharcX1Blend;
     bool restirDIEnabled = mRestirDIEnabled;
     bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
@@ -152,10 +147,9 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
         else if (key == "grisSuffixReplayEnabled") grisSuffixReplayEnabled = value;
         else if (key == "grisSuffixReplayValidateUnchanged") grisSuffixReplayValidateUnchanged = value;
-        else if (key == "grisReGIRReplayMode") grisReGIRReplayMode = value;
-        else if (key == "grisPGPrefixDepth") grisPGPrefixDepth = value;
+        else if (key == "grisReGIRReplayMode" || key == "grisReGIRSelectiveHistory" || key == "grisPGPrefixDepth")
+            logWarningOnce("RTPT ignores the retired '{}' property. GRIS selects replay and guiding automatically.", key);
         else if (key == "grisSharcX1Blend") grisSharcX1Blend = value;
-        else if (key == "grisReGIRSelectiveHistory") grisReGIRSelectiveHistory = value;
         else if (key == "restirDIEnabled") restirDIEnabled = value;
         else if (key == "regirEnabled") regirEnabled = value;
         else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
@@ -213,7 +207,6 @@ void RTPT::setProperties(const Properties& props)
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
-    FALCOR_CHECK(grisPGPrefixDepth <= 1u, "RTPT grisPGPrefixDepth must be 0 or 1.");
     FALCOR_CHECK(std::isfinite(grisSharcX1Blend) && grisSharcX1Blend >= 0.f && grisSharcX1Blend < 1.f,
         "RTPT grisSharcX1Blend must be in [0, 1).");
     FALCOR_CHECK(restirDICandidateCount >= 1 && restirDICandidateCount <= 128,
@@ -227,8 +220,6 @@ void RTPT::setProperties(const Properties& props)
     FALCOR_CHECK(std::isfinite(restirDISpatialRadius) && restirDISpatialRadius >= 1.f && restirDISpatialRadius <= 64.f,
         "ReSTIR DI spatial radius must be in [1, 64] pixels.");
     FALCOR_CHECK(rrStartBounce >= 1 && rrStartBounce <= 64, "RTPT rrStartBounce must be in [1, 64].");
-    FALCOR_CHECK(grisReGIRReplayMode == 0u || grisReGIRReplayMode == 2u,
-        "RTPT grisReGIRReplayMode must be 0 (off) or 2 (RNG UV replay).");
     FALCOR_CHECK(!enableNRD || (samplesPerPixel == 1 && !accumulate),
         "RTPT NRD mode requires samplesPerPixel=1 and accumulate=false; NRD manages temporal history.");
     FALCOR_CHECK(!enableSHARC || !accumulate,
@@ -252,7 +243,8 @@ void RTPT::setProperties(const Properties& props)
         "SHaRC accumulation frames must be in [1, 1024] and stale frames in [8, 1024].");
     FALCOR_CHECK(std::isfinite(sharcSceneScale) && sharcSceneScale > 0.f && std::isfinite(sharcMinRoughness) &&
         sharcMinRoughness >= 0.f && sharcMinRoughness <= 1.f, "Invalid SHaRC scene scale or minimum roughness.");
-    if (enableSHARC || enablePG || regirEnabled)
+    const bool needsPGResources = enablePG || (grisEnabled && enableNRD && !useRussianRoulette);
+    if (enableSHARC || needsPGResources || regirEnabled)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
             "RTPT SHaRC, PG and ReGIR require D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
     FALCOR_CHECK(regirGridSize >= 1u && regirGridSize <= 128u && regirLightsPerCell >= 1u && regirLightsPerCell <= 1024u,
@@ -273,7 +265,7 @@ void RTPT::setProperties(const Properties& props)
     const bool regirCompileChanged = regirEnabled != mReGIREnabled || (regirEnabled && restirDIEnabled != mRestirDIEnabled);
     const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || regirCompileChanged ||
         enableDeltaReflectionNRD != mEnableDeltaReflectionNRD;
-    const bool pgCompileChanged = enablePG != mEnablePG;
+    const bool pgCompileChanged = needsPGResources != needsPG();
     const bool modeChanged = transportModeChanged || pgCompileChanged;
     const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
         restirDIBudgetMB != mRestirDIBudgetMB || restirDITemporalEnabled != mRestirDITemporalEnabled ||
@@ -283,7 +275,7 @@ void RTPT::setProperties(const Properties& props)
     const bool sampleCountChanged = samplesPerPixel != mSamplesPerPixel;
     const bool trainingSamplingChanged = neeChanged || seed != mSeed || useRussianRoulette != mUseRussianRoulette;
     const bool diEligibilityChanged = neeChanged || sampleCountChanged;
-    const bool pgStructureChanged = enablePG != mEnablePG || pg.coarseLevels != mPGSettings.coarseLevels ||
+    const bool pgStructureChanged = pgCompileChanged || pg.coarseLevels != mPGSettings.coarseLevels ||
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
         pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
     const bool pgRecordsChanged = pg.recordBudgetMiB != mPGSettings.recordBudgetMiB || pgUpdateStride != mPGUpdateStride;
@@ -297,12 +289,11 @@ void RTPT::setProperties(const Properties& props)
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     const bool grisModeChanged = grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
         grisTemporalEnabled != mGRISTemporalEnabled || grisSuffixReplayEnabled != mGRISSuffixReplayEnabled ||
-        grisReGIRReplayMode != mGRISReGIRReplayMode || (grisEnabled && grisSharcReuseChanged);
-    const bool grisPGPrefixChanged = grisPGPrefixDepth != mGRISPGPrefixDepth;
+        (grisEnabled && grisSharcReuseChanged);
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
         sharcEnabled != mSHARCEnabled || transportModeChanged || sharcTransportChanged || diChanged ||
-        regirChanged || grisSharcX1Blend != mGRISSharcX1Blend || grisReGIRSelectiveHistory != mGRISReGIRSelectiveHistory;
+        regirChanged || grisSharcX1Blend != mGRISSharcX1Blend;
     // PG learns a proposal: changing its sampling/configuration or training
     // target does not require discarding the accumulated spatial model.
     if (pgStructureChanged || pgRecordsChanged || pgAsyncTraining != mPGAsyncTraining)
@@ -334,11 +325,8 @@ void RTPT::setProperties(const Properties& props)
     mGRISSpatialEnabled = grisSpatialEnabled;
     mGRISTemporalEnabled = grisTemporalEnabled;
     mGRISSuffixReplayEnabled = grisSuffixReplayEnabled;
-    mGRISReGIRReplayMode = grisReGIRReplayMode;
     mGRISSuffixReplayValidateUnchanged = grisSuffixReplayValidateUnchanged;
     mGRISSharcX1Blend = grisSharcX1Blend;
-    mGRISReGIRSelectiveHistory = grisReGIRSelectiveHistory;
-    mGRISPGPrefixDepth = grisPGPrefixDepth;
     mRestirDIEnabled = restirDIEnabled;
     mRestirDICandidateCount = restirDICandidateCount;
     mRestirDIBudgetMB = restirDIBudgetMB;
@@ -391,11 +379,6 @@ void RTPT::setProperties(const Properties& props)
         mOptionsChanged = true;
         invalidateGRIS();
     }
-    else if (grisPGPrefixChanged)
-    {
-        // Only the proposal changes; the record's reference-domain contract is identical.
-        invalidateGRIS(true, true);
-    }
     if (mStagePreparationFailed && couldUseGRISTemporal != canUseGRISTemporal())
         invalidateStages();
     // Pool sizes and training depth are runtime data. Releasing their resource
@@ -433,10 +416,7 @@ Properties RTPT::getProperties() const
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
     props["grisSuffixReplayEnabled"] = mGRISSuffixReplayEnabled;
     props["grisSuffixReplayValidateUnchanged"] = mGRISSuffixReplayValidateUnchanged;
-    props["grisReGIRReplayMode"] = mGRISReGIRReplayMode;
-    props["grisPGPrefixDepth"] = mGRISPGPrefixDepth;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;
-    props["grisReGIRSelectiveHistory"] = mGRISReGIRSelectiveHistory;
     props["restirDIEnabled"] = mRestirDIEnabled;
     props["regirEnabled"] = mReGIREnabled;
     props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
@@ -493,7 +473,7 @@ Properties RTPT::getPGStatistics() const
 {
     Properties props;
     const auto& s = mpPG->getStatistics();
-    props["enabled"] = mEnablePG && mPGSettings.enabled;
+    props["enabled"] = isPGEnabled();
     props["trainingEnabled"] = mPGSettings.trainingEnabled;
     props["directionBins"] = RTPTPG::kDirectionBins;
     props["hemisphereOnly"] = true;
@@ -612,10 +592,7 @@ void RTPT::resetForSelectiveLightChange()
 
 bool RTPT::canUseGRISSelectiveLightHistory() const
 {
-    return mpScene && mGRISReGIRSelectiveHistory && mGRISEnabled && mGRISTemporalEnabled &&
-        mReGIREnabled && mReGIRSecondaryEnabled && !mRestirDIEnabled && mEnableNRD &&
-        mSamplesPerPixel == 1u && mUseNEE && !mUseRussianRoulette && mReGIRBrightnessThreshold == 0.f &&
-        canUseGRISReferenceReuse();
+    return canUseGRISReGIRReplay() && canUseGRISReferenceReuse();
 }
 
 bool RTPT::canPreserveGRISForPointLightChange() const
@@ -643,7 +620,7 @@ bool RTPT::canPreserveGRISForPointLightChange() const
 bool RTPT::canUseGRISReGIRReplay() const
 {
     return mpScene && mReGIREnabled && mReGIRSecondaryEnabled && !mRestirDIEnabled &&
-        mGRISReGIRReplayMode == 2u && mUseNEE && mGRISReGIRSelectiveHistory && mReGIRBrightnessThreshold == 0.f &&
+        mUseNEE && mReGIRBrightnessThreshold == 0.f &&
         canUseGRISTemporal();
 }
 
@@ -802,7 +779,7 @@ ProgramDesc RTPT::makeSceneProgramDesc(const char* path, const char* entry) cons
     desc.addShaderModules(mpScene->getShaderModules());
     desc.addTypeConformances(mpScene->getTypeConformances());
     desc.addShaderLibrary(path).csEntry(entry);
-    if (mEnableSHARC || mEnablePG || mReGIREnabled)
+    if (mEnableSHARC || needsPG() || mReGIREnabled)
     {
         desc.setShaderModel(ShaderModel::SM6_6);
         desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
@@ -866,8 +843,9 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         invalidateReGIRPrograms();
     }
 
-    if (!mpComputePass || ((mEnableSHARC || mEnablePG) && !mpSparseUpdate) ||
-        (mEnablePG && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && (!mpSHARCResolve || !mpSHARCInvalidate)))
+    const bool pg = needsPG();
+    if (!mpComputePass || ((mEnableSHARC || pg) && !mpSparseUpdate) ||
+        (pg && (!mpPGPrepare || !mpPGTrain)) || (mEnableSHARC && (!mpSHARCResolve || !mpSHARCInvalidate)))
     {
         const auto desc = makeSceneProgramDesc("RenderPasses/RTPT/RTPT.cs.slang");
         DefineList defines = mpScene->getSceneDefines();
@@ -879,7 +857,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         defines.add("RTPT_DELTA_NRD", mEnableNRD && mEnableDeltaReflectionNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
-        defines.add("ENABLE_PG", mEnablePG ? "1" : "0");
+        defines.add("ENABLE_PG", pg ? "1" : "0");
         if (mReGIREnabled)
         {
             defines.add("RTPT_REGIR_TRANSPORT", "1");
@@ -901,7 +879,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         }
         if (!mpComputePass)
             mpComputePass = ComputePass::create(mpDevice, desc, defines, true);
-        if ((mEnableSHARC || mEnablePG) && !mpSparseUpdate)
+        if ((mEnableSHARC || pg) && !mpSparseUpdate)
         {
             const auto updateDesc = makeSceneProgramDesc("RenderPasses/RTPT/RTPTSparseUpdate.cs.slang");
             auto updateDefines = defines;
@@ -930,7 +908,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
                 mpSHARCInvalidate = ComputePass::create(mpDevice, resolveDesc, updateDefines, true);
             }
         }
-        if (mEnablePG)
+        if (pg)
         {
             DefineList pgDefines;
             pgDefines.add("ENABLE_PG", "1");
@@ -1072,7 +1050,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     params["accumulate"] = 0u;
     if (mEnableSHARC) bindSHARC(var);
     bindReGIRTransport(var);
-    if (mEnablePG) mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
+    if (needsPG()) mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
     auto sparse = var["gSparseSettings"];
     sparse["frameDim"] = mFrameDim;
     sparse["updateStride"] = stride;
@@ -1082,7 +1060,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     sparse["recordPG"] = pg ? 1u : 0u;
     const uint2 updateDim = (mFrameDim + stride - 1u) / stride;
     mpSparseUpdate->execute(pRenderContext, uint3(updateDim, 1));
-    if (mEnablePG) mpPG->barrierTraining(pRenderContext);
+    if (needsPG()) mpPG->barrierTraining(pRenderContext);
     if (mEnableSHARC)
     {
         pRenderContext->uavBarrier(mpSHARCHashEntries.get());
@@ -1128,11 +1106,13 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
         }
     }
     const bool sharc = mEnableSHARC && mSHARCEnabled && !mSHARCFreeze;
-    bool pg = mEnablePG && mPGSettings.enabled && mPGSettings.trainingEnabled;
-    if (mEnablePG)
+    bool pg = isPGEnabled() && mPGSettings.trainingEnabled;
+    if (needsPG())
     {
         const bool hadModel = mpPG->getStatistics().modelReservedBytes != 0u;
-        mpPG->prepare(pRenderContext, mPGSettings, mFrameDim, mPGUpdateBounces, mPGUpdateStride, mSHARCSceneScale);
+        auto settings = mPGSettings;
+        if (canUseGRIS()) settings.enabled = settings.useGuiding = true;
+        mpPG->prepare(pRenderContext, settings, mFrameDim, mPGUpdateBounces, mPGUpdateStride, mSHARCSceneScale);
         if (mResetPG)
         {
             // Allocation initializes a first model. Existing models are cleared
@@ -1288,8 +1268,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         mResetSHARCCache = true;
     // Keep the proposal and its old LOD regions. Scene changes invalidate stored
     // radiance above, while fresh independent observations adapt the PG model.
-    const bool pgCameraTranslated = mEnablePG && any(mpScene->getCamera()->getPosition() != mPGCameraPosition);
-    if (mEnablePG) mPGCameraPosition = mpScene->getCamera()->getPosition();
+    const bool pgCameraTranslated = needsPG() && any(mpScene->getCamera()->getPosition() != mPGCameraPosition);
+    if (needsPG()) mPGCameraPosition = mpScene->getCamera()->getPosition();
     if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None)
     {
         if (preserveGRISHistory) resetForSelectiveLightChange();
@@ -1314,7 +1294,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         if (mpPGAsyncTrainer) mpPGAsyncTrainer->releaseCompletedBindings();
         // Release old per-pixel records before allocating the new resolution.
         invalidateStages();
-        if (mEnablePG) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
+        if (needsPG()) mpSparseUpdate = mpPGPrepare = mpPGTrain = nullptr;
         mFrameDim = frameDim;
         mpAccumulation = mpDevice->createTexture2D(frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
             ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
@@ -1363,7 +1343,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         }
         prepareReGIR(pRenderContext);
     }
-    if (mEnableSHARC || mEnablePG)
+    if (mEnableSHARC || needsPG())
     {
         // Complete SHaRC resolve before GRIS and MainRender query the current frame's cache.
         executeTraining(pRenderContext);
@@ -1372,7 +1352,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         mAccumulatedSamples > std::numeric_limits<uint32_t>::max() - mSamplesPerPixel)
         reset();
 
-    mNRDHistoryResetThisFrame = (mEnableNRD || mEnablePG || mEnableSHARC) && mResetNRDHistory;
+    mNRDHistoryResetThisFrame = (mEnableNRD || needsPG() || mEnableSHARC) && mResetNRDHistory;
     mPGTranslationPreservedNRDThisFrame = mEnableNRD && pgCameraTranslated && !mNRDHistoryResetThisFrame;
     if (mNRDHistoryResetThisFrame)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
@@ -1419,8 +1399,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         var["gSharcCacheRadiance"] = renderData.getTexture("sharcCacheRadiance");
         var["gSharcStats"] = renderData.getTexture("sharcStats");
     }
-    if (mEnablePG)
-        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false, false, true);
+    if (needsPG())
+    {
+        const bool useGuiding = grisActive || (mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding);
+        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false, false, true, useGuiding);
+    }
     pRenderContext->uavBarrier(mpAccumulation.get());
     if (mPGAsyncRecorded)
     {
@@ -1600,24 +1583,21 @@ void RTPT::renderUI(Gui::Widgets& widget)
             }
         }
     }
-    if (mEnablePG)
+    if (needsPG())
     {
         auto pgWidget = widget.group("PG");
         if (pgWidget)
         {
             Properties props;
-            bool value = mPGSettings.enabled;
-            if (pgWidget.checkbox("Enabled", value)) props["pgEnabled"] = value;
-            pgWidget.tooltip("Enable guiding and training independently of SHaRC. Switching retains the model, sampling sequence and image histories.", true);
-            value = mPGSettings.useGuiding;
-            if (pgWidget.checkbox("Use guiding", value)) props["pgUseGuiding"] = value;
-            if (mGRISEnabled)
+            if (!canUseGRIS())
             {
-                uint32_t depth = mGRISPGPrefixDepth;
-                if (pgWidget.dropdown("GRIS guided prefix", kGRISPGPrefixDepths, depth)) props["grisPGPrefixDepth"] = depth;
-                pgWidget.tooltip("Guide only the primary diffuse edge x0 to x1. x1 and deeper directions use BSDF sampling. Switching preserves reference-domain GRIS history.", true);
+                bool enabled = mPGSettings.enabled;
+                if (pgWidget.checkbox("Enabled", enabled)) props["pgEnabled"] = enabled;
+                pgWidget.tooltip("Enable guiding and training independently of SHaRC. Switching retains the model, sampling sequence and image histories.", true);
+                bool useGuiding = mPGSettings.useGuiding;
+                if (pgWidget.checkbox("Use guiding", useGuiding)) props["pgUseGuiding"] = useGuiding;
             }
-            value = !mPGSettings.trainingEnabled;
+            bool value = !mPGSettings.trainingEnabled;
             if (pgWidget.checkbox("Freeze training", value)) props["pgFreeze"] = value;
             value = mPGAsyncTraining;
             if (pgWidget.checkbox("Independent PGTrain queue", value)) props["pgAsyncTraining"] = value;

@@ -392,7 +392,7 @@ float3 RTPT_CONTINUATION_NAME(
 #if !RTPT_GRIS_ALTERNATING
 #if RTPT_GRIS_SUFFIX_REPLAY
             if ((bounce > 2u && pathBuilder.hasTail) ||
-                (RTPT_GRIS_REGIR_REPLAY_MODE != 0 && bounce == 2u && pathBuilder.hasInterface))
+                (RTPT_GRIS_REGIR_REPLAY && bounce == 2u && pathBuilder.hasInterface))
             {
                 SampleGenerator neeRng = rtptGrisForkReplayNEERng(sg, bounce);
                 contribution = rtptGRISCapturePathNEE(bounce, sd, mi, sampling, throughput, query,

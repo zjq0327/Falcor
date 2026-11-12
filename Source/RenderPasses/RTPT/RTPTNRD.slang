@@ -164,13 +164,8 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         specularSD.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
         RTPTSamplingContext diffuseSampling = rtptBSDFSamplingContext();
         RTPTSamplingContext specularSampling = rtptBSDFSamplingContext();
-#if RTPT_USE_GRIS && !RTPT_GRIS_ALTERNATING
-        // Primary NEE must compete with Generate's actual root proposal.
-        // Apply the same context to a local fallback continuation as well.
-        if (hasDiffuse && RTPT_GRIS_PG_PREFIX_DEPTH >= 1) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
-#else
+        // In GRIS, primary NEE and local fallback use Generate's diffuse root proposal.
         if (hasDiffuse) diffuseSampling = rtptMakeSamplingContext(diffuseSD, mi);
-#endif
         // Keep primary specular NEE and continuation on the BSDF-only density.
 
         uint rootCoverage = 0u;

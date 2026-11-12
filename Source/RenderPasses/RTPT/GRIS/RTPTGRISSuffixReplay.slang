@@ -34,7 +34,7 @@ GrisNeeReplayStatus rtptGrisSampleReplayNee(GrisSpatialRecord source, ShadingDat
     bool previousLight, bool pointLightChanged, inout SampleGenerator rng, out RTPTLightSample light)
 {
     light = {};
-#if RTPT_GRIS_REGIR_REPLAY_MODE
+#if RTPT_GRIS_REGIR_REPLAY
     if (rtptGrisTerminalKind(source.candidate.terminalKind) == uint(GrisTerminalKind::GrisReGIRPath))
     {
         const float innerRISWeight = rtptGrisGetInnerRISWeight(source);
@@ -80,7 +80,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
     if (geometryChanged) result.suffixInstanceMask = 0u;
 
     const uint kind = rtptGrisTerminalKind(source.candidate.terminalKind);
-    const bool regir = RTPT_GRIS_REGIR_REPLAY_MODE != 0 && kind == uint(GrisTerminalKind::GrisReGIRPath);
+    const bool regir = RTPT_GRIS_REGIR_REPLAY && kind == uint(GrisTerminalKind::GrisReGIRPath);
     const bool nee = regir || kind == uint(GrisTerminalKind::GrisNee);
     const bool emitter = kind == uint(GrisTerminalKind::GrisEmitter);
     const bool environment = kind == uint(GrisTerminalKind::GrisEnvironment);
