@@ -27,5 +27,16 @@ void main(uint3 threadID : SV_DispatchThreadID)
     history.F = source.candidate.F;
     history.W = source.candidate.W;
     history.M = source.candidate.M;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    history.suffixInstanceMask = source.suffixInstanceMask;
+    history.terminalBounce = source.terminalBounce;
+    history.postX2RngState = source.postX2RngState;
+#endif
+#if RTPT_GRIS_SHARC_REPLAY
+    history.sharcKey = source.sharcKey;
+    history.sharcGain = source.sharcGain;
+#elif RTPT_GRIS_REGIR_REPLAY_MODE
+    history.innerRISWeight = source.innerRISWeight;
+#endif
     gGRISHistory[index] = history;
 }

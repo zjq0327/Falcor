@@ -8,6 +8,15 @@ struct GrisTemporalSettings
     uint2 previousFrameDim;
     uint historyValid;
     float3 previousCameraPosition;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    uint suffixReplayLightChange;
+    uint suffixReplayGeometryChange;
+    uint suffixReplayMovedInstanceBits;
+    uint suffixReplayValidateUnchanged;
+#endif
+#if RTPT_GRIS_SHARC_REPLAY
+    uint suffixReplaySharcChange;
+#endif
 };
 
 ConstantBuffer<GrisTemporalSettings> gGRISTemporalSettings;
@@ -38,6 +47,17 @@ bool rtptGrisLoadSelectedHistory(uint2 pixel, out GrisSpatialRecord source)
     source.suffixDirection = h.suffixDirection;
     source.suffixLight = h.suffixLight;
     source.lightPdfOrStableID = h.lightPdfOrStableID;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    source.suffixInstanceMask = h.suffixInstanceMask;
+    source.terminalBounce = h.terminalBounce;
+    source.postX2RngState = h.postX2RngState;
+#endif
+#if RTPT_GRIS_SHARC_REPLAY
+    source.sharcKey = h.sharcKey;
+    source.sharcGain = h.sharcGain;
+#elif RTPT_GRIS_REGIR_REPLAY_MODE
+    source.innerRISWeight = h.innerRISWeight;
+#endif
     source.lightIsAnalytic = (h.terminalAndFlags & kGrisHistoryAnalytic) != 0u;
     source.candidate.terminalKind = h.terminalAndFlags & ~kGrisHistoryAnalytic;
     source.candidate.rootLobe = h.rootLobe;
@@ -63,8 +83,23 @@ void main(uint3 threadID : SV_DispatchThreadID)
     float3 sourceCameras[2];
     uint sourceLightEpochs[2];
     uint inputCount = 0u;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    GrisSuffixReplaySettings replay;
+    replay.historyIndex = 2u;
+    replay.lightChanged = gGRISTemporalSettings.suffixReplayLightChange != 0u;
+    replay.geometryChanged = gGRISTemporalSettings.suffixReplayGeometryChange != 0u;
+    replay.movedInstanceBits = gGRISTemporalSettings.suffixReplayMovedInstanceBits;
+    replay.validateUnchanged = gGRISTemporalSettings.suffixReplayValidateUnchanged != 0u &&
+        !replay.lightChanged && !replay.geometryChanged;
+#if RTPT_GRIS_SHARC_REPLAY
+    replay.sharcChanges = gGRISTemporalSettings.suffixReplaySharcChange;
+#endif
+#endif
     if (rtptGrisLoadSelectedHistory(pixel, inputs[inputCount]))
     {
+#if RTPT_GRIS_SUFFIX_REPLAY
+        replay.historyIndex = inputCount;
+#endif
         sourceLightEpochs[inputCount] = rtptGrisPreviousLightEpoch();
         sourceCameras[inputCount++] = gGRISTemporalSettings.previousCameraPosition;
     }
@@ -78,7 +113,11 @@ void main(uint3 threadID : SV_DispatchThreadID)
     }
 #endif
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
-    result = rtptGrisMergeReference(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, pixel, rng);
+    result = rtptGrisMergeReference(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, pixel, rng
+#if RTPT_GRIS_SUFFIX_REPLAY
+        , replay
+#endif
+    );
 #endif
     gGRISSpatialOutput[index] = result;
 }

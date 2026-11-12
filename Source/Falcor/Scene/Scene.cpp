@@ -3502,6 +3502,16 @@ namespace Falcor
         }
     }
 
+    bool Scene::isMeshTransformable(MeshID meshID) const
+    {
+        for (const auto& group : mMeshGroups)
+        {
+            if (std::find(group.meshList.begin(), group.meshList.end(), meshID) != group.meshList.end())
+                return !group.isStatic;
+        }
+        return false;
+    }
+
     void Scene::fillInstanceDesc(std::vector<RtInstanceDesc>& instanceDescs, uint32_t rayTypeCount, bool perMeshHitEntry) const
     {
         instanceDescs.clear();

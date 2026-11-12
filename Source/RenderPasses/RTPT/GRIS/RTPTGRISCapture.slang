@@ -45,18 +45,6 @@ float rtptGRISAreaPdf(ShadingData sd, Ray ray, float continuationPdf)
 #endif
 }
 
-#if RTPT_GRIS_SHARC_REPLAY
-void rtptGRISCaptureRawEndpoint(ShadingData sd, HitInfo hit, Ray ray, float continuationPdf, inout GrisSpatialRecord suffix)
-{
-    const float areaPdf = rtptGRISAreaPdf(sd, ray, continuationPdf);
-    if (areaPdf > 0.f && isfinite(areaPdf))
-    {
-        suffix.reconnectHit = hit.pack();
-        suffix.areaPdf = areaPdf;
-    }
-}
-#endif
-
 #if ENABLE_SHARC && SHARC_QUERY
 // A recorded cache terminal owns this contribution and ends the local path.
 [ForceInline]

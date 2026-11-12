@@ -11,6 +11,10 @@ struct GrisPathBuilder
     float winnerH;
     bool hasInterface;
     bool hasTail;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    uint suffixInstanceMask;
+    uint4 postX2RngState;
+#endif
 };
 
 void rtptGRISBeginWalk(inout GrisPathBuilder builder)
@@ -23,6 +27,10 @@ void rtptGRISBeginWalk(inout GrisPathBuilder builder)
     builder.tailThroughput = 0.f;
     builder.hasInterface = false;
     builder.hasTail = false;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    builder.suffixInstanceMask = 0u;
+    builder.postX2RngState = 0u;
+#endif
 }
 
 void rtptGRISBeginInterface(uint bounce, ShadingData sd, IMaterialInstance mi, HitInfo hit,
@@ -46,7 +54,17 @@ void rtptGRISBeginInterface(uint bounce, ShadingData sd, IMaterialInstance mi, H
 void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleGenerator terminalRng,
     uint currentRoot, PackedHitInfo currentX1,
     float3 contribution, uint kind, bool deepTail, float3 direction, float3 incident,
-    uint lightPayload, bool analytic, inout GrisSpatialRecord suffix)
+    uint lightPayload, bool analytic, uint terminalBounce, inout GrisSpatialRecord suffix
+#if RTPT_GRIS_SUFFIX_REPLAY
+    , uint4 directNeeRngState = 0u
+#endif
+#if RTPT_GRIS_REGIR_REPLAY_MODE
+    , float innerRISWeight = 0.f
+#endif
+#if RTPT_GRIS_SHARC_REPLAY
+    , uint2 sharcKey = 0u, float3 sharcGain = 0.f
+#endif
+    )
 {
     const float h = dot(abs(contribution), float3(0.2126f, 0.7152f, 0.0722f));
     if (!(h > 0.f) || !isfinite(h) || !all(isfinite(incident))) return;
@@ -63,15 +81,44 @@ void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleG
     suffix.lightIsAnalytic = analytic;
     suffix.candidate.F = contribution;
     suffix.candidate.terminalKind = kind | (deepTail ? kGrisDeepTail : 0u);
+#if RTPT_GRIS_SUFFIX_REPLAY
+    suffix.suffixInstanceMask = builder.suffixInstanceMask;
+    suffix.terminalBounce = terminalBounce;
+    suffix.postX2RngState = terminalBounce == 2u ? directNeeRngState : builder.postX2RngState;
+#endif
+#if RTPT_GRIS_SHARC_REPLAY
+    suffix.sharcKey = sharcKey;
+    suffix.sharcGain = sharcGain;
+#if RTPT_GRIS_REGIR_REPLAY_MODE
+    if (rtptGrisTerminalKind(kind) == uint(GrisTerminalKind::GrisReGIRPath))
+        suffix.sharcGain.x = innerRISWeight;
+#endif
+#elif RTPT_GRIS_REGIR_REPLAY_MODE
+    suffix.innerRISWeight = innerRISWeight;
+#endif
 }
 
 void rtptGRISAddPathTerminal(inout GrisPathBuilder builder, inout SampleGenerator terminalRng,
     uint currentRoot, PackedHitInfo currentX1,
     float3 contribution, uint kind, bool deepTail, float3 direction, float3 incident,
-    float lightPdf, bool analytic, inout GrisSpatialRecord suffix)
+    float lightPdf, bool analytic, uint terminalBounce, inout GrisSpatialRecord suffix
+#if RTPT_GRIS_SHARC_REPLAY
+    , uint2 sharcKey = 0u, float3 sharcGain = 0.f
+#endif
+    )
 {
     rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
-        kind, deepTail, direction, incident, asuint(lightPdf), analytic, suffix);
+        kind, deepTail, direction, incident, asuint(lightPdf), analytic, terminalBounce, suffix
+#if RTPT_GRIS_SHARC_REPLAY
+#if RTPT_GRIS_SUFFIX_REPLAY
+        , 0u
+#endif
+#if RTPT_GRIS_REGIR_REPLAY_MODE
+        , 0.f
+#endif
+        , sharcKey, sharcGain
+#endif
+        );
 }
 
 void rtptGRISFinalizePath(GrisPathBuilder builder, inout GrisSpatialRecord suffix)
@@ -104,7 +151,17 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     uint stableID;
     float2 lightUV;
     float innerRISWeight;
+#if RTPT_GRIS_REGIR_REPLAY_MODE
+    const uint4 directRngState = bounce == 2u ? rtptGrisCaptureReplayRng(sg) : 0u;
+    SampleGenerator cellRng;
+    lightUV = rtptGrisSplitReGIRReplayRng(sg, bounce, cellRng);
+    RTPTDILightInfo lightInfo;
+    if (!rtptReGIRSelectTransportLight(sd, cellRng, lightInfo, innerRISWeight)) return float3(0.f);
+    stableID = lightInfo.pad0;
+    if (!rtptReGIRBuildTransportSample(sd, lightInfo, lightUV, innerRISWeight, light)) return float3(0.f);
+#else
     if (!rtptReGIRSampleTransportLight(sd, sg, light, stableID, lightUV, innerRISWeight)) return float3(0.f);
+#endif
     // LiOverPdf already contains the cell/RIS and conditional-light sampling
     // compensation. ReGIR owns this non-delta direct-light domain, so there
     // is no ordinary light/BSDF MIS or usable marginal light PDF here.
@@ -119,11 +176,20 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     // The historical RIS compensation remains inside incident; current table
     // weights must never replace it when an unrelated light changes.
     rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
-        uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, stableID, light.analytic, suffix);
+        uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, stableID, light.analytic,
+#if RTPT_GRIS_REGIR_REPLAY_MODE
+        bounce, suffix, directRngState, innerRISWeight);
+#else
+        0u, suffix);
+#endif
     return float3(0.f);
 #endif
 #else
     if (!rtptGRISPathReuseEnabled()) return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
+#if RTPT_GRIS_SUFFIX_REPLAY
+    // A direct NEE winner needs the state before the light category draw.
+    const uint4 directNeeRngState = bounce == 2u && builder.hasInterface ? rtptGrisCaptureReplayRng(sg) : 0u;
+#endif
     RTPTLightSample light;
     if (!rtptSampleLight(sd, sg, light)) return float3(0.f);
     const float3 value = rtptEvaluateLightSample(sd, mi, sampling, light, sg, true);
@@ -133,8 +199,18 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     const bool deepTail = bounce > 2u;
     const float3 incident = deepTail ? builder.tailThroughput * value : light.LiOverPdf;
     const float3 direction = deepTail ? builder.rcWi : light.dir;
-    rtptGRISAddPathTerminal(builder, terminalRng, currentRoot, currentX1, contribution, uint(GrisTerminalKind::GrisNee),
-        deepTail, direction, incident, light.pdf, light.analytic, suffix);
+    uint kind = uint(GrisTerminalKind::GrisNee);
+#if RTPT_GRIS_SUFFIX_REPLAY
+    if (light.replayType == RTPTReplayLightType::Emissive) kind |= kGrisEmissiveNee;
+    if (light.replayType == RTPTReplayLightType::Point) kind |= kGrisPointNee;
+    if (light.replayType == RTPTReplayLightType::Environment) kind |= kGrisEnvironmentNee;
+#endif
+    rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
+        kind, deepTail, direction, incident, asuint(light.pdf), light.analytic, bounce, suffix
+#if RTPT_GRIS_SUFFIX_REPLAY
+        , light.replayType != RTPTReplayLightType::None ? directNeeRngState : 0u
+#endif
+        );
     return float3(0.f);
 #endif
 }

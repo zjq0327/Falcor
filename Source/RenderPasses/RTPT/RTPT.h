@@ -59,6 +59,10 @@ private:
     void resetForSelectiveLightChange();
     bool canUseGRISSelectiveLightHistory() const;
     bool canPreserveGRISForPointLightChange() const;
+    bool canUseGRISReGIRReplay() const;
+    bool canUseGRISSuffixReplay() const;
+    bool canPreserveGRISSuffixReplayForPointLightChange() const;
+    bool prepareGRISSuffixReplayGeometryChange();
     void validateScene() const;
     ProgramDesc makeSceneProgramDesc(const char* path, const char* entry = "main") const;
     void prepareProgram(RenderContext* pRenderContext);
@@ -177,6 +181,7 @@ private:
         uint64_t regirDomainGeneration = 0u;
         uint32_t lightEpoch = 0u;
         bool selectiveLightDomain = false;
+        bool suffixReplayDomain = false;
 
         bool isCompatible(const GrisTemporalSnapshot& other, bool allowSharcVersionChange, bool referenceReuse) const
         {
@@ -185,7 +190,8 @@ private:
             return (referenceReuse || (all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
                 pgGeneration == other.pgGeneration)) &&
                 (sharcVersion == other.sharcVersion || (allowSharcVersionChange && sharcVersion != 0u && other.sharcVersion != 0u)) &&
-                regirDomainGeneration == other.regirDomainGeneration && selectiveLightDomain == other.selectiveLightDomain;
+                regirDomainGeneration == other.regirDomainGeneration && selectiveLightDomain == other.selectiveLightDomain &&
+                suffixReplayDomain == other.suffixReplayDomain;
         }
     };
     struct GrisTemporalHistoryFrame
@@ -202,6 +208,19 @@ private:
     bool mGRISHistoryReadValid = false;
     bool mGRISHistoryReferenceDomain = false;
     bool mGRISHistoryReplayActive = false;
+    bool mGRISSuffixReplayEnabled = false;
+    bool mGRISSuffixReplayValidateUnchanged = false;
+    uint32_t mGRISReGIRReplayMode = 0u; // 0: off, 2: RNG UV replay.
+    bool mGRISSuffixReplayPreserveRequested = false;
+    bool mGRISSuffixReplayLightChange = false;
+    bool mGRISSuffixReplayGeometryPreserveRequested = false;
+    bool mGRISSuffixReplayGeometryChange = false;
+    std::vector<ref<Light>> mGRISReplayPreviousLights;
+    std::vector<LightData> mGRISReplayPreviousLightData;
+    ref<Buffer> mpGRISReplayPreviousLights;
+    std::vector<float4x4> mGRISReplayPreviousInstanceTransforms;
+    std::vector<uint32_t> mGRISReplayMovedInstances;
+    ref<Buffer> mpGRISReplayMovedInstances;
     bool mGRISReGIRSelectiveHistory = true;
     bool mGRISSelectiveLightHistoryEnabled = false;
     bool mGRISLightHistoryPreserveRequested = false;

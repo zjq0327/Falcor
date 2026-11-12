@@ -162,7 +162,7 @@ float3 RTPT_CONTINUATION_NAME(
                     const float3 incident = deepTail ? pathBuilder.tailThroughput * environment * misWeight : environment;
                     rtptGRISAddPathTerminal(pathBuilder, terminalRng, currentRoot, prefix.x1Hit,
                         contribution, uint(GrisTerminalKind::GrisEnvironment),
-                        deepTail, pathBuilder.rcWi, incident, lightPdf, false, suffix);
+                        deepTail, pathBuilder.rcWi, incident, lightPdf, false, bounce, suffix);
                 }
                 else radiance += contribution;
 #else
@@ -228,12 +228,10 @@ float3 RTPT_CONTINUATION_NAME(
         if (bounce == 1u && HitInfo(prefix.x1Hit).isValid())
             pathBuilder.areaPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
         rtptGRISBeginInterface(bounce, sd, mi, hit, ray, previousContinuationPdf, previousDelta, prefix, pathBuilder, suffix);
+#if RTPT_GRIS_SUFFIX_REPLAY
+        if (bounce > 2u && pathBuilder.hasTail)
+            pathBuilder.suffixInstanceMask |= rtptGrisSuffixInstanceBit(triangleHit.instanceID.index);
 #endif
-#if RTPT_GRIS_SHARC_REPLAY
-        // Keep the geometric draw even if this frame's terminal is empty.
-        if (bounce == 2u && bounce < gParams.maxBounces && HitInfo(prefix.x1Hit).isValid() &&
-            rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
-            rtptGRISCaptureRawEndpoint(sd, hit, ray, previousContinuationPdf, suffix);
 #endif
 #endif
 
@@ -241,6 +239,9 @@ float3 RTPT_CONTINUATION_NAME(
         const BSDFProperties sharcProperties = mi.getProperties(sd);
         float3 cachedRadiance;
 #if RTPT_GRIS_GENERATE
+#if RTPT_GRIS_SHARC_REPLAY
+        RTPTSharcTailQuery tailQuery;
+#endif
         // The guided and BSDF techniques share one continuation on the supported diffuse edges.
         const bool sharedDiffuse = previousSharcSampling.alpha > 0.f;
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
@@ -250,6 +251,9 @@ float3 RTPT_CONTINUATION_NAME(
         if (rtptTrySharcQueryOnEdge(sd, mi, sharcProperties, bounce, previousDelta,
             previousGuideSelected && !sharedDiffuse, previousDiffuse || sharedDiffuse, previousRoughness,
             length(sd.posW - previousPosition), previousSharcSampling, ray.dir, sharcStats, cachedRadiance
+#if RTPT_GRIS_SHARC_REPLAY
+            , tailQuery
+#endif
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
             , probeX1
 #endif
@@ -272,12 +276,22 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_CACHE_TAIL
                 if (pathBuilder.hasTail)
                 {
-                    // Store only this cache terminal. Its incoming fixed tail
-                    // retains the scattering sampled after x2; reuse freezes
-                    // that RGB while reevaluating the represented prefix/x2.
+                    float3 incident = pathBuilder.tailThroughput * cachedRadiance;
+#if RTPT_GRIS_SHARC_REPLAY
+                    const float3 sharcGain = pathBuilder.tailThroughput * tailQuery.materialFactor;
+                    const float3 refreshedIncident = sharcGain * tailQuery.rawRadiance;
+                    // Preserve the original incident and allow ray replay if
+                    // folding the material factor would overflow.
+                    const bool canRefresh = all(isfinite(sharcGain)) && all(isfinite(refreshedIncident));
+                    if (canRefresh) incident = refreshedIncident;
+#endif
                     rtptGRISAddPathTerminal(pathBuilder, terminalRng, currentRoot, prefix.x1Hit,
                         contribution, uint(GrisTerminalKind::GrisSharcTail), true,
-                        pathBuilder.rcWi, pathBuilder.tailThroughput * cachedRadiance, 0.f, false, suffix);
+                        pathBuilder.rcWi, incident, 0.f, false, bounce, suffix
+#if RTPT_GRIS_SHARC_REPLAY
+                        , canRefresh ? tailQuery.key : uint2(0u), canRefresh ? sharcGain : float3(0.f)
+#endif
+                        );
                     break;
                 }
 #endif
@@ -345,7 +359,7 @@ float3 RTPT_CONTINUATION_NAME(
                         const float3 incident = deepTail ? pathBuilder.tailThroughput * emission * misWeight : emission;
                         rtptGRISAddPathTerminal(pathBuilder, terminalRng, currentRoot, prefix.x1Hit,
                             contribution, uint(GrisTerminalKind::GrisEmitter),
-                            deepTail, pathBuilder.rcWi, incident, lightPdf, false, suffix);
+                            deepTail, pathBuilder.rcWi, incident, lightPdf, false, bounce, suffix);
                     }
                     else radiance += contribution;
 #else
@@ -376,9 +390,20 @@ float3 RTPT_CONTINUATION_NAME(
             float3 contribution = 0.f;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL
 #if !RTPT_GRIS_ALTERNATING
-            contribution = rtptGRISCapturePathNEE(bounce, sd, mi, sampling, throughput, query,
-                currentRoot, prefix.x1Hit, sg,
-                terminalRng, pathBuilder, suffix);
+#if RTPT_GRIS_SUFFIX_REPLAY
+            if ((bounce > 2u && pathBuilder.hasTail) ||
+                (RTPT_GRIS_REGIR_REPLAY_MODE != 0 && bounce == 2u && pathBuilder.hasInterface))
+            {
+                SampleGenerator neeRng = rtptGrisForkReplayNEERng(sg, bounce);
+                contribution = rtptGRISCapturePathNEE(bounce, sd, mi, sampling, throughput, query,
+                    currentRoot, prefix.x1Hit, neeRng, terminalRng, pathBuilder, suffix);
+            }
+            else
+#endif
+            {
+                contribution = rtptGRISCapturePathNEE(bounce, sd, mi, sampling, throughput, query,
+                    currentRoot, prefix.x1Hit, sg, terminalRng, pathBuilder, suffix);
+            }
 #else
             if (bounce == 2 && HitInfo(prefix.x1Hit).isValid() && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
             {
@@ -453,6 +478,9 @@ float3 RTPT_CONTINUATION_NAME(
                 pathBuilder.rcWi = bs.wo;
                 pathBuilder.tailThroughput = float3(1.f);
                 pathBuilder.hasTail = true;
+#if RTPT_GRIS_SUFFIX_REPLAY
+                pathBuilder.postX2RngState = rtptGrisCaptureReplayRng(sg);
+#endif
             }
             else
             {

@@ -100,12 +100,10 @@ bool rtptReGIRRebuildTransportSample(ShadingData sd, uint stableID, float2 uv, f
     Reusing slots correlates estimates; it does not turn this weight into a PDF.
     A populated cell's empty/zero slot contributes zero and never triggers a retry.
 */
-bool rtptReGIRSampleTransportLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSample result,
-    out uint stableID, out float2 uv, out float estimatorWeight)
+bool rtptReGIRSelectTransportLight(ShadingData sd, inout SampleGenerator sg,
+    out RTPTDILightInfo light, out float estimatorWeight)
 {
-    result = {};
-    stableID = 0u;
-    uv = 0.f;
+    light = {};
     estimatorWeight = 0.f;
     const RTPTReGIRCellView view = rtptReGIRGetCellView(sd.posW, sampleNext3D(sg));
     if (view.ready == 0u || view.count == 0u) return false;
@@ -136,9 +134,17 @@ bool rtptReGIRSampleTransportLight(ShadingData sd, inout SampleGenerator sg, out
         lightIndex = rtptReGIRLoadCandidate(view, random % view.count);
         estimatorWeight = float(view.count);
     }
-    if (!(estimatorWeight > 0.f) || !isfinite(estimatorWeight)) return false;
+    return estimatorWeight > 0.f && isfinite(estimatorWeight) && rtptReGIRLoadTransportLight(sd, lightIndex, light);
+}
+
+bool rtptReGIRSampleTransportLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSample result,
+    out uint stableID, out float2 uv, out float estimatorWeight)
+{
+    result = {};
+    stableID = 0u;
+    uv = 0.f;
     RTPTDILightInfo light;
-    if (!rtptReGIRLoadTransportLight(sd, lightIndex, light)) return false;
+    if (!rtptReGIRSelectTransportLight(sd, sg, light, estimatorWeight)) return false;
 #if USE_EMISSIVE_LIGHTS
     if (light.kind == kRTPTDILightEmissive && light.sourceIndex < gScene.lightCollection.getTriangleCount())
         uv = sampleNext2D(sg);

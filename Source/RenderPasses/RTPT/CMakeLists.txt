@@ -48,6 +48,7 @@ target_sources(RTPT PRIVATE
     GRIS/RTPTGRISShade.cs.slang
     GRIS/RTPTGRISSpatial.cs.slang
     GRIS/RTPTGRISSpatial.slang
+    GRIS/RTPTGRISSuffixReplay.slang
     GRIS/RTPTGRISSupport.slang
     GRIS/RTPTGRISTemporal.cs.slang
     GRIS/RTPTGRISTemporal.slang

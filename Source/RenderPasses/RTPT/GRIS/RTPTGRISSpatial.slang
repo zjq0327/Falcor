@@ -27,7 +27,15 @@ void main(uint3 threadID : SV_DispatchThreadID)
     }
 #endif
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0x76b5a2d1u);
-    result = rtptGrisMergeReference(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, pixel, rng);
+#if RTPT_GRIS_SUFFIX_REPLAY
+    GrisSuffixReplaySettings replay = {};
+    replay.historyIndex = 2u;
+#endif
+    result = rtptGrisMergeReference(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, pixel, rng
+#if RTPT_GRIS_SUFFIX_REPLAY
+        , replay
+#endif
+    );
 #endif
     gGRISSpatialOutput[index] = result;
 }

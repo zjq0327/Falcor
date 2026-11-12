@@ -654,6 +654,9 @@ namespace Falcor
         */
         const MeshDesc& getMesh(MeshID meshID) const { return mMeshDesc[meshID.get()]; }
 
+        /** Returns true if the mesh uses a TLAS instance transform instead of a world-space BLAS. */
+        bool isMeshTransformable(MeshID meshID) const;
+
         /** Get mesh vertex and index data.
             \param[in] meshID Mesh ID.
             \param[in] buffers Map of buffers containing mesh data: "triangleIndices", "positions", and "texcrds" are required.

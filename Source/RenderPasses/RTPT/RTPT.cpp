@@ -98,6 +98,7 @@ RTPT::RTPT(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 void RTPT::setProperties(const Properties& props)
 {
     const bool couldUseGRISTemporal = canUseGRISTemporal();
+    const bool hadGRISCacheTail = useGRISCacheTail();
     drainPGAsync();
     uint32_t samplesPerPixel = mSamplesPerPixel, maxBounces = mMaxBounces, rrStartBounce = mRRStartBounce, seed = mSeed;
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
@@ -108,6 +109,9 @@ void RTPT::setProperties(const Properties& props)
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
+    bool grisSuffixReplayEnabled = mGRISSuffixReplayEnabled;
+    bool grisSuffixReplayValidateUnchanged = mGRISSuffixReplayValidateUnchanged;
+    uint32_t grisReGIRReplayMode = mGRISReGIRReplayMode;
     uint32_t grisPGPrefixDepth = mGRISPGPrefixDepth;
     float grisSharcX1Blend = mGRISSharcX1Blend;
     bool restirDIEnabled = mRestirDIEnabled;
@@ -146,6 +150,9 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
+        else if (key == "grisSuffixReplayEnabled") grisSuffixReplayEnabled = value;
+        else if (key == "grisSuffixReplayValidateUnchanged") grisSuffixReplayValidateUnchanged = value;
+        else if (key == "grisReGIRReplayMode") grisReGIRReplayMode = value;
         else if (key == "grisPGPrefixDepth") grisPGPrefixDepth = value;
         else if (key == "grisSharcX1Blend") grisSharcX1Blend = value;
         else if (key == "grisReGIRSelectiveHistory") grisReGIRSelectiveHistory = value;
@@ -220,6 +227,8 @@ void RTPT::setProperties(const Properties& props)
     FALCOR_CHECK(std::isfinite(restirDISpatialRadius) && restirDISpatialRadius >= 1.f && restirDISpatialRadius <= 64.f,
         "ReSTIR DI spatial radius must be in [1, 64] pixels.");
     FALCOR_CHECK(rrStartBounce >= 1 && rrStartBounce <= 64, "RTPT rrStartBounce must be in [1, 64].");
+    FALCOR_CHECK(grisReGIRReplayMode == 0u || grisReGIRReplayMode == 2u,
+        "RTPT grisReGIRReplayMode must be 0 (off) or 2 (RNG UV replay).");
     FALCOR_CHECK(!enableNRD || (samplesPerPixel == 1 && !accumulate),
         "RTPT NRD mode requires samplesPerPixel=1 and accumulate=false; NRD manages temporal history.");
     FALCOR_CHECK(!enableSHARC || !accumulate,
@@ -286,7 +295,10 @@ void RTPT::setProperties(const Properties& props)
     const bool sharcQuery = enableSHARC && sharcEnabled && sharcUseCache;
     const bool sharcTransportChanged = sharcSignalChanged && (sharcQuery || (mEnableSHARC && mSHARCEnabled && mSHARCUseCache));
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
-    const bool cacheTailChanged = (grisEnabled && sharcQuery && !regirEnabled) != useGRISCacheTail();
+    const bool grisModeChanged = grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
+        grisTemporalEnabled != mGRISTemporalEnabled || grisSuffixReplayEnabled != mGRISSuffixReplayEnabled ||
+        grisReGIRReplayMode != mGRISReGIRReplayMode || (grisEnabled && grisSharcReuseChanged);
+    const bool grisPGPrefixChanged = grisPGPrefixDepth != mGRISPGPrefixDepth;
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
         sharcEnabled != mSHARCEnabled || transportModeChanged || sharcTransportChanged || diChanged ||
@@ -318,23 +330,15 @@ void RTPT::setProperties(const Properties& props)
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
     mEnableDeltaReflectionNRD = enableDeltaReflectionNRD;
-    if (grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
-        grisTemporalEnabled != mGRISTemporalEnabled || (grisEnabled && grisSharcReuseChanged) || cacheTailChanged)
-    {
-        mGRISEnabled = grisEnabled;
-        mGRISSpatialEnabled = grisSpatialEnabled;
-        mGRISTemporalEnabled = grisTemporalEnabled;
-        mOptionsChanged = true;
-        invalidateGRIS();
-    }
+    mGRISEnabled = grisEnabled;
+    mGRISSpatialEnabled = grisSpatialEnabled;
+    mGRISTemporalEnabled = grisTemporalEnabled;
+    mGRISSuffixReplayEnabled = grisSuffixReplayEnabled;
+    mGRISReGIRReplayMode = grisReGIRReplayMode;
+    mGRISSuffixReplayValidateUnchanged = grisSuffixReplayValidateUnchanged;
     mGRISSharcX1Blend = grisSharcX1Blend;
     mGRISReGIRSelectiveHistory = grisReGIRSelectiveHistory;
-    if (grisPGPrefixDepth != mGRISPGPrefixDepth)
-    {
-        mGRISPGPrefixDepth = grisPGPrefixDepth;
-        // Only the proposal changes; the record's reference-domain contract is identical.
-        invalidateGRIS(true, true);
-    }
+    mGRISPGPrefixDepth = grisPGPrefixDepth;
     mRestirDIEnabled = restirDIEnabled;
     mRestirDICandidateCount = restirDICandidateCount;
     mRestirDIBudgetMB = restirDIBudgetMB;
@@ -382,6 +386,16 @@ void RTPT::setProperties(const Properties& props)
     mPGSettings = pg;
     mPGUpdateStride = pgUpdateStride;
     mPGUpdateBounces = pgUpdateBounces;
+    if (grisModeChanged || hadGRISCacheTail != useGRISCacheTail())
+    {
+        mOptionsChanged = true;
+        invalidateGRIS();
+    }
+    else if (grisPGPrefixChanged)
+    {
+        // Only the proposal changes; the record's reference-domain contract is identical.
+        invalidateGRIS(true, true);
+    }
     if (mStagePreparationFailed && couldUseGRISTemporal != canUseGRISTemporal())
         invalidateStages();
     // Pool sizes and training depth are runtime data. Releasing their resource
@@ -417,6 +431,9 @@ Properties RTPT::getProperties() const
     props["grisEnabled"] = mGRISEnabled;
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
+    props["grisSuffixReplayEnabled"] = mGRISSuffixReplayEnabled;
+    props["grisSuffixReplayValidateUnchanged"] = mGRISSuffixReplayValidateUnchanged;
+    props["grisReGIRReplayMode"] = mGRISReGIRReplayMode;
     props["grisPGPrefixDepth"] = mGRISPGPrefixDepth;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;
     props["grisReGIRSelectiveHistory"] = mGRISReGIRSelectiveHistory;
@@ -620,6 +637,113 @@ bool RTPT::canPreserveGRISForPointLightChange() const
         mLightCatalog.getSnapshot().uncoveredAnalyticCount != 0u) return false;
     for (const auto& light : mpScene->getActiveAnalyticLights())
         if (light->getType() != LightType::Point) return false;
+    return true;
+}
+
+bool RTPT::canUseGRISReGIRReplay() const
+{
+    return mpScene && mReGIREnabled && mReGIRSecondaryEnabled && !mRestirDIEnabled &&
+        mGRISReGIRReplayMode == 2u && mUseNEE && mGRISReGIRSelectiveHistory && mReGIRBrightnessThreshold == 0.f &&
+        canUseGRISTemporal();
+}
+
+bool RTPT::canUseGRISSuffixReplay() const
+{
+    const bool replay = mReGIREnabled ? canUseGRISReGIRReplay() :
+        mpScene && mGRISSuffixReplayEnabled && canUseGRISTemporal() && !mRestirDIEnabled;
+    return replay && canUseGRISReferenceReuse();
+}
+
+bool RTPT::canPreserveGRISSuffixReplayForPointLightChange() const
+{
+    if (mReGIREnabled || !canUseGRISSuffixReplay() || !mUseNEE || !mpScene->useAnalyticLights() || mOptionsChanged ||
+        !mGRISHistoryFrame.historyValid || !mGRISHistoryFrame.snapshot.suffixReplayDomain ||
+        !mpGRISReplayPreviousLights) return false;
+
+    const auto updates = mpScene->getUpdates();
+    const auto lightChanges = IScene::UpdateFlags::LightsMoved | IScene::UpdateFlags::LightIntensityChanged;
+    const auto allowed = lightChanges | IScene::UpdateFlags::CameraMoved |
+        IScene::UpdateFlags::CameraPropertiesChanged | IScene::UpdateFlags::SceneGraphChanged;
+    if ((updates & lightChanges) == IScene::UpdateFlags::None || (updates & ~allowed) != IScene::UpdateFlags::None ||
+        is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum)) return false;
+
+    // The analytic index is a stable identity within an unchanged ordered
+    // active list. The current list and category probabilities then also give
+    // the previous light proposal, while LightData gives the previous value.
+    const auto& lights = mpScene->getActiveAnalyticLights();
+    if (lights.empty() || lights != mGRISReplayPreviousLights || lights.size() != mGRISReplayPreviousLightData.size()) return false;
+    for (size_t i = 0; i < lights.size(); ++i)
+    {
+        const LightData& current = lights[i]->getData();
+        const LightData& previous = mGRISReplayPreviousLightData[i];
+        if (lights[i]->getType() != LightType::Point || any(current.dirW != previous.dirW) ||
+            current.openingAngle != previous.openingAngle || current.cosOpeningAngle != previous.cosOpeningAngle ||
+            current.penumbraAngle != previous.penumbraAngle) return false;
+    }
+    return true;
+}
+
+namespace
+{
+bool isRigidInstanceMotion(const float4x4& previous, const float4x4& current)
+{
+    constexpr float kTolerance = 1e-4f;
+    const float4 affineRow(0.f, 0.f, 0.f, 1.f);
+    if (any(previous.getRow(3) != affineRow) || any(current.getRow(3) != affineRow) ||
+        !all(isfinite(previous.getCol(3))) || !all(isfinite(current.getCol(3)))) return false;
+
+    const float3x3 previousLinear(previous);
+    const float previousDet = determinant(previousLinear);
+    if (!std::isfinite(previousDet) || previousDet == 0.f) return false;
+    const float3x3 relative = mul(float3x3(current), inverse(previousLinear));
+    const float relativeDet = determinant(relative);
+    if (!std::isfinite(relativeDet) || std::abs(relativeDet - 1.f) > kTolerance) return false;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = i; j < 3; ++j)
+        {
+            const float gram = dot(relative.getCol(i), relative.getCol(j));
+            if (!std::isfinite(gram) || std::abs(gram - (i == j ? 1.f : 0.f)) > kTolerance) return false;
+        }
+    }
+    return true;
+}
+}
+
+bool RTPT::prepareGRISSuffixReplayGeometryChange()
+{
+    if (!canUseGRISSuffixReplay() || mOptionsChanged || !mGRISHistoryFrame.historyValid ||
+        !mGRISHistoryFrame.snapshot.suffixReplayDomain) return false;
+
+    const auto updates = mpScene->getUpdates();
+    const auto allowed = IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::SceneGraphChanged |
+        IScene::UpdateFlags::CameraMoved | IScene::UpdateFlags::CameraPropertiesChanged;
+    if (!is_set(updates, IScene::UpdateFlags::GeometryMoved) || (updates & ~allowed) != IScene::UpdateFlags::None ||
+        is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum)) return false;
+
+    const uint32_t count = mpScene->getGeometryInstanceCount();
+    if (mGRISReplayPreviousInstanceTransforms.size() != count) return false;
+    const auto& matrices = mpScene->getAnimationController()->getGlobalMatrices();
+    const auto& materials = mpScene->getMaterialSystem();
+    std::vector<uint32_t> moved(count, 0u);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const auto& instance = mpScene->getGeometryInstance(i);
+        const auto& current = matrices[instance.globalMatrixID];
+        const auto& previous = mGRISReplayPreviousInstanceTransforms[i];
+        if (current == previous) continue;
+
+        // The approximation replays against current geometry. Limit moving
+        // instances to rigid, opaque, non-emissive TLAS transforms.
+        if (instance.getType() != GeometryType::TriangleMesh || instance.isDynamic() ||
+            !mpScene->isMeshTransformable(MeshID::fromSlang(instance.geometryID)) ||
+            !isRigidInstanceMotion(previous, current)) return false;
+        const auto& material = materials.getMaterial(MaterialID::fromSlang(instance.materialID));
+        if (!material->isOpaque() || material->isEmissive()) return false;
+        moved[i] = 1u;
+    }
+    mGRISReplayMovedInstances = std::move(moved);
     return true;
 }
 
@@ -995,6 +1119,8 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
             var["gSHARCMotionStats"] = mpSHARCMotionStats;
             var["gSHARCMotionSettings"]["boundsCount"] = uint32_t(mSHARCMotionBoundsCPU.size() / 2);
             mpSHARCInvalidate->execute(pRenderContext, uint3(mSHARCEntries, 1, 1));
+            // Motion can change the query data even while Resolve is frozen.
+            ++mSHARCResolveVersion;
             pRenderContext->uavBarrier(mpSHARCHashEntries.get());
             pRenderContext->uavBarrier(mpSHARCAccumulation.get());
             pRenderContext->uavBarrier(mpSHARCResolved.get());
@@ -1082,6 +1208,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mSceneMotionThisFrame = false;
     mGRISSelectiveLightHistoryEnabled = false;
     mGRISLightHistoryPreserveRequested = false;
+    mGRISSuffixReplayPreserveRequested = false;
+    mGRISSuffixReplayLightChange = false;
+    mGRISSuffixReplayGeometryPreserveRequested = false;
+    mGRISSuffixReplayGeometryChange = false;
+    mGRISReplayMovedInstances.clear();
     mGRISLightHistoryPreservedThisFrame = false;
     mGRISHistoryReadLightEpoch = 0u;
     mGRISLightHistoryResetReason.clear();
@@ -1117,9 +1248,13 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     auto& dict = renderData.getDictionary();
     const auto refreshFlags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
     mGRISLightHistoryPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && canPreserveGRISForPointLightChange();
-    // A completed progressive image must resume for point-light motion too,
+    mGRISSuffixReplayPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && canPreserveGRISSuffixReplayForPointLightChange();
+    mGRISSuffixReplayGeometryPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && prepareGRISSuffixReplayGeometryChange();
+    const bool preserveGRISHistory = mGRISLightHistoryPreserveRequested || mGRISSuffixReplayPreserveRequested ||
+        mGRISSuffixReplayGeometryPreserveRequested;
+    // A completed progressive image must resume for supported motion,
     // even when NRD's motion policy does not call for a history reset.
-    if (mGRISLightHistoryPreserveRequested) resetAccumulation();
+    if (preserveGRISHistory) resetAccumulation();
     // Motion is reprojected by NRD. Only discontinuities discard its history.
     const auto discontinuities = IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::GeometryChanged |
         IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::EmissiveMaterialsChanged |
@@ -1137,14 +1272,12 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mSceneMotionThisFrame = (updates & movingScene) != IScene::UpdateFlags::None;
     updateSHARCMotionBounds();
     if ((updates & (movingScene | IScene::UpdateFlags::LightCollectionChanged)) != IScene::UpdateFlags::None &&
-        !mGRISLightHistoryPreserveRequested)
+        !preserveGRISHistory)
     {
         mGRISLightHistoryResetReason = "Geometry, light collection or unsupported light motion";
         resetGRISHistory();
     }
-    // Previous hit/material reconstruction and temporal visibility use the
-    // current scene only while its physical state is unchanged. Camera motion
-    // is handled by reprojection, independently of PG/NRD history resets.
+    // DI retains its existing invalidation rules independently of GRIS replay.
     if ((updates & (discontinuities | movingScene)) != IScene::UpdateFlags::None)
         resetDIHistory("Scene geometry, materials or lighting changed");
     else if (is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum))
@@ -1159,7 +1292,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (mEnablePG) mPGCameraPosition = mpScene->getCamera()->getPosition();
     if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None)
     {
-        if (mGRISLightHistoryPreserveRequested) resetForSelectiveLightChange();
+        if (preserveGRISHistory) resetForSelectiveLightChange();
         else
         {
             if (mGRISLightHistoryResetReason.empty())

@@ -8,6 +8,14 @@
 #ifndef RTPT_REGIR_ONLY
 #define RTPT_REGIR_ONLY 0
 #endif
+#ifndef RTPT_GRIS_SUFFIX_REPLAY
+#define RTPT_GRIS_SUFFIX_REPLAY 0
+#endif
+
+#if RTPT_GRIS_SUFFIX_REPLAY
+static const uint kRTPTInvalidReplayLightID = 0xffffffffu;
+enum RTPTReplayLightType { None, Point, Emissive, Environment };
+#endif
 
 // All directional PDFs in this file are measured in solid angle. LiOverPdf
 // includes both the light category probability and the sampler's own PDF.
@@ -18,6 +26,9 @@ struct RTPTLightSample
     float pdf;
     bool analytic;
     Ray visibilityRay;
+#if RTPT_GRIS_SUFFIX_REPLAY
+    RTPTReplayLightType replayType;
+#endif
 };
 
 #include "ReGIR/RTPTReGIRTransport.slang"
@@ -59,6 +70,13 @@ float3 rtptLightCategoryProbabilities()
 #endif
     const float sum = p.x + p.y + p.z;
     return sum > 0.f ? p / sum : float3(0.f);
+}
+
+uint rtptSampleLightCategory(float3 probabilities, inout SampleGenerator sg)
+{
+    const float u = sampleNext1D(sg);
+    if (u < probabilities.x) return 0u;
+    return u < probabilities.x + probabilities.y ? 1u : 2u;
 }
 
 #if USE_ENV_LIGHT
@@ -124,6 +142,9 @@ float rtptEmissiveLightPdf(float3 previousPosition, float3 previousNormal, Trian
 #if USE_ENV_LIGHT
 bool rtptSampleEnvironmentLight(float3 origin, float probability, inout SampleGenerator sg, inout RTPTLightSample result)
 {
+#if RTPT_GRIS_SUFFIX_REPLAY
+    result.replayType = RTPTReplayLightType::Environment;
+#endif
     EnvMapSample ls;
     if (!gEnvMapSampler.sample(sampleNext2D(sg), ls)) return false;
     result.pdf = ls.pdf * probability;
@@ -160,16 +181,24 @@ bool rtptSampleEmissiveLight(
     const float distance = length(shadowVector);
     if (!(distance > 0.f) || !isfinite(distance)) return false;
     result.visibilityRay = Ray(origin, shadowVector / distance, 0.f, distance);
+#if RTPT_GRIS_SUFFIX_REPLAY
+    result.replayType = RTPTReplayLightType::Emissive;
+#endif
     return true;
 }
 #endif
 
 #if USE_ANALYTIC_LIGHTS
-bool rtptSampleAnalyticLight(ShadingData sd, float3 origin, uint index, uint count, float probability,
+uint rtptSampleAnalyticLightIndex(uint count, inout SampleGenerator sg)
+{
+    return min(uint(sampleNext1D(sg) * count), count - 1u);
+}
+
+bool rtptSampleAnalyticLightData(ShadingData sd, float3 origin, LightData light, uint count, float probability,
     inout SampleGenerator sg, inout RTPTLightSample result)
 {
     AnalyticLightSample ls;
-    if (!sampleLight(sd.posW, gScene.getLight(index), sg, ls)) return false;
+    if (!sampleLight(sd.posW, light, sg, ls)) return false;
     result.dir = ls.dir;
     result.pdf = ls.pdf * probability / float(count);
     // AnalyticLightSample::Li is already divided by its directional PDF.
@@ -178,6 +207,70 @@ bool rtptSampleAnalyticLight(ShadingData sd, float3 origin, uint index, uint cou
     result.visibilityRay = Ray(origin, ls.dir, 0.f, ls.distance);
     return true;
 }
+
+bool rtptSampleAnalyticLight(ShadingData sd, float3 origin, uint index, uint count, float probability,
+    inout SampleGenerator sg, inout RTPTLightSample result)
+{
+    const LightData light = gScene.getLight(index);
+#if RTPT_GRIS_SUFFIX_REPLAY
+    if (light.type == uint(LightType::Point)) result.replayType = RTPTReplayLightType::Point;
+#endif
+    return rtptSampleAnalyticLightData(sd, origin, light, count, probability, sg, result);
+}
+#endif
+
+bool rtptValidLightSample(ShadingData sd, RTPTLightSample light)
+{
+    return dot(sd.getOrientedFaceNormal(), light.dir) > 0.f &&
+        all(isfinite(light.LiOverPdf)) && any(light.LiOverPdf > 0.f);
+}
+
+#if RTPT_GRIS_SUFFIX_REPLAY
+#if USE_ANALYTIC_LIGHTS
+StructuredBuffer<LightData> gGRISReplayPreviousLights;
+#endif
+
+uint rtptReplayPointLightIndex(inout SampleGenerator sg)
+{
+#if USE_ANALYTIC_LIGHTS
+    const float3 probabilities = rtptLightCategoryProbabilities();
+    if (probabilities.z > 0.f && rtptSampleLightCategory(probabilities, sg) == 2u)
+    {
+        const uint index = rtptSampleAnalyticLightIndex(gScene.getLightCount(), sg);
+        if (gScene.getLight(index).type == uint(LightType::Point)) return index;
+    }
+#endif
+    return kRTPTInvalidReplayLightID;
+}
+
+bool rtptReplayPointLightChanged(uint lightID)
+{
+#if USE_ANALYTIC_LIGHTS
+    if (lightID >= gScene.getLightCount()) return false;
+    const LightData current = gScene.getLight(lightID);
+    const LightData previous = gGRISReplayPreviousLights[lightID];
+    return any(current.posW != previous.posW) || any(current.intensity != previous.intensity);
+#else
+    return false;
+#endif
+}
+
+bool rtptReplayPointLight(ShadingData sd, uint lightID, bool previous, inout SampleGenerator sg, out RTPTLightSample result)
+{
+    result = {};
+#if USE_ANALYTIC_LIGHTS
+    const uint count = gScene.getLightCount();
+    if (lightID >= count) return false;
+    const float probability = rtptLightCategoryProbabilities().z;
+    if (!(probability > 0.f)) return false;
+    const LightData light = previous ? gGRISReplayPreviousLights[lightID] : gScene.getLight(lightID);
+    if (light.type != uint(LightType::Point)) return false;
+    return rtptSampleAnalyticLightData(sd, sd.computeRayOrigin(), light, count, probability, sg, result) &&
+        rtptValidLightSample(sd, result);
+#else
+    return false;
+#endif
+}
 #endif
 
 bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSample result)
@@ -185,10 +278,10 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
     result = {};
     const float3 probabilities = rtptLightCategoryProbabilities();
     if (all(probabilities == 0.f)) return false;
-    const float u = sampleNext1D(sg);
+    const uint category = rtptSampleLightCategory(probabilities, sg);
     const float3 origin = sd.computeRayOrigin();
 
-    if (u < probabilities.x)
+    if (category == 0u)
     {
 #if USE_ENV_LIGHT
         if (!rtptSampleEnvironmentLight(origin, probabilities.x, sg, result)) return false;
@@ -196,7 +289,7 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
         return false;
 #endif
     }
-    else if (u < probabilities.x + probabilities.y)
+    else if (category == 1u)
     {
 #if USE_EMISSIVE_LIGHTS
         if (!rtptSampleEmissiveLight(sd, origin, probabilities.y, sg, result)) return false;
@@ -209,15 +302,14 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
 #if USE_ANALYTIC_LIGHTS
         if (probabilities.z <= 0.f) return false;
         const uint count = gScene.getLightCount();
-        const uint index = min(uint(sampleNext1D(sg) * count), count - 1);
+        const uint index = rtptSampleAnalyticLightIndex(count, sg);
         if (!rtptSampleAnalyticLight(sd, origin, index, count, probabilities.z, sg, result)) return false;
 #else
         return false;
 #endif
     }
 
-    return dot(sd.getOrientedFaceNormal(), result.dir) > 0.f &&
-        all(isfinite(result.LiOverPdf)) && any(result.LiOverPdf > 0.f);
+    return rtptValidLightSample(sd, result);
 }
 
 /** The root DI domain covers the entire light-collection triangle catalogue,

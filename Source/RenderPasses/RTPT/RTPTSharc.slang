@@ -3,6 +3,9 @@
 #ifndef RTPT_GRIS_CACHE_TAIL
 #define RTPT_GRIS_CACHE_TAIL 0
 #endif
+#ifndef RTPT_GRIS_SHARC_REPLAY
+#define RTPT_GRIS_SHARC_REPLAY 0
+#endif
 
 // One record is shared by all samples and NRD continuations of a pixel.
 struct RTPTSharcStats
@@ -87,6 +90,34 @@ uint2 rtptSharcUpdatePixel(uint2 tile)
 #endif
 
 #if SHARC_QUERY
+#if RTPT_GRIS_SHARC_REPLAY
+struct RTPTSharcTailQuery
+{
+    uint2 key;
+    float3 rawRadiance;
+    float3 materialFactor;
+};
+
+bool rtptReadSharcTailRadiance(uint2 key, out float3 rawRadiance)
+{
+    rawRadiance = 0.f;
+    const HashGridKey hashKey = HashGridKey(uint64_t(key.x) | (uint64_t(key.y) << 32u));
+    if (gSharcSettings.useCache == 0u || hashKey == HASH_GRID_INVALID_HASH_KEY) return false;
+
+    // RTPT uses non-directional radiance and folds the hit material factor
+    // into the tail gain. A reusable SHaRC terminal has no emission.
+    SharcHitData hit = {};
+#if SHARC_MATERIAL_DEMODULATION
+    hit.materialDemodulation = 1.f;
+#endif
+    if (SharcGetCachedRadianceFromHash(gSharc, hit, hashKey, rawRadiance, false) &&
+        all(isfinite(rawRadiance)) && all(rawRadiance >= 0.f))
+        return true;
+    rawRadiance = 0.f;
+    return false;
+}
+#endif
+
 void rtptCaptureSharcPrimary(ShadingData sd, BSDFProperties properties, inout RTPTSharcStats stats)
 {
     if (stats.primaryCaptured) return;
@@ -120,12 +151,18 @@ bool rtptTrySharcQueryOnEdge(
     float3 direction,
     inout RTPTSharcStats stats,
     out float3 cachedRadiance
+#if RTPT_GRIS_SHARC_REPLAY
+    , out RTPTSharcTailQuery tailQuery
+#endif
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
     , bool probeX1 = false
 #endif
 )
 {
     cachedRadiance = 0.f;
+#if RTPT_GRIS_SHARC_REPLAY
+    tailQuery = {};
+#endif
 #if RTPT_GRIS_CACHE_TAIL
     // x2 uses the full mixed BSDF, so its selected-lobe label cannot gate a
     // reusable cache endpoint at x3. From x4 the ordinary fixed tail owns
@@ -180,9 +217,22 @@ bool rtptTrySharcQueryOnEdge(
 
     ++stats.attemptedQueries;
     const SharcHitData cacheHit = rtptMakeSharcHit(sd, properties, float3(0.f));
+#if RTPT_GRIS_SHARC_REPLAY
+    const uint64_t key = uint64_t(HashGridComputeSpatialHash(cacheHit.positionWorld, cacheHit.normalWorld, gSharc.hashGridParameters));
+    tailQuery.key = uint2(uint(key), uint(key >> 32u));
+#if SHARC_MATERIAL_DEMODULATION
+    tailQuery.materialFactor = cacheHit.materialDemodulation;
+#else
+    tailQuery.materialFactor = 1.f;
+#endif
+    if (!rtptReadSharcTailRadiance(tailQuery.key, tailQuery.rawRadiance)) return false;
+    cachedRadiance = tailQuery.rawRadiance * tailQuery.materialFactor;
+    if (!all(isfinite(cachedRadiance))) return false;
+#else
     if (!SharcGetCachedRadiance(gSharc, cacheHit, cachedRadiance, false) ||
         !all(isfinite(cachedRadiance)) || any(cachedRadiance < 0.f))
         return false;
+#endif
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
     if (probeX1) return true;
 #endif
@@ -194,8 +244,15 @@ bool rtptTrySharcQuery(ShadingData sd, IMaterialInstance mi, BSDFProperties prop
     bool previousDelta, bool previousGuideSelected, bool previousDiffuse, float previousRoughness, float segmentLength,
     inout RTPTSharcStats stats, out float3 cachedRadiance)
 {
+#if RTPT_GRIS_SHARC_REPLAY
+    RTPTSharcTailQuery unusedTailQuery;
+#endif
     return rtptTrySharcQueryOnEdge(sd, mi, properties, bounce, previousDelta, previousGuideSelected, previousDiffuse,
-        previousRoughness, segmentLength, rtptBSDFSamplingContext(), float3(0.f), stats, cachedRadiance);
+        previousRoughness, segmentLength, rtptBSDFSamplingContext(), float3(0.f), stats, cachedRadiance
+#if RTPT_GRIS_SHARC_REPLAY
+        , unusedTailQuery
+#endif
+        );
 }
 
 float3 rtptSharcOccupancy(uint2 pixel)
