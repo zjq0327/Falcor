@@ -9,6 +9,9 @@ RWStructuredBuffer<GrisAlternatingFresh> gGRISFresh;
 #elif RTPT_GRIS_SPATIAL
 RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
 RWStructuredBuffer<GrisLocalContributions> gGRISLocalPrefixes;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+RWStructuredBuffer<GrisDualFirstHits> gGRISDualFirstHits;
+#endif
 #else
 RWStructuredBuffer<GrisCandidate> gGRISCandidates;
 #endif
@@ -36,7 +39,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     GrisSpatialRecord spatial = {};
     spatial.candidate.firstHit.distanceState = kRTPTDistanceUntraced;
     GrisLocalContributions local = {};
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    GrisDualFirstHits dualFirstHits = {};
+    local.firstHit[0].distanceState = kRTPTDistanceUntraced;
+    local.firstHit[1].distanceState = kRTPTDistanceUntraced;
+#else
     GrisPathBuilder pathBuilder = {};
+#endif
 #endif
 #endif
 
@@ -120,6 +129,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             {
                 spatial.candidate.prepared = true;
                 spatial.candidate.M = 1.f;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+                GrisSpatialRecord directProposals[2] = {};
+                GrisSpatialRecord deepProposals[2] = {};
+                TriangleHit deepHits[2] = {};
+                GrisDualExplicitTerminal bsdfTerminals[2] = {};
+                GrisDualExplicitTerminal lateTerminals[2] = {};
+                SampleGenerator eventRng = SampleGenerator(pixel, sampleIndex ^ 0xf5942b8bu);
+                const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
+#if RTPT_GRIS_DUAL_SHARC
+                GrisSpatialRecord cacheProposals[2] = {};
+                float3 cacheIncident[2] = {};
+#endif
+#endif
                 [unroll]
                 for (uint slot = 0u; slot < 2u; ++slot)
                 {
@@ -134,16 +156,44 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     GrisLocalPrefix prefix = {};
                     prefix.rootLobe = currentRoot;
                     GrisFirstHit firstHit;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+                    if (rtptGRISSupportsSurface(component, lobes & activeLobe))
+                        dualFirstHits.attemptedMask |= 1u << slot;
+                    directProposals[slot].ownerPrimaryHit = spatial.ownerPrimaryHit;
+                    deepProposals[slot].ownerPrimaryHit = spatial.ownerPrimaryHit;
+                    const uint lateSlot = lateCount == 0u ? 0u : min(uint(sampleNext1D(eventRng) * lateCount), lateCount - 1u);
+                    const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
+                        firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix,
+                        directProposals[slot], deepProposals[slot], deepHits[slot], lateSlot,
+                        bsdfTerminals[slot], lateTerminals[slot]
+#if RTPT_GRIS_DUAL_SHARC
+                        , cacheProposals[slot], cacheIncident[slot]
+#endif
+                    );
+                    dualFirstHits.x1[slot] = prefix.dualX1;
+                    dualFirstHits.firstHitAreaPdf[slot] = prefix.dualFirstPdf;
+                    local.firstHit[slot] = firstHit;
+#else
                     const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
                         firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f,
                         prefix, spatial, pathBuilder, terminalRng);
-                    if (slot == 0u) local.diffuse += localRadiance;
-                    else local.specular += localRadiance;
                     if (spatial.candidate.hasWinner && spatial.candidate.rootLobe == currentRoot)
                         spatial.candidate.firstHit = firstHit;
+#endif
+                    if (slot == 0u) local.diffuse += localRadiance;
+                    else local.specular += localRadiance;
                 }
+#if RTPT_GRIS_DUAL_FIRST_HIT
+                spatial = rtptGrisBuildDualFresh(spatial, dualFirstHits, directProposals, deepProposals, deepHits,
+                    bsdfTerminals, lateTerminals,
+#if RTPT_GRIS_DUAL_SHARC
+                    cacheProposals, cacheIncident,
+#endif
+                    terminalRng);
+#else
                 // One stratified D+S group, one shared terminal winner, M=1.
                 rtptGRISFinalizePath(pathBuilder, spatial);
+#endif
             }
 #else
             // Legacy non-suffix capture is not selected by the fixed-x2 host.
@@ -189,7 +239,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if RTPT_GRIS_ALTERNATING
     gGRISFresh[index] = fresh;
 #elif RTPT_GRIS_SPATIAL
-#if !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    gGRISDualFirstHits[index] = dualFirstHits;
+#elif SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
     GrisLocalPrefix selectedPrefix = {};
     selectedPrefix.x1Hit = spatial.sourceX1;
     selectedPrefix.rootLobe = spatial.candidate.rootLobe;

@@ -2,15 +2,6 @@
 
 #if RTPT_GRIS_SUFFIX_REPLAY && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
 
-StructuredBuffer<uint> gGRISReplayMovedInstances;
-
-bool rtptGrisReplayStaticSurface(PackedHitInfo packed)
-{
-    const HitInfo hit = HitInfo(packed);
-    if (hit.getType() != HitType::Triangle) return false;
-    return gGRISReplayMovedInstances[hit.getTriangleHit().instanceID.index] == 0u;
-}
-
 enum GrisNeeReplayStatus { GrisReplayInvalid, GrisReplayZero, GrisReplayCached, GrisReplaySampled };
 
 #if RTPT_GRIS_SHARC_REPLAY
@@ -68,10 +59,50 @@ GrisNeeReplayStatus rtptGrisSampleReplayNee(GrisSpatialRecord source, ShadingDat
         GrisNeeReplayStatus::GrisReplaySampled : GrisNeeReplayStatus::GrisReplayZero;
 }
 
+#if defined(RTPT_GRIS_STORED_PREFIX_REUSE)
+bool rtptGrisLoadMovedReconnect(GrisSpatialRecord source, bool previousGeometry, out ShadingData reconnect)
+{
+    reconnect = {};
+    float3 firstPosition, reconnectPosition;
+    if (!rtptGrisRefPosition(source.sourceX1, firstPosition, previousGeometry) ||
+        !rtptGrisRefPosition(source.reconnectHit, reconnectPosition, previousGeometry)) return false;
+    return rtptGrisRefLoad(source.reconnectHit, firstPosition - reconnectPosition, reconnect, previousGeometry) &&
+        reconnect.frontFacing;
+}
+
+bool rtptGrisReplayDirectNeeInPreviousGeometry(GrisSpatialRecord source, out GrisSpatialRecord result)
+{
+    result = source;
+    result.suffixLight = 0.f;
+    const uint kind = rtptGrisTerminalKind(source.candidate.terminalKind);
+    const bool regir = RTPT_GRIS_REGIR_REPLAY && kind == uint(GrisTerminalKind::GrisReGIRPath);
+    if (source.terminalBounce != 2u || source.terminalBounce >= gParams.maxBounces || rtptGrisIsDeepTail(source) ||
+        (!regir && (kind != uint(GrisTerminalKind::GrisNee) || !rtptGrisHasReplayableNee(source))) ||
+        all(source.postX2RngState == 0u)) return false;
+
+    // Geometry-only replay keeps the light sampling domain unchanged. The
+    // fresh record already witnessed visibility in the available current TLAS.
+    if (!all(isfinite(source.suffixLight)) || !any(source.suffixLight > 0.f)) return true;
+    ShadingData reconnect;
+    if (!rtptGrisLoadMovedReconnect(source, true, reconnect)) return true;
+    SampleGenerator neeRng = rtptGrisRestoreReplayRng(source.postX2RngState);
+    RTPTLightSample light;
+    const GrisNeeReplayStatus status = rtptGrisSampleReplayNee(source, reconnect, false, false, neeRng, light);
+    if (status == GrisNeeReplayStatus::GrisReplayInvalid) return false;
+    if (status == GrisNeeReplayStatus::GrisReplaySampled)
+    {
+        result.suffixDirection = light.dir;
+        result.suffixLight = light.LiOverPdf;
+        if (!regir) result.lightPdfOrStableID = asuint(light.pdf);
+    }
+    return true;
+}
+#endif
+
 // Replay a selected tail in the common fixed-x2 domain. The caller retains the
 // original reservoir, including its prefix proposal ratio and selection weight.
-// The walk always uses the current TLAS. When geometry changes, only static
-// surface vertices can participate in reuse. Previous light data is optional.
+// The walk uses the current TLAS. Stored-prefix reuse can start at a rigidly
+// moved reconnect point. Later replayed vertices must remain stationary.
 bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geometryChanged,
     out GrisSpatialRecord result, bool pointLightChanged = false)
 {
@@ -99,9 +130,17 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
         ((nee || terminalBounce > 3u) && all(source.postX2RngState == 0u)))
         return false;
 
-    if (geometryChanged && !rtptGrisReplayStaticSurface(source.reconnectHit)) return !regir;
-
     ShadingData reconnect;
+    const bool movedReconnect = geometryChanged && !rtptGrisReplayStaticSurface(source.reconnectHit);
+#if defined(RTPT_GRIS_STORED_PREFIX_REUSE)
+    if (movedReconnect)
+    {
+        if (!rtptGrisLoadMovedReconnect(source, false, reconnect)) return !regir;
+    }
+    else
+#else
+    if (movedReconnect) return !regir;
+#endif
     // The saved reflection direction is on the same side of x2 as the source
     // view. Use that side to reconstruct the ray origin. The reference
     // evaluator computes the x2 BSDF and PDF using the actual shifted prefix.

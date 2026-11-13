@@ -7,6 +7,15 @@
 #ifndef RTPT_GRIS_ALTERNATING
 #define RTPT_GRIS_ALTERNATING 0
 #endif
+#ifndef RTPT_GRIS_DUAL_FIRST_HIT
+#define RTPT_GRIS_DUAL_FIRST_HIT 0
+#endif
+#ifndef RTPT_GRIS_DUAL_REGIR
+#define RTPT_GRIS_DUAL_REGIR 0
+#endif
+#ifndef RTPT_GRIS_DUAL_SHARC
+#define RTPT_GRIS_DUAL_SHARC 0
+#endif
 #ifndef RTPT_GRIS_SHARC_REPLAY
 #define RTPT_GRIS_SHARC_REPLAY 0
 #endif
@@ -25,7 +34,7 @@
 #if RTPT_GRIS_SPATIAL
 import Scene.HitInfo;
 #endif
-#if RTPT_GRIS_SPATIAL && RTPT_GRIS_SUFFIX_REPLAY
+#if RTPT_GRIS_SPATIAL && (RTPT_GRIS_SUFFIX_REPLAY || RTPT_GRIS_DUAL_FIRST_HIT)
 import Utils.Sampling.UniformSampleGenerator;
 #endif
 
@@ -43,6 +52,13 @@ enum GrisTerminalKind : uint
     GrisReGIRPath,
     // Fixed incident factor from a generation-time SHaRC query (deep only).
     GrisSharcTail,
+    GrisDualPointNee,
+    GrisDualEmissiveNee,
+    GrisDualReGIRNee,
+    GrisDualSharcTail,
+    GrisDualEnvironmentNee,
+    GrisDualEmitter,
+    GrisDualEnvironmentMiss,
 };
 enum GrisRecordState : uint { GrisUnprepared, GrisPreparedZero, GrisPreparedWinner };
 
@@ -62,6 +78,9 @@ struct GrisCandidate
     bool prepared;
     bool hasWinner;
     GrisFirstHit firstHit;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    float3 dualF;
+#endif
 };
 
 #if RTPT_GRIS_SPATIAL
@@ -74,7 +93,9 @@ uint rtptGrisSuffixInstanceBit(uint instanceIndex)
 {
     return 1u << (instanceIndex & 31u);
 }
+#endif
 
+#if RTPT_GRIS_SUFFIX_REPLAY || RTPT_GRIS_DUAL_FIRST_HIT
 uint4 rtptGrisCaptureReplayRng(UniformSampleGenerator sg)
 {
     return uint4(sg.rng.state[0], sg.rng.state[1], sg.rng.state[2], sg.rng.state[3]);
@@ -116,7 +137,20 @@ struct GrisLocalPrefix
     float3 throughputToX1;
     float3 localRadiance;
     uint rootLobe; // Route local terms independently of the selected suffix.
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    PackedHitInfo dualX1;
+    float dualFirstPdf;
+#endif
 };
+
+#if RTPT_GRIS_DUAL_FIRST_HIT
+struct GrisDualFirstHits
+{
+    PackedHitInfo x1[2];
+    float firstHitAreaPdf[2];
+    uint attemptedMask;
+};
+#endif
 
 // Pixel-local estimates from both full root walks. Geometry belongs to the
 // selected path record; each walk's GrisLocalPrefix remains invocation-local.
@@ -124,6 +158,9 @@ struct GrisLocalContributions
 {
     float3 diffuse;
     float3 specular;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    GrisFirstHit firstHit[2];
+#endif
 };
 
 // A positive area PDF identifies a sampled x2. Its terminal may be empty.
@@ -133,10 +170,10 @@ struct GrisSpatialRecord
     PackedHitInfo ownerPrimaryHit;
     PackedHitInfo sourceX1;
     PackedHitInfo reconnectHit;
-    float areaPdf;          // Owner proposal/reference ratio R after Generate normalization.
-    float3 suffixDirection; // Fixed direction leaving x2; legacy ReGIR records use UV in xy.
-    float3 suffixLight;     // Selected tail factor, excluding x2 scatter and terminal-picker weight.
-    uint lightPdfOrStableID; // Ordinary light PDF bits, or stable light ID for ReGIR terminals.
+    float areaPdf;          // Owner proposal/reference ratio, or native x2 area times x2 direction PDF for dual deep tails.
+    float3 suffixDirection; // Fixed direction leaving x2, or light UV for dual direct NEE and legacy ReGIR.
+    float3 suffixLight;     // Tail factor (also dual SHaRC x3 BSDF weight), dual deep light UV, or dual ReGIR UV and inner RIS weight.
+    uint lightPdfOrStableID; // Light PDF bits, ReGIR stable light ID, or dual ordinary light index.
     bool lightIsAnalytic;
 #if RTPT_GRIS_SUFFIX_REPLAY
     uint suffixInstanceMask;
@@ -149,7 +186,23 @@ struct GrisSpatialRecord
 #elif RTPT_GRIS_REGIR_REPLAY
     float innerRISWeight;
 #endif
+#if RTPT_GRIS_DUAL_SHARC
+    float3 sharcDirection; // Sampled direction from x3 to the cache hit x4.
+#endif
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    uint4 dualExplicitRng; // Continuation stream after sampling x2's direction.
+    uint dualExplicitBounce; // Zero for the fixed x2/x3 NEE and x4 SHaRC records.
+    uint2 dualExplicitPathID;
+#endif
 };
+
+#if RTPT_GRIS_DUAL_FIRST_HIT
+struct GrisDualExplicitTerminal
+{
+    GrisSpatialRecord proposal;
+    float3 incident;
+};
+#endif
 
 // Extend the existing terminal word, rather than storing a second flags field.
 static const uint kGrisTerminalKindMask = 0xffu;
@@ -205,6 +258,18 @@ bool rtptGrisIsDeepTail(GrisSpatialRecord suffix)
 bool rtptGrisHasTerminal(GrisSpatialRecord suffix)
 {
     const uint kind = rtptGrisTerminalKind(suffix.candidate.terminalKind);
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    if (kind == uint(GrisTerminalKind::GrisDualPointNee) || kind == uint(GrisTerminalKind::GrisDualEmissiveNee) ||
+        kind == uint(GrisTerminalKind::GrisDualEnvironmentNee)) return true;
+    if (kind == uint(GrisTerminalKind::GrisDualEmitter) || kind == uint(GrisTerminalKind::GrisDualEnvironmentMiss))
+        return rtptGrisIsDeepTail(suffix);
+#if RTPT_GRIS_DUAL_REGIR
+    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee)) return true;
+#endif
+#if RTPT_GRIS_DUAL_SHARC
+    if (kind == uint(GrisTerminalKind::GrisDualSharcTail)) return rtptGrisIsDeepTail(suffix);
+#endif
+#endif
     return suffix.areaPdf > 0.f && (kind == uint(GrisTerminalKind::GrisNee) ||
         kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisReGIRPath) ||
         kind == uint(GrisTerminalKind::GrisCacheTerminal) ||
@@ -241,13 +306,17 @@ struct GrisTemporalFreshHistory
     uint rootLobe;
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
-    float3 suffixDirection; // Fixed x2 direction; only legacy GrisReGIR stores UV in xy.
-    float3 suffixLight;     // Weighted tail factor; only legacy GrisReGIR stores RIS/domain weights.
-    uint lightPdfOrStableID; // Preserve the winning terminal's PDF bits / stable ReGIR light ID.
+    float3 suffixDirection; // Fixed x2 direction, or light UV for dual direct NEE and legacy ReGIR.
+    float3 suffixLight;     // Weighted tail factor, or light UV for dual deep NEE.
+    uint lightPdfOrStableID; // Light PDF bits, ReGIR stable light ID, or dual ordinary light index.
     uint terminalAndFlags;
     float3 F;
     float W;
     float M;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    float3 dualF;
+    GrisDualFirstHits ownerFirstHits;
+#endif
 #if RTPT_GRIS_SUFFIX_REPLAY
     uint suffixInstanceMask;
     uint terminalBounce;
@@ -258,6 +327,14 @@ struct GrisTemporalFreshHistory
     float3 sharcGain;
 #elif RTPT_GRIS_REGIR_REPLAY
     float innerRISWeight;
+#endif
+#if RTPT_GRIS_DUAL_SHARC
+    float3 sharcDirection;
+#endif
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    uint4 dualExplicitRng;
+    uint dualExplicitBounce;
+    uint2 dualExplicitPathID;
 #endif
 };
 
@@ -274,12 +351,20 @@ struct TerminalPicker
 
 struct GrisShadedIndirect
 {
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    float3 radiance[2];
+#else
     float3 radiance;
     uint rootLobe;
+#endif
     float3 localDiffuse;
     float3 localSpecular;
     uint state;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    GrisFirstHit firstHit[2];
+#else
     GrisFirstHit firstHit;
+#endif
 };
 
 #if RTPT_GRIS_ALTERNATING

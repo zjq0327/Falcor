@@ -56,6 +56,21 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const GrisCandidate candidate = gGRISCandidates[index];
 #endif
     GrisShadedIndirect result = {};
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    const GrisLocalContributions local = gGRISLocalPrefixes[index];
+    result.firstHit = local.firstHit;
+    if (candidate.prepared)
+    {
+        result.localDiffuse = local.diffuse;
+        result.localSpecular = local.specular;
+        if (candidate.hasWinner)
+        {
+            result.radiance[0] = candidate.F * candidate.W;
+            result.radiance[1] = candidate.dualF * candidate.W;
+        }
+        result.state = candidate.hasWinner ? uint(GrisRecordState::GrisPreparedWinner) : uint(GrisRecordState::GrisPreparedZero);
+    }
+#else
     result.firstHit.distanceState = kRTPTDistanceUntraced;
     if (candidate.prepared)
     {
@@ -71,6 +86,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             ? uint(GrisRecordState::GrisPreparedWinner)
             : uint(GrisRecordState::GrisPreparedZero);
     }
+#endif
 #endif
     gGRISShadedIndirect[index] = result;
 }

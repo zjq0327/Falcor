@@ -248,6 +248,14 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
             grisPrepared = gris.state != uint(GrisRecordState::GrisUnprepared);
             if (grisPrepared)
             {
+#if RTPT_GRIS_DUAL_FIRST_HIT
+                indirectDiffuse = gris.radiance[0] + gris.localDiffuse;
+                indirectSpecular = gris.radiance[1] + gris.localSpecular;
+                signals.diffuseHitDistance = gris.firstHit[0].hitT;
+                signals.specularHitDistance = gris.firstHit[1].hitT;
+                diffuseDistanceState = gris.firstHit[0].distanceState;
+                specularDistanceState = gris.firstHit[1].distanceState;
+#else
                 if (gris.rootLobe == uint(GrisRootComponent::GrisDiffuse)) indirectDiffuse = gris.radiance;
                 if (gris.rootLobe == uint(GrisRootComponent::GrisSpecular)) indirectSpecular = gris.radiance;
                 indirectDiffuse += gris.localDiffuse;
@@ -270,6 +278,7 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
                     signals.specularHitDistance = firstHit.hitT;
                     specularDistanceState = firstHit.distanceState;
                 }
+#endif
             }
         }
         if (!grisPrepared)

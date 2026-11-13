@@ -8,6 +8,7 @@ namespace
 {
 constexpr uint32_t kReGIRDescriptorBytes = 64u;
 constexpr uint32_t kReGIRStateCount = 16u;
+constexpr uint32_t kDualTemporalProposalEpochLength = 8u;
 
 uint32_t reGIRCapacity(uint64_t requested)
 {
@@ -39,6 +40,7 @@ void RTPT::invalidateReGIR()
     mReGIRInitialFallbackReason.clear();
     mReGIRPrepared = mReGIRActive = mReGIRPreparationFailed = false;
     mReGIRCellCapacity = mReGIRSlotCount = mReGIRBuildFrameStamp = 0u;
+    mReGIRDualTemporalProposalEpochFrame = 0u;
     mReGIRLightIdCapacity = mReGIRPoolCapacity = mReGIRCatalogGeneration = 0u;
     mReGIRFallbackReason.clear();
     // Stable identities outlive buffer/option rebuilds. setScene() owns their
@@ -95,6 +97,18 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     // A changed list invalidates its own RIS; the volume proxy uses geometry.
     const bool descriptorsChanged = invalidateRIS ||
         (catalog.emissiveCount != 0u && is_set(updates, IScene::UpdateFlags::MaterialsChanged));
+    const bool dualTemporal = canUseGRISDualReGIRTemporal();
+    const float3 cameraPosition = mpScene->getCamera()->getPosition();
+    const bool proposalAnchorChanged = math::asuint(cameraPosition.x) != math::asuint(mReGIRBuildCameraPosition.x) ||
+        math::asuint(cameraPosition.y) != math::asuint(mReGIRBuildCameraPosition.y) ||
+        math::asuint(cameraPosition.z) != math::asuint(mReGIRBuildCameraPosition.z);
+    const auto proposalInvalidations = IScene::UpdateFlags::GeometryChanged | IScene::UpdateFlags::MeshesChanged |
+        IScene::UpdateFlags::MaterialsChanged | IScene::UpdateFlags::RenderSettingsChanged |
+        IScene::UpdateFlags::RecompileNeeded;
+    const bool beginDualTemporalEpoch = dualTemporal && (descriptorsChanged || proposalAnchorChanged ||
+        (updates & proposalInvalidations) != IScene::UpdateFlags::None ||
+        mReGIRDualTemporalProposalEpochFrame == 0u ||
+        mReGIRDualTemporalProposalEpochFrame == kDualTemporalProposalEpochLength);
     if (firstAllocation)
     {
         mReGIRCellCapacity = cellCapacity;
@@ -162,10 +176,24 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
 
     // Consumer dispatches can publish new cells inline. Make their persistent
     // keys and completed lists visible before this frame's maintenance passes.
-    for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISState, mpReGIRCellLastUsed, mpReGIRCandidateIds})
+    for (const auto& buffer : {mpReGIRCells, mpReGIRCellMeta, mpReGIRCellEpoch, mpReGIRCellRISState, mpReGIRCellLastUsed,
+        mpReGIRCandidateIds, mpReGIRState})
         pRenderContext->uavBarrier(buffer.get());
 
-    const float3 cameraPosition = mpScene->getCamera()->getPosition();
+    // Advance cell-use timestamps on every rendered frame, including those
+    // where the proposals backing the current temporal epoch stay fixed.
+    mReGIRBuildFrameStamp = uint32_t(++mReGIRPreparedFrameCount);
+    if (mReGIRBuildFrameStamp == 0u) mReGIRBuildFrameStamp = uint32_t(++mReGIRPreparedFrameCount);
+    mReGIRPrepared = mReGIRActive = true;
+    if (dualTemporal && !beginDualTemporalEpoch)
+    {
+        // Inline-discovered cells keep their complete uniform proposal until
+        // scheduled maintenance publishes RIS slots at the next boundary.
+        ++mReGIRDualTemporalProposalEpochFrame;
+        return true;
+    }
+    if (!dualTemporal) mReGIRDualTemporalProposalEpochFrame = 0u;
+
     // With zero weak-light cutoff, changing the camera/LOD only changes the
     // proposal's cell partition. Every cell still conservatively covers its
     // full physical light domain, and the flattened old tail keeps its own RIS
@@ -180,10 +208,6 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     const uint32_t zero = 0u;
     pRenderContext->updateBuffer(mpReGIRState.get(), &zero, 6u * sizeof(uint32_t), sizeof(uint32_t));
     pRenderContext->uavBarrier(mpReGIRState.get());
-    mReGIRBuildFrameStamp = uint32_t(mReGIRBuildCount + 1u);
-    if (mReGIRBuildFrameStamp == 0u) mReGIRBuildFrameStamp = 1u;
-    mReGIRPrepared = mReGIRActive = true;
-
     auto bind = [&](const ref<ComputePass>& pass)
     {
         const auto var = pass->getRootVar();
@@ -223,6 +247,11 @@ bool RTPT::prepareReGIR(RenderContext* pRenderContext)
     }
     pRenderContext->uavBarrier(mpReGIRRIS.get());
     ++mReGIRBuildCount;
+    if (beginDualTemporalEpoch)
+    {
+        ++mReGIRDualTemporalProposalEpoch;
+        mReGIRDualTemporalProposalEpochFrame = 1u;
+    }
     // Sampling a retained or newly discovered cell preserves the light domain.
     if (domainChanged) ++mReGIRDomainGeneration;
     mReGIRBuildCameraPosition = cameraPosition;
@@ -331,6 +360,8 @@ Properties RTPT::getReGIRStatistics() const
     props["buildFrameStamp"] = mReGIRBuildFrameStamp;
     props["buildCount"] = mReGIRBuildCount;
     props["domainGeneration"] = mReGIRDomainGeneration;
+    props["dualTemporalProposalEpoch"] = mReGIRDualTemporalProposalEpoch;
+    props["dualTemporalProposalEpochFrame"] = mReGIRDualTemporalProposalEpochFrame;
     props["lightHistoryEpoch"] = mLightCatalog.getLightHistoryEpoch();
     props["lightHistoryGeneration"] = mLightCatalog.getLightHistoryGeneration();
     props["lightHistoryMetadataBytes"] = reGIRBufferBytes(catalog.lightHistoryMetadata);

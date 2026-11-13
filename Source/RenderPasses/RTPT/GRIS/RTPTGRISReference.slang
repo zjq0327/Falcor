@@ -10,26 +10,11 @@
 #define RTPT_GRIS_REFERENCE_REUSE 1
 #endif
 
-// Fixed-x2 reference implementation. The auxiliary prefix exchange is performed
-// in a common surface-prefix/reference-tail domain, not with the legacy sum of
-// connection-area PDFs. RR must be disabled, and proposals from x2 onward
-// must be BSDF-only. The configured primary diffuse edge may use PG; the
-// actual proposal densities are captured in R. Cell-only ReGIR paths flatten
-// their inner sampling factor at the fixed x2/tail. Legacy ReGIR reconstruction
-// and legacy cache terminals remain outside this explicit-path domain.
-//
-// areaPdf stores R = Q_owner / sigma_reference after NormalizeGenerated().
-// The public record keeps the established MC convention: F_nu=F*R, W_nu=W/R.
-// sigma_reference uses a fixed sphere density at x2 and the shared sampling
-// factors after x2. Thus R only needs two prefix-area factors and one local ratio.
-// History may span ordinary root-PG publications: retain each record's stored R
-// and W. Cross evaluation and auxiliary densities never query the current guide.
-// SHaRC replay refreshes the target tail from the current cache. The original
-// incident factor remains the history owner's native MIS value; cross-source
-// evaluation uses the available current cache as a proxy for old support.
-
 #if RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
 
+// R = Q_owner / sigma_reference. Stored F and W map to F*R and W/R.
+// Prefix coordinates are surface hits, and BSDF tails use a fixed direction
+// measure at x2. A rigid transform preserves surface area on both hits.
 struct GrisReferencePrefix
 {
     PackedHitInfo x1;
@@ -115,47 +100,19 @@ float rtptGrisRefRootProbability(ShadingData primary, uint rootLobe)
     return diffuse && specular ? 0.5f : 1.f;
 }
 
-bool rtptGrisRefVisible(ShadingData from, ShadingData to)
+bool rtptGrisRefVisible(ShadingData from, ShadingData to, uint movedBoundsCount = 0u)
 {
     const float3 origin = from.computeRayOrigin();
     const float3 displacement = to.computeRayOrigin() - origin;
     const float distanceSquared = dot(displacement, displacement);
     if (!(distanceSquared > 0.f) || !isfinite(distanceSquared)) return false;
     const float distance = sqrt(distanceSquared);
+    const Ray ray = Ray(origin, displacement / distance, 0.f, distance);
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    if (movedBoundsCount != 0u && !rtptGrisReplayRayClear(ray, movedBoundsCount)) return false;
+#endif
     SceneRayQuery<true> query;
-    return query.traceVisibilityRay(Ray(origin, displacement / distance, 0.f, distance));
-}
-
-// Prefix proposal r: an explicitly selected root label followed by a uniform
-// sphere direction and its first intersection. Using the sphere gives support
-// even when a normal-mapped material's reflection hemisphere differs from the
-// geometric/shading frame. Misses remain valid auxiliary states conceptually;
-// no legal incoming path has such an x1, so all inverse neighbor terms are zero.
-GrisReferencePrefix rtptGrisRefDrawPrefix(PackedHitInfo primaryHit, float3 cameraPosition, inout SampleGenerator rng)
-{
-    GrisReferencePrefix result = {};
-    result.x1 = makeInvalidHit().pack();
-    ShadingData primary;
-    if (!rtptGrisRefPrimary(primaryHit, cameraPosition, primary)) return result;
-    const float diffuseProbability = rtptGrisRefRootProbability(primary, uint(GrisRootComponent::GrisDiffuse));
-    const float specularProbability = rtptGrisRefRootProbability(primary, uint(GrisRootComponent::GrisSpecular));
-    if (!(diffuseProbability + specularProbability > 0.f)) return result;
-    const float rootDraw = sampleNext1D(rng);
-    result.rootLobe = rootDraw < diffuseProbability ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
-    const float2 u = sampleNext2D(rng);
-    const float z = 1.f - 2.f * u.x;
-    const float radial = sqrt(max(0.f, 1.f - z * z));
-    const float phi = 6.28318530717958648f * u.y;
-    const float3 direction = float3(radial * cos(phi), radial * sin(phi), z);
-    SceneRayQuery<true> query;
-    float hitT;
-    const HitInfo hit = query.traceRay(Ray(primary.computeRayOrigin(), direction), hitT);
-    if (hit.getType() == HitType::Triangle)
-    {
-        result.x1 = hit.pack();
-        result.valid = true;
-    }
-    return result;
+    return query.traceVisibilityRay(ray);
 }
 
 GrisReferencePrefix rtptGrisRefRecordPrefix(GrisSpatialRecord record)
@@ -165,25 +122,6 @@ GrisReferencePrefix rtptGrisRefRecordPrefix(GrisSpatialRecord record)
     result.rootLobe = record.candidate.rootLobe;
     result.valid = HitInfo(result.x1).getType() == HitType::Triangle;
     return result;
-}
-
-float rtptGrisRefPrefixPdf(PackedHitInfo primaryHit, float3 cameraPosition, GrisReferencePrefix prefix)
-{
-    if (!prefix.valid) return 0.f;
-    ShadingData primary;
-    float3 position;
-    if (!rtptGrisRefPrimary(primaryHit, cameraPosition, primary) || !rtptGrisRefPosition(prefix.x1, position)) return 0.f;
-    const float rootProbability = rtptGrisRefRootProbability(primary, prefix.rootLobe);
-    if (!(rootProbability > 0.f)) return 0.f;
-    const float3 edge = position - primary.computeRayOrigin();
-    const float distanceSquared = dot(edge, edge);
-    if (!(distanceSquared > 0.f) || !isfinite(distanceSquared)) return 0.f;
-    const float3 direction = edge * rsqrt(distanceSquared);
-    ShadingData first;
-    if (!rtptGrisRefLoad(prefix.x1, -direction, first) || !rtptGrisRefVisible(primary, first)) return 0.f;
-    const float geometry = abs(dot(first.faceN, direction)) / distanceSquared;
-    const float pdf = rootProbability * kGrisReferenceDirectionPdf * geometry;
-    return pdf > 0.f && isfinite(pdf) ? pdf : 0.f;
 }
 
 bool rtptGrisRefKindSupported(GrisSpatialRecord record)
@@ -235,56 +173,47 @@ bool rtptGrisIsReGIRReplayTail(GrisSpatialRecord tail)
         rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisReGIRPath);
 }
 
-bool rtptGrisRefGeometryTailSupported(GrisSpatialRecord tail, uint movedInstanceBits)
+bool rtptGrisReplayStoredTail(GrisSpatialRecord source, GrisSuffixReplaySettings replay,
+    bool previous, out GrisSpatialRecord result)
 {
-    if (tail.terminalBounce == 0u || (tail.suffixInstanceMask & movedInstanceBits) != 0u ||
-        !rtptGrisReplayStaticSurface(tail.reconnectHit)) return false;
+    result = source;
+    if (!rtptGrisRefSampleValid(source)) return true;
+    const uint kind = rtptGrisTerminalKind(source.candidate.terminalKind);
+    const bool pointChanged = replay.lightChanged && rtptGrisIsPointNee(source);
+    const bool replayable = rtptGrisHasReplayableNee(source) ||
+        kind == uint(GrisTerminalKind::GrisEmitter) || kind == uint(GrisTerminalKind::GrisEnvironment);
 
-    const uint kind = rtptGrisTerminalKind(tail.candidate.terminalKind);
-    return kind == uint(GrisTerminalKind::GrisEmitter) || kind == uint(GrisTerminalKind::GrisEnvironment) ||
-#if RTPT_GRIS_SHARC_REPLAY
-        (rtptGrisIsSharcTail(tail) && rtptGrisIsDeepTail(tail)) ||
-#endif
-        (kind == uint(GrisTerminalKind::GrisNee) && rtptGrisHasReplayableNee(tail));
-}
-
-// The selected path and its source weights stay intact. These are the only
-// fields that change when evaluating its suffix in a different light state.
-struct GrisReplayTailValue
-{
-    float3 direction;
-    float3 incident;
-    uint lightPdf;
-
-    void apply(inout GrisSpatialRecord record)
+    if (previous)
     {
-        record.suffixDirection = direction;
-        record.suffixLight = incident;
-        record.lightPdfOrStableID = lightPdf;
+        if (pointChanged) return rtptGrisReplaySuffix(source, true, false, result, true);
+        if (!replay.geometryChanged) return true;
+        if ((source.suffixInstanceMask & replay.movedInstanceBits) != 0u) return false;
+        if (source.terminalBounce == 2u && !rtptGrisReplayStaticSurface(source.reconnectHit))
+            return rtptGrisReplayDirectNeeInPreviousGeometry(source, result);
+        // Deeper suffixes use the current-frame tail as an approximation of
+        // the old support. The cross evaluation still uses the old prefix.
+        return true;
     }
-};
 
-bool rtptGrisRefReplayTail(GrisSpatialRecord record, bool previous, bool lightChanged, bool validateUnchanged,
-    out GrisReplayTailValue tail)
-{
-    tail.direction = record.suffixDirection;
-    tail.incident = record.suffixLight;
-    tail.lightPdf = record.lightPdfOrStableID;
-    if (!rtptGrisRefSampleValid(record)) return true;
-
-    const uint kind = rtptGrisTerminalKind(record.candidate.terminalKind);
-    const bool pointLightChanged = lightChanged && rtptGrisIsPointNee(record);
-    const bool validate = validateUnchanged && (rtptGrisHasReplayableNee(record) ||
-        kind == uint(GrisTerminalKind::GrisEmitter) || kind == uint(GrisTerminalKind::GrisEnvironment));
-    if (!pointLightChanged && !validate) return true;
-
-    GrisSpatialRecord replayed;
-    if (!rtptGrisReplaySuffix(record, previous, false, replayed, pointLightChanged)) return false;
-    tail.direction = replayed.suffixDirection;
-    tail.incident = replayed.suffixLight;
-    tail.lightPdf = replayed.lightPdfOrStableID;
+    if (replay.geometryChanged)
+    {
+        if ((source.suffixInstanceMask & replay.movedInstanceBits) != 0u) return false;
+        return rtptGrisReplaySuffix(source, false, true, result);
+    }
+    if (rtptGrisIsReGIRReplayTail(source)) return rtptGrisReplaySuffix(source, false, false, result);
+#if RTPT_GRIS_SHARC_REPLAY
+    if (rtptGrisIsSharcTail(source))
+    {
+        if ((replay.sharcChanges & 2u) != 0u || replay.validateUnchanged)
+            return rtptGrisReplaySuffix(source, false, false, result);
+        return (replay.sharcChanges & 1u) == 0u || rtptGrisRefreshSharcTail(result);
+    }
+#endif
+    if (pointChanged || (replay.validateUnchanged && replayable))
+        return rtptGrisReplaySuffix(source, false, false, result, pointChanged);
     return true;
 }
+
 #endif
 
 // Evaluate one complete path in the reference-tail domain for any source/target
@@ -293,15 +222,16 @@ bool rtptGrisRefReplayTail(GrisSpatialRecord record, bool previous, bool lightCh
 // importance correction. The actual root-PG ratio is captured at generation.
 float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
     GrisReferencePrefix prefix, GrisSpatialRecord tail, inout SampleGenerator rng,
-    out float ownerRatio, out float firstDistance, bool recheckVisibility = false)
+    out float ownerRatio, out float firstDistance, bool recheckVisibility = false, bool previousGeometry = false)
 {
     ownerRatio = 0.f;
     firstDistance = kRTPTNRDMissDistance;
     if (!prefix.valid || !rtptGrisRefKindSupported(tail)) return 0.f;
     ShadingData primary;
     float3 x1Position, x2Position;
-    if (!rtptGrisRefPrimary(primaryHit, cameraPosition, primary) ||
-        !rtptGrisRefPosition(prefix.x1, x1Position) || !rtptGrisRefPosition(tail.reconnectHit, x2Position)) return 0.f;
+    if (!rtptGrisRefPrimary(primaryHit, cameraPosition, primary, previousGeometry) ||
+        !rtptGrisRefPosition(prefix.x1, x1Position, previousGeometry) ||
+        !rtptGrisRefPosition(tail.reconnectHit, x2Position, previousGeometry)) return 0.f;
     const float rootProbability = rtptGrisRefRootProbability(primary, prefix.rootLobe);
     if (!(rootProbability > 0.f)) return 0.f;
     primary.mtl.setActiveLobes(rtptGrisRefRootMask(prefix.rootLobe));
@@ -311,7 +241,7 @@ float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
     if (!rtptGrisPrefixDirection(primary.computeRayOrigin(), x1Position, firstDirection, rootDistanceSquared)) return 0.f;
     firstDistance = sqrt(rootDistanceSquared);
     ShadingData first;
-    if (!rtptGrisRefLoad(prefix.x1, -firstDirection, first)) return 0.f;
+    if (!rtptGrisRefLoad(prefix.x1, -firstDirection, first, previousGeometry)) return 0.f;
     const IMaterialInstance firstMaterial = gScene.materials.getMaterialInstance(first, ExplicitLodTextureSampler(0.f));
     if (!rtptGRISSupportsSurface(first, firstMaterial.getLobeTypes(first))) return 0.f;
     const float rootGeometry = abs(dot(first.faceN, firstDirection)) / rootDistanceSquared;
@@ -319,7 +249,7 @@ float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
     float connectionDistanceSquared;
     if (!rtptGrisPrefixDirection(first.computeRayOrigin(), x2Position, connectionDirection, connectionDistanceSquared)) return 0.f;
     ShadingData reconnect;
-    if (!rtptGrisRefLoad(tail.reconnectHit, -connectionDirection, reconnect)) return 0.f;
+    if (!rtptGrisRefLoad(tail.reconnectHit, -connectionDirection, reconnect, previousGeometry)) return 0.f;
     const IMaterialInstance reconnectMaterial = gScene.materials.getMaterialInstance(reconnect, ExplicitLodTextureSampler(0.f));
     if (!rtptGRISSupportsSurface(reconnect, reconnectMaterial.getLobeTypes(reconnect))) return 0.f;
     const float connectionGeometry = abs(dot(reconnect.faceN, connectionDirection)) / connectionDistanceSquared;
@@ -339,7 +269,23 @@ float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
     // spuriously self-occlude. Geometry changes invalidate that witness.
     const bool nativePrefix = !recheckVisibility && all(primaryHit == tail.ownerPrimaryHit) &&
         all(prefix.x1 == tail.sourceX1);
-    if (!nativePrefix && (!rtptGrisRefVisible(primary, first) || !rtptGrisRefVisible(first, reconnect))) return 0.f;
+    if (!nativePrefix)
+    {
+        ShadingData visibilityPrimary = primary;
+        ShadingData visibilityFirst = first;
+        ShadingData visibilityReconnect = reconnect;
+        if (previousGeometry)
+        {
+            // No previous TLAS. Use current surface endpoints for both rays.
+            float3 currentX1, currentX2;
+            if (!rtptGrisRefPrimary(primaryHit, cameraPosition, visibilityPrimary) ||
+                !rtptGrisRefPosition(prefix.x1, currentX1) || !rtptGrisRefPosition(tail.reconnectHit, currentX2) ||
+                !rtptGrisRefLoad(prefix.x1, visibilityPrimary.posW - currentX1, visibilityFirst) ||
+                !rtptGrisRefLoad(tail.reconnectHit, currentX1 - currentX2, visibilityReconnect)) return 0.f;
+        }
+        if (!rtptGrisRefVisible(visibilityPrimary, visibilityFirst) ||
+            !rtptGrisRefVisible(visibilityFirst, visibilityReconnect)) return 0.f;
+    }
     const float3 scatter = reconnectMaterial.eval(reconnect, tail.suffixDirection, rng);
     const float scatterPdf = reconnectMaterial.evalPdf(reconnect, tail.suffixDirection);
     if (!all(isfinite(scatter)) || !isfinite(scatterPdf) || !any(scatter > 0.f)) return 0.f;
@@ -393,291 +339,787 @@ void rtptGrisNormalizeGenerated(inout GrisSpatialRecord record, GrisLocalPrefix 
     if (ratio > 0.f && isfinite(ratio)) record.areaPdf = ratio;
 }
 
-// An inverse query that is exactly the stored native sample already has its
-// source function value. Use it consistently for own and duplicate inputs;
-// other prefixes/tails still require the full physical cross evaluation.
-float3 rtptGrisRefEvaluateSource(GrisSpatialRecord source, float3 cameraPosition,
-    GrisReferencePrefix prefix, GrisSpatialRecord tail, uint sourceLightEpoch, inout SampleGenerator rng,
-    bool recheckVisibility = false)
-{
-    // Gate the evaluated tail's light, not the source reservoir's realized
-    // winner. This also removes old-history density from a new light's fresh
-    // MIS denominator. An ineligible source still retains its domain and M.
-    if (!rtptGrisSourceAllowsTail(tail, sourceLightEpoch)) return 0.f;
-    const bool sameSample = !recheckVisibility && rtptGrisRefSampleValid(source) && prefix.valid &&
-        prefix.rootLobe == source.candidate.rootLobe && all(prefix.x1 == source.sourceX1) &&
-        all(tail.reconnectHit == source.reconnectHit) &&
-        all(asuint(tail.suffixDirection) == asuint(source.suffixDirection)) &&
-        all(asuint(tail.suffixLight) == asuint(source.suffixLight)) &&
-        tail.candidate.terminalKind == source.candidate.terminalKind &&
-        tail.lightPdfOrStableID == source.lightPdfOrStableID && tail.lightIsAnalytic == source.lightIsAnalytic
-#if RTPT_GRIS_SUFFIX_REPLAY
-        && tail.suffixInstanceMask == source.suffixInstanceMask &&
-        tail.terminalBounce == source.terminalBounce &&
-        all(tail.postX2RngState == source.postX2RngState)
-#endif
-#if RTPT_GRIS_SHARC_REPLAY
-        && (rtptGrisTerminalKind(tail.candidate.terminalKind) != uint(GrisTerminalKind::GrisSharcTail) ||
-            (all(tail.sharcKey == source.sharcKey) &&
-                all(asuint(tail.sharcGain) == asuint(source.sharcGain))))
-#endif
-        ;
-    if (sameSample) return source.candidate.F * source.areaPdf;
-    float ignoredRatio, ignoredDistance;
-    return rtptGrisRefEvaluate(source.ownerPrimaryHit, cameraPosition, prefix, tail, rng, ignoredRatio, ignoredDistance,
-        recheckVisibility);
-}
-
-GrisSpatialRecord rtptGrisMergeReference(GrisSpatialRecord canonical, GrisSpatialRecord inputs[kGrisMaxReuseInputs],
+#if defined(RTPT_GRIS_STORED_PREFIX_REUSE)
+GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpatialRecord inputs[kGrisMaxReuseInputs],
     float3 sourceCameras[kGrisMaxReuseInputs], uint sourceLightEpochs[kGrisMaxReuseInputs],
-    uint inputCount, uint2 pixel, inout SampleGenerator rng
+    uint inputCount, inout SampleGenerator rng
 #if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
     , GrisSuffixReplaySettings replay
 #endif
     )
 {
-#if !RTPT_GRIS_REFERENCE_REUSE
-    return canonical;
-#else
-    // Unsupported/numerically unrepresentable canonical records retain their
-    // complete local estimate. They do not enter a mismatched resampling domain.
     if (gParams.useRussianRoulette != 0u || !rtptGrisRefDomainValid(canonical) ||
         (canonical.candidate.hasWinner && !rtptGrisRefSampleValid(canonical))) return canonical;
-    inputCount = min(inputCount, kGrisMaxReuseInputs);
-    if (inputCount == 0u) return canonical;
+
     const float3 targetCamera = gScene.camera.getPosition();
     bool domainValid[kGrisMaxReuseInputs];
-    bool anyInputDomain = false;
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
+    GrisSpatialRecord historyInCurrent = {};
+    GrisSpatialRecord canonicalInHistory = {};
+    bool historyWinnerSupported = false;
+    bool canonicalInHistorySupported = false;
+#endif
     float totalM = canonical.candidate.M;
-    [loop] for (uint j = 0u; j < inputCount; ++j)
+    bool hasSource = false;
+    for (uint j = 0u; j < inputCount; ++j)
     {
         domainValid[j] = rtptGrisRefDomainValid(inputs[j]) &&
             (!inputs[j].candidate.hasWinner || rtptGrisRefSampleValid(inputs[j]));
-    }
-
 #if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
-    GrisReplayTailValue historyInCurrent = {};
-    GrisReplayTailValue canonicalInHistory = {};
-    GrisReplayTailValue inputsInHistory[kGrisMaxReuseInputs];
-    bool useReplay = false;
-    const bool geometryHistory = (!RTPT_GRIS_REGIR_REPLAY || RTPT_GRIS_SHARC_REPLAY) &&
-        replay.geometryChanged && replay.historyIndex < inputCount;
-    if (geometryHistory)
-    {
-        // This motion mode shares only stationary owner surfaces across
-        // frames. The realized winner's eligibility is checked separately.
-        domainValid[replay.historyIndex] = domainValid[replay.historyIndex] &&
-            rtptGrisReplayStaticSurface(canonical.ownerPrimaryHit) &&
-            rtptGrisReplayStaticSurface(inputs[replay.historyIndex].ownerPrimaryHit);
-    }
-    if (!RTPT_GRIS_REGIR_REPLAY && replay.historyIndex < inputCount && (replay.lightChanged || replay.validateUnchanged))
-    {
-        const uint historyIndex = replay.historyIndex;
-        if (domainValid[historyIndex])
+        if (domainValid[j] && j == replay.historyIndex)
         {
-            bool supported = rtptGrisRefReplayTail(inputs[historyIndex], false, replay.lightChanged,
-                replay.validateUnchanged, historyInCurrent);
-            if (supported && replay.lightChanged)
+            // Primary reprojection still requires a stationary owner. The two
+            // saved prefix vertices can move independently of that owner.
+            if (replay.geometryChanged && (!rtptGrisReplayStaticSurface(canonical.ownerPrimaryHit) ||
+                !rtptGrisReplayStaticSurface(inputs[j].ownerPrimaryHit)))
             {
-                supported = rtptGrisRefReplayTail(canonical, true, true, false, canonicalInHistory);
-                [loop] for (uint i = 0u; supported && i < inputCount; ++i)
-                {
-                    if (i != historyIndex && domainValid[i])
-                        supported = rtptGrisRefReplayTail(inputs[i], true, true, false, inputsInHistory[i]);
-                }
+                domainValid[j] = false;
+                continue;
             }
-            // Without a complete cross evaluation, remove this source from
-            // the entire MIS calculation, including M and the fresh term.
-            domainValid[historyIndex] = supported;
-            useReplay = supported;
+            historyWinnerSupported = rtptGrisSourceAllowsTail(inputs[j], sourceLightEpochs[j]) &&
+                rtptGrisReplayStoredTail(inputs[j], replay, false, historyInCurrent);
+            canonicalInHistorySupported = rtptGrisReplayStoredTail(canonical, replay, true, canonicalInHistory);
+            // An unavailable previous point-light proposal invalidates the
+            // history domain. A geometrically blocked candidate is only zero.
+            if (replay.lightChanged || (replay.validateUnchanged && !RTPT_GRIS_REGIR_REPLAY &&
+                !RTPT_GRIS_SHARC_REPLAY))
+                domainValid[j] = historyWinnerSupported && canonicalInHistorySupported;
+        }
+#endif
+        if (domainValid[j])
+        {
+            totalM += inputs[j].candidate.M;
+            hasSource = true;
         }
     }
-#endif
-    [loop] for (uint j = 0u; j < inputCount; ++j)
-    {
-        if (domainValid[j]) totalM += inputs[j].candidate.M;
-        anyInputDomain = anyInputDomain || domainValid[j];
-    }
-    if (!anyInputDomain) return canonical;
-    // Two independent auxiliary probes. Sharing B between neighbor candidates
-    // is allowed; neither probe reuses the canonical path's random prefix.
-    const GrisReferencePrefix auxiliary = rtptGrisRefDrawPrefix(canonical.ownerPrimaryHit, targetCamera, rng);
-    const GrisReferencePrefix active = rtptGrisRefDrawPrefix(canonical.ownerPrimaryHit, targetCamera, rng);
-    const float auxiliaryPdf = rtptGrisRefPrefixPdf(canonical.ownerPrimaryHit, targetCamera, auxiliary);
-    const float activePdf = rtptGrisRefPrefixPdf(canonical.ownerPrimaryHit, targetCamera, active);
+    if (!hasSource) return canonical;
+
     GrisSpatialRecord winner = canonical;
-    float3 winnerReferenceF = 0.f;
+    float3 winnerValue = 0.f;
     float winnerRatio = 0.f;
     float weightSum = 0.f;
-    if (rtptGrisRefSampleValid(canonical))
+    // The last slot is the center. Each candidate retains its own surface
+    // coordinates and its native F/R/W. Tail replay supplies cross-domain F.
+    for (uint i = 0u; i <= inputCount; ++i)
     {
-        const float3 value = canonical.candidate.F * canonical.areaPdf;
-        const float h = rtptGrisRefTarget(value);
-        float mis = 1.f;
-        if (auxiliaryPdf > 0.f)
+        const bool center = i == inputCount;
+        GrisSpatialRecord candidate = canonical;
+        if (!center)
         {
-            const float canonicalDensity = canonical.candidate.M * h * auxiliaryPdf;
-            float denominator = canonicalDensity;
-            const float canonicalPrefixPdf = rtptGrisRefPrefixPdf(canonical.ownerPrimaryHit, targetCamera, rtptGrisRefRecordPrefix(canonical));
-            [loop] for (uint j = 0u; j < inputCount; ++j)
-            {
-                if (!domainValid[j]) continue;
-                GrisSpatialRecord crossTail = canonical;
-                bool recheckVisibility = false;
-#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
-                recheckVisibility = geometryHistory && j == replay.historyIndex && !rtptGrisIsReGIRReplayTail(crossTail);
-                if (recheckVisibility && (!rtptGrisReplayStaticSurface(canonical.sourceX1) ||
-                    !rtptGrisReplayStaticSurface(auxiliary.x1) ||
-                    !rtptGrisRefGeometryTailSupported(canonical, replay.movedInstanceBits))) continue;
-                if (useReplay && replay.lightChanged && j == replay.historyIndex) canonicalInHistory.apply(crossTail);
-#endif
-                const float3 cross = rtptGrisRefEvaluateSource(inputs[j], sourceCameras[j], auxiliary, crossTail,
-                    sourceLightEpochs[j], rng, recheckVisibility);
-                denominator += inputs[j].candidate.M * rtptGrisRefTarget(cross) * canonicalPrefixPdf;
-            }
-            mis = denominator > 0.f ? canonicalDensity / denominator : 0.f;
+            if (!domainValid[i] || !rtptGrisSourceAllowsTail(inputs[i], sourceLightEpochs[i])) continue;
+            candidate = inputs[i];
         }
-        // h(C*R)*(W/R) == h(C)*W; use the cancellation for the native draw.
-        const float weight = mis * rtptGrisRefTarget(canonical.candidate.F) * canonical.candidate.W;
-        if (weight > 0.f && isfinite(weight))
-        {
-            weightSum = weight;
-            winnerReferenceF = value;
-            winnerRatio = canonical.areaPdf;
-        }
-    }
-    [loop] for (uint i = 0u; i < inputCount; ++i)
-    {
-        if (!domainValid[i] || !rtptGrisRefSampleValid(inputs[i]) ||
-            !rtptGrisSourceAllowsTail(inputs[i], sourceLightEpochs[i]) || !(activePdf > 0.f)) continue;
-        const GrisReferencePrefix sourcePrefix = rtptGrisRefRecordPrefix(inputs[i]);
-        const float sourceAuxiliaryPdf = rtptGrisRefPrefixPdf(canonical.ownerPrimaryHit, targetCamera, sourcePrefix);
-        if (!(sourceAuxiliaryPdf > 0.f)) continue;
-        float ratio, firstDistance;
-        GrisSpatialRecord targetTail = inputs[i];
+        if (!candidate.candidate.hasWinner) continue;
+
+        const float3 ownValue = candidate.candidate.F * candidate.areaPdf;
+        const float ownTarget = rtptGrisRefTarget(ownValue);
+        if (!(ownTarget > 0.f)) continue;
+        const GrisReferencePrefix prefix = rtptGrisRefRecordPrefix(candidate);
+        float targetRatio = candidate.areaPdf;
+        float firstDistance = candidate.candidate.firstHit.hitT;
+        float3 targetValue = ownValue;
+        GrisSpatialRecord targetTail = candidate;
         bool geometryForward = false;
 #if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
-        const bool regirTail = rtptGrisIsReGIRReplayTail(targetTail);
-        if (i == replay.historyIndex)
+        if (!center && i == replay.historyIndex)
         {
-            if (regirTail)
-            {
-                if (replay.geometryChanged && (inputs[i].suffixInstanceMask & replay.movedInstanceBits) != 0u) continue;
-                if (!rtptGrisReplaySuffix(inputs[i], false, replay.geometryChanged, targetTail) ||
-                    all(targetTail.suffixLight == 0.f)) continue;
-            }
-            else
-            {
-                if (replay.geometryChanged && !geometryHistory) continue;
-                geometryForward = geometryHistory;
-                if (geometryForward)
-                {
-                    if (!rtptGrisReplayStaticSurface(sourcePrefix.x1) || !rtptGrisReplayStaticSurface(active.x1) ||
-                        !rtptGrisRefGeometryTailSupported(inputs[i], replay.movedInstanceBits)) continue;
-                    if (!rtptGrisReplaySuffix(inputs[i], false, true, targetTail) || all(targetTail.suffixLight == 0.f)) continue;
-                }
-#if RTPT_GRIS_SHARC_REPLAY
-                if (rtptGrisIsSharcTail(inputs[i]))
-                {
-                    if (!geometryForward)
-                    {
-                        const bool lookupChanged = (replay.sharcChanges & 2u) != 0u;
-                        const bool cacheChanged = (replay.sharcChanges & 1u) != 0u;
-                        if (lookupChanged || replay.validateUnchanged)
-                        {
-                            if (!rtptGrisReplaySuffix(inputs[i], false, false, targetTail)) continue;
-                        }
-                        else if (cacheChanged && !rtptGrisRefreshSharcTail(targetTail)) continue;
-                    }
-                }
-                else
-#endif
-                if (useReplay) historyInCurrent.apply(targetTail);
-            }
+            if (!historyWinnerSupported) continue;
+            targetTail = historyInCurrent;
+            geometryForward = replay.geometryChanged;
         }
 #endif
-        const float3 value = rtptGrisRefEvaluate(canonical.ownerPrimaryHit, targetCamera, active, targetTail, rng,
-            ratio, firstDistance, geometryForward);
-        const float h = rtptGrisRefTarget(value);
-        if (!(h > 0.f) || !(ratio > 0.f)) continue;
-        float denominator = canonical.candidate.M * h * sourceAuxiliaryPdf;
-        float ownDensity = 0.f;
-        [loop] for (uint j = 0u; j < inputCount; ++j)
+        if (!center)
+            targetValue = rtptGrisRefEvaluate(canonical.ownerPrimaryHit, targetCamera, prefix, targetTail, rng,
+                targetRatio, firstDistance, geometryForward);
+        const float target = rtptGrisRefTarget(targetValue);
+        if (!(target > 0.f) || !(targetRatio > 0.f)) continue;
+
+        // Equal domain coefficients. Even an empty source contributes a
+        // cross term if it supports this candidate.
+        float denominator = center ? ownTarget : ownTarget + target;
+        for (uint j = 0u; j < inputCount; ++j)
         {
-            if (!domainValid[j]) continue;
-#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE) && RTPT_GRIS_REGIR_REPLAY
-            // ReGIR replay changes only the destination suffix. Its source
-            // terms use the selected light and compensation from generation.
-            GrisSpatialRecord crossTail = regirTail ? inputs[i] : targetTail;
-#else
+            if (!domainValid[j] || j == i) continue;
             GrisSpatialRecord crossTail = targetTail;
-#endif
-            bool recheckVisibility = false;
+            bool previousGeometry = false;
 #if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
-            // Evaluate cross terms with the current TLAS. The old source's
-            // self term alone still uses the unchanged historical record.
-            const bool geometryReverse = geometryHistory && j == replay.historyIndex && i != j && !regirTail;
-            if (geometryReverse && (!rtptGrisReplayStaticSurface(sourcePrefix.x1) ||
-                !rtptGrisReplayStaticSurface(active.x1) ||
-                !rtptGrisRefGeometryTailSupported(crossTail, replay.movedInstanceBits))) continue;
-            recheckVisibility = geometryReverse || (geometryForward && i != j);
-            if (geometryForward && i == j) crossTail = inputs[i];
-            if (useReplay && j == replay.historyIndex)
+            if (j == replay.historyIndex)
             {
-                if (i == j) crossTail = inputs[i];
-                else if (replay.lightChanged) inputsInHistory[i].apply(crossTail);
+                if (center)
+                {
+                    if (!canonicalInHistorySupported) continue;
+                    crossTail = canonicalInHistory;
+                }
+                previousGeometry = replay.geometryChanged;
             }
-#if RTPT_GRIS_SHARC_REPLAY
-            if (i == replay.historyIndex && i == j && rtptGrisIsSharcTail(inputs[i])) crossTail = inputs[i];
 #endif
-#endif
-            const float3 cross = rtptGrisRefEvaluateSource(inputs[j], sourceCameras[j], sourcePrefix, crossTail,
-                sourceLightEpochs[j], rng, recheckVisibility);
-            const float density = inputs[j].candidate.M * rtptGrisRefTarget(cross) * activePdf;
-            denominator += density;
-            if (j == i) ownDensity = density;
+            if (!rtptGrisSourceAllowsTail(crossTail, sourceLightEpochs[j])) continue;
+            float crossRatio, crossDistance;
+            const float3 cross = rtptGrisRefEvaluate(inputs[j].ownerPrimaryHit, sourceCameras[j], prefix, crossTail,
+                rng, crossRatio, crossDistance, previousGeometry, previousGeometry);
+            denominator += rtptGrisRefTarget(cross);
         }
-        if (!(denominator > 0.f) || !(ownDensity > 0.f)) continue;
-        const float mis = ownDensity / denominator;
-        const float weight = mis * h * (inputs[i].candidate.W / inputs[i].areaPdf) * sourceAuxiliaryPdf / activePdf;
+
+        const float sourceWeight = candidate.candidate.W / candidate.areaPdf;
+        const float weight = (ownTarget / denominator) * target * sourceWeight;
         if (!(weight > 0.f) || !isfinite(weight)) continue;
         weightSum += weight;
         if (!isfinite(weightSum)) return canonical;
-        if (sampleNext1D(rng) * weightSum <= weight)
+        if (sampleNext1D(rng) * weightSum < weight)
         {
             winner = targetTail;
-            winner.ownerPrimaryHit = canonical.ownerPrimaryHit;
-            winner.sourceX1 = active.x1;
-            winner.candidate.rootLobe = active.rootLobe;
-            winner.candidate.firstHit.hitT = min(kRTPTNRDMissDistance, max(1e-5f, firstDistance));
-            winner.candidate.firstHit.distanceState = kRTPTDistanceHit;
-            winnerReferenceF = value;
-            winnerRatio = ratio;
+            if (!center)
+            {
+                winner.candidate.firstHit.hitT = min(kRTPTNRDMissDistance, max(1e-5f, firstDistance));
+                winner.candidate.firstHit.distanceState = kRTPTDistanceHit;
+            }
+            winnerValue = targetValue;
+            winnerRatio = targetRatio;
         }
     }
-    GrisSpatialRecord result = canonical;
-    result.candidate.M = totalM;
-    if (!(weightSum > 0.f) || !(winnerRatio > 0.f))
+
+    if (!(weightSum > 0.f))
     {
-        result.candidate.F = 0.f;
-        result.candidate.W = 0.f;
-        result.candidate.hasWinner = false;
-        return result;
+        canonical.candidate.F = 0.f;
+        canonical.candidate.W = 0.f;
+        canonical.candidate.M = totalM;
+        canonical.candidate.hasWinner = false;
+        return canonical;
     }
-    const float h = rtptGrisRefTarget(winnerReferenceF);
-    const float W = winnerRatio * weightSum / h;
-    const float3 F = winnerReferenceF / winnerRatio;
-    if (!(h > 0.f) || !(W > 0.f) || !isfinite(W) || !all(isfinite(F * W))) return canonical;
-    result = winner;
-    result.ownerPrimaryHit = canonical.ownerPrimaryHit;
-    result.areaPdf = winnerRatio;
-    result.candidate.F = F;
-    result.candidate.W = W;
-    result.candidate.M = totalM;
-    result.candidate.prepared = true;
-    result.candidate.hasWinner = true;
-    return result;
-#endif
+
+    const float3 F = winnerValue / winnerRatio;
+    const float W = winnerRatio * (weightSum / rtptGrisRefTarget(winnerValue));
+    if (!(W > 0.f) || !isfinite(W) || !all(isfinite(F * W))) return canonical;
+    winner.ownerPrimaryHit = canonical.ownerPrimaryHit;
+    winner.areaPdf = winnerRatio;
+    winner.candidate.F = F;
+    winner.candidate.W = W;
+    winner.candidate.M = totalM;
+    return winner;
 }
+#endif
+
+#if RTPT_GRIS_DUAL_FIRST_HIT
+#include "RTPTGRISDualExplicitPath.slang"
+// Direct and deep events have separate measures. Both use dA(x2) and the
+// light ID (plus unit-square coordinates for a triangle). Deep events also
+// use solid angle for the shared direction leaving x2.
+// The generated x1 and its actual sampling density condition this domain.
+struct GrisDualTailValue
+{
+    float3 diffuse;
+    float3 specular;
+    float2 proposalPdf;
+
+    float target() { return rtptGrisRefTarget(diffuse + specular); }
+};
+
+struct GrisDualReplayDomain
+{
+    bool previousLights;
+    bool previousGeometry;
+    uint movedBoundsCount;
+#if RTPT_GRIS_DUAL_SHARC && defined(RTPT_GRIS_TEMPORAL_REUSE)
+    uint previousSharcMode;
+#endif
+};
+
+float rtptGrisDualLightProbability(GrisSpatialRecord tail)
+{
+    const uint kind = rtptGrisTerminalKind(tail.candidate.terminalKind);
+    if (kind == uint(GrisTerminalKind::GrisDualEmitter) || kind == uint(GrisTerminalKind::GrisDualEnvironmentMiss))
+        return 1.f;
+#if RTPT_GRIS_DUAL_SHARC
+    // At fixed x2 and outgoing direction, both routes share the x3 draw.
+    // Its selected-lobe proposal compensation is folded into the incident.
+    if (kind == uint(GrisTerminalKind::GrisDualSharcTail)) return 1.f;
+#endif
+#if RTPT_GRIS_DUAL_REGIR
+    // The ReGIR draw is conditional on the shared receiver. Both routes
+    // therefore use the same light proposal, including its inner RIS weight.
+    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee))
+        return tail.suffixLight.z > 0.f && isfinite(tail.suffixLight.z) ? 1.f : 0.f;
+#endif
+    const float3 categories = rtptLightCategoryProbabilities();
+#if USE_ENV_LIGHT
+    if (kind == uint(GrisTerminalKind::GrisDualEnvironmentNee)) return categories.x;
+#endif
+#if USE_ANALYTIC_LIGHTS
+    if (kind == uint(GrisTerminalKind::GrisDualPointNee) &&
+        tail.lightPdfOrStableID < gScene.getLightCount())
+        return categories.z / float(gScene.getLightCount());
+#endif
+#if USE_EMISSIVE_LIGHTS
+    if (kind == uint(GrisTerminalKind::GrisDualEmissiveNee) &&
+        categories.y > 0.f && tail.lightPdfOrStableID < gScene.lightCollection.getTriangleCount() &&
+        gScene.lightCollection.getActiveTriangleIndex(tail.lightPdfOrStableID) != LightCollection::kInvalidIndex)
+        return categories.y / float(gScene.lightCollection.getActiveTriangleCount());
+#endif
+    return 0.f;
+}
+
+float3 rtptGrisEvaluateDualLight(ShadingData surface, ShadingData visibilitySurface, IMaterialInstance material,
+    GrisSpatialRecord tail, float lightProbability, inout SampleGenerator rng, bool previousLights,
+    out bool shadowClear, uint movedBoundsCount = 0u)
+{
+    shadowClear = false;
+    SceneRayQuery<true> query;
+    const uint kind = rtptGrisTerminalKind(tail.candidate.terminalKind);
+#if USE_ENV_LIGHT
+    if (kind == uint(GrisTerminalKind::GrisDualEnvironmentNee))
+    {
+        const float2 uv = rtptGrisIsDeepTail(tail) ? tail.suffixLight.xy : tail.suffixDirection.xy;
+        EnvMapSample sample;
+        if (!gEnvMapSampler.sample(uv, sample) || !(sample.pdf > 0.f) || !isfinite(sample.pdf) ||
+            !all(isfinite(sample.dir)) || !all(isfinite(sample.Le)) || !any(sample.Le > 0.f) ||
+            dot(surface.getOrientedFaceNormal(), sample.dir) <= 0.f) return 0.f;
+
+        const Ray shadow = Ray(visibilitySurface.computeRayOrigin(), sample.dir);
+        if (!query.traceVisibilityRay(shadow)) return 0.f;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+        if (movedBoundsCount != 0u) shadowClear = rtptGrisDualExplicitInfiniteRayClear(shadow, movedBoundsCount);
+#endif
+
+        const float bsdfPdf = rtptContinuationPdf(surface, material, rtptBSDFSamplingContext(), sample.dir);
+        if (!isfinite(bsdfPdf)) return 0.f;
+        const float mis = rtptPowerHeuristic(lightProbability * sample.pdf, bsdfPdf);
+        // The outer proposal accounts for the environment category probability.
+        return material.eval(surface, sample.dir, rng) * sample.Le * (mis / sample.pdf);
+    }
+#endif
+#if RTPT_GRIS_DUAL_REGIR
+    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee))
+    {
+        RTPTLightSample light;
+        if (!rtptReGIRRebuildTransportSample(surface, tail.lightPdfOrStableID, tail.suffixLight.xy,
+            tail.suffixLight.z, light) || !query.traceVisibilityRay(light.visibilityRay)) return 0.f;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+        if (movedBoundsCount != 0u) shadowClear = rtptGrisReplayRayClear(light.visibilityRay, movedBoundsCount);
+#endif
+        // LiOverPdf already includes the inner weight. ReGIR owns the
+        // covered NEE domain, with no competing ordinary BSDF light sample.
+        return material.eval(surface, light.dir, rng) * light.LiOverPdf;
+    }
+#endif
+#if USE_ANALYTIC_LIGHTS
+    if (kind == uint(GrisTerminalKind::GrisDualPointNee))
+    {
+        const uint lightIndex = tail.lightPdfOrStableID;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY && !RTPT_GRIS_DUAL_REGIR
+        const LightData light = previousLights ? gGRISReplayPreviousLights[lightIndex] : gScene.getLight(lightIndex);
+#else
+        const LightData light = gScene.getLight(lightIndex);
+#endif
+        AnalyticLightSample sample;
+        if (!samplePointLight(surface.posW, light, sample) ||
+            dot(surface.getOrientedFaceNormal(), sample.dir) <= 0.f ||
+            !all(isfinite(sample.Li)) || !any(sample.Li > 0.f)) return 0.f;
+        AnalyticLightSample visibilitySample = sample;
+        if (any(surface.posW != visibilitySurface.posW) &&
+            !samplePointLight(visibilitySurface.posW, light, visibilitySample)) return 0.f;
+        const Ray shadow = Ray(visibilitySurface.computeRayOrigin(), visibilitySample.dir, 0.f, visibilitySample.distance);
+        if (!query.traceVisibilityRay(shadow)) return 0.f;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+        if (movedBoundsCount != 0u) shadowClear = rtptGrisReplayRayClear(shadow, movedBoundsCount);
+#endif
+        return material.eval(surface, sample.dir, rng) * sample.Li;
+    }
+#endif
+#if USE_EMISSIVE_LIGHTS
+    if (kind == uint(GrisTerminalKind::GrisDualEmissiveNee))
+    {
+        const uint lightIndex = tail.lightPdfOrStableID;
+        const float2 uv = rtptGrisIsDeepTail(tail) ? tail.suffixLight.xy : tail.suffixDirection.xy;
+        TriangleLightSample sample;
+        if (!sampleTriangle(surface.posW, lightIndex, uv, sample) ||
+            dot(surface.getOrientedFaceNormal(), sample.dir) <= 0.f || !(sample.pdf > 0.f) || !isfinite(sample.pdf)) return 0.f;
+
+        const EmissiveTriangle triangle = gScene.lightCollection.getTriangle(lightIndex);
+        VertexData lightVertex = {};
+        lightVertex.posW = sample.posW;
+        lightVertex.texC = triangle.getTexCoord(sample_triangle(uv));
+        if (gScene.materials.alphaTest(lightVertex, triangle.materialID, 0.f)) return 0.f;
+        const float3 origin = visibilitySurface.computeRayOrigin();
+        const float3 edge = computeRayOrigin(sample.posW, sample.normalW) - origin;
+        const float distance = length(edge);
+        if (!(distance > 0.f) || !isfinite(distance)) return 0.f;
+        const Ray shadow = Ray(origin, edge / distance, 0.f, distance);
+        if (!query.traceVisibilityRay(shadow)) return 0.f;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+        if (movedBoundsCount != 0u) shadowClear = rtptGrisReplayRayClear(shadow, movedBoundsCount);
+#endif
+
+        const float lightPdf = lightProbability * sample.pdf;
+        const float bsdfPdf = rtptContinuationPdf(surface, material, rtptBSDFSamplingContext(), sample.dir);
+        if (!isfinite(lightPdf) || !isfinite(bsdfPdf)) return 0.f;
+        const float mis = rtptPowerHeuristic(lightPdf, bsdfPdf);
+        // sample.pdf converts unit-square light coordinates to solid angle.
+        return material.eval(surface, sample.dir, rng) * sample.Le * (mis / sample.pdf);
+    }
+#endif
+    return 0.f;
+}
+
+float3 rtptGrisEvaluateDualDeep(GrisSpatialRecord tail, TriangleHit triangle, float lightProbability,
+    inout SampleGenerator rng, out bool shadowClear, bool previousLights = false, uint movedBoundsCount = 0u)
+{
+    shadowClear = false;
+    ShadingData surface = gScene.materials.prepareShadingData(gScene.getVertexData(triangle),
+        gScene.getMaterialID(triangle.instanceID), -tail.suffixDirection);
+    surface.mtl.setActiveLobes(uint(LobeType::Reflection));
+    const IMaterialInstance material = gScene.materials.getMaterialInstance(surface, ExplicitLodTextureSampler(0.f));
+    if ((material.getLobeTypes(surface) & uint(LobeType::NonDeltaReflection)) == 0u) return 0.f;
+    return rtptGrisEvaluateDualLight(surface, surface, material, tail, lightProbability, rng,
+        previousLights, shadowClear, movedBoundsCount);
+}
+
+struct GrisDualDeepIncident
+{
+    float3 current;
+    float3 previous;
+    float lightPdf; // Competing NEE density for x3 BSDF terminals.
+};
+
+#if RTPT_GRIS_DUAL_SHARC
+#if defined(RTPT_GRIS_TEMPORAL_REUSE)
+ParameterBlock<SharcParameters> gGRISPreviousSharc;
+#endif
+
+GrisDualDeepIncident rtptGrisTraceDualSharc(GrisSpatialRecord tail, GrisDualReplayDomain domain)
+{
+    GrisDualDeepIncident result = {};
+    if (!all(isfinite(tail.suffixDirection)) || !all(isfinite(tail.sharcDirection)) ||
+        !(dot(tail.suffixDirection, tail.suffixDirection) > 0.f) ||
+        !(dot(tail.sharcDirection, tail.sharcDirection) > 0.f) ||
+        !all(isfinite(tail.suffixLight)) || !any(tail.suffixLight > 0.f)) return result;
+
+    const TriangleHit reconnect = HitInfo(tail.reconnectHit).getTriangleHit();
+    const VertexData x2 = rtptGrisPrefixVertex(reconnect);
+    const Ray firstRay = Ray(computeRayOrigin(x2.posW, x2.faceNormalW), tail.suffixDirection);
+    SceneRayQuery<true> query;
+    float firstT;
+    const HitInfo first = query.traceRay(firstRay, firstT);
+    if (first.getType() != HitType::Triangle) return result;
+    const TriangleHit x3 = first.getTriangleHit();
+    ShadingData third = gScene.materials.prepareShadingData(gScene.getVertexData(x3),
+        gScene.getMaterialID(x3.instanceID), -firstRay.dir);
+    third.mtl.setActiveLobes(uint(LobeType::Reflection));
+    const IMaterialInstance thirdMaterial = gScene.materials.getMaterialInstance(third, ExplicitLodTextureSampler(0.f));
+    const float roughness = thirdMaterial.getProperties(third).roughness;
+    const Ray secondRay = Ray(third.computeRayOrigin(), tail.sharcDirection);
+    float secondT;
+    const HitInfo second = query.traceRay(secondRay, secondT);
+    if (second.getType() != HitType::Triangle) return result;
+    const TriangleHit x4 = second.getTriangleHit();
+    ShadingData fourth = gScene.materials.prepareShadingData(gScene.getVertexData(x4),
+        gScene.getMaterialID(x4.instanceID), -secondRay.dir);
+    fourth.mtl.setActiveLobes(uint(LobeType::Reflection));
+    const IMaterialInstance fourthMaterial = gScene.materials.getMaterialInstance(fourth, ExplicitLodTextureSampler(0.f));
+    const BSDFProperties fourthProperties = fourthMaterial.getProperties(fourth);
+    const float distance = length(fourth.posW - third.posW);
+    const RTPTSamplingContext sampling = rtptBSDFSamplingContext();
+    RTPTSharcStats stats = {};
+    float3 cached;
+    if (rtptTrySharcQueryOnEdgeFrom(gSharc, fourth, fourthMaterial, fourthProperties, 4u, false, false,
+        true, roughness, distance, sampling, secondRay.dir, stats, cached))
+        result.current = tail.suffixLight * cached;
+    result.previous = result.current;
+
+#if defined(RTPT_GRIS_TEMPORAL_REUSE)
+    result.previous = 0.f;
+    bool compatibleGeometry = true;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    if (domain.previousGeometry)
+    {
+        compatibleGeometry = rtptGrisReplayStaticSurface(tail.reconnectHit) &&
+            rtptGrisReplayStaticSurface(first.pack()) && rtptGrisReplayStaticSurface(second.pack()) &&
+            rtptGrisReplayRayClear(Ray(firstRay.origin, firstRay.dir, firstRay.tMin, firstT), domain.movedBoundsCount) &&
+            rtptGrisReplayRayClear(Ray(secondRay.origin, secondRay.dir, secondRay.tMin, secondT), domain.movedBoundsCount);
+        // The stored x3 sample belongs to a static suffix. Changed vertices or
+        // visibility leave both mappings unverified.
+        if (!compatibleGeometry) result.current = 0.f;
+    }
+#endif
+    if (compatibleGeometry && domain.previousSharcMode != 0u)
+    {
+        if (domain.previousSharcMode == 1u &&
+            all(gGRISPreviousSharc.hashGridParameters.cameraPosition == gSharc.hashGridParameters.cameraPosition))
+            result.previous = result.current;
+        else if (rtptTrySharcQueryOnEdgeFrom(gGRISPreviousSharc, fourth, fourthMaterial, fourthProperties, 4u,
+            false, false, true, roughness, distance, sampling, secondRay.dir, stats, cached))
+            result.previous = tail.suffixLight * cached;
+    }
+#endif
+    return result;
+}
+#endif
+
+GrisDualDeepIncident rtptGrisTraceDualDeep(GrisSpatialRecord tail, inout SampleGenerator rng,
+    GrisDualReplayDomain domain, bool evaluatePrevious)
+{
+    GrisDualDeepIncident result = {};
+    const float3 direction = tail.suffixDirection;
+    if (!all(isfinite(direction)) || !(dot(direction, direction) > 0.f)) return result;
+    const float lightProbability = rtptGrisDualLightProbability(tail);
+    if (!(lightProbability > 0.f)) return result;
+
+    // Both eligible routes see the front of x2. The same offset origin and
+    // outgoing direction therefore give the same x3 and NEE evaluation.
+    const TriangleHit reconnect = HitInfo(tail.reconnectHit).getTriangleHit();
+    const VertexData vertex = rtptGrisPrefixVertex(reconnect);
+    SceneRayQuery<true> query;
+    float hitT;
+    const Ray ray = Ray(computeRayOrigin(vertex.posW, vertex.faceNormalW), direction);
+    const HitInfo hit = query.traceRay(ray, hitT);
+    if (hit.getType() != HitType::Triangle) return result;
+
+    uint shadowBoundsCount = 0u;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    if (evaluatePrevious && domain.previousGeometry && rtptGrisReplayStaticSurface(tail.reconnectHit) &&
+        rtptGrisReplayStaticSurface(hit.pack()) &&
+        rtptGrisReplayRayClear(Ray(ray.origin, ray.dir, ray.tMin, hitT), domain.movedBoundsCount))
+        shadowBoundsCount = domain.movedBoundsCount;
+#endif
+    bool shadowClear;
+    result.current = rtptGrisEvaluateDualDeep(tail, hit.getTriangleHit(), lightProbability, rng,
+        shadowClear, false, shadowBoundsCount);
+    result.previous = result.current;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    if (domain.previousGeometry)
+        result.previous = shadowClear ? result.current : float3(0.f);
+#if !RTPT_GRIS_DUAL_REGIR
+    else if (evaluatePrevious && domain.previousLights &&
+        rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualPointNee))
+        result.previous = rtptGrisEvaluateDualDeep(tail, hit.getTriangleHit(), lightProbability, rng, shadowClear, true);
+#endif
+#endif
+    return result;
+}
+
+#include "RTPTGRISDualExplicitReplay.slang"
+
+float3 rtptGrisEvaluateDualRoute(PackedHitInfo primaryHit, ShadingData primary, float3 camera, GrisDualFirstHits hits, uint slot,
+    GrisSpatialRecord tail, float3 x2, float lightProbability, inout SampleGenerator rng, out float proposal,
+    bool nativeConnection, GrisDualReplayDomain domain, bool deep, float3 deepIncident, float deepLightPdf)
+{
+    proposal = 0.f;
+    const float firstPdf = hits.firstHitAreaPdf[slot];
+    if ((hits.attemptedMask & (1u << slot)) == 0u || !(firstPdf > 0.f) || !isfinite(firstPdf)) return 0.f;
+    bool certifyPrevious = domain.previousGeometry && deep;
+    bool certifyDirect = false;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY && RTPT_GRIS_DUAL_REGIR
+    certifyDirect = domain.previousGeometry && !deep &&
+        rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualReGIRNee);
+    certifyPrevious = certifyPrevious || certifyDirect;
+#endif
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY && USE_ENV_LIGHT
+    certifyDirect = certifyDirect || (domain.previousGeometry && !deep &&
+        rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualEnvironmentNee));
+    certifyPrevious = certifyPrevious || certifyDirect;
+#endif
+    const bool rebuildPrevious = domain.previousGeometry && !certifyPrevious;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    if (certifyPrevious && (!rtptGrisReplayStaticSurface(hits.x1[slot]) ||
+        !rtptGrisReplayStaticSurface(tail.reconnectHit))) return 0.f;
+#endif
+
+    const uint root = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
+    primary.mtl.setActiveLobes(rtptGrisRefRootMask(root));
+    const IMaterialInstance rootMaterial = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
+    float3 x1, firstDirection;
+    float firstDistanceSquared;
+    ShadingData first;
+    if (!rtptGrisRefPosition(hits.x1[slot], x1, rebuildPrevious) ||
+        !rtptGrisPrefixDirection(primary.computeRayOrigin(), x1, firstDirection, firstDistanceSquared) ||
+        !rtptGrisRefLoad(hits.x1[slot], -firstDirection, first, rebuildPrevious)) return 0.f;
+    const IMaterialInstance firstMaterial = gScene.materials.getMaterialInstance(first, ExplicitLodTextureSampler(0.f));
+    if (!rtptGRISSupportsSurface(first, firstMaterial.getLobeTypes(first))) return 0.f;
+
+    float3 connectionDirection;
+    float connectionDistanceSquared;
+    ShadingData reconnect;
+    if (!rtptGrisPrefixDirection(first.computeRayOrigin(), x2, connectionDirection, connectionDistanceSquared) ||
+        !rtptGrisRefLoad(tail.reconnectHit, -connectionDirection, reconnect, rebuildPrevious)) return 0.f;
+    const IMaterialInstance reconnectMaterial = gScene.materials.getMaterialInstance(reconnect, ExplicitLodTextureSampler(0.f));
+    if (!rtptGRISSupportsSurface(reconnect, reconnectMaterial.getLobeTypes(reconnect))) return 0.f;
+
+    ShadingData visibilityFirst = first;
+    ShadingData visibilityReconnect = reconnect;
+    uint connectionBoundsCount = 0u;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    if (certifyPrevious)
+    {
+        const Ray firstRay = Ray(primary.computeRayOrigin(), firstDirection, 0.f, sqrt(firstDistanceSquared));
+        if (!rtptGrisReplayRayClear(firstRay, domain.movedBoundsCount)) return 0.f;
+        connectionBoundsCount = domain.movedBoundsCount;
+    }
+    else if (rebuildPrevious)
+    {
+        // Evaluate historical scattering at the historical hits, with
+        // visibility approximated using their current endpoints and TLAS.
+        ShadingData visibilityPrimary;
+        float3 currentX1, currentX2;
+        if (!rtptGrisRefPrimary(primaryHit, camera, visibilityPrimary) ||
+            !rtptGrisRefPosition(hits.x1[slot], currentX1) ||
+            !rtptGrisRefPosition(tail.reconnectHit, currentX2) ||
+            !rtptGrisRefLoad(hits.x1[slot], visibilityPrimary.posW - currentX1, visibilityFirst) ||
+            !rtptGrisRefLoad(tail.reconnectHit, currentX1 - currentX2, visibilityReconnect) ||
+            !rtptGrisRefVisible(visibilityPrimary, visibilityFirst)) return 0.f;
+    }
+#endif
+    if (!nativeConnection && !rtptGrisRefVisible(visibilityFirst, visibilityReconnect, connectionBoundsCount)) return 0.f;
+
+    const float connectionGeometry = abs(dot(reconnect.faceN, connectionDirection)) / connectionDistanceSquared;
+    const float connectionPdf = firstMaterial.evalPdf(first, connectionDirection);
+    if (!(connectionPdf > 0.f) || !isfinite(connectionPdf)) return 0.f;
+
+    const float directionPdf = deep ?
+        rtptContinuationPdf(reconnect, reconnectMaterial, rtptBSDFSamplingContext(), tail.suffixDirection) : 1.f;
+    proposal = connectionPdf * connectionGeometry * directionPdf * lightProbability;
+    if (!(proposal > 0.f) || !isfinite(proposal)) { proposal = 0.f; return 0.f; }
+
+    const float rootGeometry = abs(dot(first.faceN, firstDirection)) / firstDistanceSquared;
+    const float3 prefixValue = rootMaterial.eval(primary, firstDirection, rng) * (rootGeometry / firstPdf) *
+        firstMaterial.eval(first, connectionDirection, rng) * connectionGeometry;
+    float3 incident;
+    bool shadowClear;
+    if (deep)
+    {
+        const float mis = deepLightPdf > 0.f ? rtptPowerHeuristic(directionPdf, deepLightPdf) : 1.f;
+        incident = reconnectMaterial.eval(reconnect, tail.suffixDirection, rng) * deepIncident * mis;
+    }
+    else incident = rtptGrisEvaluateDualLight(reconnect, visibilityReconnect, reconnectMaterial, tail,
+        lightProbability, rng, domain.previousLights, shadowClear, certifyDirect ? connectionBoundsCount : 0u);
+    if (certifyDirect && !shadowClear) return 0.f;
+    const float3 value = prefixValue * incident;
+    return all(isfinite(value)) ? value : 0.f;
+}
+
+GrisDualTailValue rtptGrisEvaluateDualTail(GrisSpatialRecord owner, GrisDualFirstHits hits,
+    float3 camera, GrisSpatialRecord tail, float3 deepIncident, inout SampleGenerator rng,
+    uint nativeSlot = 2u, GrisDualReplayDomain domain = {}, float deepLightPdf = 0.f)
+{
+    GrisDualTailValue result = {};
+    ShadingData primary;
+    float3 x2;
+    const bool deep = rtptGrisIsDeepTail(tail);
+    if (deep && (gParams.maxBounces < 3u || !all(isfinite(deepIncident)) || !any(deepIncident > 0.f))) return result;
+    bool rebuildPrevious = domain.previousGeometry && !deep;
+#if RTPT_GRIS_DUAL_REGIR
+    if (rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualReGIRNee))
+        rebuildPrevious = false;
+#endif
+#if USE_ENV_LIGHT
+    if (rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualEnvironmentNee))
+        rebuildPrevious = false;
+#endif
+    const float lightProbability = rtptGrisDualLightProbability(tail);
+    if (!(lightProbability > 0.f) ||
+        !rtptGrisRefPrimary(owner.ownerPrimaryHit, camera, primary, rebuildPrevious) ||
+        !rtptGrisRefPosition(tail.reconnectHit, x2, rebuildPrevious)) return result;
+
+    result.diffuse = rtptGrisEvaluateDualRoute(owner.ownerPrimaryHit, primary, camera, hits, 0u, tail, x2,
+        lightProbability, rng, result.proposalPdf[0], nativeSlot == 0u, domain, deep, deepIncident, deepLightPdf);
+    result.specular = rtptGrisEvaluateDualRoute(owner.ownerPrimaryHit, primary, camera, hits, 1u, tail, x2,
+        lightProbability, rng, result.proposalPdf[1], nativeSlot == 1u, domain, deep, deepIncident, deepLightPdf);
+    return result;
+}
+
+GrisDualTailValue rtptGrisNativeDualTail(GrisSpatialRecord record)
+{
+    GrisDualTailValue result = {};
+    result.diffuse = record.candidate.F;
+    result.specular = record.candidate.dualF;
+    return result;
+}
+
+bool rtptGrisDualTailValid(GrisSpatialRecord record)
+{
+    const uint kind = rtptGrisTerminalKind(record.candidate.terminalKind);
+    return record.candidate.hasWinner &&
+        (
+#if RTPT_GRIS_DUAL_REGIR
+            kind == uint(GrisTerminalKind::GrisDualReGIRNee) ||
+#endif
+#if RTPT_GRIS_DUAL_SHARC
+            kind == uint(GrisTerminalKind::GrisDualSharcTail) ||
+#endif
+            kind == uint(GrisTerminalKind::GrisDualPointNee) || kind == uint(GrisTerminalKind::GrisDualEmissiveNee) ||
+            kind == uint(GrisTerminalKind::GrisDualEnvironmentNee) || kind == uint(GrisTerminalKind::GrisDualEmitter) ||
+            kind == uint(GrisTerminalKind::GrisDualEnvironmentMiss)) &&
+        HitInfo(record.reconnectHit).getType() == HitType::Triangle;
+}
+
+void rtptGrisSelectDualTail(GrisSpatialRecord proposal, GrisDualTailValue value, float weight,
+    inout SampleGenerator rng, inout float sum, inout GrisSpatialRecord winner, inout float winnerTarget)
+{
+    if (!(weight > 0.f) || !isfinite(weight)) return;
+    sum += weight;
+    if (sampleNext1D(rng) * sum < weight)
+    {
+        winner = proposal;
+        winner.candidate.F = value.diffuse;
+        winner.candidate.dualF = value.specular;
+        winnerTarget = value.target();
+    }
+}
+
+GrisSpatialRecord rtptGrisFinalizeDualTail(GrisSpatialRecord center, GrisSpatialRecord winner,
+    float sum, float winnerTarget, float count)
+{
+    const float W = winnerTarget > 0.f ? sum / winnerTarget : 0.f;
+    if (W > 0.f && isfinite(W) && all(isfinite(winner.candidate.F * W)) && all(isfinite(winner.candidate.dualF * W)))
+    {
+        winner.ownerPrimaryHit = center.ownerPrimaryHit;
+        winner.candidate.prepared = center.candidate.prepared;
+        winner.candidate.W = W;
+        winner.candidate.M = count;
+        return winner;
+    }
+    center.candidate.hasWinner = false;
+    center.candidate.W = 0.f;
+    center.candidate.M = count;
+    return center;
+}
+
+GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirstHits firstHits,
+    GrisSpatialRecord direct[2], GrisSpatialRecord deep[2], TriangleHit deepHits[2],
+    GrisDualExplicitTerminal bsdfTerminals[2], GrisDualExplicitTerminal lateTerminals[2],
+#if RTPT_GRIS_DUAL_SHARC
+    GrisSpatialRecord cache[2],
+    float3 cacheIncident[2],
+#endif
+    inout SampleGenerator rng)
+{
+    const float3 camera = gScene.camera.getPosition();
+    GrisSpatialRecord winner = center;
+    float sum = 0.f, winnerTarget = 0.f;
+    uint eventCount = gParams.maxBounces > 3u ? 4u : 3u;
+#if RTPT_GRIS_DUAL_SHARC
+    if (gParams.maxBounces > 4u) eventCount = 5u;
+#endif
+    [loop] for (uint event = 0u; event < eventCount; ++event)
+    {
+        [unroll] for (uint slot = 0u; slot < 2u; ++slot)
+        {
+            GrisSpatialRecord proposal = event == 0u ? direct[slot] : deep[slot];
+            if (event == 2u) proposal = bsdfTerminals[slot].proposal;
+            if (event == 3u) proposal = lateTerminals[slot].proposal;
+#if RTPT_GRIS_DUAL_SHARC
+            if (event == 4u) proposal = cache[slot];
+#endif
+            if (!rtptGrisDualTailValid(proposal)) continue;
+            const float lightProbability = rtptGrisDualLightProbability(proposal);
+            float3 deepIncident = 0.f;
+            float deepLightPdf = 0.f;
+            bool shadowClear;
+            if (event == 1u && lightProbability > 0.f)
+                deepIncident = rtptGrisEvaluateDualDeep(proposal, deepHits[slot], lightProbability, rng, shadowClear);
+            if (event == 2u)
+            {
+                deepIncident = bsdfTerminals[slot].incident;
+                deepLightPdf = asfloat(proposal.lightPdfOrStableID);
+            }
+            if (event == 3u) deepIncident = lateTerminals[slot].incident;
+#if RTPT_GRIS_DUAL_SHARC
+            if (event == 4u) deepIncident = cacheIncident[slot];
+#endif
+            GrisDualTailValue value = rtptGrisEvaluateDualTail(center, firstHits, camera, proposal, deepIncident,
+                rng, slot, {}, deepLightPdf);
+            // The native density was captured at the draw (q2 or q2*qDir).
+            value.proposalPdf[slot] = proposal.areaPdf * lightProbability;
+            const float proposalSum = value.proposalPdf.x + value.proposalPdf.y;
+            if (!(proposalSum > 0.f) || !isfinite(proposalSum)) continue;
+            rtptGrisSelectDualTail(proposal, value, value.target() / proposalSum, rng, sum, winner, winnerTarget);
+        }
+    }
+    // The summed proposal density already accounts for both strata.
+    return rtptGrisFinalizeDualTail(center, winner, sum, winnerTarget, float(countbits(firstHits.attemptedMask)));
+}
+
+GrisSpatialRecord rtptGrisMergeDualTails(GrisSpatialRecord canonical, GrisDualFirstHits targetHits,
+    GrisSpatialRecord inputs[kGrisMaxReuseInputs], GrisDualFirstHits sourceHits[kGrisMaxReuseInputs],
+    float3 sourceCameras[kGrisMaxReuseInputs], uint inputCount, inout SampleGenerator rng
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    , bool previousLights, bool previousGeometry, uint movedBoundsCount
+#endif
+#if RTPT_GRIS_DUAL_SHARC && defined(RTPT_GRIS_TEMPORAL_REUSE)
+    , uint previousSharcMode
+#endif
+    )
+{
+    if (!rtptGrisRefDomainValid(canonical) || inputCount == 0u) return canonical;
+    const float3 camera = gScene.camera.getPosition();
+    GrisDualReplayDomain sourceDomain = {};
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+    sourceDomain.previousLights = previousLights;
+    sourceDomain.previousGeometry = previousGeometry;
+    sourceDomain.movedBoundsCount = movedBoundsCount;
+#endif
+#if RTPT_GRIS_DUAL_SHARC && defined(RTPT_GRIS_TEMPORAL_REUSE)
+    sourceDomain.previousSharcMode = previousSharcMode;
+#endif
+    GrisSpatialRecord winner = canonical;
+    float sum = 0.f, winnerTarget = 0.f, count = canonical.candidate.M;
+    bool accepted[kGrisMaxReuseInputs];
+    [loop] for (uint j = 0u; j < inputCount; ++j)
+    {
+        accepted[j] = rtptGrisRefDomainValid(inputs[j]);
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+        if (previousGeometry && (!rtptGrisReplayStaticSurface(canonical.ownerPrimaryHit) ||
+            !rtptGrisReplayStaticSurface(inputs[j].ownerPrimaryHit))) accepted[j] = false;
+#endif
+        if (accepted[j]) count += inputs[j].candidate.M;
+    }
+
+    [loop] for (uint i = 0u; i <= inputCount; ++i)
+    {
+        const bool center = i == inputCount;
+        GrisSpatialRecord proposal = canonical;
+        if (!center)
+        {
+            if (!accepted[i]) continue;
+            proposal = inputs[i];
+        }
+        if (!rtptGrisDualTailValid(proposal) || !(proposal.candidate.W > 0.f)) continue;
+        const bool deep = rtptGrisIsDeepTail(proposal);
+        GrisDualDeepIncident deepIncident = {};
+#if RTPT_GRIS_DUAL_SHARC
+        const bool sharc = rtptGrisTerminalKind(proposal.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualSharcTail);
+        if (sharc) deepIncident = rtptGrisTraceDualSharc(proposal, sourceDomain);
+        else
+#endif
+        if (proposal.dualExplicitBounce != 0u) deepIncident = rtptGrisTraceDualExplicit(proposal, rng, sourceDomain);
+        else if (deep) deepIncident = rtptGrisTraceDualDeep(proposal, rng, sourceDomain, center || sourceDomain.previousGeometry);
+        const GrisDualTailValue targetValue = center ? rtptGrisNativeDualTail(proposal) :
+            rtptGrisEvaluateDualTail(canonical, targetHits, camera, proposal, deepIncident.current, rng,
+                2u, {}, deepIncident.lightPdf);
+        const float target = targetValue.target();
+        if (!(target > 0.f)) continue;
+
+        float denominator = target;
+        float sourceTarget = center ? target : 0.f;
+        [loop] for (uint j = 0u; j < inputCount; ++j)
+        {
+            // Domain support is independent of its realized winning sample.
+            if (!accepted[j]) continue;
+            // On motion, apply the same old-domain visibility rule to both
+            // directions of MIS, including the old domain's own winner.
+            bool useNative = !center && j == i && !sourceDomain.previousGeometry;
+#if RTPT_GRIS_DUAL_SHARC && defined(RTPT_GRIS_TEMPORAL_REUSE)
+            if (sharc && sourceDomain.previousSharcMode == 0u) useNative = false;
+#endif
+            const float cross = useNative ? rtptGrisNativeDualTail(proposal).target() :
+                rtptGrisEvaluateDualTail(inputs[j], sourceHits[j], sourceCameras[j], proposal, deepIncident.previous,
+                    rng, 2u, sourceDomain, deepIncident.lightPdf).target();
+            denominator += cross;
+            if (!center && j == i) sourceTarget = cross;
+        }
+        const float weight = target * (sourceTarget / denominator) * proposal.candidate.W;
+        rtptGrisSelectDualTail(proposal, targetValue, weight, rng, sum, winner, winnerTarget);
+    }
+    return rtptGrisFinalizeDualTail(canonical, winner, sum, winnerTarget, count);
+}
+#endif
 
 #endif

@@ -9,6 +9,10 @@
 static const uint kGrisSpatialNeighborCount = 3u;
 static const uint kGrisMaxReuseInputs = 1u + (RTPT_GRIS_SPATIAL_REUSE ? kGrisSpatialNeighborCount : 0u);
 
+#if RTPT_GRIS_DUAL_FIRST_HIT && (RTPT_GRIS_SPATIAL_REUSE || defined(RTPT_GRIS_TEMPORAL_REUSE))
+StructuredBuffer<GrisDualFirstHits> gGRISDualFirstHits;
+#endif
+
 #if RTPT_GRIS_SPATIAL_REUSE && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
 Texture1D<float2> gGRISNeighborOffsets;
 
@@ -21,9 +25,14 @@ bool rtptGrisLoadSpatialSurface(uint2 pixel, out ShadingData surface)
 }
 
 void rtptGrisGatherSpatialNeighbors(uint2 pixel, StructuredBuffer<GrisSpatialRecord> spatialInput,
-    float3 camera, uint lightEpoch, inout uint inputCount,
+    float3 camera, inout uint inputCount,
     inout GrisSpatialRecord inputs[kGrisMaxReuseInputs], inout float3 sourceCameras[kGrisMaxReuseInputs],
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    inout GrisDualFirstHits sourceHits[kGrisMaxReuseInputs])
+#else
+    uint lightEpoch,
     inout uint sourceLightEpochs[kGrisMaxReuseInputs])
+#endif
 {
     ShadingData center;
     if (!rtptGrisLoadSpatialSurface(pixel, center)) return;
@@ -44,9 +53,15 @@ void rtptGrisGatherSpatialNeighbors(uint2 pixel, StructuredBuffer<GrisSpatialRec
         if (!(dot(center.frame.N, source.frame.N) >= 0.5f &&
             abs(centerDistance - distance(camera, source.posW)) < 0.1f * centerDistance)) continue;
 
-        inputs[inputCount] = spatialInput[uint(neighbor.y) * gPrimarySettings.frameDim.x + uint(neighbor.x)];
+        const uint index = uint(neighbor.y) * gPrimarySettings.frameDim.x + uint(neighbor.x);
+        inputs[inputCount] = spatialInput[index];
         sourceCameras[inputCount] = camera;
-        sourceLightEpochs[inputCount++] = lightEpoch;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+        sourceHits[inputCount] = gGRISDualFirstHits[index];
+#else
+        sourceLightEpochs[inputCount] = lightEpoch;
+#endif
+        ++inputCount;
     }
 }
 #endif

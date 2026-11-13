@@ -35,12 +35,17 @@ public:
     // The legacy "prefix" entry now contains local diffuse/specular RGB contributions.
     std::vector<ref<Buffer>> getGRISValidationBuffers() const
     {
-        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput};
+        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput,
+            mpGRISDualFirstHits};
     }
     // Explicit diagnostic access to existing resources only; no GPU readback.
     std::vector<ref<Buffer>> getSHARCValidationBuffers() const
     {
-        return {mpSHARCHashEntries, mpSHARCAccumulation, mpSHARCResolved};
+        return {mpSHARCHashEntries, mpSHARCAccumulation, mpSHARCResolved,
+            mGRISPreviousSharcMode == 2u ? mGRISPreviousSharc.hashEntries :
+                (mGRISPreviousSharcMode == 1u ? mpSHARCHashEntries : nullptr),
+            mGRISPreviousSharcMode == 2u ? mGRISPreviousSharc.resolved :
+                (mGRISPreviousSharcMode == 1u ? mpSHARCResolved : nullptr)};
     }
     ref<Buffer> getGRISLightHistoryMetadataBuffer() const { return mLightCatalog.getSnapshot().lightHistoryMetadata; }
     Properties getDIStatistics() const;
@@ -61,6 +66,7 @@ private:
     bool canPreserveGRISForPointLightChange() const;
     bool canUseGRISReGIRReplay() const;
     bool canUseGRISSuffixReplay() const;
+    bool canUseGRISDualDynamicReplay() const;
     bool canPreserveGRISSuffixReplayForPointLightChange() const;
     bool prepareGRISSuffixReplayGeometryChange();
     void validateScene() const;
@@ -74,6 +80,8 @@ private:
     bool canUseGRISReferenceReuse() const;
     bool useGRISCacheTail() const;
     bool canUseGRIS() const;
+    bool canUseGRISDualFirstHit() const;
+    bool canUseGRISDualReGIRTemporal() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
@@ -94,7 +102,10 @@ private:
     bool prepareDIReuse();
     void bindDIReuseSettings(const ShaderVar& rootVar, uint32_t inputBank, uint32_t outputBank) const;
     void publishDIHistory(RenderContext* pRenderContext);
+    void bindSHARCQuery(const ShaderVar& sharc, const float3& cameraPosition,
+        const ref<Buffer>& hashEntries, const ref<Buffer>& resolved);
     void bindSHARC(const ShaderVar& rootVar);
+    void captureGRISPreviousSHARC(RenderContext* pRenderContext);
     void clearSHARC(RenderContext* pRenderContext);
     void updateSHARCMotionBounds();
     void executeTraining(RenderContext* pRenderContext);
@@ -151,8 +162,11 @@ private:
     uint32_t mReGIRSlotCount = 0u;
     uint32_t mReGIRCellCapacity = 0u;
     uint32_t mReGIRBuildFrameStamp = 0u;
+    uint64_t mReGIRPreparedFrameCount = 0u;
     uint64_t mReGIRBuildCount = 0u;
     uint64_t mReGIRDomainGeneration = 0u;
+    uint64_t mReGIRDualTemporalProposalEpoch = 0u;
+    uint32_t mReGIRDualTemporalProposalEpochFrame = 0u;
     float3 mReGIRBuildCameraPosition = float3(0.f);
     std::string mReGIRFallbackReason;
     ref<ComputePass> mpComputePass;
@@ -173,6 +187,7 @@ private:
     ref<Buffer> mpGRISTemporalOutput;
     ref<Texture> mpGRISNeighborOffsets;
     ref<Buffer> mpGRISLocalPrefixes; // Compatibility name for local D/S contributions, not path geometry.
+    ref<Buffer> mpGRISDualFirstHits;
     ref<Buffer> mpGRISShadedIndirect;
     ref<Buffer> mpGRISHistory;
     struct GrisTemporalSnapshot
@@ -182,9 +197,14 @@ private:
         uint32_t pgGeneration = 0u;
         uint64_t sharcVersion = 0u;
         uint64_t regirDomainGeneration = 0u;
+        uint64_t regirProposalEpoch = 0u;
         uint32_t lightEpoch = 0u;
         bool selectiveLightDomain = false;
         bool suffixReplayDomain = false;
+        bool dualFirstHitDomain = false;
+        bool dualDynamicReplayDomain = false;
+
+        bool hasDynamicReplay() const { return suffixReplayDomain || dualDynamicReplayDomain; }
 
         bool isCompatible(const GrisTemporalSnapshot& other, bool allowSharcVersionChange, bool referenceReuse) const
         {
@@ -193,8 +213,10 @@ private:
             return (referenceReuse || (all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
                 pgGeneration == other.pgGeneration)) &&
                 (sharcVersion == other.sharcVersion || (allowSharcVersionChange && sharcVersion != 0u && other.sharcVersion != 0u)) &&
-                regirDomainGeneration == other.regirDomainGeneration && selectiveLightDomain == other.selectiveLightDomain &&
-                suffixReplayDomain == other.suffixReplayDomain;
+                regirDomainGeneration == other.regirDomainGeneration && regirProposalEpoch == other.regirProposalEpoch &&
+                selectiveLightDomain == other.selectiveLightDomain &&
+                suffixReplayDomain == other.suffixReplayDomain && dualFirstHitDomain == other.dualFirstHitDomain &&
+                dualDynamicReplayDomain == other.dualDynamicReplayDomain;
         }
     };
     struct GrisTemporalHistoryFrame
@@ -223,6 +245,9 @@ private:
     std::vector<float4x4> mGRISReplayPreviousInstanceTransforms;
     std::vector<uint32_t> mGRISReplayMovedInstances;
     ref<Buffer> mpGRISReplayMovedInstances;
+    std::vector<AABB> mGRISReplayMovedBounds;
+    ref<Buffer> mpGRISReplayMovedBounds;
+    ref<Buffer> mpGRISReplayPreviousInstanceTransforms;
     bool mGRISSelectiveLightHistoryEnabled = false;
     bool mGRISLightHistoryPreserveRequested = false;
     bool mGRISLightHistoryPreservedThisFrame = false;
@@ -232,6 +257,7 @@ private:
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
+    bool mGRISDualFirstHitEnabled = false;
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;
@@ -328,6 +354,16 @@ private:
     ref<Buffer> mpSHARCHashEntries;
     ref<Buffer> mpSHARCAccumulation;
     ref<Buffer> mpSHARCResolved;
+    struct GrisSharcSnapshot
+    {
+        ref<Buffer> hashEntries;
+        ref<Buffer> resolved;
+        uint64_t version = 0u;
+        uint32_t frameStamp = 0u;
+    } mGRISPreviousSharc;
+    uint32_t mGRISPreviousSharcMode = 0u;
+    uint64_t mGRISReadSharcVersion = 0u;
+    uint32_t mGRISReadSharcFrameStamp = 0u;
     ref<Buffer> mpSHARCMotionBounds;
     ref<Buffer> mpSHARCMotionStats;
     std::vector<AABB> mSHARCPreviousInstanceBounds;

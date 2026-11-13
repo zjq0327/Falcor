@@ -42,35 +42,119 @@ bool rtptGrisPrefixDirection(float3 origin, float3 position, out float3 directio
 }
 
 #if (RTPT_GRIS_SPATIAL || RTPT_USE_GRIS) && !RTPT_GRIS_ALTERNATING && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+#if RTPT_GRIS_SUFFIX_REPLAY || RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+StructuredBuffer<uint> gGRISReplayMovedInstances;
+
+bool rtptGrisReplayStaticSurface(PackedHitInfo packed)
+{
+    const HitInfo hit = HitInfo(packed);
+    if (hit.getType() != HitType::Triangle) return false;
+    return gGRISReplayMovedInstances[hit.getTriangleHit().instanceID.index] == 0u;
+}
+#endif
+
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+struct GrisReplayMovedBounds
+{
+    float3 minPoint;
+    float3 maxPoint;
+};
+
+StructuredBuffer<GrisReplayMovedBounds> gGRISReplayMovedBounds;
+
+bool rtptGrisReplayRayClear(Ray ray, uint count)
+{
+    if (count == 0u || !all(isfinite(ray.origin)) || !all(isfinite(ray.dir)) ||
+        !isfinite(ray.tMin) || !isfinite(ray.tMax) || ray.tMax < ray.tMin) return false;
+    // Include the ray's arithmetic scale as well as the host's transform padding.
+    const float3 scale = max(abs(ray.origin), abs(ray.dir) * max(abs(ray.tMin), abs(ray.tMax)));
+    const float3 padding = max(1.f, scale) * 1.9073486328125e-6f;
+    if (!all(isfinite(padding))) return false;
+    [loop] for (uint i = 0u; i < count; ++i)
+    {
+        const GrisReplayMovedBounds bounds = gGRISReplayMovedBounds[i];
+        const float3 lo = bounds.minPoint - padding;
+        const float3 hi = bounds.maxPoint + padding;
+        float nearT = ray.tMin;
+        float farT = ray.tMax;
+        bool intersects = true;
+        [unroll] for (uint axis = 0u; axis < 3u; ++axis)
+        {
+            if (ray.dir[axis] == 0.f)
+                intersects = intersects && ray.origin[axis] >= lo[axis] && ray.origin[axis] <= hi[axis];
+            else
+            {
+                const float a = (lo[axis] - ray.origin[axis]) / ray.dir[axis];
+                const float b = (hi[axis] - ray.origin[axis]) / ray.dir[axis];
+                nearT = max(nearT, min(a, b));
+                farT = min(farT, max(a, b));
+            }
+        }
+        if (intersects && nearT <= farT) return false;
+    }
+    return true;
+}
+#endif
+
+#if defined(RTPT_GRIS_TEMPORAL_REUSE) && ((RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_STORED_PREFIX_REUSE)) || RTPT_GRIS_DUAL_DYNAMIC_REPLAY)
+struct GrisReplayInstanceTransform
+{
+    float4x4 world;
+    float4x4 inverseTransposeWorld;
+};
+
+// These transforms belong to the frame that published the history reservoir.
+StructuredBuffer<GrisReplayInstanceTransform> gGRISReplayPreviousInstanceTransforms;
+#endif
+
 // The represented prefix is defined by packed surface hits. Generate and
 // reconnection must use the same geometry and view normalization: a sampled
 // ray cannot be recovered exactly from float intersection barycentrics, and
 // even a tiny direction error changes a grazing BSDF by several percent.
-VertexData rtptGrisPrefixVertex(TriangleHit triangle)
+VertexData rtptGrisPrefixVertex(TriangleHit triangle, bool previousGeometry = false)
 {
     StaticVertexData vertices[3];
-    VertexData vertex = gScene.getVertexData(triangle, vertices);
+    VertexData vertex;
+    float4x4 world;
+#if defined(RTPT_GRIS_TEMPORAL_REUSE) && ((RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_STORED_PREFIX_REUSE)) || RTPT_GRIS_DUAL_DYNAMIC_REPLAY)
+    if (previousGeometry)
+    {
+        // Temporal replay only enables this path for rigid motion, so the
+        // object-space vertices and barycentric coordinates are unchanged.
+        const uint3 indices = gScene.getIndices(triangle.instanceID, triangle.primitiveIndex);
+        vertices = { gScene.getVertex(indices[0]), gScene.getVertex(indices[1]), gScene.getVertex(indices[2]) };
+        const GrisReplayInstanceTransform transform = gGRISReplayPreviousInstanceTransforms[triangle.instanceID.index];
+        world = transform.world;
+        vertex = gScene.computeVertexData(vertices, world, float3x3(transform.inverseTransposeWorld),
+            gScene.isObjectFrontFaceCW(triangle.instanceID), triangle.getBarycentricWeights());
+    }
+    else
+#endif
+    {
+        vertex = gScene.getVertexData(triangle, vertices);
+        world = gScene.getWorldMatrix(triangle.instanceID);
+    }
     // Affine interpolation preserves constant plane coordinates. Explicit
     // precision prevents separate Generate/reuse compilations from choosing
     // different reassociations or fused operations for the same packed hit.
     precise float3 positionO = vertices[0].position +
         triangle.barycentrics.x * (vertices[1].position - vertices[0].position) +
         triangle.barycentrics.y * (vertices[2].position - vertices[0].position);
-    precise float3 positionW = mul(gScene.getWorldMatrix(triangle.instanceID), float4(positionO, 1.f)).xyz;
+    precise float3 positionW = mul(world, float4(positionO, 1.f)).xyz;
     vertex.posW = positionW;
     return vertex;
 }
 
-bool rtptGrisRefPosition(PackedHitInfo packed, out float3 position)
+bool rtptGrisRefPosition(PackedHitInfo packed, out float3 position, bool previousGeometry = false)
 {
     position = 0.f;
     const HitInfo hit = HitInfo(packed);
     if (hit.getType() != HitType::Triangle) return false;
-    position = rtptGrisPrefixVertex(hit.getTriangleHit()).posW;
+    position = rtptGrisPrefixVertex(hit.getTriangleHit(), previousGeometry).posW;
     return all(isfinite(position));
 }
 
-bool rtptGrisRefLoad(PackedHitInfo packed, float3 view, out ShadingData sd)
+bool rtptGrisRefLoad(PackedHitInfo packed, float3 view, out ShadingData sd, bool previousGeometry = false)
 {
     sd = {};
     const HitInfo hit = HitInfo(packed);
@@ -78,18 +162,19 @@ bool rtptGrisRefLoad(PackedHitInfo packed, float3 view, out ShadingData sd)
     const float viewLengthSquared = dot(view, view);
     if (!(viewLengthSquared > 0.f) || !isfinite(viewLengthSquared)) return false;
     const TriangleHit triangle = hit.getTriangleHit();
-    sd = gScene.materials.prepareShadingData(rtptGrisPrefixVertex(triangle),
+    sd = gScene.materials.prepareShadingData(rtptGrisPrefixVertex(triangle, previousGeometry),
         gScene.getMaterialID(triangle.instanceID), view * rsqrt(viewLengthSquared));
     sd.mtl.setActiveLobes(uint(LobeType::Reflection));
     return true;
 }
 
-bool rtptGrisRefPrimary(PackedHitInfo primaryHit, float3 cameraPosition, out ShadingData primary)
+bool rtptGrisRefPrimary(PackedHitInfo primaryHit, float3 cameraPosition, out ShadingData primary,
+    bool previousGeometry = false)
 {
     float3 position;
     primary = {};
-    return rtptGrisRefPosition(primaryHit, position) &&
-        rtptGrisRefLoad(primaryHit, cameraPosition - position, primary);
+    return rtptGrisRefPosition(primaryHit, position, previousGeometry) &&
+        rtptGrisRefLoad(primaryHit, cameraPosition - position, primary, previousGeometry);
 }
 
 #endif

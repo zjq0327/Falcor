@@ -4,6 +4,9 @@
 
 ConstantBuffer<RTPTPrimarySettings> gPrimarySettings;
 StructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+StructuredBuffer<GrisDualFirstHits> gGRISDualFirstHits;
+#endif
 RWStructuredBuffer<GrisTemporalFreshHistory> gGRISHistory;
 
 [numthreads(8, 8, 1)]
@@ -21,10 +24,20 @@ void main(uint3 threadID : SV_DispatchThreadID)
     history.sourceAreaPdf = source.areaPdf;
     history.suffixDirection = source.suffixDirection;
     history.suffixLight = source.suffixLight;
+#if RTPT_GRIS_DUAL_SHARC
+    history.sharcDirection = source.sharcDirection;
+#endif
     history.lightPdfOrStableID = source.lightPdfOrStableID;
     history.terminalAndFlags = source.candidate.terminalKind |
         (source.lightIsAnalytic ? kGrisHistoryAnalytic : 0u);
     history.F = source.candidate.F;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    history.dualF = source.candidate.dualF;
+    history.ownerFirstHits = gGRISDualFirstHits[index];
+    history.dualExplicitRng = source.dualExplicitRng;
+    history.dualExplicitBounce = source.dualExplicitBounce;
+    history.dualExplicitPathID = source.dualExplicitPathID;
+#endif
     history.W = source.candidate.W;
     history.M = source.candidate.M;
 #if RTPT_GRIS_SUFFIX_REPLAY

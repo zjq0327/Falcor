@@ -53,6 +53,8 @@ target_sources(RTPT PRIVATE
     GRIS/RTPTGRISTemporal.cs.slang
     GRIS/RTPTGRISTemporal.slang
     GRIS/RTPTGRISTypes.slang
+    GRIS/RTPTGRISDualExplicitPath.slang
+    GRIS/RTPTGRISDualExplicitReplay.slang
     GRIS/RTPTGRISTerminalPicker.slang
     PrimarySurface/RTPTCamera.slang
     PrimarySurface/RTPTPrimarySurfaceTypes.slang

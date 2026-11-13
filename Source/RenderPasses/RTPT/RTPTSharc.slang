@@ -98,7 +98,7 @@ struct RTPTSharcTailQuery
     float3 materialFactor;
 };
 
-bool rtptReadSharcTailRadiance(uint2 key, out float3 rawRadiance)
+bool rtptReadSharcTailRadianceFrom(SharcParameters cache, uint2 key, out float3 rawRadiance)
 {
     rawRadiance = 0.f;
     const HashGridKey hashKey = HashGridKey(uint64_t(key.x) | (uint64_t(key.y) << 32u));
@@ -110,11 +110,16 @@ bool rtptReadSharcTailRadiance(uint2 key, out float3 rawRadiance)
 #if SHARC_MATERIAL_DEMODULATION
     hit.materialDemodulation = 1.f;
 #endif
-    if (SharcGetCachedRadianceFromHash(gSharc, hit, hashKey, rawRadiance, false) &&
+    if (SharcGetCachedRadianceFromHash(cache, hit, hashKey, rawRadiance, false) &&
         all(isfinite(rawRadiance)) && all(rawRadiance >= 0.f))
         return true;
     rawRadiance = 0.f;
     return false;
+}
+
+bool rtptReadSharcTailRadiance(uint2 key, out float3 rawRadiance)
+{
+    return rtptReadSharcTailRadianceFrom(gSharc, key, rawRadiance);
 }
 #endif
 
@@ -137,7 +142,8 @@ void rtptCaptureSharcPrimary(ShadingData sd, BSDFProperties properties, inout RT
         stats.primaryCachedRadiance = cachedRadiance;
 }
 
-bool rtptTrySharcQueryOnEdge(
+bool rtptTrySharcQueryOnEdgeFrom(
+    SharcParameters cache,
     ShadingData sd,
     IMaterialInstance mi,
     BSDFProperties properties,
@@ -196,8 +202,8 @@ bool rtptTrySharcQueryOnEdge(
         return false;
     }
 
-    const uint level = HashGridGetLevel(sd.posW, gSharc.hashGridParameters);
-    const float voxelSize = HashGridGetVoxelSize(level, gSharc.hashGridParameters);
+    const uint level = HashGridGetLevel(sd.posW, cache.hashGridParameters);
+    const float voxelSize = HashGridGetVoxelSize(level, cache.hashGridParameters);
     if (!(segmentLength >= voxelSize)) return false;
     if (!previousDiffuse)
     {
@@ -218,18 +224,18 @@ bool rtptTrySharcQueryOnEdge(
     ++stats.attemptedQueries;
     const SharcHitData cacheHit = rtptMakeSharcHit(sd, properties, float3(0.f));
 #if RTPT_GRIS_SHARC_REPLAY
-    const uint64_t key = uint64_t(HashGridComputeSpatialHash(cacheHit.positionWorld, cacheHit.normalWorld, gSharc.hashGridParameters));
+    const uint64_t key = uint64_t(HashGridComputeSpatialHash(cacheHit.positionWorld, cacheHit.normalWorld, cache.hashGridParameters));
     tailQuery.key = uint2(uint(key), uint(key >> 32u));
 #if SHARC_MATERIAL_DEMODULATION
     tailQuery.materialFactor = cacheHit.materialDemodulation;
 #else
     tailQuery.materialFactor = 1.f;
 #endif
-    if (!rtptReadSharcTailRadiance(tailQuery.key, tailQuery.rawRadiance)) return false;
+    if (!rtptReadSharcTailRadianceFrom(cache, tailQuery.key, tailQuery.rawRadiance)) return false;
     cachedRadiance = tailQuery.rawRadiance * tailQuery.materialFactor;
     if (!all(isfinite(cachedRadiance))) return false;
 #else
-    if (!SharcGetCachedRadiance(gSharc, cacheHit, cachedRadiance, false) ||
+    if (!SharcGetCachedRadiance(cache, cacheHit, cachedRadiance, false) ||
         !all(isfinite(cachedRadiance)) || any(cachedRadiance < 0.f))
         return false;
 #endif
@@ -238,6 +244,29 @@ bool rtptTrySharcQueryOnEdge(
 #endif
     ++stats.cacheTerminations;
     return true;
+}
+
+bool rtptTrySharcQueryOnEdge(
+    ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce, bool previousDelta,
+    bool previousGuideSelected, bool previousDiffuse, float previousRoughness, float segmentLength,
+    RTPTSamplingContext previousSampling, float3 direction, inout RTPTSharcStats stats, out float3 cachedRadiance
+#if RTPT_GRIS_SHARC_REPLAY
+    , out RTPTSharcTailQuery tailQuery
+#endif
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+    , bool probeX1 = false
+#endif
+)
+{
+    return rtptTrySharcQueryOnEdgeFrom(gSharc, sd, mi, properties, bounce, previousDelta, previousGuideSelected,
+        previousDiffuse, previousRoughness, segmentLength, previousSampling, direction, stats, cachedRadiance
+#if RTPT_GRIS_SHARC_REPLAY
+        , tailQuery
+#endif
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+        , probeX1
+#endif
+    );
 }
 
 bool rtptTrySharcQuery(ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce,
