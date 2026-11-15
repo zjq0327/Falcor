@@ -152,6 +152,8 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
+        else if (key == "grisTemporalSuffixSplit" || key == "grisTemporalSuffixCombine" || key == "grisTemporalSuffixDiagnostics")
+            logWarningOnce("RTPT ignores the retired '{}' property. GRIS Temporal uses a single pass.", key);
         else if (key == "grisDualFirstHitEnabled") grisDualFirstHitEnabled = value;
         else if (key == "grisSpatialStoredPrefixReuse" || key == "grisTemporalStoredPrefixReuse")
             logWarningOnce("RTPT ignores the retired '{}' property. GRIS selects stored-prefix reuse automatically.", key);

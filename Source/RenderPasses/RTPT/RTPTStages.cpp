@@ -45,6 +45,7 @@ uint64_t structuredStride(const ShaderVar& var)
 void RTPT::invalidateStages(bool preserveGRISHistory)
 {
     invalidateGRIS(true, preserveGRISHistory);
+    mGRISSpatialDeepIncidentDisabled = false;
     invalidateDirectLighting();
     mLightCatalog.retry();
     // Release parameter blocks as well as our own references before reallocating.
@@ -193,6 +194,7 @@ void RTPT::invalidateGRIS(bool clearTemporalFailure, bool preserveHistory)
     mpGRISTemporalPass = mpGRISPublishHistoryPass = mpGRISLocalPass = nullptr;
     mpGRISCandidates = mpGRISSpatialInput = mpGRISTemporalOutput = mpGRISLocalPrefixes = mpGRISShadedIndirect = nullptr;
     mpGRISDualFirstHits = nullptr;
+    mpGRISSpatialDeepIncident = nullptr;
     if (!keepHistory)
     {
         mpGRISHistory = nullptr;
@@ -234,6 +236,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         logWarningOnce("RTPT GRIS Temporal requires compatible lighting, internal NRD signals, one sample per pixel, and RR disabled.");
     const bool supportedLighting = !mReGIREnabled || diActive || mReGIRSecondaryEnabled;
     const bool spatialEnabled = mGRISSpatialEnabled && supportedLighting;
+    const bool spatialDeepIncident = !mGRISSpatialDeepIncidentDisabled && dualFirstHit && spatialEnabled &&
+        mpScene->hasGeometryType(GeometryType::TriangleMesh);
     const bool referenceReuse = canUseGRISReferenceReuse();
     const bool cacheTail = useGRISCacheTail();
     const bool dualSharc = dualFirstHit && cacheTail;
@@ -260,8 +264,15 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     };
     const bool matchesTemporalReplay = !mpGRISTemporalPass ||
         (mpGRISTemporalPass->getProgram()->getDefines().count("RTPT_GRIS_DUAL_DYNAMIC_REPLAY") != 0) == dualDynamicReplay;
+    const auto matchesSpatialDeepIncident = [spatialDeepIncident](const ref<ComputePass>& pass)
+    {
+        return !pass ||
+            (pass->getProgram()->getDefines().count("RTPT_GRIS_SPATIAL_DEEP_INCIDENT") != 0) == spatialDeepIncident;
+    };
     if (mpGRISMainPass && bool(mpGRISSpatialPass) == spatialEnabled &&
         bool(mpGRISTemporalPass) == temporalEnabled && matchesTemporalReplay &&
+        matchesSpatialDeepIncident(mpGRISGeneratePass) && matchesSpatialDeepIncident(mpGRISTemporalPass) &&
+        matchesSpatialDeepIncident(mpGRISSpatialPass) &&
         matchesTailDefines(mpGRISGeneratePass) && matchesTailDefines(mpGRISTemporalPass) &&
         matchesTailDefines(mpGRISSpatialPass) && matchesTailDefines(mpGRISLocalPass) &&
         matchesTailDefines(mpGRISShadePass) && matchesTailDefines(mpGRISPublishHistoryPass) && matchesTailDefines(mpGRISMainPass) &&
@@ -291,6 +302,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         auto generateDefines = baseDefines;
         if (captureSuffix) generateDefines.add("RTPT_GRIS_SPATIAL", "1");
         if (blendX1Cache) generateDefines.add("RTPT_GRIS_SHARC_X1_BLEND", "1");
+        if (spatialDeepIncident) generateDefines.add("RTPT_GRIS_SPATIAL_DEEP_INCIDENT", "1");
         const auto generateDesc = makeSceneProgramDesc("RenderPasses/RTPT/GRIS/RTPTGRISGenerate.cs.slang");
         mpGRISGeneratePass = ComputePass::create(mpDevice, generateDesc, generateDefines, true);
 
@@ -321,6 +333,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
                 auto temporalDefines = baseDefines;
                 if (referenceReuse && !dualFirstHit) temporalDefines.add("RTPT_GRIS_STORED_PREFIX_REUSE", "1");
                 if (dualDynamicReplay) temporalDefines.add("RTPT_GRIS_DUAL_DYNAMIC_REPLAY", "1");
+                if (spatialDeepIncident) temporalDefines.add("RTPT_GRIS_SPATIAL_DEEP_INCIDENT", "1");
                 mpGRISTemporalPass = ComputePass::create(mpDevice, temporalDesc, temporalDefines, true);
                 ProgramDesc publishDesc;
                 publishDesc.addShaderLibrary("RenderPasses/RTPT/GRIS/RTPTGRISPublishHistory.cs.slang").csEntry("main");
@@ -334,6 +347,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
                     auto spatialDefines = baseDefines;
                     spatialDefines.add("RTPT_GRIS_SPATIAL_REUSE", "1");
                     if (referenceReuse && !dualFirstHit) spatialDefines.add("RTPT_GRIS_STORED_PREFIX_REUSE", "1");
+                    if (spatialDeepIncident) spatialDefines.add("RTPT_GRIS_SPATIAL_DEEP_INCIDENT", "1");
                     if (!mpGRISNeighborOffsets) mpGRISNeighborOffsets = createGRISNeighborOffsets(*mpDevice);
                     mpGRISSpatialPass = ComputePass::create(mpDevice, spatialDesc, spatialDefines, true);
                 }
@@ -362,6 +376,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         const auto temporalOutputVar = temporalEnabled && spatialEnabled
             ? mpGRISTemporalPass->getRootVar()["gGRISSpatialOutput"] : ShaderVar{};
         const auto dualFirstHitVar = dualFirstHit ? mpGRISGeneratePass->getRootVar()["gGRISDualFirstHits"] : ShaderVar{};
+        const auto spatialDeepIncidentVar = spatialDeepIncident
+            ? mpGRISGeneratePass->getRootVar()["gGRISSpatialDeepIncident"] : ShaderVar{};
         const uint64_t pixelCount = uint64_t(mFrameDim.x) * mFrameDim.y;
         const uint64_t spatialStride = captureSuffix
             ? structuredStride(spatialInputVar) + (alternating ? 0u : structuredStride(prefixVar))
@@ -372,6 +388,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         const uint64_t prefixStride = structuredStride(prefixVar);
         const uint64_t temporalOutputStride = temporalEnabled && spatialEnabled ? structuredStride(temporalOutputVar) : 0u;
         const uint64_t dualFirstHitStride = dualFirstHit ? structuredStride(dualFirstHitVar) : 0u;
+        const uint64_t spatialDeepIncidentStride = spatialDeepIncident ? structuredStride(spatialDeepIncidentVar) : 0u;
         const auto& firstReusePass = temporalEnabled ? mpGRISTemporalPass : finalReusePass;
         FALCOR_CHECK(structuredStride(firstReusePass->getRootVar()["gGRISSpatialInput"]) == freshStride,
             "RTPT GRIS Generate and the first reuse pass disagree on the fresh path record layout.");
@@ -403,9 +420,24 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
                         "RTPT GRIS Generate and reuse disagree on the dual first-hit record layout.");
             }
         }
+        if (spatialDeepIncident)
+        {
+            FALCOR_CHECK(spatialDeepIncidentStride == sizeof(float4) &&
+                structuredStride(mpGRISSpatialPass->getRootVar()["gGRISSpatialDeepIncident"]) == spatialDeepIncidentStride &&
+                (!mpGRISTemporalPass ||
+                    structuredStride(mpGRISTemporalPass->getRootVar()["gGRISSpatialDeepIncident"]) == spatialDeepIncidentStride),
+                "RTPT GRIS Generate, Temporal and Spatial disagree on the deep incident layout.");
+        }
         const uint64_t grisBytes = pixelCount * (candidateStride + spatialStride + structuredStride(shadedVar) +
-            historyStride + temporalOutputStride + dualFirstHitStride);
+            historyStride + temporalOutputStride + dualFirstHitStride + spatialDeepIncidentStride);
         const uint64_t stageBytes = mpPrimarySurfaces->getSize() + mpSignalRecords->getSize();
+        if (spatialDeepIncident && !temporalSupported && !alternating &&
+            stageBytes + grisBytes > kStageResourceBudgetBytes &&
+            stageBytes + grisBytes - pixelCount * spatialDeepIncidentStride <= kStageResourceBudgetBytes)
+        {
+            mGRISSpatialDeepIncidentDisabled = true;
+            return prepareGRIS(baseMainPass, diActive);
+        }
         FALCOR_CHECK(stageBytes + grisBytes <= kStageResourceBudgetBytes || temporalSupported || alternating,
             "RTPT GRIS and primary/signal buffers exceed their 1 GiB budget.");
         if (stageBytes + grisBytes > kStageResourceBudgetBytes)
@@ -432,6 +464,19 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
                 resetGRISHistory();
             }
             if (!mpGRISHistory) mpGRISHistory = mpDevice->createStructuredBuffer(historyVar, uint32_t(pixelCount));
+        }
+        if (spatialDeepIncident)
+        {
+            try
+            {
+                mpGRISSpatialDeepIncident = mpDevice->createStructuredBuffer(spatialDeepIncidentVar, uint32_t(pixelCount));
+            }
+            catch (const std::exception& error)
+            {
+                logWarningOnce("RTPT GRIS Spatial is replaying deep suffixes after incident buffer allocation failed: {}", error.what());
+                mGRISSpatialDeepIncidentDisabled = true;
+                return prepareGRIS(baseMainPass, diActive);
+            }
         }
         mpGRISMainPass->getRootVar()["gGRISShadedIndirect"] = mpGRISShadedIndirect;
         return true;
@@ -529,11 +574,13 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
     }
     else generateVar["gGRISCandidates"] = mpGRISCandidates;
     if (mpGRISDualFirstHits) generateVar["gGRISDualFirstHits"] = mpGRISDualFirstHits;
+    if (mpGRISSpatialDeepIncident) generateVar["gGRISSpatialDeepIncident"] = mpGRISSpatialDeepIncident;
     {
         FALCOR_PROFILE(pRenderContext, "GRISGenerate");
         mpGRISGeneratePass->execute(pRenderContext, uint3(mFrameDim, 1u));
     }
     if (mpGRISDualFirstHits) pRenderContext->uavBarrier(mpGRISDualFirstHits.get());
+    if (mpGRISSpatialDeepIncident) pRenderContext->uavBarrier(mpGRISSpatialDeepIncident.get());
     const auto bindReuse = [&](const ref<ComputePass>& pass, const ref<Buffer>& input, const ref<Buffer>& output)
     {
         pRenderContext->uavBarrier(input.get());
@@ -550,6 +597,8 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         reuseVar["gGRISSpatialOutput"] = output;
         if (auto dualFirstHits = reuseVar.findMember("gGRISDualFirstHits"); dualFirstHits.isValid())
             dualFirstHits = mpGRISDualFirstHits;
+        if (auto deepIncident = reuseVar.findMember("gGRISSpatialDeepIncident"); deepIncident.isValid())
+            deepIncident = mpGRISSpatialDeepIncident;
         return reuseVar;
     };
     if (mpGRISTemporalPass)
@@ -696,6 +745,8 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         FALCOR_PROFILE(pRenderContext, "GRISTemporal");
         mpGRISTemporalPass->execute(pRenderContext, uint3(mFrameDim, 1u));
     }
+    if (mpGRISTemporalPass && mpGRISSpatialDeepIncident)
+        pRenderContext->uavBarrier(mpGRISSpatialDeepIncident.get());
     if (mpGRISSpatialPass || mpGRISLocalPass)
     {
         // Center and neighbors read the same immutable reservoir image for this round.
@@ -831,7 +882,7 @@ Properties RTPT::getStageStatistics() const
     props["signalBytes"] = signalBytes;
     uint64_t grisBytes = 0;
     for (const auto& buffer : {mpGRISCandidates, mpGRISSpatialInput, mpGRISTemporalOutput, mpGRISLocalPrefixes,
-        mpGRISShadedIndirect, mpGRISHistory, mpGRISDualFirstHits})
+        mpGRISShadedIndirect, mpGRISHistory, mpGRISDualFirstHits, mpGRISSpatialDeepIncident})
         grisBytes += buffer ? buffer->getSize() : 0;
     props["grisSpatialActive"] = bool(mpGRISSpatialPass);
     props["grisDualFirstHitActive"] = bool(mpGRISDualFirstHits);

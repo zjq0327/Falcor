@@ -31,9 +31,29 @@ ConstantBuffer<GrisTemporalSettings> gGRISTemporalSettings;
 StructuredBuffer<GrisTemporalFreshHistory> gGRISHistory;
 StructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
 RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialOutput;
+#if RTPT_GRIS_DUAL_FIRST_HIT && RTPT_GRIS_SPATIAL_DEEP_INCIDENT && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+RWStructuredBuffer<float4> gGRISSpatialDeepIncident;
+#endif
 
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-bool rtptGrisLoadSelectedHistory(uint2 pixel, out GrisSpatialRecord source
+static const uint kGrisInvalidReprojectedPixel = 0xffffffffu;
+
+uint rtptGrisReprojectHistory(uint2 pixel)
+{
+    if (gGRISTemporalSettings.historyValid == 0u) return kGrisInvalidReprojectedPixel;
+    RTPTPrimarySurface primary;
+    if (!rtptTryLoadPrimary(pixel, gPrimarySettings.sampleIndex, primary)) return kGrisInvalidReprojectedPixel;
+    float2 previousPixel;
+    float previousDepth;
+    const uint2 previousDim = gGRISTemporalSettings.previousFrameDim;
+    if (!rtptProjectPreviousPixel(primary.position + primary.motionW, previousDim,
+        gGRISTemporalSettings.previousViewProj, previousPixel, previousDepth)) return kGrisInvalidReprojectedPixel;
+    const int2 previousIndex = int2(round(previousPixel));
+    if (any(previousIndex < 0) || any(uint2(previousIndex) >= previousDim)) return kGrisInvalidReprojectedPixel;
+    return uint(previousIndex.y) * previousDim.x + uint(previousIndex.x);
+}
+
+bool rtptGrisLoadHistory(uint historyPixel, out GrisSpatialRecord source
 #if RTPT_GRIS_DUAL_FIRST_HIT
     , out GrisDualFirstHits sourceHits
 #endif
@@ -43,17 +63,8 @@ bool rtptGrisLoadSelectedHistory(uint2 pixel, out GrisSpatialRecord source
 #if RTPT_GRIS_DUAL_FIRST_HIT
     sourceHits = {};
 #endif
-    if (gGRISTemporalSettings.historyValid == 0u) return false;
-    RTPTPrimarySurface primary;
-    if (!rtptTryLoadPrimary(pixel, gPrimarySettings.sampleIndex, primary)) return false;
-    float2 previousPixel;
-    float previousDepth;
-    const uint2 previousDim = gGRISTemporalSettings.previousFrameDim;
-    if (!rtptProjectPreviousPixel(primary.position + primary.motionW, previousDim,
-        gGRISTemporalSettings.previousViewProj, previousPixel, previousDepth)) return false;
-    const int2 previousIndex = int2(round(previousPixel));
-    if (any(previousIndex < 0) || any(uint2(previousIndex) >= previousDim)) return false;
-    const GrisTemporalFreshHistory h = gGRISHistory[uint(previousIndex.y) * previousDim.x + uint(previousIndex.x)];
+    if (historyPixel == kGrisInvalidReprojectedPixel) return false;
+    const GrisTemporalFreshHistory h = gGRISHistory[historyPixel];
     if (!(h.M > 0.f) || !HitInfo(h.ownerPrimaryHit).isValid()) return false;
     source.ownerPrimaryHit = h.ownerPrimaryHit;
     source.sourceX1 = h.sourceX1;
@@ -97,7 +108,6 @@ bool rtptGrisLoadSelectedHistory(uint2 pixel, out GrisSpatialRecord source
     source.candidate.hasWinner = h.W > 0.f && rtptGrisHasTerminal(source);
     return true;
 }
-
 #endif
 
 [numthreads(8, 8, 1)]
@@ -109,26 +119,45 @@ void main(uint3 threadID : SV_DispatchThreadID)
     GrisSpatialRecord canonical = gGRISSpatialInput[index];
     GrisSpatialRecord result = canonical;
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+    SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
     GrisSpatialRecord inputs[kGrisMaxReuseInputs];
     float3 sourceCameras[kGrisMaxReuseInputs];
     uint inputCount = 0u;
-    SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
+    const uint historyPixel = rtptGrisReprojectHistory(pixel);
 #if RTPT_GRIS_DUAL_FIRST_HIT
     GrisDualFirstHits sourceHits[kGrisMaxReuseInputs];
-    if (rtptGrisLoadSelectedHistory(pixel, inputs[0], sourceHits[0]))
+    if (rtptGrisLoadHistory(historyPixel, inputs[0], sourceHits[0]) && rtptGrisRefDomainValid(canonical))
     {
         sourceCameras[0] = gGRISTemporalSettings.previousCameraPosition;
         inputCount = 1u;
-    }
-    result = rtptGrisMergeDualTails(canonical, gGRISDualFirstHits[index], inputs, sourceHits, sourceCameras, inputCount, rng
+        const GrisDualTemporalWinner selection = rtptGrisMergeDualTails(canonical, gGRISDualFirstHits[index],
+            inputs, sourceHits, sourceCameras, inputCount, rng, pixel
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
-        , gGRISTemporalSettings.suffixReplayLightChange != 0u, gGRISTemporalSettings.suffixReplayGeometryChange != 0u,
-        gGRISTemporalSettings.suffixReplayMovedBoundsCount
+            , gGRISTemporalSettings.suffixReplayLightChange != 0u, gGRISTemporalSettings.suffixReplayGeometryChange != 0u,
+            gGRISTemporalSettings.suffixReplayMovedBoundsCount
 #endif
 #if RTPT_GRIS_DUAL_SHARC
-        , gGRISTemporalSettings.dualSharcPreviousCacheMode
+            , gGRISTemporalSettings.dualSharcPreviousCacheMode
 #endif
-    );
+        );
+        // Reload the output payload after replay so only selection data crosses the proposal loop.
+        const GrisSpatialRecord center = gGRISSpatialInput[index];
+        GrisSpatialRecord winner = center;
+        if (selection.inputIndex == 0u)
+        {
+            GrisDualFirstHits unusedHits;
+            rtptGrisLoadHistory(historyPixel, winner, unusedHits);
+        }
+        winner.candidate.F = selection.diffuse;
+        winner.candidate.dualF = selection.specular;
+        result = rtptGrisFinalizeDualTail(center, winner, selection.sum, selection.target, selection.count);
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+        // Fresh winners keep the incident written by Generate. A history
+        // winner replaces it with the forward replay result for this frame.
+        if (selection.inputIndex == 0u && result.candidate.hasWinner && rtptGrisIsDeepTail(result))
+            gGRISSpatialDeepIncident[index] = selection.deepIncident;
+#endif
+    }
 #elif defined(RTPT_GRIS_STORED_PREFIX_REUSE)
     uint sourceLightEpochs[kGrisMaxReuseInputs];
 #if RTPT_GRIS_SUFFIX_REPLAY
@@ -143,7 +172,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     replay.sharcChanges = gGRISTemporalSettings.suffixReplaySharcChange;
 #endif
 #endif
-    if (rtptGrisLoadSelectedHistory(pixel, inputs[inputCount]))
+    if (rtptGrisLoadHistory(historyPixel, inputs[inputCount]))
     {
 #if RTPT_GRIS_SUFFIX_REPLAY
         replay.historyIndex = inputCount;

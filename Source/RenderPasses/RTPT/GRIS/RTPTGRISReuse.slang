@@ -24,12 +24,12 @@ bool rtptGrisLoadSpatialSurface(uint2 pixel, out ShadingData surface)
     return rtptGrisRefLoad(primary.packedHit, -primary.rayDirection, surface);
 }
 
-void rtptGrisGatherSpatialNeighbors(uint2 pixel, StructuredBuffer<GrisSpatialRecord> spatialInput,
-    float3 camera, inout uint inputCount,
-    inout GrisSpatialRecord inputs[kGrisMaxReuseInputs], inout float3 sourceCameras[kGrisMaxReuseInputs],
+void rtptGrisGatherSpatialNeighbors(uint2 pixel, float3 camera, inout uint inputCount,
 #if RTPT_GRIS_DUAL_FIRST_HIT
-    inout GrisDualFirstHits sourceHits[kGrisMaxReuseInputs])
+    inout GrisDualFirstHits sourceHits[kGrisMaxReuseInputs], inout uint sourceIndices[kGrisMaxReuseInputs])
 #else
+    StructuredBuffer<GrisSpatialRecord> spatialInput,
+    inout GrisSpatialRecord inputs[kGrisMaxReuseInputs], inout float3 sourceCameras[kGrisMaxReuseInputs],
     uint lightEpoch,
     inout uint sourceLightEpochs[kGrisMaxReuseInputs])
 #endif
@@ -54,11 +54,12 @@ void rtptGrisGatherSpatialNeighbors(uint2 pixel, StructuredBuffer<GrisSpatialRec
             abs(centerDistance - distance(camera, source.posW)) < 0.1f * centerDistance)) continue;
 
         const uint index = uint(neighbor.y) * gPrimarySettings.frameDim.x + uint(neighbor.x);
-        inputs[inputCount] = spatialInput[index];
-        sourceCameras[inputCount] = camera;
 #if RTPT_GRIS_DUAL_FIRST_HIT
         sourceHits[inputCount] = gGRISDualFirstHits[index];
+        sourceIndices[inputCount] = index;
 #else
+        inputs[inputCount] = spatialInput[index];
+        sourceCameras[inputCount] = camera;
         sourceLightEpochs[inputCount] = lightEpoch;
 #endif
         ++inputCount;

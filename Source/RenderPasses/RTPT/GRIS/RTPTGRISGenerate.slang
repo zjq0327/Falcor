@@ -11,6 +11,9 @@ RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
 RWStructuredBuffer<GrisLocalContributions> gGRISLocalPrefixes;
 #if RTPT_GRIS_DUAL_FIRST_HIT
 RWStructuredBuffer<GrisDualFirstHits> gGRISDualFirstHits;
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+RWStructuredBuffer<float4> gGRISSpatialDeepIncident;
+#endif
 #endif
 #else
 RWStructuredBuffer<GrisCandidate> gGRISCandidates;
@@ -41,6 +44,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     GrisLocalContributions local = {};
 #if RTPT_GRIS_DUAL_FIRST_HIT
     GrisDualFirstHits dualFirstHits = {};
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+    float4 spatialDeepIncident = {};
+#endif
     local.firstHit[0].distanceState = kRTPTDistanceUntraced;
     local.firstHit[1].distanceState = kRTPTDistanceUntraced;
 #else
@@ -189,7 +195,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #if RTPT_GRIS_DUAL_SHARC
                     cacheProposals, cacheIncident,
 #endif
-                    terminalRng);
+                    terminalRng
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+                    , spatialDeepIncident
+#endif
+                );
 #else
                 // One stratified D+S group, one shared terminal winner, M=1.
                 rtptGRISFinalizePath(pathBuilder, spatial);
@@ -241,6 +251,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #elif RTPT_GRIS_SPATIAL
 #if RTPT_GRIS_DUAL_FIRST_HIT
     gGRISDualFirstHits[index] = dualFirstHits;
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+    gGRISSpatialDeepIncident[index] = spatialDeepIncident;
+#endif
 #elif SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
     GrisLocalPrefix selectedPrefix = {};
     selectedPrefix.x1Hit = spatial.sourceX1;

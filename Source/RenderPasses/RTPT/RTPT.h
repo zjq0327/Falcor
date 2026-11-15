@@ -188,6 +188,7 @@ private:
     ref<Texture> mpGRISNeighborOffsets;
     ref<Buffer> mpGRISLocalPrefixes; // Compatibility name for local D/S contributions, not path geometry.
     ref<Buffer> mpGRISDualFirstHits;
+    ref<Buffer> mpGRISSpatialDeepIncident;
     ref<Buffer> mpGRISShadedIndirect;
     ref<Buffer> mpGRISHistory;
     struct GrisTemporalSnapshot
@@ -254,6 +255,7 @@ private:
     uint32_t mGRISHistoryReadLightEpoch = 0u;
     std::string mGRISLightHistoryResetReason;
     std::string mGRISTemporalFallbackReason;
+    bool mGRISSpatialDeepIncidentDisabled = false;
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
