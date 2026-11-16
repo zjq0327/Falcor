@@ -8,13 +8,19 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
     const uint kind = rtptGrisTerminalKind(tail.candidate.terminalKind);
     const bool emitter = kind == uint(GrisTerminalKind::GrisDualEmitter);
     const bool environment = kind == uint(GrisTerminalKind::GrisDualEnvironmentMiss);
-    const bool nee = !emitter && !environment;
+#if RTPT_GRIS_DUAL_SHARC
+    const bool sharc = kind == uint(GrisTerminalKind::GrisDualSharcTail);
+#else
+    const bool sharc = false;
+#endif
+    const bool nee = !emitter && !environment && !sharc;
     const uint terminalBounce = tail.dualExplicitBounce;
     if (terminalBounce < (nee ? 4u : 3u) || terminalBounce > gParams.maxBounces ||
-        (nee && terminalBounce == gParams.maxBounces) || !all(isfinite(tail.suffixDirection)) ||
+        ((nee || sharc) && terminalBounce == gParams.maxBounces) || (sharc && terminalBounce != 4u) ||
+        !all(isfinite(tail.suffixDirection)) ||
         !(dot(tail.suffixDirection, tail.suffixDirection) > 0.f) || all(tail.dualExplicitRng == 0u)) return result;
 
-    const float terminalMultiplier = terminalBounce == 3u ? 1.f : float(rtptGrisDualExplicitLateCount(gParams.maxBounces));
+    const float terminalMultiplier = sharc || terminalBounce == 3u ? 1.f : float(rtptGrisDualExplicitLateCount(gParams.maxBounces));
     const TriangleHit reconnect = HitInfo(tail.reconnectHit).getTriangleHit();
     const VertexData x2 = rtptGrisPrefixVertex(reconnect);
     Ray ray = Ray(computeRayOrigin(x2.posW, x2.faceNormalW), tail.suffixDirection);
@@ -34,7 +40,11 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
     bool currentSupported = true;
     bool previousSupported = true;
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
-    if (domain.previousGeometry) previousSupported = rtptGrisReplayStaticSurface(tail.reconnectHit);
+    if (domain.previousGeometry)
+    {
+        previousSupported = rtptGrisReplayStaticSurface(tail.reconnectHit);
+        if (sharc && !previousSupported) return result;
+    }
 #endif
 #if RTPT_GRIS_DUAL_SHARC
     bool previousDiffuse = false;
@@ -79,9 +89,15 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
         const PackedHitInfo packed = hit.pack();
         pathID = rtptGrisDualExplicitAppendHit(pathID, packed);
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
-        if (previousSupported && domain.previousGeometry)
-            previousSupported = rtptGrisReplayStaticSurface(packed) &&
+        if (domain.previousGeometry && (previousSupported || sharc))
+        {
+            const bool compatibleGeometry = rtptGrisReplayStaticSurface(packed) &&
                 rtptGrisReplayRayClear(Ray(ray.origin, ray.dir, ray.tMin, hitT), domain.movedBoundsCount);
+            // A SHaRC suffix needs certified geometry in both domains when
+            // the scene has moved, independently of old-cache availability.
+            if (sharc && !compatibleGeometry) return result;
+            previousSupported = previousSupported && compatibleGeometry;
+        }
 #endif
         const TriangleHit triangle = hit.getTriangleHit();
         const uint materialID = gScene.getMaterialID(triangle.instanceID);
@@ -91,6 +107,31 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
         const bool usesNee = gParams.useNEE != 0u &&
             (material.getLobeTypes(surface) & uint(LobeType::NonDeltaReflection)) != 0u;
 #if RTPT_GRIS_DUAL_SHARC
+        if (sharc && bounce == terminalBounce)
+        {
+            if (any(pathID != tail.dualExplicitPathID) || previousDelta || !previousDiffuse) return result;
+            const BSDFProperties properties = material.getProperties(surface);
+            const float distance = length(surface.posW - previousPosition);
+            RTPTSharcStats stats = {};
+            float3 cached;
+            if (rtptTrySharcQueryOnEdgeFrom(gSharc, surface, material, properties, bounce,
+                previousDelta, false, previousDiffuse, previousRoughness, distance, sampling, ray.dir, stats, cached))
+                result.current = throughput * cached;
+#if defined(RTPT_GRIS_TEMPORAL_REUSE)
+            if (previousSupported)
+            {
+                if (sameCache)
+                    result.previous = result.current;
+                else if (rtptTrySharcQueryOnEdgeFrom(gGRISPreviousSharc, surface, material, properties, bounce,
+                    previousDelta, false, previousDiffuse, previousRoughness, distance, sampling, ray.dir, stats, cached))
+                    result.previous = throughput * cached;
+            }
+#else
+            result.previous = result.current;
+#endif
+            return result;
+        }
+
         // A successful cache query owns the remainder of its frame's path.
         // An explicit terminal can still be supported in the other frame.
         if (bounce >= 4u && previousDiffuse)
@@ -187,6 +228,7 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
         if (!all(isfinite(throughput)) || !any(throughput > 0.f)) return result;
 #if RTPT_GRIS_DUAL_SHARC
         previousDiffuse = !guideSelected && scatter.isLobe(LobeType::DiffuseReflection);
+        if (sharc && (previousDelta || !previousDiffuse)) return result;
         previousRoughness = material.getProperties(surface).roughness;
 #endif
         previousUsedNEE = usesNee;

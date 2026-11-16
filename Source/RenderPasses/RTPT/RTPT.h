@@ -260,6 +260,7 @@ private:
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
     bool mGRISDualFirstHitEnabled = false;
+    uint32_t mGRISGenerateX2SuffixMode = 0u; // 0: D-only, 1: full D/S, 2: one tail, 3: deferred scoring.
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;

@@ -24,9 +24,6 @@ void main(uint3 threadID : SV_DispatchThreadID)
     history.sourceAreaPdf = source.areaPdf;
     history.suffixDirection = source.suffixDirection;
     history.suffixLight = source.suffixLight;
-#if RTPT_GRIS_DUAL_SHARC
-    history.sharcDirection = source.sharcDirection;
-#endif
     history.lightPdfOrStableID = source.lightPdfOrStableID;
     history.terminalAndFlags = source.candidate.terminalKind |
         (source.lightIsAnalytic ? kGrisHistoryAnalytic : 0u);

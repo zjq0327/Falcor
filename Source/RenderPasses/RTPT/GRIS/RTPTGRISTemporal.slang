@@ -77,9 +77,6 @@ bool rtptGrisLoadHistory(uint historyPixel, out GrisSpatialRecord source
     source.dualExplicitBounce = h.dualExplicitBounce;
     source.dualExplicitPathID = h.dualExplicitPathID;
 #endif
-#if RTPT_GRIS_DUAL_SHARC
-    source.sharcDirection = h.sharcDirection;
-#endif
     source.lightPdfOrStableID = h.lightPdfOrStableID;
 #if RTPT_GRIS_SUFFIX_REPLAY
     source.suffixInstanceMask = h.suffixInstanceMask;

@@ -113,6 +113,7 @@ void RTPT::setProperties(const Properties& props)
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
     bool grisDualFirstHitEnabled = mGRISDualFirstHitEnabled;
+    uint32_t grisGenerateX2SuffixMode = mGRISGenerateX2SuffixMode;
     bool grisSuffixReplayEnabled = mGRISSuffixReplayEnabled;
     bool grisSuffixReplayValidateUnchanged = mGRISSuffixReplayValidateUnchanged;
     float grisSharcX1Blend = mGRISSharcX1Blend;
@@ -155,6 +156,7 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisTemporalSuffixSplit" || key == "grisTemporalSuffixCombine" || key == "grisTemporalSuffixDiagnostics")
             logWarningOnce("RTPT ignores the retired '{}' property. GRIS Temporal uses a single pass.", key);
         else if (key == "grisDualFirstHitEnabled") grisDualFirstHitEnabled = value;
+        else if (key == "grisGenerateX2SuffixMode") grisGenerateX2SuffixMode = value;
         else if (key == "grisSpatialStoredPrefixReuse" || key == "grisTemporalStoredPrefixReuse")
             logWarningOnce("RTPT ignores the retired '{}' property. GRIS selects stored-prefix reuse automatically.", key);
         else if (key == "grisSuffixReplayEnabled") grisSuffixReplayEnabled = value;
@@ -221,6 +223,7 @@ void RTPT::setProperties(const Properties& props)
     }
     FALCOR_CHECK(samplesPerPixel >= 1 && samplesPerPixel <= 1024, "RTPT samplesPerPixel must be in [1, 1024].");
     FALCOR_CHECK(maxBounces >= 1 && maxBounces <= 64, "RTPT maxBounces must be in [1, 64].");
+    FALCOR_CHECK(grisGenerateX2SuffixMode <= 3u, "RTPT grisGenerateX2SuffixMode must be in [0, 3].");
     FALCOR_CHECK(std::isfinite(grisSharcX1Blend) && grisSharcX1Blend >= 0.f && grisSharcX1Blend < 1.f,
         "RTPT grisSharcX1Blend must be in [0, 1).");
     FALCOR_CHECK(restirDICandidateCount >= 1 && restirDICandidateCount <= 128,
@@ -303,6 +306,7 @@ void RTPT::setProperties(const Properties& props)
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     const bool grisModeChanged = grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
         grisTemporalEnabled != mGRISTemporalEnabled || grisDualFirstHitEnabled != mGRISDualFirstHitEnabled ||
+        grisGenerateX2SuffixMode != mGRISGenerateX2SuffixMode ||
         grisSuffixReplayEnabled != mGRISSuffixReplayEnabled ||
         (grisEnabled && grisSharcReuseChanged);
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
@@ -340,6 +344,7 @@ void RTPT::setProperties(const Properties& props)
     mGRISSpatialEnabled = grisSpatialEnabled;
     mGRISTemporalEnabled = grisTemporalEnabled;
     mGRISDualFirstHitEnabled = grisDualFirstHitEnabled;
+    mGRISGenerateX2SuffixMode = grisGenerateX2SuffixMode;
     mGRISSuffixReplayEnabled = grisSuffixReplayEnabled;
     mGRISSuffixReplayValidateUnchanged = grisSuffixReplayValidateUnchanged;
     mGRISSharcX1Blend = grisSharcX1Blend;
@@ -431,6 +436,7 @@ Properties RTPT::getProperties() const
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
     props["grisDualFirstHitEnabled"] = mGRISDualFirstHitEnabled;
+    props["grisGenerateX2SuffixMode"] = mGRISGenerateX2SuffixMode;
     props["grisSuffixReplayEnabled"] = mGRISSuffixReplayEnabled;
     props["grisSuffixReplayValidateUnchanged"] = mGRISSuffixReplayValidateUnchanged;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;

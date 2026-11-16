@@ -28,19 +28,20 @@
 #include "GRIS/RTPTGRISDualExplicitPath.slang"
 #include "GRIS/RTPTGRISReference.slang"
 
-void rtptGrisCaptureDualExplicit(GrisSpatialRecord proposal, uint kind, uint bounce, uint2 pathID,
-    float3 incident, float lightPdf, out GrisDualExplicitTerminal terminal)
+void rtptGrisCaptureDualExplicit(GrisDualNeeTerminal light, uint kind, uint bounce, uint2 pathID,
+    float3 incident, uint lightPdfOrStableID, out GrisDualExplicitTerminal terminal)
 {
-    proposal.dualExplicitBounce = bounce;
-    proposal.dualExplicitPathID = pathID;
-    proposal.lightPdfOrStableID = asuint(lightPdf);
-    proposal.candidate.terminalKind = kind | kGrisDeepTail;
-    proposal.candidate.hasWinner = true;
-    terminal.proposal = proposal;
     terminal.incident = incident;
+    // x3 NEE can update the deep proposal after an x3 emitter was recorded.
+    terminal.suffixLight = light.coordinates;
+    terminal.dualExplicitPathID = pathID;
+    terminal.dualExplicitBounce = bounce;
+    terminal.terminalKind = kind | kGrisDeepTail;
+    terminal.lightPdfOrStableID = lightPdfOrStableID;
+    terminal.lightIsAnalytic = light.lightIsAnalytic;
 }
 
-bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisSpatialRecord proposal, inout SampleGenerator rng, bool deep)
+bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisDualNeeTerminal terminal, inout SampleGenerator rng, bool deep)
 {
 #if RTPT_GRIS_DUAL_REGIR
     if (rtptReGIRTransportCoverage(false) == 0u) return false;
@@ -55,10 +56,10 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisSpatialRecord proposa
     if (light.kind == kRTPTDILightEmissive && light.sourceIndex < gScene.lightCollection.getTriangleCount())
         uv = sampleNext2D(rng);
 #endif
-    proposal.lightPdfOrStableID = light.pad0;
-    proposal.lightIsAnalytic = light.kind == kRTPTDILightPoint;
-    proposal.suffixLight = float3(uv, innerRISWeight);
-    proposal.candidate.terminalKind = uint(GrisTerminalKind::GrisDualReGIRNee);
+    terminal.lightPdfOrStableID = light.pad0;
+    terminal.lightIsAnalytic = light.kind == kRTPTDILightPoint;
+    terminal.coordinates = float3(uv, innerRISWeight);
+    terminal.terminalKind = uint(GrisTerminalKind::GrisDualReGIRNee);
 #else
     const float3 probabilities = rtptLightCategoryProbabilities();
     if (!any(probabilities > 0.f)) return false;
@@ -67,10 +68,8 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisSpatialRecord proposa
 #if USE_ENV_LIGHT
     if (category == 0u)
     {
-        const float3 coordinates = float3(sampleNext2D(rng), 0.f);
-        if (deep) proposal.suffixLight = coordinates;
-        else proposal.suffixDirection = coordinates;
-        proposal.candidate.terminalKind = uint(GrisTerminalKind::GrisDualEnvironmentNee);
+        terminal.coordinates = float3(sampleNext2D(rng), 0.f);
+        terminal.terminalKind = uint(GrisTerminalKind::GrisDualEnvironmentNee);
     }
 #endif
 #if USE_EMISSIVE_LIGHTS
@@ -78,26 +77,24 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisSpatialRecord proposa
     {
         const uint count = gScene.lightCollection.getActiveTriangleCount();
         const uint slot = min(uint(sampleNext1D(rng) * count), count - 1u);
-        proposal.lightPdfOrStableID = gScene.lightCollection.activeTriangles[slot];
-        const float3 coordinates = float3(sampleNext2D(rng), 0.f);
-        if (deep) proposal.suffixLight = coordinates;
-        else proposal.suffixDirection = coordinates;
-        proposal.candidate.terminalKind = uint(GrisTerminalKind::GrisDualEmissiveNee);
+        terminal.lightPdfOrStableID = gScene.lightCollection.activeTriangles[slot];
+        terminal.coordinates = float3(sampleNext2D(rng), 0.f);
+        terminal.terminalKind = uint(GrisTerminalKind::GrisDualEmissiveNee);
     }
 #endif
 #if USE_ANALYTIC_LIGHTS
     if (category == 2u)
     {
         // The host enables this mode for point analytic lights.
-        proposal.lightPdfOrStableID = rtptSampleAnalyticLightIndex(gScene.getLightCount(), rng);
-        proposal.lightIsAnalytic = true;
-        proposal.candidate.terminalKind = uint(GrisTerminalKind::GrisDualPointNee);
+        terminal.lightPdfOrStableID = rtptSampleAnalyticLightIndex(gScene.getLightCount(), rng);
+        terminal.lightIsAnalytic = true;
+        terminal.terminalKind = uint(GrisTerminalKind::GrisDualPointNee);
     }
 #endif
 #endif
-    if (deep) proposal.candidate.terminalKind |= kGrisDeepTail;
+    if (deep) terminal.terminalKind |= kGrisDeepTail;
     // Keep raw proposals before backface, alpha, radiance and visibility tests.
-    proposal.candidate.hasWinner = true;
+    terminal.hasWinner = true;
     return true;
 }
 #endif
@@ -124,17 +121,27 @@ float3 RTPT_CONTINUATION_NAME(
     , float rootProbability
 #if RTPT_GRIS_SPATIAL
     , inout GrisLocalPrefix prefix
-    , inout GrisSpatialRecord suffix
 #if RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
-    , inout GrisSpatialRecord deepSuffix
-    , out TriangleHit deepHit
+    , inout GrisDualX2Sample x2
+    , out GrisDualDeepSample deepSample
     , uint lateSlot
+#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+    , bool canonicalPrimary
+#endif
     , out GrisDualExplicitTerminal bsdfTerminal
     , out GrisDualExplicitTerminal lateTerminal
+#if defined(RTPT_GRIS_SINGLE_DEEP_PATH)
+    , float deepWeight
+#endif
 #if RTPT_GRIS_DUAL_SHARC
     , inout GrisSpatialRecord cacheSuffix
     , out float3 cacheIncident
 #endif
+#if RTPT_GRIS_X2_SUFFIX_MODE >= 2
+    , float suffixRootProbability
+#endif
+#else
+    , inout GrisSpatialRecord suffix
 #endif
 #if !RTPT_GRIS_ALTERNATING && !RTPT_GRIS_DUAL_FIRST_HIT
     , inout GrisPathBuilder pathBuilder
@@ -158,11 +165,18 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
     const uint currentRoot = prefix.rootLobe;
 #if RTPT_GRIS_DUAL_FIRST_HIT
-    deepHit = {};
+    deepSample = {};
     bsdfTerminal = {};
     lateTerminal = {};
+#if RTPT_GRIS_X2_SUFFIX_MODE >= 2
+    // Only local fallback past the split needs the root-selection factor.
+    const float selectedLocalWeight = suffixRootProbability > 0.f ? rcp(suffixRootProbability) : 0.f;
+#endif
     uint2 explicitPathID = rtptGrisDualExplicitBeginPath();
     float3 explicitThroughput = 1.f;
+#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+    float3 nativeRootFactor = 0.f;
+#endif
     const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
 #if defined(RTPT_GRIS_DUAL_EXPLICIT_LOCAL_CONTROL)
     const bool captureExplicit = false;
@@ -230,6 +244,13 @@ float3 RTPT_CONTINUATION_NAME(
     // available even when the radiance estimator later terminates.
     for (uint bounce = 1; bounce <= gParams.maxBounces; ++bounce)
     {
+#if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
+        const float localRadianceWeight = bounce > 2u ? selectedLocalWeight : 1.f;
+#elif defined(RTPT_GRIS_SINGLE_DEEP_PATH) && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
+        const float localRadianceWeight = bounce > 3u ? deepWeight : 1.f;
+#else
+        const float localRadianceWeight = 1.f;
+#endif
         float hitT;
 #if ENABLE_SHARC && SHARC_QUERY
         ++sharcStats.radianceRays;
@@ -261,15 +282,15 @@ float3 RTPT_CONTINUATION_NAME(
             const float3 environment = gScene.envMap.eval(ray.dir);
             const float3 contribution = throughput * environment * misWeight;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
-            if (captureExplicit && bounce >= 3u && deepSuffix.areaPdf > 0.f)
+            if (captureExplicit && bounce >= 3u && x2.deepPdf > 0.f)
             {
                 const uint2 missID = rtptGrisDualExplicitAppendMiss(explicitPathID);
                 if (bounce == 3u)
-                    rtptGrisCaptureDualExplicit(deepSuffix, uint(GrisTerminalKind::GrisDualEnvironmentMiss),
-                        bounce, missID, environment, lightPdf, bsdfTerminal);
+                    rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss),
+                        bounce, missID, environment, asuint(lightPdf), bsdfTerminal);
                 else if (lateSlot == 2u * (bounce - 4u))
-                    rtptGrisCaptureDualExplicit(deepSuffix, uint(GrisTerminalKind::GrisDualEnvironmentMiss),
-                        bounce, missID, explicitThroughput * environment * (misWeight * float(lateCount)), 0.f, lateTerminal);
+                    rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss),
+                        bounce, missID, explicitThroughput * environment * (misWeight * float(lateCount)), 0u, lateTerminal);
                 break;
             }
 #endif
@@ -289,7 +310,7 @@ float3 RTPT_CONTINUATION_NAME(
                 }
                 else radiance += contribution;
 #else
-                radiance += contribution;
+                radiance += contribution * localRadianceWeight;
 #endif
             }
 #endif
@@ -299,12 +320,23 @@ float3 RTPT_CONTINUATION_NAME(
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
         const TriangleHit triangleHit = hit.getTriangleHit();
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
-        if (bounce >= 3u && deepSuffix.areaPdf > 0.f)
+        if (bounce >= 3u && x2.deepPdf > 0.f)
             explicitPathID = rtptGrisDualExplicitAppendHit(explicitPathID, hit.pack());
 #endif
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
+        const bool rebuildPrefix = representedPrefix && bounce <= 2u;
+#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+        float3 nativePrefixValue = 0.f;
+        float nativeConnectionAreaPdf = 0.f;
+#endif
+        VertexData vertex;
+        if (rebuildPrefix) vertex = rtptGrisPrefixVertex(triangleHit);
+        else vertex = gScene.getVertexData(triangleHit);
+#else
         VertexData vertex = gScene.getVertexData(triangleHit);
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
         if (representedPrefix && bounce <= 2u) vertex = rtptGrisPrefixVertex(triangleHit);
+#endif
 #endif
         if (bounce == 1)
             firstHitDistance = min(kRTPTNRDMissDistance, max(1e-5f, length(vertex.posW - primarySD.posW)));
@@ -315,13 +347,25 @@ float3 RTPT_CONTINUATION_NAME(
         ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
         sd.mtl.setActiveLobes(uint(LobeType::Reflection));
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+#if RTPT_GRIS_DUAL_FIRST_HIT
+        if (rebuildPrefix)
+#else
         if (representedPrefix && bounce <= 2u)
+#endif
         {
             float3 direction;
             float distanceSquared;
             ShadingData represented;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+            // The triangle was decoded from hit.pack() already. Reuse its
+            // canonical attributes while shading the reconstructed view.
+            const GrisDualSpatialVertex prefixVertex = { vertex, materialID };
+            if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
+                rtptGrisShadeDualSpatialVertex(prefixVertex, -direction, represented))
+#else
             if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
                 rtptGrisRefLoad(hit.pack(), -direction, represented))
+#endif
             {
 #if RTPT_GRIS_DUAL_FIRST_HIT
                 // Keep the actual draw even if this walk cannot represent its second edge.
@@ -342,7 +386,23 @@ float3 RTPT_CONTINUATION_NAME(
                     // Retain q from the real draw, including its guide leaf;
                     // never ask the guide to evaluate the reconstructed ray.
                     const IMaterialInstance fromMI = gScene.materials.getMaterialInstance(prefixFrom, ExplicitLodTextureSampler(0.f));
-                    throughput = prefixThroughput * fromMI.eval(prefixFrom, direction, sg) / previousContinuationPdf;
+                    const float3 edgeValue = fromMI.eval(prefixFrom, direction, sg);
+                    throughput = prefixThroughput * edgeValue / previousContinuationPdf;
+#if RTPT_GRIS_DUAL_FIRST_HIT && defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+                    // The origin, represented view and BSDF are the canonical
+                    // ones used by the fresh scorer. Keep its area measure.
+                    if (canonicalPrimary && prefix.dualFirstPdf > 0.f)
+                    {
+                        const float geometry = abs(dot(represented.faceN, direction)) / distanceSquared;
+                        if (bounce == 1u) nativeRootFactor = edgeValue * (geometry / prefix.dualFirstPdf);
+                        else
+                        {
+                            const float pdf = fromMI.evalPdf(prefixFrom, direction);
+                            if (pdf > 0.f && isfinite(pdf)) nativeConnectionAreaPdf = pdf * geometry;
+                            nativePrefixValue = nativeRootFactor * edgeValue * geometry;
+                        }
+                    }
+#endif
                     sd = represented;
                 }
                 else representedPrefix = false;
@@ -415,10 +475,13 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_SHARC
                 if (bounce == 4u && cacheSuffix.areaPdf > 0.f)
                 {
-                    const float3 incident = cacheSuffix.suffixLight * cachedRadiance;
+                    const float3 incident = explicitThroughput * cachedRadiance;
                     if (all(isfinite(incident)) && all(incident >= 0.f))
                     {
                         cacheIncident = incident;
+                        cacheSuffix.dualExplicitRng = x2.replayRng;
+                        cacheSuffix.dualExplicitBounce = bounce;
+                        cacheSuffix.dualExplicitPathID = explicitPathID;
                         cacheSuffix.candidate.terminalKind = uint(GrisTerminalKind::GrisDualSharcTail) | kGrisDeepTail;
                         cacheSuffix.candidate.hasWinner = true;
                         break;
@@ -456,7 +519,7 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
                     rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisCacheTerminal);
 #endif
-                    radiance += contribution;
+                    radiance += contribution * localRadianceWeight;
                 }
                 break;
             }
@@ -499,14 +562,14 @@ float3 RTPT_CONTINUATION_NAME(
                 const float misWeight = hasNeeCompetitor ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
                 const float3 contribution = throughput * emission * misWeight;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
-                if (captureExplicit && bounce >= 3u && deepSuffix.areaPdf > 0.f)
+                if (captureExplicit && bounce >= 3u && x2.deepPdf > 0.f)
                 {
                     if (bounce == 3u)
-                        rtptGrisCaptureDualExplicit(deepSuffix, uint(GrisTerminalKind::GrisDualEmitter),
-                            bounce, explicitPathID, emission, lightPdf, bsdfTerminal);
+                        rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter),
+                            bounce, explicitPathID, emission, asuint(lightPdf), bsdfTerminal);
                     else if (lateSlot == 2u * (bounce - 4u))
-                        rtptGrisCaptureDualExplicit(deepSuffix, uint(GrisTerminalKind::GrisDualEmitter),
-                            bounce, explicitPathID, explicitThroughput * emission * (misWeight * float(lateCount)), 0.f, lateTerminal);
+                        rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter),
+                            bounce, explicitPathID, explicitThroughput * emission * (misWeight * float(lateCount)), 0u, lateTerminal);
                 }
                 else
 #endif
@@ -527,7 +590,7 @@ float3 RTPT_CONTINUATION_NAME(
                     }
                     else radiance += contribution;
 #else
-                    radiance += contribution;
+                    radiance += contribution * localRadianceWeight;
 #endif
                 }
             }
@@ -536,6 +599,11 @@ float3 RTPT_CONTINUATION_NAME(
         }
 #endif
         if (bounce == gParams.maxBounces) break;
+#if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
+        // Both roots keep arrival events at x2. Only the selected root
+        // samples light or a continuation at x2.
+        if (bounce == 2u && suffixRootProbability == 0.f) break;
+#endif
 #if RTPT_GRIS_GENERATE || RTPT_USE_GRIS
         // GRIS guides only the primary diffuse edge. x1 and every later
         // vertex retain BSDF-only proposals for both root walks.
@@ -557,53 +625,96 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_DUAL_FIRST_HIT
             bool captured = false;
             SampleGenerator neeRng = sg;
-            if (bounce >= 3u && deepSuffix.areaPdf > 0.f)
+            if (bounce >= 3u && x2.deepPdf > 0.f)
                 neeRng = rtptGrisForkReplayNEERng(sg, bounce);
             if (bounce == 2u && representedPrefix && !previousDelta && prefix.dualFirstPdf > 0.f)
             {
                 const float secondPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
                 if (secondPdf > 0.f && isfinite(secondPdf))
                 {
-                    suffix.candidate.rootLobe = currentRoot;
-                    suffix.sourceX1 = prefix.dualX1;
-                    suffix.reconnectHit = hit.pack();
-                    suffix.areaPdf = secondPdf;
-                    captured = rtptGrisCaptureDualNee(sd, suffix, sg, false);
+                    // Deep can use this draw even when NEE consumes a zero sample.
+                    x2.hit = hit.pack();
+                    x2.areaPdf = secondPdf;
+                    captured = rtptGrisCaptureDualNee(sd, x2.directLight, sg, false);
+#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+                    if (canonicalPrimary && x2.directLight.hasWinner)
+                    {
+                        x2.hasNativeDirectF = true;
+                        GrisSpatialRecord direct = {};
+                        rtptGrisApplyDualNeeTerminal(x2.directLight, false, direct);
+                        const float lightProbability = rtptGrisDualLightProbability(direct);
+                        const float proposal = nativeConnectionAreaPdf * lightProbability;
+                        if (proposal > 0.f && isfinite(proposal))
+                        {
+                            // Supported Standard/PBRTDiffuse eval is deterministic.
+                            // Keep the path RNG independent of direct scoring.
+                            SampleGenerator scoringRng = sg;
+                            bool shadowClear;
+                            const float3 incident = rtptGrisEvaluateDualLight(sd, sd, mi, direct,
+                                lightProbability, scoringRng, false, shadowClear);
+                            const float3 value = nativePrefixValue * incident;
+                            if (all(isfinite(value))) x2.nativeDirectF = value;
+                        }
+                    }
+#endif
                 }
             }
-            else if (bounce == 3u && deepSuffix.areaPdf > 0.f)
+            else if (bounce == 3u && x2.deepPdf > 0.f)
             {
-                captured = rtptGrisCaptureDualNee(sd, deepSuffix, neeRng, true);
-                // Generate can evaluate x3 with the native traversal result.
-                if (deepSuffix.candidate.hasWinner) deepHit = triangleHit;
+                captured = rtptGrisCaptureDualNee(sd, x2.deepLight, neeRng, true);
+                if (x2.deepLight.hasWinner)
+                {
+#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+                    // These evaluate a BSDF without consuming the reservoir RNG.
+                    const MaterialType materialType = sd.mtl.getMaterialType();
+                    if (materialType == MaterialType::Standard || materialType == MaterialType::PBRTDiffuse)
+                    {
+                        GrisSpatialRecord proposal = {};
+                        rtptGrisApplyDualNeeTerminal(x2.deepLight, true, proposal);
+                        const float lightProbability = rtptGrisDualLightProbability(proposal);
+                        float3 incident = 0.f;
+                        if (lightProbability > 0.f)
+                        {
+                            SampleGenerator scoringRng = neeRng;
+                            bool shadowClear;
+                            incident = rtptGrisEvaluateDualLight(sd, sd, mi, proposal, lightProbability,
+                                scoringRng, false, shadowClear);
+                        }
+                        deepSample = uint4(asuint(incident), kGrisEvaluatedDeepLight);
+                    }
+                    else deepSample = rtptGrisStoreDeepHit(triangleHit);
+#else
+                    deepSample = triangleHit;
+#endif
+                }
             }
-            else if (captureExplicit && bounce >= 4u && deepSuffix.areaPdf > 0.f)
+            else if (captureExplicit && bounce >= 4u && x2.deepPdf > 0.f)
             {
                 // One uniform slot covers all late explicit events, including
                 // slots skipped by misses, unsupported lobes or cache hits.
                 captured = true;
                 if (lateSlot == 2u * (bounce - 4u) + 1u)
                 {
-                    GrisSpatialRecord proposal = deepSuffix;
-                    proposal.candidate.hasWinner = false;
+                    GrisDualNeeTerminal light = x2.deepLight;
+                    light.hasWinner = false;
                     SampleGenerator evalRng = neeRng;
-                    captured = rtptGrisCaptureDualNee(sd, proposal, neeRng, true);
-                    if (proposal.candidate.hasWinner)
+                    captured = rtptGrisCaptureDualNee(sd, light, neeRng, true);
+                    if (light.hasWinner)
                     {
-                        proposal.dualExplicitBounce = bounce;
-                        proposal.dualExplicitPathID = explicitPathID;
+                        GrisSpatialRecord proposal = {};
+                        rtptGrisApplyDualNeeTerminal(light, true, proposal);
                         const float lightProbability = rtptGrisDualLightProbability(proposal);
                         bool shadowClear;
                         const float3 value = rtptGrisEvaluateDualLight(sd, sd, mi, proposal, lightProbability,
                             evalRng, false, shadowClear);
-                        lateTerminal.proposal = proposal;
-                        lateTerminal.incident = explicitThroughput * value * float(lateCount);
+                        rtptGrisCaptureDualExplicit(light, light.terminalKind, bounce, explicitPathID,
+                            explicitThroughput * value * float(lateCount), light.lightPdfOrStableID, lateTerminal);
                     }
                 }
             }
             if (!captured)
             {
-                if (bounce >= 3u && deepSuffix.areaPdf > 0.f)
+                if (bounce >= 3u && x2.deepPdf > 0.f)
                     contribution = throughput * rtptEstimateDirect(sd, mi, sampling, neeRng);
                 else contribution = throughput * rtptEstimateDirect(sd, mi, sampling, sg);
             }
@@ -651,10 +762,20 @@ float3 RTPT_CONTINUATION_NAME(
                 rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisNee);
 #endif
 #endif
-                radiance += contribution;
+#if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
+                const float neeLocalWeight = bounce == 2u ? selectedLocalWeight : localRadianceWeight;
+                radiance += contribution * neeLocalWeight;
+#else
+                radiance += contribution * localRadianceWeight;
+#endif
             }
         }
 
+#if defined(RTPT_GRIS_SINGLE_DEEP_PATH) && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
+        // Retain both x3 endpoints and their NEE/BSDF MIS. Only the selected
+        // path samples x3 -> x4. Keep replay and roulette on physical weights.
+        if (bounce == 3u && deepWeight == 0.f) break;
+#endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING
         // Only the scheduled component samples x1 -> x2. At x2 the suffix
         // ends with NEE, so there is no competing BSDF sample at that vertex.
@@ -672,8 +793,21 @@ float3 RTPT_CONTINUATION_NAME(
             const float marginalPdf = rtptContinuationPdf(sd, mi, sampling, bs.wo);
             if (!(marginalPdf > 0.f) || !isfinite(marginalPdf)) break;
             bs.pdf = marginalPdf;
-            bs.weight = mi.eval(sd, bs.wo, sg) / marginalPdf;
+            const float3 numerator = mi.eval(sd, bs.wo, sg);
+            bs.weight = numerator / marginalPdf;
             if (!all(isfinite(bs.weight))) break;
+#if RTPT_GRIS_DUAL_FIRST_HIT && defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+            if (bounce == 2u && gParams.maxBounces >= 3u && x2.areaPdf > 0.f &&
+                !bs.isLobe(LobeType::Delta) && nativeConnectionAreaPdf > 0.f)
+            {
+                // Use the represented prefix and raw BSDF numerator from this draw.
+                // A terminal can supply its own incident radiance and MIS later.
+                x2.nativeDeepPrefix = nativePrefixValue;
+                x2.nativeDeepBsdf = numerator;
+                x2.nativeDeepAreaPdf = nativeConnectionAreaPdf * marginalPdf;
+                x2.nativeDeepDirectionPdf = marginalPdf;
+            }
+#endif
         }
 #endif
         previousDelta = bs.isLobe(LobeType::Delta);
@@ -686,33 +820,26 @@ float3 RTPT_CONTINUATION_NAME(
 #endif
         if (!previousDelta && (!(bs.pdf > 0.f) || !isfinite(bs.pdf))) break;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
-        if (bounce == 2u && gParams.maxBounces >= 3u && suffix.areaPdf > 0.f && !previousDelta)
+        if (bounce == 2u && gParams.maxBounces >= 3u && x2.areaPdf > 0.f && !previousDelta)
         {
-            const float deepPdf = suffix.areaPdf * bs.pdf;
+            const float deepPdf = x2.areaPdf * bs.pdf;
             if (deepPdf > 0.f && isfinite(deepPdf))
             {
-                deepSuffix.candidate.rootLobe = currentRoot;
-                deepSuffix.sourceX1 = prefix.dualX1;
-                deepSuffix.reconnectHit = hit.pack();
-                deepSuffix.areaPdf = deepPdf;
-                deepSuffix.suffixDirection = bs.wo;
-                deepSuffix.dualExplicitRng = rtptGrisCaptureReplayRng(sg);
+                x2.deepPdf = deepPdf;
+                x2.direction = bs.wo;
+                x2.replayRng = rtptGrisCaptureReplayRng(sg);
             }
         }
-        if (bounce >= 3u && deepSuffix.areaPdf > 0.f) explicitThroughput *= bs.weight;
+        if (bounce >= 3u && x2.deepPdf > 0.f) explicitThroughput *= bs.weight;
 #if RTPT_GRIS_DUAL_SHARC
-        if (bounce == 3u && gParams.maxBounces > 4u && deepSuffix.areaPdf > 0.f &&
+        if (bounce == 3u && gParams.maxBounces > 4u && x2.deepPdf > 0.f &&
             !previousDelta && previousDiffuse)
         {
             cacheSuffix.candidate.rootLobe = currentRoot;
-            cacheSuffix.sourceX1 = deepSuffix.sourceX1;
-            cacheSuffix.reconnectHit = deepSuffix.reconnectHit;
-            cacheSuffix.areaPdf = deepSuffix.areaPdf;
-            cacheSuffix.suffixDirection = deepSuffix.suffixDirection;
-            // x3 and its incoming direction are shared. The sampled diffuse
-            // event carries its own continuation weight downstream of x2.
-            cacheSuffix.suffixLight = bs.weight;
-            cacheSuffix.sharcDirection = bs.wo;
+            cacheSuffix.sourceX1 = prefix.dualX1;
+            cacheSuffix.reconnectHit = x2.hit;
+            cacheSuffix.areaPdf = x2.deepPdf;
+            cacheSuffix.suffixDirection = x2.direction;
         }
 #endif
 #endif
@@ -758,7 +885,7 @@ float3 RTPT_CONTINUATION_NAME(
         if (!(representedPrefix && bounce == 1u) &&
 #if RTPT_GRIS_DUAL_FIRST_HIT
             // A zero native route can still propose a tail for the other lobe.
-            !(bounce >= 2u && deepSuffix.areaPdf > 0.f && any(explicitThroughput > 0.f)) &&
+            !(bounce >= 2u && x2.deepPdf > 0.f && any(explicitThroughput > 0.f)) &&
 #if RTPT_GRIS_DUAL_SHARC
             !(bounce == 3u && cacheSuffix.areaPdf > 0.f) &&
 #endif

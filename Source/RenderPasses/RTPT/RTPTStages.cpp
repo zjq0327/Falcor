@@ -301,6 +301,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         if (alternating) baseDefines.add("RTPT_GRIS_ALTERNATING", "1");
         auto generateDefines = baseDefines;
         if (captureSuffix) generateDefines.add("RTPT_GRIS_SPATIAL", "1");
+        if (dualFirstHit && mGRISGenerateX2SuffixMode != 0u)
+            generateDefines.add("RTPT_GRIS_X2_SUFFIX_MODE", std::to_string(mGRISGenerateX2SuffixMode));
         if (blendX1Cache) generateDefines.add("RTPT_GRIS_SHARC_X1_BLEND", "1");
         if (spatialDeepIncident) generateDefines.add("RTPT_GRIS_SPATIAL_DEEP_INCIDENT", "1");
         const auto generateDesc = makeSceneProgramDesc("RenderPasses/RTPT/GRIS/RTPTGRISGenerate.cs.slang");
@@ -886,6 +888,8 @@ Properties RTPT::getStageStatistics() const
         grisBytes += buffer ? buffer->getSize() : 0;
     props["grisSpatialActive"] = bool(mpGRISSpatialPass);
     props["grisDualFirstHitActive"] = bool(mpGRISDualFirstHits);
+    props["grisGenerateX2SuffixMode"] = mpGRISGeneratePass &&
+        mpGRISGeneratePass->getProgram()->getDefines().count("RTPT_GRIS_X2_SUFFIX_MODE") != 0 ? mGRISGenerateX2SuffixMode : 0u;
     const bool dualReGIR = mpGRISMainPass && mpGRISMainPass->getProgram()->getDefines().count("RTPT_GRIS_DUAL_REGIR") != 0;
     props["grisDualReGIRActive"] = dualReGIR;
     props["grisDualReGIRTemporalActive"] = dualReGIR && bool(mpGRISTemporalPass);

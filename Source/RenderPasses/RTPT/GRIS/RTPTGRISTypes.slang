@@ -175,7 +175,7 @@ struct GrisSpatialRecord
     PackedHitInfo reconnectHit;
     float areaPdf;          // Owner proposal/reference ratio, or native x2 area times x2 direction PDF for dual deep tails.
     float3 suffixDirection; // Fixed direction leaving x2, or light UV for dual direct NEE and legacy ReGIR.
-    float3 suffixLight;     // Tail factor (also dual SHaRC x3 BSDF weight), dual deep light UV, or dual ReGIR UV and inner RIS weight.
+    float3 suffixLight;     // Tail factor, dual deep light UV, or dual ReGIR UV and inner RIS weight.
     uint lightPdfOrStableID; // Light PDF bits, ReGIR stable light ID, or dual ordinary light index.
     bool lightIsAnalytic;
 #if RTPT_GRIS_SUFFIX_REPLAY
@@ -189,21 +189,52 @@ struct GrisSpatialRecord
 #elif RTPT_GRIS_REGIR_REPLAY
     float innerRISWeight;
 #endif
-#if RTPT_GRIS_DUAL_SHARC
-    float3 sharcDirection; // Sampled direction from x3 to the cache hit x4.
-#endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng; // Continuation stream after sampling x2's direction.
-    uint dualExplicitBounce; // Zero for the fixed x2/x3 NEE and x4 SHaRC records.
+    uint dualExplicitBounce; // Zero for fixed x2/x3 NEE, 4 for an x4 SHaRC terminal.
     uint2 dualExplicitPathID;
 #endif
 };
 
 #if RTPT_GRIS_DUAL_FIRST_HIT
+struct GrisDualNeeTerminal
+{
+    float3 coordinates; // Ordinary light UV, or ReGIR UV and inner RIS weight.
+    uint terminalKind;
+    uint lightPdfOrStableID;
+    bool lightIsAnalytic;
+    bool hasWinner;
+};
+
+// Invocation-local state for the direct and deep events from one native x2 draw.
+struct GrisDualX2Sample
+{
+    PackedHitInfo hit;
+    float areaPdf;
+    float deepPdf;
+    float3 direction;
+    uint4 replayRng;
+    GrisDualNeeTerminal directLight;
+    GrisDualNeeTerminal deepLight;
+#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
+    float3 nativeDirectF;
+    bool hasNativeDirectF;
+    float3 nativeDeepPrefix;
+    float3 nativeDeepBsdf;
+    float nativeDeepAreaPdf;
+    float nativeDeepDirectionPdf; // Zero when the represented path was unavailable.
+#endif
+};
+
 struct GrisDualExplicitTerminal
 {
-    GrisSpatialRecord proposal;
     float3 incident;
+    float3 suffixLight;
+    uint2 dualExplicitPathID;
+    uint dualExplicitBounce; // Zero denotes an empty terminal.
+    uint terminalKind;
+    uint lightPdfOrStableID;
+    bool lightIsAnalytic;
 };
 #endif
 
@@ -330,9 +361,6 @@ struct GrisTemporalFreshHistory
     float3 sharcGain;
 #elif RTPT_GRIS_REGIR_REPLAY
     float innerRISWeight;
-#endif
-#if RTPT_GRIS_DUAL_SHARC
-    float3 sharcDirection;
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng;
