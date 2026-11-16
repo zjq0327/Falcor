@@ -58,9 +58,6 @@ void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleG
 #if RTPT_GRIS_SUFFIX_REPLAY
     , uint4 directNeeRngState = 0u
 #endif
-#if RTPT_GRIS_REGIR_REPLAY
-    , float innerRISWeight = 0.f
-#endif
 #if RTPT_GRIS_SHARC_REPLAY
     , uint2 sharcKey = 0u, float3 sharcGain = 0.f
 #endif
@@ -77,7 +74,7 @@ void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleG
     suffix.areaPdf = builder.areaPdf;
     suffix.suffixDirection = direction;
     suffix.suffixLight = incident;
-    suffix.lightPdfOrStableID = lightPayload;
+    suffix.lightPdfOrIndex = lightPayload;
     suffix.lightIsAnalytic = analytic;
     suffix.candidate.F = contribution;
     suffix.candidate.terminalKind = kind | (deepTail ? kGrisDeepTail : 0u);
@@ -89,12 +86,6 @@ void rtptGRISAddPathTerminalPayload(inout GrisPathBuilder builder, inout SampleG
 #if RTPT_GRIS_SHARC_REPLAY
     suffix.sharcKey = sharcKey;
     suffix.sharcGain = sharcGain;
-#if RTPT_GRIS_REGIR_REPLAY
-    if (rtptGrisTerminalKind(kind) == uint(GrisTerminalKind::GrisReGIRPath))
-        suffix.sharcGain.x = innerRISWeight;
-#endif
-#elif RTPT_GRIS_REGIR_REPLAY
-    suffix.innerRISWeight = innerRISWeight;
 #endif
 }
 
@@ -112,9 +103,6 @@ void rtptGRISAddPathTerminal(inout GrisPathBuilder builder, inout SampleGenerato
 #if RTPT_GRIS_SHARC_REPLAY
 #if RTPT_GRIS_SUFFIX_REPLAY
         , 0u
-#endif
-#if RTPT_GRIS_REGIR_REPLAY
-        , 0.f
 #endif
         , sharcKey, sharcGain
 #endif
@@ -139,52 +127,6 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
     inout SampleGenerator sg, inout SampleGenerator terminalRng,
     inout GrisPathBuilder builder, inout GrisSpatialRecord suffix)
 {
-#if RTPT_REGIR_TRANSPORT
-    // The explicit-path adapter currently supports the cell-only domain.
-    // Mixed remaining-light domains retain the complete local estimator.
-#if !RTPT_REGIR_ONLY
-    return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
-#else
-    if (!rtptGRISPathReuseEnabled()) return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
-    if (rtptReGIRTransportCoverage(false) == 0u) return float3(0.f);
-    RTPTLightSample light;
-    uint stableID;
-    float2 lightUV;
-    float innerRISWeight;
-#if RTPT_GRIS_REGIR_REPLAY
-    const uint4 directRngState = bounce == 2u ? rtptGrisCaptureReplayRng(sg) : 0u;
-    SampleGenerator cellRng;
-    lightUV = rtptGrisSplitReGIRReplayRng(sg, bounce, cellRng);
-    RTPTDILightInfo lightInfo;
-    if (!rtptReGIRSelectTransportLight(sd, cellRng, lightInfo, innerRISWeight)) return float3(0.f);
-    stableID = lightInfo.pad0;
-    if (!rtptReGIRBuildTransportSample(sd, lightInfo, lightUV, innerRISWeight, light)) return float3(0.f);
-#else
-    if (!rtptReGIRSampleTransportLight(sd, sg, light, stableID, lightUV, innerRISWeight)) return float3(0.f);
-#endif
-    // LiOverPdf already contains the cell/RIS and conditional-light sampling
-    // compensation. ReGIR owns this non-delta direct-light domain, so there
-    // is no ordinary light/BSDF MIS or usable marginal light PDF here.
-    const float3 value = rtptEvaluateLightSample(sd, mi, sampling, light, sg, false);
-    const float3 contribution = throughput * value;
-    if (!all(isfinite(contribution)) || !query.traceVisibilityRay(light.visibilityRay)) return float3(0.f);
-    if (!builder.hasInterface) return contribution;
-    const bool deepTail = bounce > 2u;
-    const float3 incident = deepTail ? builder.tailThroughput * value : light.LiOverPdf;
-    const float3 direction = deepTail ? builder.rcWi : light.dir;
-    // Identity changes with the selected terminal, including deep-tail terms.
-    // The historical RIS compensation remains inside incident; current table
-    // weights must never replace it when an unrelated light changes.
-    rtptGRISAddPathTerminalPayload(builder, terminalRng, currentRoot, currentX1, contribution,
-        uint(GrisTerminalKind::GrisReGIRPath), deepTail, direction, incident, stableID, light.analytic,
-#if RTPT_GRIS_REGIR_REPLAY
-        bounce, suffix, directRngState, innerRISWeight);
-#else
-        0u, suffix);
-#endif
-    return float3(0.f);
-#endif
-#else
     if (!rtptGRISPathReuseEnabled()) return throughput * rtptEstimateDirect(sd, mi, sampling, sg);
 #if RTPT_GRIS_SUFFIX_REPLAY
     // A direct NEE winner needs the state before the light category draw.
@@ -212,5 +154,4 @@ float3 rtptGRISCapturePathNEE(uint bounce, ShadingData sd, IMaterialInstance mi,
 #endif
         );
     return float3(0.f);
-#endif
 }

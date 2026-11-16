@@ -24,7 +24,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     history.sourceAreaPdf = source.areaPdf;
     history.suffixDirection = source.suffixDirection;
     history.suffixLight = source.suffixLight;
-    history.lightPdfOrStableID = source.lightPdfOrStableID;
+    history.lightPdfOrIndex = source.lightPdfOrIndex;
     history.terminalAndFlags = source.candidate.terminalKind |
         (source.lightIsAnalytic ? kGrisHistoryAnalytic : 0u);
     history.F = source.candidate.F;
@@ -45,8 +45,6 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #if RTPT_GRIS_SHARC_REPLAY
     history.sharcKey = source.sharcKey;
     history.sharcGain = source.sharcGain;
-#elif RTPT_GRIS_REGIR_REPLAY
-    history.innerRISWeight = source.innerRISWeight;
 #endif
     gGRISHistory[index] = history;
 }

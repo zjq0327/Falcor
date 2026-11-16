@@ -77,7 +77,7 @@ bool rtptGrisLoadHistory(uint historyPixel, out GrisSpatialRecord source
     source.dualExplicitBounce = h.dualExplicitBounce;
     source.dualExplicitPathID = h.dualExplicitPathID;
 #endif
-    source.lightPdfOrStableID = h.lightPdfOrStableID;
+    source.lightPdfOrIndex = h.lightPdfOrIndex;
 #if RTPT_GRIS_SUFFIX_REPLAY
     source.suffixInstanceMask = h.suffixInstanceMask;
     source.terminalBounce = h.terminalBounce;
@@ -86,8 +86,6 @@ bool rtptGrisLoadHistory(uint historyPixel, out GrisSpatialRecord source
 #if RTPT_GRIS_SHARC_REPLAY
     source.sharcKey = h.sharcKey;
     source.sharcGain = h.sharcGain;
-#elif RTPT_GRIS_REGIR_REPLAY
-    source.innerRISWeight = h.innerRISWeight;
 #endif
     source.lightIsAnalytic = (h.terminalAndFlags & kGrisHistoryAnalytic) != 0u;
     source.candidate.terminalKind = h.terminalAndFlags & ~kGrisHistoryAnalytic;
@@ -156,7 +154,6 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #endif
     }
 #elif defined(RTPT_GRIS_STORED_PREFIX_REUSE)
-    uint sourceLightEpochs[kGrisMaxReuseInputs];
 #if RTPT_GRIS_SUFFIX_REPLAY
     GrisSuffixReplaySettings replay;
     replay.historyIndex = kGrisMaxReuseInputs;
@@ -174,10 +171,9 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #if RTPT_GRIS_SUFFIX_REPLAY
         replay.historyIndex = inputCount;
 #endif
-        sourceLightEpochs[inputCount] = rtptGrisPreviousLightEpoch();
         sourceCameras[inputCount++] = gGRISTemporalSettings.previousCameraPosition;
     }
-    result = rtptGrisMergeStoredPrefix(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, rng
+    result = rtptGrisMergeStoredPrefix(canonical, inputs, sourceCameras, inputCount, rng
 #if RTPT_GRIS_SUFFIX_REPLAY
         , replay
 #endif

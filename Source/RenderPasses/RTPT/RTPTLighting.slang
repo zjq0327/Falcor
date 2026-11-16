@@ -5,9 +5,6 @@
 #ifndef RTPT_USE_RESTIR_DI
 #define RTPT_USE_RESTIR_DI 0
 #endif
-#ifndef RTPT_REGIR_ONLY
-#define RTPT_REGIR_ONLY 0
-#endif
 #ifndef RTPT_GRIS_SUFFIX_REPLAY
 #define RTPT_GRIS_SUFFIX_REPLAY 0
 #endif
@@ -30,8 +27,6 @@ struct RTPTLightSample
     RTPTReplayLightType replayType;
 #endif
 };
-
-#include "ReGIR/RTPTReGIRTransport.slang"
 
 float rtptPowerHeuristic(float pdf, float otherPdf)
 {
@@ -225,7 +220,7 @@ bool rtptValidLightSample(ShadingData sd, RTPTLightSample light)
         all(isfinite(light.LiOverPdf)) && any(light.LiOverPdf > 0.f);
 }
 
-#if (RTPT_GRIS_SUFFIX_REPLAY || (RTPT_GRIS_DUAL_DYNAMIC_REPLAY && !RTPT_GRIS_DUAL_REGIR)) && defined(RTPT_GRIS_TEMPORAL_REUSE) && USE_ANALYTIC_LIGHTS
+#if (RTPT_GRIS_SUFFIX_REPLAY || RTPT_GRIS_DUAL_DYNAMIC_REPLAY) && defined(RTPT_GRIS_TEMPORAL_REUSE) && USE_ANALYTIC_LIGHTS
 StructuredBuffer<LightData> gGRISReplayPreviousLights;
 #endif
 
@@ -318,7 +313,7 @@ bool rtptSampleLight(ShadingData sd, inout SampleGenerator sg, out RTPTLightSamp
 */
 bool rtptDICoversEmissiveHit(TriangleHit hit, uint coverage)
 {
-#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
+#if RTPT_USE_RESTIR_DI
     if ((coverage & kRTPTDICoverEmissive) == 0u) return false;
     const uint index = gScene.lightCollection.getTriangleIndex(hit.instanceID, hit.primitiveIndex);
     if (index == LightCollection::kInvalidIndex) return false;
@@ -331,10 +326,6 @@ bool rtptDICoversEmissiveHit(TriangleHit hit, uint coverage)
 uint rtptAnalyticLightCountForCoverage(uint coverage)
 {
 #if USE_ANALYTIC_LIGHTS
-#if RTPT_REGIR_TRANSPORT
-    if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRSettings.active != 0u)
-        return gReGIRSettings.uncoveredAnalyticCount;
-#endif
 #if RTPT_USE_RESTIR_DI
     if ((coverage & kRTPTDICoverPoint) != 0u) return gDISettings.uncoveredAnalyticCount;
 #endif
@@ -355,7 +346,7 @@ float3 rtptLightCategoryProbabilitiesForCoverage(uint coverage)
     p.x = rtptEnvironmentHasEnergy() ? 1.f : 0.f;
 #endif
 #if USE_EMISSIVE_LIGHTS
-#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
+#if RTPT_USE_RESTIR_DI
     if ((coverage & kRTPTDICoverEmissive) == 0u)
 #endif
         p.y = gScene.lightCollection.getActiveTriangleCount() > 0u ? 1.f : 0.f;
@@ -389,7 +380,7 @@ float rtptEmissiveLightPdfForCoverage(
 #endif
 }
 
-/** Sample the light domain left over after DI or ReGIR claims its coverage. */
+/** Sample the light domain left over after ReSTIR DI claims its coverage. */
 bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGenerator sg, out RTPTLightSample result)
 {
     if (coverage == 0u) return rtptSampleLight(sd, sg, result);
@@ -422,11 +413,6 @@ bool rtptSampleLightForCoverage(ShadingData sd, uint coverage, inout SampleGener
         if (count == 0u) return false;
         const uint rank = min(uint(sampleNext1D(sg) * count), count - 1u);
         uint index = rank;
-#if RTPT_REGIR_TRANSPORT
-        if ((coverage & kRTPTDICoverPoint) != 0u && gReGIRSettings.active != 0u)
-            index = gReGIRTransportUncoveredAnalyticIndices[rank];
-        else
-#endif
 #if RTPT_USE_RESTIR_DI
         if ((coverage & kRTPTDICoverPoint) != 0u) index = gDIUncoveredAnalyticIndices[rank];
 #else
@@ -469,103 +455,20 @@ float3 rtptEstimateDirectSample(ShadingData sd, IMaterialInstance mi, RTPTSampli
     return query.traceVisibilityRay(ls.visibilityRay) ? contribution : float3(0.f);
 }
 
-#if RTPT_REGIR_TRANSPORT
-float3 rtptEstimateReGIRDirectSample(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg,
-    out RTPTLightSample lightSample, out uint stableID, out float2 uv, out float estimatorWeight)
-{
-    if (!rtptReGIRSampleTransportLight(sd, sg, lightSample, stableID, uv, estimatorWeight)) return float3(0.f);
-    const float3 value = mi.eval(sd, lightSample.dir, sg) * lightSample.LiOverPdf;
-    if (!all(isfinite(value)) || !any(value > 0.f)) return float3(0.f);
-    SceneRayQuery<true> query;
-    return query.traceVisibilityRay(lightSample.visibilityRay) ? value : float3(0.f);
-}
-
-float3 rtptEstimateReGIRDirectSample(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg,
-    out RTPTLightSample lightSample)
-{
-    uint unusedID;
-    float2 unusedUV;
-    float unusedWeight;
-    return rtptEstimateReGIRDirectSample(sd, mi, sg, lightSample, unusedID, unusedUV, unusedWeight);
-}
-
-#endif
 float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, RTPTSamplingContext sampling, inout SampleGenerator sg,
-    bool hasBSDFCompetitor = true, bool training = false)
+    bool hasBSDFCompetitor = true)
 {
-#if RTPT_REGIR_TRANSPORT
-    const uint coverage = rtptReGIRTransportCoverage(training);
-    if (coverage != 0u)
-    {
-        RTPTLightSample local;
-        float3 contribution = rtptEstimateReGIRDirectSample(sd, mi, sg, local);
-#if !RTPT_REGIR_ONLY
-        // The remaining categories retain their actual BSDF/PG MIS density.
-        RTPTLightSample remaining;
-        if (rtptSampleLightForCoverage(sd, coverage, sg, remaining))
-        {
-            const float3 value = rtptEvaluateLightSample(sd, mi, sampling, remaining, sg, hasBSDFCompetitor);
-            SceneRayQuery<true> query;
-            if (all(isfinite(value)) && any(value > 0.f) && query.traceVisibilityRay(remaining.visibilityRay)) contribution += value;
-        }
-#endif
-        return contribution;
-    }
-#endif
-#if RTPT_REGIR_ONLY
-    return float3(0.f);
-#else
     RTPTLightSample ls;
     return rtptEstimateDirectSample(sd, mi, sampling, sg, ls, hasBSDFCompetitor);
-#endif
 }
 
 // Sparse cache updates intentionally retain the original BSDF-only transport.
 float3 rtptEstimateDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg)
 {
-    return rtptEstimateDirect(sd, mi, rtptBSDFSamplingContext(), sg, true, true);
+    return rtptEstimateDirect(sd, mi, rtptBSDFSamplingContext(), sg);
 }
 
 #if ENABLE_NRD
-#if RTPT_REGIR_TRANSPORT
-uint rtptReGIRRootCoverage()
-{
-    return gParams.useNEE != 0u && gReGIRSettings.active != 0u ? gReGIRSettings.coverageMask : 0u;
-}
-
-/** A freshly traced root can fail the primary-record bitwise ray guard. It
-    still belongs to the cell-only local-light model: construct/query its cell
-    and evaluate a counted world-space estimate, never the global light pool.
-    Return coverage even for a legitimate zero/empty cell to retain ownership.
-*/
-uint rtptEstimateReGIRRootDirect(ShadingData sd, IMaterialInstance mi, inout SampleGenerator sg,
-    out float3 diffuse, out float3 specular)
-{
-    diffuse = specular = float3(0.f);
-    const uint coverage = rtptReGIRRootCoverage();
-    if (coverage == 0u) return 0u;
-    RTPTLightSample light;
-    if (!rtptReGIRSampleTransportLight(sd, sg, light)) return coverage;
-    SceneRayQuery<true> query;
-    if (!query.traceVisibilityRay(light.visibilityRay)) return coverage;
-    const uint lobes = mi.getLobeTypes(sd);
-    if ((lobes & uint(LobeType::DiffuseReflection)) != 0u)
-    {
-        ShadingData component = sd;
-        component.mtl.setActiveLobes(uint(LobeType::DiffuseReflection));
-        diffuse = mi.eval(component, light.dir, sg) * light.LiOverPdf;
-        if (!all(isfinite(diffuse))) diffuse = 0.f;
-    }
-    if ((lobes & uint(LobeType::SpecularReflection)) != 0u)
-    {
-        ShadingData component = sd;
-        component.mtl.setActiveLobes(uint(LobeType::SpecularReflection));
-        specular = mi.eval(component, light.dir, sg) * light.LiOverPdf;
-        if (!all(isfinite(specular))) specular = 0.f;
-    }
-    return coverage;
-}
-#endif
 
 /** Evaluate a previously sampled and visibility-tested light for one component.
     A diffuse continuation and a specular continuation are both generated, so

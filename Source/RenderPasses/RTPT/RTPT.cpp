@@ -74,7 +74,6 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             if (buffers[5]) result["dualFirstHits"] = buffers[5];
             return result;
         });
-        pass.def("getGRISLightHistoryMetadataBuffer", &RTPT::getGRISLightHistoryMetadataBuffer);
         pass.def("getSHARCValidationBuffers", [](const RTPT& self)
         {
             const auto buffers = self.getSHARCValidationBuffers();
@@ -87,7 +86,6 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             return result;
         });
         pass.def_property_readonly("diStats", [](const RTPT& self) { return self.getDIStatistics().toPython(); });
-        pass.def_property_readonly("regirStats", [](const RTPT& self) { return self.getReGIRStatistics().toPython(); });
         pass.def("resetPG", &RTPT::resetPG);
     });
 }
@@ -118,12 +116,6 @@ void RTPT::setProperties(const Properties& props)
     bool grisSuffixReplayValidateUnchanged = mGRISSuffixReplayValidateUnchanged;
     float grisSharcX1Blend = mGRISSharcX1Blend;
     bool restirDIEnabled = mRestirDIEnabled;
-    bool regirEnabled = mReGIREnabled, regirSecondaryEnabled = mReGIRSecondaryEnabled, regirTrainingEnabled = mReGIRTrainingEnabled;
-    bool regirLightCullingEnabled = mReGIRCullingEnabled;
-    uint32_t regirGridSize = mReGIRGridSize, regirLightsPerCell = mReGIRLightsPerCell;
-    uint32_t regirBuildSamples = mReGIRBuildSamples, regirBudgetMB = mReGIRBudgetMB;
-    float regirCellSize = mReGIRCellSize, regirSamplingJitter = mReGIRSamplingJitter;
-    float regirCoarsenCellDistance = mReGIRCoarsenCellDistance, regirBrightnessThreshold = mReGIRBrightnessThreshold;
     uint32_t restirDICandidateCount = mRestirDICandidateCount, restirDIBudgetMB = mRestirDIBudgetMB;
     bool restirDITemporalEnabled = mRestirDITemporalEnabled, restirDISpatialEnabled = mRestirDISpatialEnabled;
     uint32_t restirDIHistoryLength = mRestirDIHistoryLength, restirDISpatialSamples = mRestirDISpatialSamples;
@@ -163,23 +155,10 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisSuffixReplayValidateUnchanged") grisSuffixReplayValidateUnchanged = value;
         else if (key == "grisTemporalPrefixMode" || key == "grisTemporalPrefixUniformMix" || key == "grisTemporalPrefixDiagnostics")
             logWarningOnce("RTPT ignores the retired '{}' property. GRIS uses the first hit stored in each candidate.", key);
-        else if (key == "grisReGIRReplayMode" || key == "grisReGIRSelectiveHistory" || key == "grisPGPrefixDepth")
-            logWarningOnce("RTPT ignores the retired '{}' property. GRIS selects replay and guiding automatically.", key);
+        else if (key == "grisPGPrefixDepth")
+            logWarningOnce("RTPT ignores the retired '{}' property. GRIS selects its guiding depth automatically.", key);
         else if (key == "grisSharcX1Blend") grisSharcX1Blend = value;
         else if (key == "restirDIEnabled") restirDIEnabled = value;
-        else if (key == "regirEnabled") regirEnabled = value;
-        else if (key == "regirSecondaryEnabled") regirSecondaryEnabled = value;
-        else if (key == "regirTrainingEnabled") regirTrainingEnabled = value;
-        else if (key == "regirFreeze") logWarningOnce("RTPT ignores the retired regirFreeze property. ReGIR RIS reuse is automatic.");
-        else if (key == "regirLightCullingEnabled") regirLightCullingEnabled = value;
-        else if (key == "regirGridSize") regirGridSize = value;
-        else if (key == "regirLightsPerCell") regirLightsPerCell = value;
-        else if (key == "regirBuildSamples") regirBuildSamples = value;
-        else if (key == "regirBudgetMB") regirBudgetMB = value;
-        else if (key == "regirCellSize") regirCellSize = value;
-        else if (key == "regirSamplingJitter") regirSamplingJitter = value;
-        else if (key == "regirCoarsenCellDistance") regirCoarsenCellDistance = value;
-        else if (key == "regirBrightnessThreshold") regirBrightnessThreshold = value;
         else if (key == "restirDICandidateCount") restirDICandidateCount = value;
         else if (key == "restirDIBudgetMB") restirDIBudgetMB = value;
         else if (key == "restirDITemporalEnabled") restirDITemporalEnabled = value;
@@ -261,26 +240,10 @@ void RTPT::setProperties(const Properties& props)
     FALCOR_CHECK(std::isfinite(sharcSceneScale) && sharcSceneScale > 0.f && std::isfinite(sharcMinRoughness) &&
         sharcMinRoughness >= 0.f && sharcMinRoughness <= 1.f, "Invalid SHaRC scene scale or minimum roughness.");
     const bool needsPGResources = enablePG || (grisEnabled && enableNRD && !useRussianRoulette);
-    if (enableSHARC || needsPGResources || regirEnabled)
+    if (enableSHARC || needsPGResources)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
-            "RTPT SHaRC, PG and ReGIR require D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
-    FALCOR_CHECK(regirGridSize >= 1u && regirGridSize <= 128u && regirLightsPerCell >= 1u && regirLightsPerCell <= 1024u,
-        "ReGIR grid size must be in [1,128], slots per cell in [1,1024].");
-    FALCOR_CHECK(regirBuildSamples >= 1u && regirBuildSamples <= 128u && regirBudgetMB >= 1u && regirBudgetMB <= 1024u,
-        "ReGIR build samples must be in [1,128], budget in [1,1024] MiB.");
-    FALCOR_CHECK(std::isfinite(regirCellSize) && regirCellSize >= 1e-6f && regirCellSize <= 1e6f && std::isfinite(regirSamplingJitter) &&
-        regirSamplingJitter >= 0.f && regirSamplingJitter <= 4.f, "ReGIR cell size must be in [1e-6,1e6], jitter in [0,4].");
-    FALCOR_CHECK(std::isfinite(regirCoarsenCellDistance) && regirCoarsenCellDistance >= 1.f && regirCoarsenCellDistance <= 1024.f &&
-        std::isfinite(regirBrightnessThreshold) && regirBrightnessThreshold >= 0.f && regirBrightnessThreshold <= 1e12f,
-        "ReGIR LOD distance must be in [1,1024] cells and brightness threshold in [0,1e12].");
-    const bool regirChanged = regirEnabled != mReGIREnabled || regirSecondaryEnabled != mReGIRSecondaryEnabled ||
-        regirTrainingEnabled != mReGIRTrainingEnabled || regirGridSize != mReGIRGridSize ||
-        regirLightsPerCell != mReGIRLightsPerCell || regirBuildSamples != mReGIRBuildSamples ||
-        regirBudgetMB != mReGIRBudgetMB || regirCellSize != mReGIRCellSize || regirSamplingJitter != mReGIRSamplingJitter ||
-        regirLightCullingEnabled != mReGIRCullingEnabled || regirCoarsenCellDistance != mReGIRCoarsenCellDistance ||
-        regirBrightnessThreshold != mReGIRBrightnessThreshold;
-    const bool regirCompileChanged = regirEnabled != mReGIREnabled || (regirEnabled && restirDIEnabled != mRestirDIEnabled);
-    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC || regirCompileChanged ||
+            "RTPT SHaRC and PG require D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
+    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC ||
         enableDeltaReflectionNRD != mEnableDeltaReflectionNRD;
     const bool pgCompileChanged = needsPGResources != needsPG();
     const bool modeChanged = transportModeChanged || pgCompileChanged;
@@ -312,7 +275,7 @@ void RTPT::setProperties(const Properties& props)
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
         sharcEnabled != mSHARCEnabled || transportModeChanged || sharcTransportChanged || diChanged ||
-        regirChanged || grisSharcX1Blend != mGRISSharcX1Blend;
+        grisSharcX1Blend != mGRISSharcX1Blend;
     // PG learns a proposal: changing its sampling/configuration or training
     // target does not require discarding the accumulated spatial model.
     if (pgStructureChanged || pgRecordsChanged || pgAsyncTraining != mPGAsyncTraining)
@@ -356,26 +319,12 @@ void RTPT::setProperties(const Properties& props)
     mRestirDIHistoryLength = restirDIHistoryLength;
     mRestirDISpatialSamples = restirDISpatialSamples;
     mRestirDISpatialRadius = restirDISpatialRadius;
-    mReGIREnabled = regirEnabled;
-    mReGIRSecondaryEnabled = regirSecondaryEnabled;
-    mReGIRTrainingEnabled = regirTrainingEnabled;
-    mReGIRCullingEnabled = regirLightCullingEnabled;
-    mReGIRGridSize = regirGridSize;
-    mReGIRLightsPerCell = regirLightsPerCell;
-    mReGIRBuildSamples = regirBuildSamples;
-    mReGIRBudgetMB = regirBudgetMB;
-    mReGIRCellSize = regirCellSize;
-    mReGIRSamplingJitter = regirSamplingJitter;
-    mReGIRCoarsenCellDistance = regirCoarsenCellDistance;
-    mReGIRBrightnessThreshold = regirBrightnessThreshold;
-    if (diChanged || diEligibilityChanged || regirChanged)
+    if (diChanged || diEligibilityChanged)
     {
         invalidateDirectLighting();
         mLightCatalog.retry();
     }
-    if (regirChanged) invalidateReGIR();
-    if (!mRestirDIEnabled && !mReGIREnabled && (diChanged || regirChanged)) mLightCatalog.release();
-    mResetSHARCCache |= regirChanged || regirCompileChanged;
+    if (!mRestirDIEnabled && diChanged) mLightCatalog.release();
     mEnableSHARC = enableSHARC;
     mSHARCEnabled = sharcEnabled;
     mSHARCUseCache = sharcUseCache;
@@ -441,18 +390,6 @@ Properties RTPT::getProperties() const
     props["grisSuffixReplayValidateUnchanged"] = mGRISSuffixReplayValidateUnchanged;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;
     props["restirDIEnabled"] = mRestirDIEnabled;
-    props["regirEnabled"] = mReGIREnabled;
-    props["regirSecondaryEnabled"] = mReGIRSecondaryEnabled;
-    props["regirTrainingEnabled"] = mReGIRTrainingEnabled;
-    props["regirLightCullingEnabled"] = mReGIRCullingEnabled;
-    props["regirGridSize"] = mReGIRGridSize;
-    props["regirLightsPerCell"] = mReGIRLightsPerCell;
-    props["regirBuildSamples"] = mReGIRBuildSamples;
-    props["regirBudgetMB"] = mReGIRBudgetMB;
-    props["regirCellSize"] = mReGIRCellSize;
-    props["regirSamplingJitter"] = mReGIRSamplingJitter;
-    props["regirCoarsenCellDistance"] = mReGIRCoarsenCellDistance;
-    props["regirBrightnessThreshold"] = mReGIRBrightnessThreshold;
     props["restirDICandidateCount"] = mRestirDICandidateCount;
     props["restirDIBudgetMB"] = mRestirDIBudgetMB;
     props["restirDITemporalEnabled"] = mRestirDITemporalEnabled;
@@ -605,46 +542,12 @@ void RTPT::resetAccumulation()
     mAccumulatedFrames = 0;
 }
 
-void RTPT::resetForSelectiveLightChange()
+void RTPT::resetAccumulationAndNRDHistory()
 {
     // Keep the sample sequence independent of retained history/auxiliary draws.
     // NRD and progressive image accumulation still discard obsolete radiance.
     resetAccumulation();
     mResetNRDHistory = true;
-}
-
-bool RTPT::canUseGRISSelectiveLightHistory() const
-{
-    return canUseGRISReGIRReplay() && canUseGRISReferenceReuse() && !canUseGRISDualFirstHit();
-}
-
-bool RTPT::canPreserveGRISForPointLightChange() const
-{
-    if (!canUseGRISSelectiveLightHistory() || !mLightCatalog.hasLightHistoryMetadata() ||
-        !mGRISHistoryFrame.historyValid || !mGRISHistoryReferenceDomain || mOptionsChanged ||
-        !mGRISHistoryFrame.snapshot.selectiveLightDomain ||
-        mGRISHistoryFrame.snapshot.regirDomainGeneration != mLightCatalog.getLightHistoryGeneration()) return false;
-    const auto updates = mpScene->getUpdates();
-    const auto pointChanges = IScene::UpdateFlags::LightsMoved | IScene::UpdateFlags::LightIntensityChanged |
-        IScene::UpdateFlags::LightPropertiesChanged | IScene::UpdateFlags::LightCountChanged;
-    const auto incompatible = IScene::UpdateFlags::CameraSwitched | IScene::UpdateFlags::GeometryChanged |
-        IScene::UpdateFlags::GeometryMoved | IScene::UpdateFlags::MeshesChanged | IScene::UpdateFlags::MaterialsChanged |
-        IScene::UpdateFlags::EmissiveMaterialsChanged | IScene::UpdateFlags::LightCollectionChanged |
-        IScene::UpdateFlags::EnvMapChanged | IScene::UpdateFlags::EnvMapPropertiesChanged |
-        IScene::UpdateFlags::RenderSettingsChanged | IScene::UpdateFlags::RecompileNeeded;
-    if ((updates & pointChanges) == IScene::UpdateFlags::None || (updates & incompatible) != IScene::UpdateFlags::None ||
-        is_set(mpScene->getCamera()->getChanges(), Camera::Changes::Frustum) ||
-        mLightCatalog.getSnapshot().uncoveredAnalyticCount != 0u) return false;
-    for (const auto& light : mpScene->getActiveAnalyticLights())
-        if (light->getType() != LightType::Point) return false;
-    return true;
-}
-
-bool RTPT::canUseGRISReGIRReplay() const
-{
-    return mpScene && mReGIREnabled && mReGIRSecondaryEnabled && !mRestirDIEnabled &&
-        mUseNEE && mReGIRBrightnessThreshold == 0.f &&
-        canUseGRISTemporal();
 }
 
 bool RTPT::canUseGRISDualFirstHit() const
@@ -653,8 +556,6 @@ bool RTPT::canUseGRISDualFirstHit() const
         mRestirDIEnabled ||
         (mLightingMask & (kEnvLighting | kEmissiveLighting | kAnalyticLighting)) == 0u) return false;
     if (mEnableSHARC && mSHARCEnabled && mSHARCUseCache && mMaxBounces <= 4u) return false;
-    if (mReGIREnabled && (!mReGIRSecondaryEnabled || mReGIRBrightnessThreshold != 0.f ||
-        (mLightingMask & kEnvLighting) != 0u)) return false;
 
     if ((mLightingMask & kAnalyticLighting) != 0u)
     {
@@ -669,19 +570,12 @@ bool RTPT::canUseGRISDualFirstHit() const
 bool RTPT::canUseGRISSuffixReplay() const
 {
     if (canUseGRISDualFirstHit()) return false;
-    const bool replay = mReGIREnabled ? canUseGRISReGIRReplay() :
-        mpScene && mGRISSuffixReplayEnabled && canUseGRISTemporal() && !mRestirDIEnabled;
+    const bool replay = mpScene && mGRISSuffixReplayEnabled && canUseGRISTemporal() && !mRestirDIEnabled;
     return replay && canUseGRISReferenceReuse();
-}
-
-bool RTPT::canUseGRISDualReGIRTemporal() const
-{
-    return mReGIREnabled && canUseGRISDualFirstHit() && canUseGRISTemporal() && mGRISTemporalFallbackReason.empty();
 }
 
 bool RTPT::canUseGRISDualDynamicReplay() const
 {
-    if (mReGIREnabled) return canUseGRISDualReGIRTemporal();
     return mGRISSuffixReplayEnabled && canUseGRISTemporal() && canUseGRISDualFirstHit();
 }
 
@@ -690,7 +584,7 @@ bool RTPT::canPreserveGRISSuffixReplayForPointLightChange() const
     const auto& snapshot = mGRISHistoryFrame.snapshot;
     const bool compatibleReplay = (snapshot.suffixReplayDomain && canUseGRISSuffixReplay()) ||
         (snapshot.dualDynamicReplayDomain && canUseGRISDualDynamicReplay());
-    if (mReGIREnabled || !compatibleReplay || !mUseNEE || !mpScene->useAnalyticLights() || mOptionsChanged ||
+    if (!compatibleReplay || !mUseNEE || !mpScene->useAnalyticLights() || mOptionsChanged ||
         !mGRISHistoryFrame.historyValid ||
         !mpGRISReplayPreviousLights) return false;
 
@@ -848,7 +742,6 @@ void RTPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     drainPGAsync();
     invalidateStages();
-    invalidateReGIR();
     mLightCatalog.reset();
     mpScene = pScene;
     mpComputePass = nullptr;
@@ -880,7 +773,7 @@ ProgramDesc RTPT::makeSceneProgramDesc(const char* path, const char* entry) cons
     desc.addShaderModules(mpScene->getShaderModules());
     desc.addTypeConformances(mpScene->getTypeConformances());
     desc.addShaderLibrary(path).csEntry(entry);
-    if (mEnableSHARC || needsPG() || mReGIREnabled)
+    if (mEnableSHARC || needsPG())
     {
         desc.setShaderModel(ShaderModel::SM6_6);
         desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
@@ -918,16 +811,11 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         (mpScene->useAnalyticLights() ? kAnalyticLighting : 0u);
     if (lightingMask != mLightingMask)
     {
-        const uint32_t previousLightingMask = mLightingMask;
         mLightingMask = lightingMask;
         mpComputePass = nullptr;
         mpSparseUpdate = nullptr;
         mResetSHARCCache = true;
-        // A last-point removal can change USE_ANALYTIC_LIGHTS without changing
-        // the reference path layout or any surviving light's contribution.
-        if (mGRISLightHistoryPreserveRequested && ((lightingMask ^ previousLightingMask) & ~kAnalyticLighting) == 0u)
-            resetForSelectiveLightChange();
-        else reset();
+        reset();
     }
     if (mpScene->useEnvLight())
     {
@@ -941,7 +829,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
     if (!mpComputePass)
     {
         invalidateStages(true);
-        invalidateReGIRPrograms();
     }
 
     const bool pg = needsPG();
@@ -959,11 +846,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("RTPT_DELTA_NRD", mEnableNRD && mEnableDeltaReflectionNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
         defines.add("ENABLE_PG", pg ? "1" : "0");
-        if (mReGIREnabled)
-        {
-            defines.add("RTPT_REGIR_TRANSPORT", "1");
-            if (!mRestirDIEnabled) defines.add("RTPT_REGIR_ONLY", "1");
-        }
         if (mEnableSHARC)
         {
             defines.add("SHARC_MATERIAL_DEMODULATION", "1");
@@ -1191,7 +1073,6 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
     params["accumulate"] = 0u;
     if (mEnableSHARC) bindSHARC(var);
-    bindReGIRTransport(var);
     if (needsPG()) mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
     auto sparse = var["gSparseSettings"];
     sparse["frameDim"] = mFrameDim;
@@ -1325,7 +1206,6 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
 void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     collectPGAsyncTiming();
-    mReGIRInitialActive = false;
     mNRDHistoryResetThisFrame = false;
     mPGTranslationPreservedNRDThisFrame = false;
     mPGModelResetThisFrame = false;
@@ -1334,16 +1214,12 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     mGRISReadSharcVersion = 0u;
     mGRISReadSharcFrameStamp = 0u;
     mSceneMotionThisFrame = false;
-    mGRISSelectiveLightHistoryEnabled = false;
-    mGRISLightHistoryPreserveRequested = false;
     mGRISSuffixReplayPreserveRequested = false;
     mGRISSuffixReplayLightChange = false;
     mGRISSuffixReplayGeometryPreserveRequested = false;
     mGRISSuffixReplayGeometryChange = false;
     mGRISReplayMovedInstances.clear();
     mGRISReplayMovedBounds.clear();
-    mGRISLightHistoryPreservedThisFrame = false;
-    mGRISHistoryReadLightEpoch = 0u;
     mGRISLightHistoryResetReason.clear();
     auto color = renderData.getTexture("color");
     auto noisyColor = renderData.getTexture("noisyColor");
@@ -1376,10 +1252,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         sceneChanged |= (mpScene->getCamera()->getChanges() & ~(Camera::Changes::Jitter | Camera::Changes::History)) != Camera::Changes::None;
     auto& dict = renderData.getDictionary();
     const auto refreshFlags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
-    mGRISLightHistoryPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && canPreserveGRISForPointLightChange();
     mGRISSuffixReplayPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && canPreserveGRISSuffixReplayForPointLightChange();
     mGRISSuffixReplayGeometryPreserveRequested = refreshFlags == RenderPassRefreshFlags::None && prepareGRISSuffixReplayGeometryChange();
-    const bool preserveGRISHistory = mGRISLightHistoryPreserveRequested || mGRISSuffixReplayPreserveRequested ||
+    const bool preserveGRISHistory = mGRISSuffixReplayPreserveRequested ||
         mGRISSuffixReplayGeometryPreserveRequested;
     // A completed progressive image must resume for supported motion,
     // even when NRD's motion policy does not call for a history reset.
@@ -1422,7 +1297,7 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (needsPG()) mPGCameraPosition = mpScene->getCamera()->getPosition();
     if (nrdDiscontinuity || mOptionsChanged || refreshFlags != RenderPassRefreshFlags::None)
     {
-        if (preserveGRISHistory) resetForSelectiveLightChange();
+        if (preserveGRISHistory) resetAccumulationAndNRDHistory();
         else
         {
             if (mGRISLightHistoryResetReason.empty())
@@ -1469,30 +1344,6 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         pRenderContext->copyResource(color.get(), mpAccumulation.get());
         return;
     }
-    bool stagesActive = false;
-    bool diActive = false;
-    auto prepareLightCatalog = [&]()
-    {
-        return mLightCatalog.prepare(*mpScene, *mpDevice, uint64_t(mRestirDIBudgetMB) << 20u,
-            mReGIREnabled);
-    };
-    if (mReGIREnabled)
-    {
-        // Publish one frame-local world-space light model before independent
-        // training. Primary records and pixel reservoirs are not inputs here.
-        mReGIRActive = false;
-        stagesActive = prepareStages();
-        FALCOR_CHECK(stagesActive && mEnableNRD && mSamplesPerPixel == 1u && (!mRestirDIEnabled || mUseNEE),
-            "Cell-only ReGIR requires prepared Primary Surface and supported one-sample NRD/NEE inputs; global fallback is disabled.");
-        const bool catalogReady = prepareLightCatalog();
-        FALCOR_CHECK(catalogReady, "ReGIR cell-only light catalogue preparation failed; global sampling is disabled: {}", mLightCatalog.getFailure());
-        if (mRestirDIEnabled)
-        {
-            diActive = prepareDirectLighting(catalogReady);
-            FALCOR_CHECK(diActive, "ReGIR with ReSTIR DI requires prepared DI resources; global fallback is disabled: {}", mDIFallbackReason);
-        }
-        prepareReGIR(pRenderContext);
-    }
     if (mEnableSHARC || needsPG())
     {
         // Complete SHaRC resolve before GRIS and MainRender query the current frame's cache.
@@ -1508,13 +1359,11 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         dict[kRenderPassRefreshFlags] = refreshFlags | RenderPassRefreshFlags::RenderOptionsChanged;
     mResetNRDHistory = false;
 
-    if (!mReGIREnabled) stagesActive = prepareStages();
+    const bool stagesActive = prepareStages();
     if (stagesActive) executePrimarySurface(pRenderContext);
-    if (!mReGIREnabled)
-    {
-        const bool catalogReady = mRestirDIEnabled && stagesActive && mEnableNRD && mSamplesPerPixel == 1u && mUseNEE && prepareLightCatalog();
-        diActive = prepareDirectLighting(catalogReady);
-    }
+    const bool catalogReady = mRestirDIEnabled && stagesActive && mEnableNRD && mSamplesPerPixel == 1u && mUseNEE &&
+        mLightCatalog.prepare(*mpScene, *mpDevice, uint64_t(mRestirDIBudgetMB) << 20u);
+    const bool diActive = prepareDirectLighting(catalogReady);
     if (diActive) executeDirectLighting(pRenderContext);
     const auto& baseMainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
     const bool grisActive = prepareGRIS(baseMainPass, diActive);
@@ -1541,7 +1390,6 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
         if (mEnableNRD) var["gSignalRecords"] = mpSignalRecords;
     }
     if (diActive) bindDIMainResources(var);
-    bindReGIRTransport(var);
     if (mEnableSHARC)
     {
         bindSHARC(var);
@@ -1631,29 +1479,6 @@ void RTPT::renderUI(Gui::Widgets& widget)
     if (widget.button(mEnableNRD ? "Reset NRD history" : "Reset accumulation")) mOptionsChanged = true;
     if (!mEnableNRD)
         widget.text("Accumulated samples: " + std::to_string(mAccumulatedSamples));
-    if (auto regirWidget = widget.group("ReGIR"))
-    {
-        Properties props;
-        bool enabled = mReGIREnabled, secondary = mReGIRSecondaryEnabled, training = mReGIRTrainingEnabled, culling = mReGIRCullingEnabled;
-        if (regirWidget.checkbox("Enabled", enabled)) props["regirEnabled"] = enabled;
-        if (regirWidget.checkbox("Secondary lighting", secondary)) props["regirSecondaryEnabled"] = secondary;
-        if (regirWidget.checkbox("Independent training", training)) props["regirTrainingEnabled"] = training;
-        if (regirWidget.checkbox("Light culling", culling)) props["regirLightCullingEnabled"] = culling;
-        uint32_t size = mReGIRGridSize, slots = mReGIRLightsPerCell, build = mReGIRBuildSamples, budget = mReGIRBudgetMB;
-        if (regirWidget.var("Hash capacity cube root", size, 1u, 128u)) props["regirGridSize"] = size;
-        if (regirWidget.var("Lights per cell", slots, 1u, 1024u)) props["regirLightsPerCell"] = slots;
-        if (regirWidget.var("Build candidates per slot", build, 1u, 128u)) props["regirBuildSamples"] = build;
-        float cellSize = mReGIRCellSize, distance = mReGIRCoarsenCellDistance, threshold = mReGIRBrightnessThreshold;
-        if (regirWidget.var("Near cell edge", cellSize, 1e-6f, 1e6f)) props["regirCellSize"] = cellSize;
-        if (regirWidget.var("Coarsen distance (cell edges)", distance, 1.f, 1024.f)) props["regirCoarsenCellDistance"] = distance;
-        if (regirWidget.var("Weak-light threshold", threshold, 0.f, 1e12f, 0.00001f)) props["regirBrightnessThreshold"] = threshold;
-        regirWidget.tooltip("Linear incident-light proxy cutoff. Zero disables weak-light distance culling. Tests cover the complete cell and query jitter.", true);
-        if (regirWidget.var("LOD hash budget (MiB)", budget, 1u, 1024u)) props["regirBudgetMB"] = budget;
-        if (!props.empty()) setProperties(props);
-        regirWidget.text(mReGIRActive ? "Active: cell-only LOD candidates" : "Inactive");
-        regirWidget.text("Candidate IDs persist until light membership changes.");
-        if (!mReGIRFallbackReason.empty()) regirWidget.text(mReGIRFallbackReason.substr(0, mReGIRFallbackReason.find('\n')));
-    }
     if (auto diWidget = widget.group("ReSTIR DI"))
     {
         Properties props;
@@ -1672,8 +1497,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
         if (diWidget.var("Spatial samples", neighbors, 1u, 32u)) props["restirDISpatialSamples"] = neighbors;
         if (diWidget.var("Spatial radius", radius, 1.f, 64.f)) props["restirDISpatialRadius"] = radius;
         if (!props.empty()) setProperties(props);
-        diWidget.text(mDIActive ? (mReGIRInitialActive ? "Active: ReGIR Initial RIS" : "Active: global Initial RIS") : "Inactive");
-        if (!mReGIRInitialFallbackReason.empty()) diWidget.text(mReGIRInitialFallbackReason.substr(0, mReGIRInitialFallbackReason.find('\n')));
+        diWidget.text(mDIActive ? "Active: global Initial RIS" : "Inactive");
         if (mDITemporalActive) diWidget.text(mDIHistoryReadValid ? "Temporal: history available" : "Temporal: current frame only");
         if (mDISpatialActive) diWidget.text("Spatial: active");
         if (mRestirDIEnabled && !mDIFallbackReason.empty())

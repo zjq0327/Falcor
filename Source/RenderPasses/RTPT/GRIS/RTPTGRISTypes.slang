@@ -13,9 +13,6 @@
 #ifndef RTPT_GRIS_DUAL_FIRST_HIT
 #define RTPT_GRIS_DUAL_FIRST_HIT 0
 #endif
-#ifndef RTPT_GRIS_DUAL_REGIR
-#define RTPT_GRIS_DUAL_REGIR 0
-#endif
 #ifndef RTPT_GRIS_DUAL_SHARC
 #define RTPT_GRIS_DUAL_SHARC 0
 #endif
@@ -25,14 +22,8 @@
 #ifndef RTPT_GRIS_SUFFIX_REPLAY
 #define RTPT_GRIS_SUFFIX_REPLAY 0
 #endif
-#ifndef RTPT_GRIS_REGIR_REPLAY
-#define RTPT_GRIS_REGIR_REPLAY 0
-#endif
 #ifndef RTPT_GRIS_CACHE_TAIL
 #define RTPT_GRIS_CACHE_TAIL 0
-#endif
-#ifndef RTPT_REGIR_ONLY
-#define RTPT_REGIR_ONLY 0
 #endif
 #if RTPT_GRIS_SPATIAL
 import Scene.HitInfo;
@@ -48,17 +39,12 @@ enum GrisTerminalKind : uint
     GrisNee,
     GrisEmitter,
     GrisEnvironment,
-    GrisReGIR,
-    GrisCacheTerminal,
-    // Fixed-x2 explicit paths store a weighted incident factor, never the
-    // legacy GrisReGIR UV/RIS reconstruction payload.
-    GrisReGIRPath,
+    GrisCacheTerminal = 5,
     // Fixed incident factor from a generation-time SHaRC query (deep only).
-    GrisSharcTail,
+    GrisSharcTail = 7,
     GrisDualPointNee,
     GrisDualEmissiveNee,
-    GrisDualReGIRNee,
-    GrisDualSharcTail,
+    GrisDualSharcTail = 11,
     GrisDualEnvironmentNee,
     GrisDualEmitter,
     GrisDualEnvironmentMiss,
@@ -122,15 +108,6 @@ UniformSampleGenerator rtptGrisForkReplayNEERng(inout UniformSampleGenerator sg,
     const uint second = sg.next();
     return UniformSampleGenerator(uint2(first, second), bounce);
 }
-#if RTPT_GRIS_REGIR_REPLAY
-float2 rtptGrisSplitReGIRReplayRng(inout UniformSampleGenerator directRng, uint bounce,
-    out UniformSampleGenerator cellRng)
-{
-    const float2 uv = sampleNext2D(directRng);
-    cellRng = rtptGrisForkReplayNEERng(directRng, bounce);
-    return uv;
-}
-#endif
 #endif
 
 struct GrisLocalPrefix
@@ -174,9 +151,9 @@ struct GrisSpatialRecord
     PackedHitInfo sourceX1;
     PackedHitInfo reconnectHit;
     float areaPdf;          // Owner proposal/reference ratio, or native x2 area times x2 direction PDF for dual deep tails.
-    float3 suffixDirection; // Fixed direction leaving x2, or light UV for dual direct NEE and legacy ReGIR.
-    float3 suffixLight;     // Tail factor, dual deep light UV, or dual ReGIR UV and inner RIS weight.
-    uint lightPdfOrStableID; // Light PDF bits, ReGIR stable light ID, or dual ordinary light index.
+    float3 suffixDirection; // Fixed direction leaving x2, or light UV for dual direct NEE.
+    float3 suffixLight;     // Tail factor or dual deep light UV.
+    uint lightPdfOrIndex; // Light PDF bits or dual NEE light index.
     bool lightIsAnalytic;
 #if RTPT_GRIS_SUFFIX_REPLAY
     uint suffixInstanceMask;
@@ -185,9 +162,7 @@ struct GrisSpatialRecord
 #endif
 #if RTPT_GRIS_SHARC_REPLAY
     uint2 sharcKey;
-    float3 sharcGain; // SHaRC gain, or the ReGIR inner RIS weight in x when both are enabled.
-#elif RTPT_GRIS_REGIR_REPLAY
-    float innerRISWeight;
+    float3 sharcGain;
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng; // Continuation stream after sampling x2's direction.
@@ -199,9 +174,9 @@ struct GrisSpatialRecord
 #if RTPT_GRIS_DUAL_FIRST_HIT
 struct GrisDualNeeTerminal
 {
-    float3 coordinates; // Ordinary light UV, or ReGIR UV and inner RIS weight.
+    float3 coordinates; // Light sample coordinates.
     uint terminalKind;
-    uint lightPdfOrStableID;
+    uint lightPdfOrIndex;
     bool lightIsAnalytic;
     bool hasWinner;
 };
@@ -233,7 +208,7 @@ struct GrisDualExplicitTerminal
     uint2 dualExplicitPathID;
     uint dualExplicitBounce; // Zero denotes an empty terminal.
     uint terminalKind;
-    uint lightPdfOrStableID;
+    uint lightPdfOrIndex;
     bool lightIsAnalytic;
 };
 #endif
@@ -272,17 +247,6 @@ uint rtptGrisTerminalKind(uint terminalAndFlags)
     return terminalAndFlags & kGrisTerminalKindMask;
 }
 
-#if RTPT_GRIS_REGIR_REPLAY
-float rtptGrisGetInnerRISWeight(GrisSpatialRecord suffix)
-{
-#if RTPT_GRIS_SHARC_REPLAY
-    const uint kind = rtptGrisTerminalKind(suffix.candidate.terminalKind);
-    return kind == uint(GrisTerminalKind::GrisReGIRPath) ? suffix.sharcGain.x : 0.f;
-#else
-    return suffix.innerRISWeight;
-#endif
-}
-#endif
 
 bool rtptGrisIsDeepTail(GrisSpatialRecord suffix)
 {
@@ -297,15 +261,11 @@ bool rtptGrisHasTerminal(GrisSpatialRecord suffix)
         kind == uint(GrisTerminalKind::GrisDualEnvironmentNee)) return true;
     if (kind == uint(GrisTerminalKind::GrisDualEmitter) || kind == uint(GrisTerminalKind::GrisDualEnvironmentMiss))
         return rtptGrisIsDeepTail(suffix);
-#if RTPT_GRIS_DUAL_REGIR
-    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee)) return true;
-#endif
 #if RTPT_GRIS_DUAL_SHARC
     if (kind == uint(GrisTerminalKind::GrisDualSharcTail)) return rtptGrisIsDeepTail(suffix);
 #endif
 #endif
     return suffix.areaPdf > 0.f && (kind == uint(GrisTerminalKind::GrisNee) ||
-        kind == uint(GrisTerminalKind::GrisReGIR) || kind == uint(GrisTerminalKind::GrisReGIRPath) ||
         kind == uint(GrisTerminalKind::GrisCacheTerminal) ||
 #if RTPT_GRIS_CACHE_TAIL
         (kind == uint(GrisTerminalKind::GrisSharcTail) && rtptGrisIsDeepTail(suffix)) ||
@@ -340,9 +300,9 @@ struct GrisTemporalFreshHistory
     uint rootLobe;
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
-    float3 suffixDirection; // Fixed x2 direction, or light UV for dual direct NEE and legacy ReGIR.
+    float3 suffixDirection; // Fixed x2 direction, or light UV for dual direct NEE.
     float3 suffixLight;     // Weighted tail factor, or light UV for dual deep NEE.
-    uint lightPdfOrStableID; // Light PDF bits, ReGIR stable light ID, or dual ordinary light index.
+    uint lightPdfOrIndex; // Light PDF bits or dual NEE light index.
     uint terminalAndFlags;
     float3 F;
     float W;
@@ -359,8 +319,6 @@ struct GrisTemporalFreshHistory
 #if RTPT_GRIS_SHARC_REPLAY
     uint2 sharcKey;
     float3 sharcGain;
-#elif RTPT_GRIS_REGIR_REPLAY
-    float innerRISWeight;
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng;

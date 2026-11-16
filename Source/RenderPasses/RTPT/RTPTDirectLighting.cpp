@@ -16,10 +16,6 @@ uint64_t reflectedStride(const ShaderVar& var)
 void RTPT::invalidateDirectLighting()
 {
     invalidateDIReuse();
-    // ReGIR Initial is the DI variant that uses cell candidates.
-    mpReGIRInitial = nullptr;
-    mReGIRInitialActive = mReGIRInitialPreparationFailed = false;
-    mReGIRInitialFallbackReason.clear();
     mpDIComputePass = mpDIInitialPass = mpDIShadePass = nullptr;
     mpDIReservoirs = mpDISampleRecords = mpDIResults = nullptr;
     mDIPreparedCatalogGeneration = 0u;
@@ -121,7 +117,7 @@ bool RTPT::prepareDirectLighting(bool catalogReady)
         mDIPreparedCatalogGeneration = catalog.generation;
         mDIPreparationFailed = true;
         mDIFallbackReason = reason;
-        if (!mReGIREnabled) logWarning("ReSTIR DI preparation failed; using original root lighting: {}", reason);
+        logWarning("ReSTIR DI preparation failed; using original root lighting: {}", reason);
         return false;
     }
 }
@@ -155,9 +151,6 @@ void RTPT::bindDIMainResources(const ShaderVar& rootVar) const
 
 void RTPT::executeDirectLighting(RenderContext* pRenderContext)
 {
-    mReGIRInitialActive = false;
-    FALCOR_CHECK(!mReGIREnabled || !mReGIRInitialPreparationFailed,
-        "ReGIR cell-only Initial is unavailable; global Initial sampling is disabled: {}", mReGIRInitialFallbackReason);
     const bool reuse = prepareDIReuse();
     auto bind = [&](const ShaderVar& var)
     {
@@ -168,7 +161,6 @@ void RTPT::executeDirectLighting(RenderContext* pRenderContext)
         var["gDILightCatalog"] = mLightCatalog.getSnapshot().lights;
         var["gDIReservoirs"] = mpDIReservoirs;
         var["gDISampleRecords"] = mpDISampleRecords;
-        if (mReGIREnabled) bindReGIRInitial(var);
         if (reuse)
         {
             bindDIReuseSettings(var, 0u, 0u);
@@ -176,38 +168,9 @@ void RTPT::executeDirectLighting(RenderContext* pRenderContext)
             if (var.hasMember("gDINeighborOffsets")) var["gDINeighborOffsets"] = mpDINeighborOffsets;
         }
     };
-    auto initialPass = reuse ? mpDIReuseInitialPass : mpDIInitialPass;
-    if (mReGIRActive && !mReGIRInitialPreparationFailed)
-    {
-        try
-        {
-            if (!mpReGIRInitial || mReGIRInitialReuse != reuse)
-            {
-                auto defines = initialPass->getProgram()->getDefines();
-                defines.add("RTPT_REGIR_ENABLED", "1");
-                auto desc = initialPass->getProgram()->getDesc();
-                desc.setShaderModel(ShaderModel::SM6_6);
-                desc.setCompilerArguments({"-Xdxc", "-enable-16bit-types"});
-                mpReGIRInitial = ComputePass::create(mpDevice, desc, defines, true);
-                mReGIRInitialReuse = reuse;
-            }
-            auto candidateVar = mpReGIRInitial->getRootVar();
-            bind(candidateVar);
-            bindReGIRInitial(candidateVar);
-            initialPass = mpReGIRInitial;
-            mReGIRInitialActive = true;
-            mReGIRInitialFallbackReason.clear();
-        }
-        catch (const std::exception& error)
-        {
-            mpReGIRInitial = nullptr;
-            mReGIRInitialPreparationFailed = true;
-            mReGIRInitialFallbackReason = error.what();
-            FALCOR_THROW("ReGIR cell-only Initial preparation failed; global Initial sampling is disabled: {}", error.what());
-        }
-    }
+    const auto& initialPass = reuse ? mpDIReuseInitialPass : mpDIInitialPass;
     auto initialVar = initialPass->getRootVar();
-    if (!mReGIRInitialActive) bind(initialVar);
+    bind(initialVar);
     {
         FALCOR_PROFILE(pRenderContext, "DIInitial");
         initialPass->execute(pRenderContext, uint3(mFrameDim, 1u));

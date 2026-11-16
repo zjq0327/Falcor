@@ -7,14 +7,6 @@ target_sources(RTPT PRIVATE
     RTPTDirectLighting.cpp
     RTPTLightCatalog.cpp
     RTPTLightCatalog.h
-    RTPTReGIR.cpp
-    ReGIR/RTPTReGIRResources.slang
-    ReGIR/RTPTReGIRGrid.slang
-    ReGIR/RTPTReGIRCulling.slang
-    ReGIR/RTPTReGIRBuild.cs.slang
-    ReGIR/RTPTReGIRCellLists.slang
-    ReGIR/RTPTReGIRUpdate.cs.slang
-    ReGIR/RTPTReGIRTransport.slang
     RTPTDIReuse.cpp
     RTPTPG.h
     RTPTPG.cpp

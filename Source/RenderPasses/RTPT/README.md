@@ -26,47 +26,17 @@ PG 现在保留已学习区域并按新的独立观测持续更新。相机移�
 
 模型池扩缩容保留已有 Read/Build、未消费统计和诊断后重新绑定，不重编译仅因容量变化而不变的 shader。相机选择不同 LOD 时保留原 level 的区域；sceneScale 切换用 CPU 命名空间区分同数值 key 对应的不同世界范围。容量压力每批最多替换容量 1/8 的陈旧区域，预算缩小时保留有界子集，不承诺永久保留所有访问过的区域。Read 在本帧采样/PDF 评价期间保持不变，训练写独立 Build，发布仍在本帧及训练完成后进行。
 
-固定 x2 reference-domain GRIS 不再以 PG version、generation 或 lookup 相机锚点判断历史有效性。PG 引起的程序重编译保留符合尺寸、反射布局及 reference 语义的 GRIS 历史，重新建立程序绑定和工作资源；旧 owner 使用保存的上一帧相机评价，目标 owner 使用当前相机。其他阶段按自身规则重建，例如 ENABLE_PG 重编译仍清首表面 ReSTIR DI 历史。cell-only ReGIR 在 brightnessThreshold=0 时，相机/LOD 改变不再单独触发域失效；正弱光截断保留其独立域检查。旧 F/W/M/R 始终配套使用，不按新 PG 重算源 R。GPU 记录仍为 fresh/candidate 128 B、history 108 B/像素。
+固定 x2 reference-domain GRIS 不再以 PG version、generation 或 lookup 相机锚点判断历史有效性。PG 引起的程序重编译保留符合尺寸、反射布局及 reference 语义的 GRIS 历史，重新建立程序绑定和工作资源；旧 owner 使用保存的上一帧相机评价，目标 owner 使用当前相机。其他阶段按自身规则重建，例如 ENABLE_PG 重编译仍清首表面 ReSTIR DI 历史。
+
+固定 x2 的 reference-domain GRIS保留每条历史记录配套的 `F/W/M` 和表示比例 `R=areaPdf/sourceAreaPdf`。fresh 记录的 R 来自实际生成密度，重连赢家则保存新 owner 下配套的 R 与归一化权重。交叉评价使用物理 BSDF 和固定辅助前缀分布，不使用新版 guide 重算旧记录的 R。连续帧、尺寸、记录语义和真实运输/光照域检查继续有效，PG 数据身份不再参与这条路径的历史门控，无需新增逐像素字段或保存旧 PG 树。
 
 `pgStats` 新增 initializations、resetCalls、modelMigrations、lastMigrationPreservedRegions、evictedRegions、namespaceChanges、activeRegions 和 readModelFingerprint；后者描述当前 namespace 的 Read 内容。`stageStats` 提供历史代际/已发布帧及 reference 语义标记；grisPGSnapshotDependent 在 reference 模式为 false，实际引导状态由 grisPGProposalActive 报告。实施契约和验证范围见 [持续更新计划](GRIS_PG_HISTORY_DECOUPLING_PLAN.md)。下文首版和性能实验中的“相机平移重置 PG”“跨 LOD 区域保留暂缓”属于当时行为，当前以上述实现为准。
 
-本次 Release 构建通过；最终 GPU 生命周期验收为 821 帧、43,879 项检查，覆盖普通采灯、ReGIR、实际独立队列训练、容量压力及预检失败恢复。两种采灯模式各 10 独立种子的 PT/local/joint 原始 HDR 均值验收均通过，local/joint 的 D/S/RGB 共 36/36 通道满足预定 ±2% / 95% 区间门槛，包含连续 alpha 更新和 16/32 MiB 模型池迁移。精确枚举和实际 shader 抽样压力检查也通过；完整协议、数值边界限制、二进制指纹和结果见 [最终验证汇总](../../../build/gris-pg-continuous-validation/summary.json)。这些结果不作等时画质或性能结论。
+连续 PG 更新的历史 Release 验收为 821 帧、43,879 项检查，覆盖普通采灯、ReGIR、实际独立队列训练、容量压力及预检失败恢复。两种采灯模式各 10 独立种子的 PT/local/joint 原始 HDR 均值验收均通过，local/joint 的 D/S/RGB 共 36/36 通道满足预定 ±2% / 95% 区间门槛，包含连续 alpha 更新和 16/32 MiB 模型池迁移。精确枚举和实际 shader 抽样压力检查也通过；完整协议、数值边界限制、二进制指纹和结果见 [最终验证汇总](../../../build/gris-pg-continuous-validation/summary.json)。这些结果不作等时画质或性能结论。
 
-## ReGIR：3D LOD cell 候选光源列表
+## 首表面 ReSTIR DI 与 NRD
 
-ReGIR 使用与 SHaRC 同类的世界空间对数 LOD，尺寸独立设置：`regirCellSize=2.0`，`regirCoarsenCellDistance=16.0`。相机欧氏距离达到 16 个当前层 cell 边长时变粗一级，默认距离 32、64、128 分别换为边长 4、8、16；改变 `sharcSceneScale` 不改变 ReGIR。`regirGridSize=20` 是兼容容量提示，向上取二次幂后分配 8192 个持久哈希槽，不表示空间边长。
-
-每个 cell 缓存完整的候选稳定 ID 列表，RIS 只从该列表抽样，首表面、次反弹和独立训练均无全局候选混合或全局回退。新 cell 首次使用先完整筛选候选，再从 cell 内抽取；没有当前 RIS 的新 cell 先使用列表内均匀提议。构建中的并发查询不自旋等待，而使用同一完整筛选集合的程序化视图。哈希或 ID 池不足也使用完整 cell 视图，不截断列表，不随机从全局取灯再拒绝；这条保留支持的路径可能增加成本，由统计明确报告。首表面记录未通过逐位相机射线校验时，仍对新追踪的表面使用 cell 内估计，并保留相同覆盖域，不能进入旧的全局 NEE；关闭屏幕 DI 时也采用该 cell 内根估计。准备和专用资源预算失败会明确报错，独立关闭 ReGIR 时保留原全局模式。
-
-`regirLightCullingEnabled` 控制整 cell 剔除；LOD 先按未抖动位置选择，再扩展 AABB 覆盖该层完整 jitter 范围与数值余量。单面发光面须整个体积都背向才剔除，双面材质跳过背向判断；聚光灯使用完整包围体与光锥。`regirBrightnessThreshold=1e-4` 是可调的线性入射光强度代理阈值，0 关闭弱光距离截断，启动脚本可用 `RTPT_REGIR_BRIGHTNESS_THRESHOLD` 覆盖。点光以最大绝对 RGB 强度、无纹理面光以面积乘最大绝对 RGB 辐亮度估计上界；发光纹理/光源方向配置没有可靠最大值时保留距离支持。距离取源/接收 AABB 的保守最近距离，不用中心距离。这是已接受的弱光近似，不是最终像素误差上限。
-
-静态光源不重复构建描述和候选列表；光源增删、移动、朝向或强度变化时，只重建旧/新候选归属不同的 cell。稳定 ID 与当前目录位置分离，压缩重排不串灯；RIS 使用当前光源每帧刷新，归一化分母为本 cell 候选数量。120 帧未查询的 cell 回收并复用候选存储段。64 MiB 专用预算计入所有新增缓存、描述、映射和临时资源；默认 32 RIS 槽/每槽 8 候选。`regirStats` 报告实际字节、列表构建/复用、程序化视图、容量压力、回收与稳定 ID。测试代码已清理，历史验证结果见 [验证汇总](../../../build/regir-cell-validation/summary.json)，VeachAjar 开关对比见 [场景报告](../../../build/regir-veach-comparison/summary.json)。
-
-## 固定 x2 GRIS 的 ReGIR 尾段采灯
-
-[RTPTGRISReGIR 测试图](../../../scripts/RTPTGRISReGIR.py) 将已有 cell-only ReGIR 接入新版多跳 GRIS：x0 直接光和 x1 本地贡献独立累计，x2 及深处的 ReGIR 项进入共享 terminal picker，再参与空间/时间重采样。图中关闭屏幕 ReSTIR DI、SHaRC 查询和 RR，开启 ReGIR 次级与独立训练；`useNEE` 保持 true，以启用直接光入口。GRIS 自动开启 PG，只引导漫反射首段 x0 → x1，x1 及更深方向仍为 BSDF。弱光距离截断设为 0。
-
-新 `GrisReGIRPath` kind 使用现有方向/尾因子槽保存已含内层 RIS 补偿的静态尾段，与旧 `GrisReGIR` 的 UV/权重重建编码区分。x2 直接项不套普通灯/BSDF MIS，也不含 x2 continuation 比率；深尾继续保留 q2/reference 转换。被 ReGIR 覆盖的非 delta 命灯 emission 按已有规则去重，delta 及直接可见 emission 保留。
-
-reference-tail 支持启用次级采灯的 cell-only ReGIR。开启时间复用与 NEE、关闭 RR 和弱光距离截断时，自动重建历史 ReGIR 后缀，从 RNG 恢复灯面 UV。SHaRC 查询可与这条重放路径共用。混合屏幕 DI 的组合保留完整本地估计。`stageStats.grisReGIRPathReuseEnabled` 报告实际编译生效状态。持久结构不新增字段，历史按场景、运输参数及独立光照域规则失效，不依赖 PG reset generation。ReGIR 自身共享缓存仍单独占用显存。
-
-满足 ReGIR 后缀重放条件时，按光源分域的历史检查自动启用。光源目录记录点光源及聚光灯的身份与版本，相关旧光源域从时间复用和交叉 MIS 中剔除。当前 fresh/空间技术覆盖当前光源，旧源继续使用对应的 `R/W/M`。光源版本表按稳定光源 ID 共享。
-
-该动态扩展完整重建通过；18 组/268 项精确检查、310 功能检查帧与持续 PG 联合测试通过。PG0 固定 10 seed、三臂各 1,024 移动帧的原始 D/S/RGB 对照完成 30,720 帧，旧/新策略各 9/9 通道满足预先锁定的 ±2% 均值等价门槛；40 帧关闭 ReGIR 回归的原始/NRD/记录字节与修改前完全一致。实际未变化灯旧尾段导入、元数据、版本、RNG 连续性、失败保留和范围限制见 [动态验证汇总](../../../build/gris-regir-dynamic-validation/summary.json)。该组结果不作性能或任意动态场景无偏性结论。
-
-固定 x2 的 reference-domain GRIS（普通采灯及上述 ReGIR-only 模式）保留每条历史记录配套的 `F/W/M` 和表示比例 `R=areaPdf/sourceAreaPdf`。fresh 记录的 R 来自实际生成密度，重连赢家则保存新 owner 下配套的 R 与归一化权重。交叉评价使用物理 BSDF 和固定辅助前缀分布，不使用新版 guide 重算旧记录的 R。连续帧、尺寸、记录语义和真实运输/光照域检查继续有效，PG 数据身份不再参与这条路径的历史门控，无需新增逐像素字段或保存旧 PG 树。
-
-此前仅放宽普通 publication 的验证：Release 构建通过；独立有理数枚举的 7 项用例、33,363 个状态和 56 项 indicator 检查通过。普通采灯及 ReGIR-only 的 temporal/joint 共 272 帧、4,068 项生命周期/有限值检查通过；其中 prefix 切换、Reset PG 和相机平移沿用旧失效预期。该历史验证仅检查可读标志，不代表本节持续更新实现或实际历史赢家的验收。记录见 [旧验证汇总](../../../build/gris-pg-history-validation/summary.json)。
-
-光路图、MIS/PDF 契约、实施范围及验证结果见 [接入计划](GRIS_REGIR_NEE_PLAN.md)。构建、245,631 条严格重建路径、功能和独立 10 seed 均值确认通过，PG0 四模式与 PG1 joint 共 45/45 通道满足预定 ±2% / 95% 区间门槛。PG1 精确关闭回归和初轮 5 seed 均值对照的未通过结果仍分别保留，最终汇总不标为全部验收通过。本场景 640×360 完整图 GPU 均值为 off 4.556 ms、on 5.424 ms；ReGIR 缓存约 34.283 MiB，GRIS 持久记录净增 0 B。具体范围见 [最终汇总](../../../build/gris-regir-validation/summary.json)。本轮隔离验证保存在 `build/gris-regir-validation/`，不恢复已归档的旧测试构建。
-
-## 首表面 ReSTIR DI 与 NRD 及后续 ReGIR 接入方案
-
-[实施方案与参考代码](REGIR_RESTIR_DI_NRD_PLAN.md) 以当前 PG、SHaRC、NRD 版本为基线，按用户指定顺序先完成首表面 ReSTIR DI 与 NRD：全局候选 → 最终灯样本 → RayQuery 阴影 → 分别评价 D/S → 与原间接信号合成并送入 NRD，完整验收后再增加 ReGIR。首批保留当前 D/S 双续接，概率式根通道单路径单独评估。阶段 1 的结构拆分、阶段 2 的全局 Initial RIS 和阶段 3 的 Temporal/Spatial 已接入；ReGIR 留在阶段 5。
-
-方案第 11 节列出 ReSTIR DI 的具体实现：已安装 RTXDI 1.3 的算法调用、RTPT 私有 bridge、Initial/Temporal/Spatial、buffer bank、运动和灯身份、最终 D/S 着色，以及每一步对应的本地和官方参考代码。
-
-第 12 节补充 ReGIR 的完整实现参考：本地 SDK 的 Grid/Onion、建表与查询函数、体素目标及资源布局，NVIDIA 官方示例、原始论文与补充实现，并记录当前包装层空缺及 1.3 参数适配细节。ReGIR 仍在首批 ReSTIR DI 与 NRD 验收之后实施。
+ReSTIR DI 在首表面对光源目录执行全局 Initial RIS，随后可执行 Temporal 和 Spatial 复用。DI 未覆盖的光源和后续反弹继续走 NEE。RTPT 输出 D/S 光照信号给 NRD。
 
 ## 阶段 3：Temporal 与 Spatial
 
@@ -86,7 +56,7 @@ reference-tail 支持启用次级采灯的 cell-only ReGIR。开启时间复用�
 
 ## 阶段 2：全局 Initial RIS 与最终 D/S 着色（2026-10-31）
 
-新增 RTPT 私有 `DirectLighting/`、`ReSTIRDI/` 和 `RTPTDirectLighting.cpp`。Initial 调用本地 RTXDI 1.3 的 `RTXDI_SampleLightsForSurface()`，关闭 ReGIR、BRDF、环境及时间/空间候选；全局均匀目录覆盖全部发光三角形与启用的点光/聚光灯。目录不按近似功率或 active 三角形列表剔除零代理灯。最终着色从完整精度 UV、稳定灯身份与代次重建当前灯样本，乘一次 SDK 已归一化的逆 PDF，共用一次当前 RayQuery 阴影，分别评价真实材质的 D/S。
+新增 RTPT 私有 `DirectLighting/`、`ReSTIRDI/` 和 `RTPTDirectLighting.cpp`。Initial 调用本地 RTXDI 1.3 的 `RTXDI_SampleLightsForSurface()`，关闭 BRDF、环境及时间/空间候选；全局均匀目录覆盖全部发光三角形与启用的点光/聚光灯。目录不按近似功率或 active 三角形列表剔除零代理灯。最终着色从完整精度 UV、稳定灯身份与代次重建当前灯样本，乘一次 SDK 已归一化的逆 PDF，共用一次当前 RayQuery 阴影，分别评价真实材质的 D/S。
 
 DI 接管首表面非 delta 的覆盖域：去掉该域的旧根 NEE 和首段命中发光面的 emission，同时继续原间接续接。环境、方向光及其他解析灯使用剩余域的正确选灯概率；主可见 emission、delta residual、深层 NEE 和独立 PG/SHaRC 训练保留原规则。合法空、黑色、遮挡或选中身份失效保留 DI 域，不根据结果补抽旧 NEE。只有准备或记录元数据失败才能恢复旧域。
 

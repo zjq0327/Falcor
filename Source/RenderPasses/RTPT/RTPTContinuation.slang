@@ -29,7 +29,7 @@
 #include "GRIS/RTPTGRISReference.slang"
 
 void rtptGrisCaptureDualExplicit(GrisDualNeeTerminal light, uint kind, uint bounce, uint2 pathID,
-    float3 incident, uint lightPdfOrStableID, out GrisDualExplicitTerminal terminal)
+    float3 incident, uint lightPdfOrIndex, out GrisDualExplicitTerminal terminal)
 {
     terminal.incident = incident;
     // x3 NEE can update the deep proposal after an x3 emitter was recorded.
@@ -37,30 +37,12 @@ void rtptGrisCaptureDualExplicit(GrisDualNeeTerminal light, uint kind, uint boun
     terminal.dualExplicitPathID = pathID;
     terminal.dualExplicitBounce = bounce;
     terminal.terminalKind = kind | kGrisDeepTail;
-    terminal.lightPdfOrStableID = lightPdfOrStableID;
+    terminal.lightPdfOrIndex = lightPdfOrIndex;
     terminal.lightIsAnalytic = light.lightIsAnalytic;
 }
 
 bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisDualNeeTerminal terminal, inout SampleGenerator rng, bool deep)
 {
-#if RTPT_GRIS_DUAL_REGIR
-    if (rtptReGIRTransportCoverage(false) == 0u) return false;
-
-    RTPTDILightInfo light;
-    float innerRISWeight;
-    // A failed draw from the cell estimates zero. Returning true consumes
-    // this event so the local estimator cannot retry the draw.
-    if (!rtptReGIRSelectTransportLight(surface, rng, light, innerRISWeight)) return true;
-    float2 uv = 0.f;
-#if USE_EMISSIVE_LIGHTS
-    if (light.kind == kRTPTDILightEmissive && light.sourceIndex < gScene.lightCollection.getTriangleCount())
-        uv = sampleNext2D(rng);
-#endif
-    terminal.lightPdfOrStableID = light.pad0;
-    terminal.lightIsAnalytic = light.kind == kRTPTDILightPoint;
-    terminal.coordinates = float3(uv, innerRISWeight);
-    terminal.terminalKind = uint(GrisTerminalKind::GrisDualReGIRNee);
-#else
     const float3 probabilities = rtptLightCategoryProbabilities();
     if (!any(probabilities > 0.f)) return false;
 
@@ -77,7 +59,7 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisDualNeeTerminal termi
     {
         const uint count = gScene.lightCollection.getActiveTriangleCount();
         const uint slot = min(uint(sampleNext1D(rng) * count), count - 1u);
-        terminal.lightPdfOrStableID = gScene.lightCollection.activeTriangles[slot];
+        terminal.lightPdfOrIndex = gScene.lightCollection.activeTriangles[slot];
         terminal.coordinates = float3(sampleNext2D(rng), 0.f);
         terminal.terminalKind = uint(GrisTerminalKind::GrisDualEmissiveNee);
     }
@@ -86,11 +68,10 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisDualNeeTerminal termi
     if (category == 2u)
     {
         // The host enables this mode for point analytic lights.
-        terminal.lightPdfOrStableID = rtptSampleAnalyticLightIndex(gScene.getLightCount(), rng);
+        terminal.lightPdfOrIndex = rtptSampleAnalyticLightIndex(gScene.getLightCount(), rng);
         terminal.lightIsAnalytic = true;
         terminal.terminalKind = uint(GrisTerminalKind::GrisDualPointNee);
     }
-#endif
 #endif
     if (deep) terminal.terminalKind |= kGrisDeepTail;
     // Keep raw proposals before backface, alpha, radiance and visibility tests.
@@ -225,9 +206,6 @@ float3 RTPT_CONTINUATION_NAME(
     float3 previousNormal = primarySD.getOrientedFaceNormal();
     float previousContinuationPdf = bs.pdf;
     bool previousUsedNEE = gParams.useNEE != 0 && !previousDelta;
-#if RTPT_REGIR_TRANSPORT
-    uint previousReGIRCoverage = 0u;
-#endif
 #if ENABLE_SHARC && SHARC_QUERY
     bool previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
     float previousRoughness = primaryMI.getProperties(primarySD).roughness;
@@ -264,14 +242,7 @@ float3 RTPT_CONTINUATION_NAME(
         if (!hit.isValid())
         {
 #if USE_ENV_LIGHT
-#if RTPT_REGIR_ONLY
-            const float lightPdf = 0.f;
-            const float misWeight = 1.f;
-#elif RTPT_REGIR_TRANSPORT
-            const float lightPdf = previousUsedNEE && !previousDelta
-                ? rtptEnvironmentLightPdfForCoverage(ray.dir, bounce == 1u ? rootCoverage : previousReGIRCoverage) : 0.f;
-            const float misWeight = previousUsedNEE && !previousDelta ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
-#elif RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI
             const float lightPdf = previousUsedNEE && !previousDelta
                 ? (bounce == 1u ? rtptEnvironmentLightPdfForCoverage(ray.dir, rootCoverage) : rtptEnvironmentLightPdf(ray.dir)) : 0.f;
             const float misWeight = previousUsedNEE && !previousDelta ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
@@ -533,32 +504,21 @@ float3 RTPT_CONTINUATION_NAME(
         if (any(emission > 0.f))
         {
             bool coveredRootEvent = false;
-#if RTPT_REGIR_TRANSPORT
-            if (!previousDelta)
-                coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, bounce == 1u ? rootCoverage : previousReGIRCoverage);
-#elif RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI
             if (bounce == 1u && !previousDelta)
                 coveredRootEvent = rtptDICoversEmissiveHit(triangleHit, rootCoverage);
 #endif
             if (!coveredRootEvent)
             {
-#if RTPT_REGIR_ONLY
-                const bool hasNeeCompetitor = false;
-                const float lightPdf = 0.f;
-#else
                 const bool hasNeeCompetitor = previousUsedNEE && !previousDelta;
                 const float lightPdf = hasNeeCompetitor ?
-#if RTPT_REGIR_TRANSPORT
-                        rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd,
-                            bounce == 1u ? rootCoverage : previousReGIRCoverage)
-#elif RTPT_USE_RESTIR_DI
+#if RTPT_USE_RESTIR_DI
                         bounce == 1u ? rtptEmissiveLightPdfForCoverage(previousPosition, previousNormal, triangleHit, sd, rootCoverage)
                                      : rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd)
 #else
                         rtptEmissiveLightPdf(previousPosition, previousNormal, triangleHit, sd)
 #endif
                     : 0.f;
-#endif
                 const float misWeight = hasNeeCompetitor ? rtptPowerHeuristic(previousContinuationPdf, lightPdf) : 1.f;
                 const float3 contribution = throughput * emission * misWeight;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
@@ -614,9 +574,6 @@ float3 RTPT_CONTINUATION_NAME(
 
         const bool hasNonDeltaLobes = (mi.getLobeTypes(sd) & uint(LobeType::NonDeltaReflection)) != 0;
         previousUsedNEE = gParams.useNEE != 0 && hasNonDeltaLobes;
-#if RTPT_REGIR_TRANSPORT
-        previousReGIRCoverage = previousUsedNEE ? rtptReGIRTransportCoverage(false) : 0u;
-#endif
         if (previousUsedNEE)
         {
             float3 contribution = 0.f;
@@ -708,7 +665,7 @@ float3 RTPT_CONTINUATION_NAME(
                         const float3 value = rtptGrisEvaluateDualLight(sd, sd, mi, proposal, lightProbability,
                             evalRng, false, shadowClear);
                         rtptGrisCaptureDualExplicit(light, light.terminalKind, bounce, explicitPathID,
-                            explicitThroughput * value * float(lateCount), light.lightPdfOrStableID, lateTerminal);
+                            explicitThroughput * value * float(lateCount), light.lightPdfOrIndex, lateTerminal);
                     }
                 }
             }
@@ -720,8 +677,7 @@ float3 RTPT_CONTINUATION_NAME(
             }
 #else
 #if RTPT_GRIS_SUFFIX_REPLAY
-            if ((bounce > 2u && pathBuilder.hasTail) ||
-                (RTPT_GRIS_REGIR_REPLAY && bounce == 2u && pathBuilder.hasInterface))
+            if (bounce > 2u && pathBuilder.hasTail)
             {
                 SampleGenerator neeRng = rtptGrisForkReplayNEERng(sg, bounce);
                 contribution = rtptGRISCapturePathNEE(bounce, sd, mi, sampling, throughput, query,
@@ -756,11 +712,7 @@ float3 RTPT_CONTINUATION_NAME(
             if (all(isfinite(contribution)))
             {
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
-#if RTPT_REGIR_ONLY
-                rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisReGIR);
-#else
                 rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisNee);
-#endif
 #endif
 #if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
                 const float neeLocalWeight = bounce == 2u ? selectedLocalWeight : localRadianceWeight;

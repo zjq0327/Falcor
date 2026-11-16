@@ -29,9 +29,7 @@ void rtptGrisGatherSpatialNeighbors(uint2 pixel, float3 camera, inout uint input
     inout GrisDualFirstHits sourceHits[kGrisMaxReuseInputs], inout uint sourceIndices[kGrisMaxReuseInputs])
 #else
     StructuredBuffer<GrisSpatialRecord> spatialInput,
-    inout GrisSpatialRecord inputs[kGrisMaxReuseInputs], inout float3 sourceCameras[kGrisMaxReuseInputs],
-    uint lightEpoch,
-    inout uint sourceLightEpochs[kGrisMaxReuseInputs])
+    inout GrisSpatialRecord inputs[kGrisMaxReuseInputs], inout float3 sourceCameras[kGrisMaxReuseInputs])
 #endif
 {
     ShadingData center;
@@ -60,7 +58,6 @@ void rtptGrisGatherSpatialNeighbors(uint2 pixel, float3 camera, inout uint input
 #else
         inputs[inputCount] = spatialInput[index];
         sourceCameras[inputCount] = camera;
-        sourceLightEpochs[inputCount] = lightEpoch;
 #endif
         ++inputCount;
     }

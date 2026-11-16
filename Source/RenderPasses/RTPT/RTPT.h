@@ -47,24 +47,14 @@ public:
             mGRISPreviousSharcMode == 2u ? mGRISPreviousSharc.resolved :
                 (mGRISPreviousSharcMode == 1u ? mpSHARCResolved : nullptr)};
     }
-    ref<Buffer> getGRISLightHistoryMetadataBuffer() const { return mLightCatalog.getSnapshot().lightHistoryMetadata; }
     Properties getDIStatistics() const;
-    Properties getReGIRStatistics() const;
     // Explicit model clear only. A proposal reset does not reset radiance or RNG history.
     void resetPG() { mResetPG = true; }
 
 private:
-    void invalidateReGIR();
-    void invalidateReGIRPrograms();
-    bool prepareReGIR(RenderContext* pRenderContext);
-    void bindReGIRInitial(const ShaderVar& rootVar, bool invalidateRIS = false) const;
-    void bindReGIRTransport(const ShaderVar& rootVar) const;
     void reset();
     void resetAccumulation();
-    void resetForSelectiveLightChange();
-    bool canUseGRISSelectiveLightHistory() const;
-    bool canPreserveGRISForPointLightChange() const;
-    bool canUseGRISReGIRReplay() const;
+    void resetAccumulationAndNRDHistory();
     bool canUseGRISSuffixReplay() const;
     bool canUseGRISDualDynamicReplay() const;
     bool canPreserveGRISSuffixReplayForPointLightChange() const;
@@ -81,7 +71,6 @@ private:
     bool useGRISCacheTail() const;
     bool canUseGRIS() const;
     bool canUseGRISDualFirstHit() const;
-    bool canUseGRISDualReGIRTemporal() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
@@ -120,55 +109,6 @@ private:
 
     ref<Scene> mpScene;
     RTPTLightCatalog mLightCatalog;
-    bool mReGIREnabled = false;
-    bool mReGIRSecondaryEnabled = true;
-    bool mReGIRTrainingEnabled = true;
-    bool mReGIRCullingEnabled = true;
-    uint32_t mReGIRGridSize = 20u;
-    uint32_t mReGIRLightsPerCell = 32u;
-    uint32_t mReGIRBuildSamples = 8u;
-    uint32_t mReGIRBudgetMB = 64u;
-    float mReGIRCellSize = 2.f;
-    float mReGIRCoarsenCellDistance = 16.f;
-    float mReGIRBrightnessThreshold = 1e-4f;
-    float mReGIRSamplingJitter = 1.f;
-    ref<ComputePass> mpReGIRBuild;
-    ref<ComputePass> mpReGIRInitial;
-    ref<ComputePass> mpReGIRUpdateLights;
-    ref<ComputePass> mpReGIRUpdateCells;
-    ref<Buffer> mpReGIRRIS;
-    ref<Buffer> mpReGIRCells;
-    ref<Buffer> mpReGIRCellRequests;
-    ref<Buffer> mpReGIRCellMeta;
-    ref<Buffer> mpReGIRCellEpoch;
-    ref<Buffer> mpReGIRCellRISState;
-    ref<Buffer> mpReGIRCellLastUsed;
-    ref<Buffer> mpReGIRCandidateIds;
-    ref<Buffer> mpReGIRState;
-    ref<Buffer> mpReGIRIdToCatalog;
-    ref<Buffer> mpReGIRLightDescriptors;
-    ref<Buffer> mpReGIRPreviousLightDescriptors;
-    ref<Buffer> mpReGIRDirtyLights;
-    uint32_t mReGIRLightIdCapacity = 0u;
-    uint32_t mReGIRPoolCapacity = 0u;
-    uint32_t mReGIRCatalogGeneration = 0u;
-    bool mReGIRInitialReuse = false;
-    bool mReGIRInitialActive = false;
-    bool mReGIRInitialPreparationFailed = false;
-    std::string mReGIRInitialFallbackReason;
-    bool mReGIRPrepared = false;
-    bool mReGIRActive = false;
-    bool mReGIRPreparationFailed = false;
-    uint32_t mReGIRSlotCount = 0u;
-    uint32_t mReGIRCellCapacity = 0u;
-    uint32_t mReGIRBuildFrameStamp = 0u;
-    uint64_t mReGIRPreparedFrameCount = 0u;
-    uint64_t mReGIRBuildCount = 0u;
-    uint64_t mReGIRDomainGeneration = 0u;
-    uint64_t mReGIRDualTemporalProposalEpoch = 0u;
-    uint32_t mReGIRDualTemporalProposalEpochFrame = 0u;
-    float3 mReGIRBuildCameraPosition = float3(0.f);
-    std::string mReGIRFallbackReason;
     ref<ComputePass> mpComputePass;
     ref<ComputePass> mpStageComputePass;
     ref<ComputePass> mpPrimarySurfacePass;
@@ -197,10 +137,6 @@ private:
         uint64_t pgVersion = 0u;
         uint32_t pgGeneration = 0u;
         uint64_t sharcVersion = 0u;
-        uint64_t regirDomainGeneration = 0u;
-        uint64_t regirProposalEpoch = 0u;
-        uint32_t lightEpoch = 0u;
-        bool selectiveLightDomain = false;
         bool suffixReplayDomain = false;
         bool dualFirstHitDomain = false;
         bool dualDynamicReplayDomain = false;
@@ -214,8 +150,6 @@ private:
             return (referenceReuse || (all(cameraPosition == other.cameraPosition) && pgVersion == other.pgVersion &&
                 pgGeneration == other.pgGeneration)) &&
                 (sharcVersion == other.sharcVersion || (allowSharcVersionChange && sharcVersion != 0u && other.sharcVersion != 0u)) &&
-                regirDomainGeneration == other.regirDomainGeneration && regirProposalEpoch == other.regirProposalEpoch &&
-                selectiveLightDomain == other.selectiveLightDomain &&
                 suffixReplayDomain == other.suffixReplayDomain && dualFirstHitDomain == other.dualFirstHitDomain &&
                 dualDynamicReplayDomain == other.dualDynamicReplayDomain;
         }
@@ -249,10 +183,6 @@ private:
     std::vector<AABB> mGRISReplayMovedBounds;
     ref<Buffer> mpGRISReplayMovedBounds;
     ref<Buffer> mpGRISReplayPreviousInstanceTransforms;
-    bool mGRISSelectiveLightHistoryEnabled = false;
-    bool mGRISLightHistoryPreserveRequested = false;
-    bool mGRISLightHistoryPreservedThisFrame = false;
-    uint32_t mGRISHistoryReadLightEpoch = 0u;
     std::string mGRISLightHistoryResetReason;
     std::string mGRISTemporalFallbackReason;
     bool mGRISSpatialDeepIncidentDisabled = false;

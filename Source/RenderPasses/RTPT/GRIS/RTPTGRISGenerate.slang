@@ -106,11 +106,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
             const uint lobes = mi.getLobeTypes(sd);
             float3 diDiffuse, diSpecular;
-            uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
-#if RTPT_REGIR_TRANSPORT
-            // Match Main when the primary DI record did not claim the light domain.
-            if (rootCoverage == 0u) rootCoverage = rtptReGIRRootCoverage();
-#endif
+            const uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
 #if RTPT_GRIS_ALTERNATING
             [unroll]
             for (uint slot = 0u; slot < 2u; ++slot)

@@ -34,9 +34,6 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
     float previousPdf = 0.f;
     bool previousDelta = false;
     bool previousUsedNEE = gParams.useNEE != 0u;
-#if RTPT_REGIR_TRANSPORT
-    uint previousCoverage = previousUsedNEE ? rtptReGIRTransportCoverage(false) : 0u;
-#endif
     bool currentSupported = true;
     bool previousSupported = true;
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
@@ -60,7 +57,7 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
     {
         float hitT;
         const HitInfo hit = query.traceRay(ray, hitT);
-        const bool usesMis = !RTPT_REGIR_ONLY && previousUsedNEE && !previousDelta;
+        const bool usesMis = previousUsedNEE && !previousDelta;
         if (!hit.isValid())
         {
 #if USE_ENV_LIGHT
@@ -164,9 +161,6 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
 #if USE_EMISSIVE_LIGHTS
             if (emitter)
             {
-#if RTPT_REGIR_TRANSPORT
-                if (!previousDelta && rtptDICoversEmissiveHit(triangle, previousCoverage)) return result;
-#endif
                 float3 emission = material.getProperties(surface).emission;
                 if (surface.frontFacing && gScene.materials.hasLightProfile(materialID))
                     emission *= gScene.materials.evalLightProfile(dot(surface.faceN, surface.V));
@@ -198,7 +192,6 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
             if (previousSupported)
             {
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
-#if !RTPT_GRIS_DUAL_REGIR
                 if (domain.previousLights && kind == uint(GrisTerminalKind::GrisDualPointNee))
                 {
                     SampleGenerator previousRng = evalRng;
@@ -208,7 +201,6 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
                         result.previous = oldValue;
                     return result;
                 }
-#endif
                 if (domain.previousGeometry && !shadowClear) return result;
 #endif
                 if (all(isfinite(value))) result.previous = value;
@@ -232,9 +224,6 @@ GrisDualDeepIncident rtptGrisTraceDualExplicit(GrisSpatialRecord tail, inout Sam
         previousRoughness = material.getProperties(surface).roughness;
 #endif
         previousUsedNEE = usesNee;
-#if RTPT_REGIR_TRANSPORT
-        previousCoverage = usesNee ? rtptReGIRTransportCoverage(false) : 0u;
-#endif
         previousPdf = scatter.pdf;
         previousPosition = surface.posW;
         previousNormal = surface.getOrientedFaceNormal();

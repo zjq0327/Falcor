@@ -3,7 +3,6 @@
 #ifndef RTPT_DI_REUSE_ENABLED
 #define RTPT_DI_REUSE_ENABLED 1
 #endif
-#define RTXDI_REGIR_MODE 0
 #define RTXDI_ENABLE_PRESAMPLING 0
 #include "rtxdi/RtxdiParameters.h"
 #include "RTPTDIBridge.slangh"

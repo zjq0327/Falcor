@@ -1,26 +1,7 @@
 #pragma once
 
-// Keep the validated uniform Initial a separate compile-time path. ReGIR uses
-// the SDK's RIS consumer with our shared SHaRC LOD lookup.
-#ifndef RTPT_REGIR_ENABLED
-#define RTPT_REGIR_ENABLED 0
-#endif
-#ifndef RTPT_REGIR_TRANSPORT
-#define RTPT_REGIR_TRANSPORT 0
-#endif
-#if RTPT_REGIR_ENABLED
-#define RTXDI_REGIR_MODE 0
-// Enable the RIS buffer reader, without the SDK's fixed Grid/Onion lookup.
-#define RTXDI_ENABLE_PRESAMPLING 1
-#else
-#define RTXDI_REGIR_MODE 0
 #define RTXDI_ENABLE_PRESAMPLING 0
-#endif
 #include "rtxdi/RtxdiParameters.h"
-#if RTPT_REGIR_ENABLED
-#include "../ReGIR/RTPTReGIRResources.slang"
-#define RTXDI_RIS_BUFFER gReGIRRIS
-#endif
 
 #ifndef RTPT_DI_WRITE_RESERVOIRS
 #define RTPT_DI_WRITE_RESERVOIRS 0
@@ -50,6 +31,6 @@ RTXDI_ResamplingRuntimeParameters rtptDIInitialRuntimeParameters()
     params.numLocalLights = gDISettings.lightCount;
     params.tileCount = 1u;
     params.tileSize = 1u;
-    // No infinite, environment, BRDF, ReGIR, checkerboard or importance tiles.
+    // No infinite, environment, BRDF, checkerboard or importance tiles.
     return params;
 }

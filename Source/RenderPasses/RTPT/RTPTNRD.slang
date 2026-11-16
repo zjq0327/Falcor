@@ -181,16 +181,8 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         }
 #endif
 
-#if RTPT_REGIR_TRANSPORT
-        // A rejected/missing primary record requires a fresh traced surface,
-        // not a global-light proposal. ReGIR retains the same local domain.
-        if (rootCoverage == 0u && gParams.useNEE != 0u && (hasDiffuse || hasSpecular))
-            rootCoverage = rtptEstimateReGIRRootDirect(sd, mi, sg, signals.diffuse, signals.specular);
-#endif
-
-#if !RTPT_REGIR_ONLY
         RTPTLightSample ls;
-#if RTPT_USE_RESTIR_DI || RTPT_REGIR_TRANSPORT
+#if RTPT_USE_RESTIR_DI
         if (rootCoverage != 0u)
         {
             if (gParams.useNEE != 0 && (hasDiffuse || hasSpecular) && rtptSampleLightForCoverage(sd, rootCoverage, sg, ls))
@@ -214,7 +206,6 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
                 }
             }
         }
-#endif
 #if RTPT_SEPARATE_SIGNAL_RESOLVE
 #if RTPT_USE_GRIS && RTPT_GRIS_ALTERNATING
         GrisDualShadedIndirect gris = {};

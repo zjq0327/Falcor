@@ -22,58 +22,6 @@ struct GrisReferencePrefix
     bool valid;
 };
 
-#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
-struct GrisLightHistorySettings
-{
-    uint enabled;
-    uint currentEpoch;
-    uint historyEpoch;
-    uint stableIdCount;
-};
-ConstantBuffer<GrisLightHistorySettings> gGRISLightHistorySettings;
-// birth epoch, last physical change epoch, alive, light kind. Unlike the
-// ReGIR culling descriptor this tracks RGB/spot changes, not only a proxy.
-StructuredBuffer<uint4> gGRISLightHistoryMetadata;
-#endif
-
-uint rtptGrisCurrentLightEpoch()
-{
-#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
-    return gGRISLightHistorySettings.currentEpoch;
-#else
-    return 0u;
-#endif
-}
-
-uint rtptGrisPreviousLightEpoch()
-{
-#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
-    return gGRISLightHistorySettings.historyEpoch;
-#else
-    return 0u;
-#endif
-}
-
-bool rtptGrisSourceAllowsTail(GrisSpatialRecord tail, uint sourceLightEpoch)
-{
-#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
-    if (gGRISLightHistorySettings.enabled == 0u || sourceLightEpoch == gGRISLightHistorySettings.currentEpoch)
-        return true;
-    // Phase one changes only analytic point/spot lights. Geometry, materials,
-    // emissive sources and environment changes retain structural invalidation.
-    if (rtptGrisTerminalKind(tail.candidate.terminalKind) != uint(GrisTerminalKind::GrisReGIRPath) ||
-        !tail.lightIsAnalytic) return true;
-    const uint stableID = tail.lightPdfOrStableID;
-    if (sourceLightEpoch == 0u || sourceLightEpoch > gGRISLightHistorySettings.currentEpoch ||
-        stableID >= gGRISLightHistorySettings.stableIdCount) return false;
-    const uint4 state = gGRISLightHistoryMetadata[stableID];
-    return state.z != 0u && state.w == kRTPTDILightPoint &&
-        state.x <= sourceLightEpoch && state.y <= sourceLightEpoch;
-#else
-    return true;
-#endif
-}
-
 float rtptGrisRefTarget(float3 value)
 {
     return dot(abs(value), float3(0.2126f, 0.7152f, 0.0722f));
@@ -132,9 +80,6 @@ bool rtptGrisRefKindSupported(GrisSpatialRecord record)
 #if RTPT_GRIS_CACHE_TAIL
         || (kind == uint(GrisTerminalKind::GrisSharcTail) && rtptGrisIsDeepTail(record))
 #endif
-#if RTPT_REGIR_TRANSPORT && RTPT_REGIR_ONLY
-        || kind == uint(GrisTerminalKind::GrisReGIRPath)
-#endif
         ;
 }
 
@@ -167,12 +112,6 @@ struct GrisSuffixReplaySettings
 #endif
 };
 
-bool rtptGrisIsReGIRReplayTail(GrisSpatialRecord tail)
-{
-    return RTPT_GRIS_REGIR_REPLAY &&
-        rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisReGIRPath);
-}
-
 bool rtptGrisReplayStoredTail(GrisSpatialRecord source, GrisSuffixReplaySettings replay,
     bool previous, out GrisSpatialRecord result)
 {
@@ -200,7 +139,6 @@ bool rtptGrisReplayStoredTail(GrisSpatialRecord source, GrisSuffixReplaySettings
         if ((source.suffixInstanceMask & replay.movedInstanceBits) != 0u) return false;
         return rtptGrisReplaySuffix(source, false, true, result);
     }
-    if (rtptGrisIsReGIRReplayTail(source)) return rtptGrisReplaySuffix(source, false, false, result);
 #if RTPT_GRIS_SHARC_REPLAY
     if (rtptGrisIsSharcTail(source))
     {
@@ -293,25 +231,17 @@ float3 rtptGrisRefEvaluate(PackedHitInfo primaryHit, float3 cameraPosition,
     const uint kind = rtptGrisTerminalKind(tail.candidate.terminalKind);
     if (!rtptGrisIsDeepTail(tail) && kind == uint(GrisTerminalKind::GrisNee))
     {
-        const float lightPdf = asfloat(tail.lightPdfOrStableID);
+        const float lightPdf = asfloat(tail.lightPdfOrIndex);
         if (!tail.lightIsAnalytic && 2u < gParams.maxBounces)
             endpoint *= rtptPowerHeuristic(lightPdf, scatterPdf);
-    }
-    else if (!rtptGrisIsDeepTail(tail) && kind == uint(GrisTerminalKind::GrisReGIRPath))
-    {
-        // Direct x2 -> light: its inner RIS compensation is already in
-        // endpoint, and the covered emission has no BSDF competitor. This
-        // sample did not draw an x2 continuation, so do not add q2/q_ref.
     }
     else
     {
         if (!(scatterPdf > 0.f)) return 0.f;
         ownerRatio *= scatterPdf / kGrisReferenceDirectionPdf;
         endpoint /= kGrisReferenceDirectionPdf;
-#if !RTPT_REGIR_ONLY
         if (!rtptGrisIsDeepTail(tail) && gParams.useNEE != 0u && !tail.lightIsAnalytic)
-            endpoint *= rtptPowerHeuristic(scatterPdf, asfloat(tail.lightPdfOrStableID));
-#endif
+            endpoint *= rtptPowerHeuristic(scatterPdf, asfloat(tail.lightPdfOrIndex));
     }
     const float3 value = prefixFactor * scatter * endpoint;
     if (!(ownerRatio > 0.f) || !isfinite(ownerRatio) || !all(isfinite(value))) { ownerRatio = 0.f; return 0.f; }
@@ -341,7 +271,7 @@ void rtptGrisNormalizeGenerated(inout GrisSpatialRecord record, GrisLocalPrefix 
 
 #if defined(RTPT_GRIS_STORED_PREFIX_REUSE)
 GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpatialRecord inputs[kGrisMaxReuseInputs],
-    float3 sourceCameras[kGrisMaxReuseInputs], uint sourceLightEpochs[kGrisMaxReuseInputs],
+    float3 sourceCameras[kGrisMaxReuseInputs],
     uint inputCount, inout SampleGenerator rng
 #if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
     , GrisSuffixReplaySettings replay
@@ -376,13 +306,11 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
                 domainValid[j] = false;
                 continue;
             }
-            historyWinnerSupported = rtptGrisSourceAllowsTail(inputs[j], sourceLightEpochs[j]) &&
-                rtptGrisReplayStoredTail(inputs[j], replay, false, historyInCurrent);
+            historyWinnerSupported = rtptGrisReplayStoredTail(inputs[j], replay, false, historyInCurrent);
             canonicalInHistorySupported = rtptGrisReplayStoredTail(canonical, replay, true, canonicalInHistory);
             // An unavailable previous point-light proposal invalidates the
             // history domain. A geometrically blocked candidate is only zero.
-            if (replay.lightChanged || (replay.validateUnchanged && !RTPT_GRIS_REGIR_REPLAY &&
-                !RTPT_GRIS_SHARC_REPLAY))
+            if (replay.lightChanged || (replay.validateUnchanged && !RTPT_GRIS_SHARC_REPLAY))
                 domainValid[j] = historyWinnerSupported && canonicalInHistorySupported;
         }
 #endif
@@ -406,7 +334,7 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
         GrisSpatialRecord candidate = canonical;
         if (!center)
         {
-            if (!domainValid[i] || !rtptGrisSourceAllowsTail(inputs[i], sourceLightEpochs[i])) continue;
+            if (!domainValid[i]) continue;
             candidate = inputs[i];
         }
         if (!candidate.candidate.hasWinner) continue;
@@ -453,7 +381,6 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
                 previousGeometry = replay.geometryChanged;
             }
 #endif
-            if (!rtptGrisSourceAllowsTail(crossTail, sourceLightEpochs[j])) continue;
             float crossRatio, crossDistance;
             const float3 cross = rtptGrisRefEvaluate(inputs[j].ownerPrimaryHit, sourceCameras[j], prefix, crossTail,
                 rng, crossRatio, crossDistance, previousGeometry, previousGeometry);
@@ -534,25 +461,19 @@ float rtptGrisDualLightProbability(GrisSpatialRecord tail)
     // Its selected-lobe proposal compensation is folded into the incident.
     if (kind == uint(GrisTerminalKind::GrisDualSharcTail)) return 1.f;
 #endif
-#if RTPT_GRIS_DUAL_REGIR
-    // The ReGIR draw is conditional on the shared receiver. Both routes
-    // therefore use the same light proposal, including its inner RIS weight.
-    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee))
-        return tail.suffixLight.z > 0.f && isfinite(tail.suffixLight.z) ? 1.f : 0.f;
-#endif
     const float3 categories = rtptLightCategoryProbabilities();
 #if USE_ENV_LIGHT
     if (kind == uint(GrisTerminalKind::GrisDualEnvironmentNee)) return categories.x;
 #endif
 #if USE_ANALYTIC_LIGHTS
     if (kind == uint(GrisTerminalKind::GrisDualPointNee) &&
-        tail.lightPdfOrStableID < gScene.getLightCount())
+        tail.lightPdfOrIndex < gScene.getLightCount())
         return categories.z / float(gScene.getLightCount());
 #endif
 #if USE_EMISSIVE_LIGHTS
     if (kind == uint(GrisTerminalKind::GrisDualEmissiveNee) &&
-        categories.y > 0.f && tail.lightPdfOrStableID < gScene.lightCollection.getTriangleCount() &&
-        gScene.lightCollection.getActiveTriangleIndex(tail.lightPdfOrStableID) != LightCollection::kInvalidIndex)
+        categories.y > 0.f && tail.lightPdfOrIndex < gScene.lightCollection.getTriangleCount() &&
+        gScene.lightCollection.getActiveTriangleIndex(tail.lightPdfOrIndex) != LightCollection::kInvalidIndex)
         return categories.y / float(gScene.lightCollection.getActiveTriangleCount());
 #endif
     return 0.f;
@@ -588,21 +509,10 @@ bool rtptGrisSampleSpatialDualLight(ShadingData surface, GrisSpatialRecord tail,
         return true;
     }
 #endif
-#if RTPT_GRIS_DUAL_REGIR
-    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee))
-    {
-        RTPTLightSample light;
-        if (!rtptReGIRRebuildTransportSample(surface, tail.lightPdfOrStableID, tail.suffixLight.xy,
-            tail.suffixLight.z, light)) return false;
-        result.dir = light.dir;
-        result.radiance = light.LiOverPdf;
-        return true;
-    }
-#endif
 #if USE_ANALYTIC_LIGHTS
     if (kind == uint(GrisTerminalKind::GrisDualPointNee))
     {
-        const LightData light = gScene.getLight(tail.lightPdfOrStableID);
+        const LightData light = gScene.getLight(tail.lightPdfOrIndex);
         AnalyticLightSample sample;
         if (!samplePointLight(surface.posW, light, sample) ||
             dot(surface.getOrientedFaceNormal(), sample.dir) <= 0.f ||
@@ -615,7 +525,7 @@ bool rtptGrisSampleSpatialDualLight(ShadingData surface, GrisSpatialRecord tail,
 #if USE_EMISSIVE_LIGHTS
     if (kind == uint(GrisTerminalKind::GrisDualEmissiveNee))
     {
-        const uint lightIndex = tail.lightPdfOrStableID;
+        const uint lightIndex = tail.lightPdfOrIndex;
         const float2 uv = tail.suffixDirection.xy;
         TriangleLightSample sample;
         if (!sampleTriangle(surface.posW, lightIndex, uv, sample) ||
@@ -654,7 +564,7 @@ float3 rtptGrisEvaluateSpatialDualLight(ShadingData surface, IMaterialInstance m
     if (light.state != kGrisSpatialLightValid) return 0.f;
 
     const uint kind = rtptGrisTerminalKind(tail.candidate.terminalKind);
-    if (kind == uint(GrisTerminalKind::GrisDualPointNee) || kind == uint(GrisTerminalKind::GrisDualReGIRNee))
+    if (kind == uint(GrisTerminalKind::GrisDualPointNee))
         return material.eval(surface, light.dir, rng) * light.radiance;
 
     const float lightPdf = lightProbability * light.pdf;
@@ -694,26 +604,11 @@ float3 rtptGrisEvaluateDualLight(ShadingData surface, ShadingData visibilitySurf
         return material.eval(surface, sample.dir, rng) * sample.Le * (mis / sample.pdf);
     }
 #endif
-#if RTPT_GRIS_DUAL_REGIR
-    if (kind == uint(GrisTerminalKind::GrisDualReGIRNee))
-    {
-        RTPTLightSample light;
-        if (!rtptReGIRRebuildTransportSample(surface, tail.lightPdfOrStableID, tail.suffixLight.xy,
-            tail.suffixLight.z, light)) return 0.f;
-        if (!knownVisible && !query.traceVisibilityRay(light.visibilityRay)) return 0.f;
-#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
-        if (movedBoundsCount != 0u) shadowClear = rtptGrisReplayRayClear(light.visibilityRay, movedBoundsCount);
-#endif
-        // LiOverPdf already includes the inner weight. ReGIR owns the
-        // covered NEE domain, with no competing ordinary BSDF light sample.
-        return material.eval(surface, light.dir, rng) * light.LiOverPdf;
-    }
-#endif
 #if USE_ANALYTIC_LIGHTS
     if (kind == uint(GrisTerminalKind::GrisDualPointNee))
     {
-        const uint lightIndex = tail.lightPdfOrStableID;
-#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY && !RTPT_GRIS_DUAL_REGIR
+        const uint lightIndex = tail.lightPdfOrIndex;
+#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
         const LightData light = previousLights ? gGRISReplayPreviousLights[lightIndex] : gScene.getLight(lightIndex);
 #else
         const LightData light = gScene.getLight(lightIndex);
@@ -736,7 +631,7 @@ float3 rtptGrisEvaluateDualLight(ShadingData surface, ShadingData visibilitySurf
 #if USE_EMISSIVE_LIGHTS
     if (kind == uint(GrisTerminalKind::GrisDualEmissiveNee))
     {
-        const uint lightIndex = tail.lightPdfOrStableID;
+        const uint lightIndex = tail.lightPdfOrIndex;
         const float2 uv = rtptGrisIsDeepTail(tail) ? tail.suffixLight.xy : tail.suffixDirection.xy;
         TriangleLightSample sample;
         if (!sampleTriangle(surface.posW, lightIndex, uv, sample) ||
@@ -825,11 +720,9 @@ GrisDualDeepIncident rtptGrisTraceDualDeep(GrisSpatialRecord tail, inout SampleG
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
     if (domain.previousGeometry)
         result.previous = shadowClear ? result.current : float3(0.f);
-#if !RTPT_GRIS_DUAL_REGIR
     else if (evaluatePrevious && domain.previousLights &&
         rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualPointNee))
         result.previous = rtptGrisEvaluateDualDeep(tail, hit.getTriangleHit(), lightProbability, rng, shadowClear, true);
-#endif
 #endif
     return result;
 }
@@ -893,11 +786,6 @@ bool rtptGrisBuildDualRoute(ShadingData primary, GrisDualFirstHits hits, uint sl
     if ((hits.attemptedMask & (1u << slot)) == 0u || !(firstPdf > 0.f) || !isfinite(firstPdf)) return false;
     bool certifyPrevious = domain.previousGeometry && deep;
     bool certifyDirect = false;
-#if RTPT_GRIS_DUAL_DYNAMIC_REPLAY && RTPT_GRIS_DUAL_REGIR
-    certifyDirect = domain.previousGeometry && !deep &&
-        rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualReGIRNee);
-    certifyPrevious = certifyPrevious || certifyDirect;
-#endif
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY && USE_ENV_LIGHT
     certifyDirect = certifyDirect || (domain.previousGeometry && !deep &&
         rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualEnvironmentNee));
@@ -1054,10 +942,6 @@ bool rtptGrisLoadDualTailEndpoints(PackedHitInfo ownerPrimaryHit, float3 camera,
 #else
     x2 = 0.f;
     bool rebuildPrevious = domain.previousGeometry && !deep;
-#if RTPT_GRIS_DUAL_REGIR
-    if (rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualReGIRNee))
-        rebuildPrevious = false;
-#endif
 #if USE_ENV_LIGHT
     if (rtptGrisTerminalKind(tail.candidate.terminalKind) == uint(GrisTerminalKind::GrisDualEnvironmentNee))
         rebuildPrevious = false;
@@ -1122,9 +1006,6 @@ bool rtptGrisDualTailValid(GrisSpatialRecord record)
     const uint kind = rtptGrisTerminalKind(record.candidate.terminalKind);
     return record.candidate.hasWinner &&
         (
-#if RTPT_GRIS_DUAL_REGIR
-            kind == uint(GrisTerminalKind::GrisDualReGIRNee) ||
-#endif
 #if RTPT_GRIS_DUAL_SHARC
 #if RTPT_GRIS_GENERATE
             kind == uint(GrisTerminalKind::GrisDualSharcTail) ||
@@ -1199,14 +1080,10 @@ void rtptGrisApplyDualNeeTerminal(GrisDualNeeTerminal terminal, bool deep, inout
 {
     record.candidate.terminalKind = terminal.terminalKind;
     record.candidate.hasWinner = terminal.hasWinner;
-    record.lightPdfOrStableID = terminal.lightPdfOrStableID;
+    record.lightPdfOrIndex = terminal.lightPdfOrIndex;
     record.lightIsAnalytic = terminal.lightIsAnalytic;
-#if RTPT_GRIS_DUAL_REGIR
-    record.suffixLight = terminal.coordinates;
-#else
     if (deep) record.suffixLight = terminal.coordinates;
     else record.suffixDirection = terminal.coordinates;
-#endif
 }
 
 // Rebuild the same record for scoring and for publishing the chosen event.
@@ -1242,7 +1119,7 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
         proposal.dualExplicitBounce = terminal.dualExplicitBounce;
         proposal.candidate.terminalKind = terminal.terminalKind;
         proposal.candidate.hasWinner = terminal.dualExplicitBounce != 0u;
-        proposal.lightPdfOrStableID = terminal.lightPdfOrStableID;
+        proposal.lightPdfOrIndex = terminal.lightPdfOrIndex;
         proposal.lightIsAnalytic = terminal.lightIsAnalytic;
     }
     return proposal;
@@ -1352,7 +1229,7 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
             const float lightProbability = rtptGrisDualLightProbability(proposal);
             const float3 deepIncident = rtptGrisResolveFreshIncident(proposal, event, deepSamples[slot],
                 recordedIncident, lightProbability, rng);
-            const float deepLightPdf = event == 2u ? asfloat(terminal.lightPdfOrStableID) : 0.f;
+            const float deepLightPdf = event == 2u ? asfloat(terminal.lightPdfOrIndex) : 0.f;
             GrisDualTailValue value = {};
 #if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
             if (event == 0u && x2Samples[slot].hasNativeDirectF)
@@ -1437,7 +1314,7 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
 #if RTPT_GRIS_X2_SUFFIX_MODE == 3
             winnerDeepSample = deepSamples[slot];
             if (event == 2u || event == 3u) winnerIncident = terminal.incident;
-            if (event == 2u) winnerDeepLightPdf = asfloat(terminal.lightPdfOrStableID);
+            if (event == 2u) winnerDeepLightPdf = asfloat(terminal.lightPdfOrIndex);
 #if RTPT_GRIS_DUAL_SHARC
             if (event == 4u) winnerIncident = cacheIncident[slot];
 #endif

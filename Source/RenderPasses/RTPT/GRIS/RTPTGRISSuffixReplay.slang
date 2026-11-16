@@ -25,18 +25,6 @@ GrisNeeReplayStatus rtptGrisSampleReplayNee(GrisSpatialRecord source, ShadingDat
     bool previousLight, bool pointLightChanged, inout SampleGenerator rng, out RTPTLightSample light)
 {
     light = {};
-#if RTPT_GRIS_REGIR_REPLAY
-    if (rtptGrisTerminalKind(source.candidate.terminalKind) == uint(GrisTerminalKind::GrisReGIRPath))
-    {
-        const float innerRISWeight = rtptGrisGetInnerRISWeight(source);
-        if (previousLight || !(innerRISWeight > 0.f) || !isfinite(innerRISWeight))
-            return GrisNeeReplayStatus::GrisReplayInvalid;
-        SampleGenerator unusedCellRng;
-        const float2 uv = rtptGrisSplitReGIRReplayRng(rng, source.terminalBounce, unusedCellRng);
-        return rtptReGIRRebuildTransportSample(sd, source.lightPdfOrStableID, uv, innerRISWeight, light)
-            ? GrisNeeReplayStatus::GrisReplaySampled : GrisNeeReplayStatus::GrisReplayZero;
-    }
-#endif
     const bool environmentNee = rtptGrisIsEnvironmentNee(source);
     if (environmentNee || rtptGrisIsEmissiveNee(source))
     {
@@ -75,9 +63,8 @@ bool rtptGrisReplayDirectNeeInPreviousGeometry(GrisSpatialRecord source, out Gri
     result = source;
     result.suffixLight = 0.f;
     const uint kind = rtptGrisTerminalKind(source.candidate.terminalKind);
-    const bool regir = RTPT_GRIS_REGIR_REPLAY && kind == uint(GrisTerminalKind::GrisReGIRPath);
     if (source.terminalBounce != 2u || source.terminalBounce >= gParams.maxBounces || rtptGrisIsDeepTail(source) ||
-        (!regir && (kind != uint(GrisTerminalKind::GrisNee) || !rtptGrisHasReplayableNee(source))) ||
+        kind != uint(GrisTerminalKind::GrisNee) || !rtptGrisHasReplayableNee(source) ||
         all(source.postX2RngState == 0u)) return false;
 
     // Geometry-only replay keeps the light sampling domain unchanged. The
@@ -93,7 +80,7 @@ bool rtptGrisReplayDirectNeeInPreviousGeometry(GrisSpatialRecord source, out Gri
     {
         result.suffixDirection = light.dir;
         result.suffixLight = light.LiOverPdf;
-        if (!regir) result.lightPdfOrStableID = asuint(light.pdf);
+        result.lightPdfOrIndex = asuint(light.pdf);
     }
     return true;
 }
@@ -111,8 +98,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
     if (geometryChanged) result.suffixInstanceMask = 0u;
 
     const uint kind = rtptGrisTerminalKind(source.candidate.terminalKind);
-    const bool regir = RTPT_GRIS_REGIR_REPLAY && kind == uint(GrisTerminalKind::GrisReGIRPath);
-    const bool nee = regir || kind == uint(GrisTerminalKind::GrisNee);
+    const bool nee = kind == uint(GrisTerminalKind::GrisNee);
     const bool emitter = kind == uint(GrisTerminalKind::GrisEmitter);
     const bool environment = kind == uint(GrisTerminalKind::GrisEnvironment);
 #if RTPT_GRIS_SHARC_REPLAY
@@ -126,7 +112,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
         terminalBounce < (nee ? 2u : 3u) || terminalBounce > gParams.maxBounces ||
         deep != (terminalBounce > (nee ? 2u : 3u)) ||
         (sharc && (previousLight || terminalBounce < 4u || terminalBounce == gParams.maxBounces)) ||
-        (nee && (terminalBounce == gParams.maxBounces || (!regir && !rtptGrisHasReplayableNee(source)))) ||
+        (nee && (terminalBounce == gParams.maxBounces || !rtptGrisHasReplayableNee(source))) ||
         ((nee || terminalBounce > 3u) && all(source.postX2RngState == 0u)))
         return false;
 
@@ -135,11 +121,11 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
 #if defined(RTPT_GRIS_STORED_PREFIX_REUSE)
     if (movedReconnect)
     {
-        if (!rtptGrisLoadMovedReconnect(source, false, reconnect)) return !regir;
+        if (!rtptGrisLoadMovedReconnect(source, false, reconnect)) return true;
     }
     else
 #else
-    if (movedReconnect) return !regir;
+    if (movedReconnect) return true;
 #endif
     // The saved reflection direction is on the same side of x2 as the source
     // view. Use that side to reconstruct the ray origin. The reference
@@ -158,7 +144,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
         if (status == GrisNeeReplayStatus::GrisReplaySampled)
         {
             result.suffixDirection = light.dir;
-            if (!regir) result.lightPdfOrStableID = asuint(light.pdf);
+            result.lightPdfOrIndex = asuint(light.pdf);
             if (query.traceVisibilityRay(light.visibilityRay)) result.suffixLight = light.LiOverPdf;
         }
         return true;
@@ -188,16 +174,10 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
     {
         float hitT;
         const HitInfo hit = query.traceRay(ray, hitT);
-#if RTPT_REGIR_ONLY
-        // Generate assigns the explicit BSDF terminals full weight in the
-        // cell-only light domain.
-        const bool hasNeeCompetitor = false;
-#else
         const bool hasNeeCompetitor = previousUsedNEE && !previousDelta;
-#endif
         if (!hit.isValid())
         {
-            if (pointLightChanged || regir) return false;
+            if (pointLightChanged) return false;
 #if USE_ENV_LIGHT
             if (environment && bounce == terminalBounce)
             {
@@ -206,18 +186,18 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
                 const float mis = deep && hasNeeCompetitor ? rtptPowerHeuristic(previousPdf, pdf) : 1.f;
                 const float3 value = throughput * emission * mis;
                 if (all(isfinite(value))) result.suffixLight = value;
-                result.lightPdfOrStableID = asuint(pdf);
+                result.lightPdfOrIndex = asuint(pdf);
             }
 #endif
             return true;
         }
-        if (hit.getType() != HitType::Triangle) return !(pointLightChanged || regir);
+        if (hit.getType() != HitType::Triangle) return !pointLightChanged;
 
         const TriangleHit triangleHit = hit.getTriangleHit();
         if (geometryChanged)
         {
             const uint instance = triangleHit.instanceID.index;
-            if (gGRISReplayMovedInstances[instance] != 0u) return !regir;
+            if (gGRISReplayMovedInstances[instance] != 0u) return true;
             result.suffixInstanceMask |= rtptGrisSuffixInstanceBit(instance);
         }
         const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
@@ -260,7 +240,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
 #endif
             if (nee)
             {
-                if (!usesNEE) return !(pointLightChanged || regir);
+                if (!usesNEE) return !pointLightChanged;
                 SampleGenerator neeRng = rtptGrisForkReplayNEERng(rng, bounce);
                 RTPTLightSample light;
                 const GrisNeeReplayStatus status = rtptGrisSampleReplayNee(source, sd, previousLight,
@@ -269,8 +249,8 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
                 if (status == GrisNeeReplayStatus::GrisReplayCached) result = source;
                 if (status == GrisNeeReplayStatus::GrisReplaySampled)
                 {
-                    const float3 value = throughput * rtptEvaluateLightSample(sd, material, sampling, light, neeRng, !regir);
-                    if (!regir) result.lightPdfOrStableID = asuint(light.pdf);
+                    const float3 value = throughput * rtptEvaluateLightSample(sd, material, sampling, light, neeRng, true);
+                    result.lightPdfOrIndex = asuint(light.pdf);
                     if (all(isfinite(value)) && query.traceVisibilityRay(light.visibilityRay))
                         result.suffixLight = value;
                 }
@@ -287,7 +267,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
                 const float mis = deep && hasNeeCompetitor ? rtptPowerHeuristic(previousPdf, pdf) : 1.f;
                 const float3 value = throughput * emission * mis;
                 if (all(isfinite(value))) result.suffixLight = value;
-                result.lightPdfOrStableID = asuint(pdf);
+                result.lightPdfOrIndex = asuint(pdf);
             }
 #endif
             return true;
@@ -300,7 +280,7 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
         bool guideSelected;
         if (!rtptSampleContinuation(sd, material, sampling, rng, scatter, guideSelected) ||
             scatter.isLobe(LobeType::Transmission) ||
-            !all(isfinite(scatter.wo)) || !all(isfinite(scatter.weight))) return !(pointLightChanged || regir);
+            !all(isfinite(scatter.wo)) || !all(isfinite(scatter.weight))) return !pointLightChanged;
         previousDelta = scatter.isLobe(LobeType::Delta);
 #if RTPT_GRIS_SHARC_REPLAY
         if (sharc)
@@ -310,9 +290,9 @@ bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geo
             previousRoughness = material.getProperties(sd).roughness;
         }
 #endif
-        if (!previousDelta && (!(scatter.pdf > 0.f) || !isfinite(scatter.pdf))) return !(pointLightChanged || regir);
+        if (!previousDelta && (!(scatter.pdf > 0.f) || !isfinite(scatter.pdf))) return !pointLightChanged;
         throughput *= scatter.weight;
-        if (!all(isfinite(throughput)) || !any(throughput > 0.f)) return !(pointLightChanged || regir);
+        if (!all(isfinite(throughput)) || !any(throughput > 0.f)) return !pointLightChanged;
 
         previousUsedNEE = usesNEE;
         previousPdf = scatter.pdf;

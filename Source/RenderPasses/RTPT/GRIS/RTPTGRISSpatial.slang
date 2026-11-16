@@ -42,10 +42,9 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #else
     GrisSpatialRecord inputs[kGrisMaxReuseInputs];
     float3 sourceCameras[kGrisMaxReuseInputs];
-    uint sourceLightEpochs[kGrisMaxReuseInputs];
     rtptGrisGatherSpatialNeighbors(pixel, gScene.camera.getPosition(), inputCount, gGRISSpatialInput,
-        inputs, sourceCameras, rtptGrisCurrentLightEpoch(), sourceLightEpochs);
-    result = rtptGrisMergeStoredPrefix(canonical, inputs, sourceCameras, sourceLightEpochs, inputCount, rng);
+        inputs, sourceCameras);
+    result = rtptGrisMergeStoredPrefix(canonical, inputs, sourceCameras, inputCount, rng);
 #endif
 #endif
     gGRISSpatialOutput[index] = result;
