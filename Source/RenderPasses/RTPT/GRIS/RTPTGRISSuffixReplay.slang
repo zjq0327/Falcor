@@ -86,10 +86,10 @@ bool rtptGrisReplayDirectNeeInPreviousGeometry(GrisSpatialRecord source, out Gri
 }
 #endif
 
-// Replay a selected tail in the common fixed-x2 domain. The caller retains the
-// original reservoir, including its prefix proposal ratio and selection weight.
-// The walk uses the current TLAS. Stored-prefix reuse can start at a rigidly
-// moved reconnect point. Later replayed vertices must remain stationary.
+// Replay the selected suffix from its stored x2. The reservoir keeps its x1
+// anchor, prefix proposal ratio, and selection weight. The walk uses the
+// current TLAS and can start at a rigidly moved x2. Later replayed vertices
+// must remain stationary.
 bool rtptGrisReplaySuffix(GrisSpatialRecord source, bool previousLight, bool geometryChanged,
     out GrisSpatialRecord result, bool pointLightChanged = false)
 {

@@ -35,8 +35,7 @@ public:
     // The legacy "prefix" entry now contains local diffuse/specular RGB contributions.
     std::vector<ref<Buffer>> getGRISValidationBuffers() const
     {
-        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput,
-            mpGRISDualFirstHits};
+        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput};
     }
     // Explicit diagnostic access to existing resources only; no GPU readback.
     std::vector<ref<Buffer>> getSHARCValidationBuffers() const
@@ -71,6 +70,7 @@ private:
     bool useGRISCacheTail() const;
     bool canUseGRIS() const;
     bool canUseGRISDualFirstHit() const;
+    bool isGRISDualFirstHitActive() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
     bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
@@ -127,7 +127,6 @@ private:
     ref<Buffer> mpGRISTemporalOutput;
     ref<Texture> mpGRISNeighborOffsets;
     ref<Buffer> mpGRISLocalPrefixes; // Compatibility name for local D/S contributions, not path geometry.
-    ref<Buffer> mpGRISDualFirstHits;
     ref<Buffer> mpGRISSpatialDeepIncident;
     ref<Buffer> mpGRISShadedIndirect;
     ref<Buffer> mpGRISHistory;
@@ -190,7 +189,6 @@ private:
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
     bool mGRISDualFirstHitEnabled = false;
-    uint32_t mGRISGenerateX2SuffixMode = 0u; // 0: D-only, 1: full D/S, 2: one tail, 3: deferred scoring.
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;

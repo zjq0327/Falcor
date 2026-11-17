@@ -30,6 +30,7 @@ target_sources(RTPT PRIVATE
     RTPTLighting.slang
     RTPTNRD.slang
     GRIS/RTPTGRISCapture.slang
+    GRIS/RTPTGRISFixedX1.slang
     GRIS/RTPTGRISGenerate.cs.slang
     GRIS/RTPTGRISGenerate.slang
     GRIS/RTPTGRISIndirect.slang

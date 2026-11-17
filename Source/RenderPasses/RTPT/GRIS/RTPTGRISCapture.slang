@@ -14,9 +14,8 @@ void rtptGRISCapturePrefix(
     inout GrisLocalPrefix prefix
 )
 {
-    // New fixed-x2 generation uses full-BSDF / marginal-PDF continuation at
-    // both continuous interfaces. The legacy alternating path keeps its
-    // original single-diffuse support contract.
+    // Fixed-prefix generation uses full-BSDF / marginal-PDF continuation at
+    // both continuous interfaces. Alternating generation uses diffuse support.
 #if RTPT_GRIS_ALTERNATING
     const bool supported = rtptGRISSupportsFirstVertex(sd, mi.getLobeTypes(sd));
 #else

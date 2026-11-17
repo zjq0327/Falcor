@@ -53,16 +53,9 @@ uint rtptGrisReprojectHistory(uint2 pixel)
     return uint(previousIndex.y) * previousDim.x + uint(previousIndex.x);
 }
 
-bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecord source
-#if RTPT_GRIS_DUAL_FIRST_HIT
-    , out GrisDualFirstHits sourceHits
-#endif
-    )
+bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecord source)
 {
     source = {};
-#if RTPT_GRIS_DUAL_FIRST_HIT
-    sourceHits = {};
-#endif
     if (historyPixel == kGrisInvalidReprojectedPixel) return false;
     const GrisTemporalFreshHistory h = gGRISHistory[historyPixel];
     if (!(h.M > 0.f) || !HitInfo(h.ownerPrimaryHit).isValid()) return false;
@@ -96,7 +89,6 @@ bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecor
     source.candidate.M = min(h.M, 20.f * currentM);
 #if RTPT_GRIS_DUAL_FIRST_HIT
     source.candidate.dualF = h.dualF;
-    sourceHits = h.ownerFirstHits;
 #endif
     source.candidate.prepared = true;
     source.candidate.hasWinner = h.W > 0.f && rtptGrisHasTerminal(source);
@@ -119,14 +111,13 @@ void main(uint3 threadID : SV_DispatchThreadID)
     uint inputCount = 0u;
     const uint historyPixel = rtptGrisReprojectHistory(pixel);
 #if RTPT_GRIS_DUAL_FIRST_HIT
-    GrisDualFirstHits sourceHits[kGrisMaxReuseInputs];
     if (rtptGrisRefDomainValid(canonical) &&
-        rtptGrisLoadHistory(historyPixel, canonical.candidate.M, inputs[0], sourceHits[0]))
+        rtptGrisLoadHistory(historyPixel, canonical.candidate.M, inputs[0]))
     {
         sourceCameras[0] = gGRISTemporalSettings.previousCameraPosition;
         inputCount = 1u;
-        const GrisDualTemporalWinner selection = rtptGrisMergeDualTails(canonical, gGRISDualFirstHits[index],
-            inputs, sourceHits, sourceCameras, inputCount, rng, pixel
+        const GrisDualTemporalWinner selection = rtptGrisMergeDualTails(canonical,
+            inputs, sourceCameras, inputCount, rng, pixel
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
             , gGRISTemporalSettings.suffixReplayLightChange != 0u, gGRISTemporalSettings.suffixReplayGeometryChange != 0u,
             gGRISTemporalSettings.suffixReplayMovedBoundsCount
@@ -139,10 +130,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
         const GrisSpatialRecord center = gGRISSpatialInput[index];
         GrisSpatialRecord winner = center;
         if (selection.inputIndex == 0u)
-        {
-            GrisDualFirstHits unusedHits;
-            rtptGrisLoadHistory(historyPixel, center.candidate.M, winner, unusedHits);
-        }
+            rtptGrisLoadHistory(historyPixel, center.candidate.M, winner);
         winner.candidate.F = selection.diffuse;
         winner.candidate.dualF = selection.specular;
         result = rtptGrisFinalizeDualTail(center, winner, selection.sum, selection.target, selection.count);

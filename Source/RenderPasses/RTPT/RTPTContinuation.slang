@@ -104,22 +104,13 @@ float3 RTPT_CONTINUATION_NAME(
     , inout GrisLocalPrefix prefix
 #if RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
     , inout GrisDualX2Sample x2
-    , out GrisDualDeepSample deepSample
+    , out TriangleHit deepSample
     , uint lateSlot
-#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-    , bool canonicalPrimary
-#endif
     , out GrisDualExplicitTerminal bsdfTerminal
     , out GrisDualExplicitTerminal lateTerminal
-#if defined(RTPT_GRIS_SINGLE_DEEP_PATH)
-    , float deepWeight
-#endif
 #if RTPT_GRIS_DUAL_SHARC
     , inout GrisSpatialRecord cacheSuffix
     , out float3 cacheIncident
-#endif
-#if RTPT_GRIS_X2_SUFFIX_MODE >= 2
-    , float suffixRootProbability
 #endif
 #else
     , inout GrisSpatialRecord suffix
@@ -149,15 +140,10 @@ float3 RTPT_CONTINUATION_NAME(
     deepSample = {};
     bsdfTerminal = {};
     lateTerminal = {};
-#if RTPT_GRIS_X2_SUFFIX_MODE >= 2
-    // Only local fallback past the split needs the root-selection factor.
-    const float selectedLocalWeight = suffixRootProbability > 0.f ? rcp(suffixRootProbability) : 0.f;
-#endif
+    x2.rootDirection = 0.f;
+    x2.firstNee = {};
     uint2 explicitPathID = rtptGrisDualExplicitBeginPath();
     float3 explicitThroughput = 1.f;
-#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-    float3 nativeRootFactor = 0.f;
-#endif
     const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
 #if defined(RTPT_GRIS_DUAL_EXPLICIT_LOCAL_CONTROL)
     const bool captureExplicit = false;
@@ -191,6 +177,9 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
     bool representedPrefix = rtptGRISPathReuseEnabled() && !previousDelta &&
         rtptGRISSupportsSurface(primarySD, primaryMI.getLobeTypes(primarySD) & primaryLobes);
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    x2.rootDirection = bs.wo;
+#endif
     ShadingData prefixFrom = primarySD;
     float3 prefixThroughput = float3(1.f / rootProbability);
 #endif
@@ -222,13 +211,6 @@ float3 RTPT_CONTINUATION_NAME(
     // available even when the radiance estimator later terminates.
     for (uint bounce = 1; bounce <= gParams.maxBounces; ++bounce)
     {
-#if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
-        const float localRadianceWeight = bounce > 2u ? selectedLocalWeight : 1.f;
-#elif defined(RTPT_GRIS_SINGLE_DEEP_PATH) && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
-        const float localRadianceWeight = bounce > 3u ? deepWeight : 1.f;
-#else
-        const float localRadianceWeight = 1.f;
-#endif
         float hitT;
 #if ENABLE_SHARC && SHARC_QUERY
         ++sharcStats.radianceRays;
@@ -281,7 +263,7 @@ float3 RTPT_CONTINUATION_NAME(
                 }
                 else radiance += contribution;
 #else
-                radiance += contribution * localRadianceWeight;
+                radiance += contribution;
 #endif
             }
 #endif
@@ -296,10 +278,6 @@ float3 RTPT_CONTINUATION_NAME(
 #endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
         const bool rebuildPrefix = representedPrefix && bounce <= 2u;
-#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-        float3 nativePrefixValue = 0.f;
-        float nativeConnectionAreaPdf = 0.f;
-#endif
         VertexData vertex;
         if (rebuildPrefix) vertex = rtptGrisPrefixVertex(triangleHit);
         else vertex = gScene.getVertexData(triangleHit);
@@ -330,9 +308,8 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_DUAL_FIRST_HIT
             // The triangle was decoded from hit.pack() already. Reuse its
             // canonical attributes while shading the reconstructed view.
-            const GrisDualSpatialVertex prefixVertex = { vertex, materialID };
             if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
-                rtptGrisShadeDualSpatialVertex(prefixVertex, -direction, represented))
+                rtptGrisRefLoad(vertex, materialID, -direction, represented))
 #else
             if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
                 rtptGrisRefLoad(hit.pack(), -direction, represented))
@@ -359,21 +336,6 @@ float3 RTPT_CONTINUATION_NAME(
                     const IMaterialInstance fromMI = gScene.materials.getMaterialInstance(prefixFrom, ExplicitLodTextureSampler(0.f));
                     const float3 edgeValue = fromMI.eval(prefixFrom, direction, sg);
                     throughput = prefixThroughput * edgeValue / previousContinuationPdf;
-#if RTPT_GRIS_DUAL_FIRST_HIT && defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-                    // The origin, represented view and BSDF are the canonical
-                    // ones used by the fresh scorer. Keep its area measure.
-                    if (canonicalPrimary && prefix.dualFirstPdf > 0.f)
-                    {
-                        const float geometry = abs(dot(represented.faceN, direction)) / distanceSquared;
-                        if (bounce == 1u) nativeRootFactor = edgeValue * (geometry / prefix.dualFirstPdf);
-                        else
-                        {
-                            const float pdf = fromMI.evalPdf(prefixFrom, direction);
-                            if (pdf > 0.f && isfinite(pdf)) nativeConnectionAreaPdf = pdf * geometry;
-                            nativePrefixValue = nativeRootFactor * edgeValue * geometry;
-                        }
-                    }
-#endif
                     sd = represented;
                 }
                 else representedPrefix = false;
@@ -490,7 +452,7 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
                     rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisCacheTerminal);
 #endif
-                    radiance += contribution * localRadianceWeight;
+                    radiance += contribution;
                 }
                 break;
             }
@@ -550,7 +512,7 @@ float3 RTPT_CONTINUATION_NAME(
                     }
                     else radiance += contribution;
 #else
-                    radiance += contribution * localRadianceWeight;
+                    radiance += contribution;
 #endif
                 }
             }
@@ -559,11 +521,6 @@ float3 RTPT_CONTINUATION_NAME(
         }
 #endif
         if (bounce == gParams.maxBounces) break;
-#if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
-        // Both roots keep arrival events at x2. Only the selected root
-        // samples light or a continuation at x2.
-        if (bounce == 2u && suffixRootProbability == 0.f) break;
-#endif
 #if RTPT_GRIS_GENERATE || RTPT_USE_GRIS
         // GRIS guides only the primary diffuse edge. x1 and every later
         // vertex retain BSDF-only proposals for both root walks.
@@ -584,7 +541,12 @@ float3 RTPT_CONTINUATION_NAME(
             SampleGenerator neeRng = sg;
             if (bounce >= 3u && x2.deepPdf > 0.f)
                 neeRng = rtptGrisForkReplayNEERng(sg, bounce);
-            if (bounce == 2u && representedPrefix && !previousDelta && prefix.dualFirstPdf > 0.f)
+            if (bounce == 1u && representedPrefix && prefix.dualFirstPdf > 0.f)
+            {
+                captured = rtptGrisCaptureDualNee(sd, x2.firstNee, sg, false);
+                if (captured) x2.firstNee.terminalKind |= kGrisFixedX1Nee;
+            }
+            else if (bounce == 2u && representedPrefix && !previousDelta && prefix.dualFirstPdf > 0.f)
             {
                 const float secondPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
                 if (secondPdf > 0.f && isfinite(secondPdf))
@@ -593,27 +555,6 @@ float3 RTPT_CONTINUATION_NAME(
                     x2.hit = hit.pack();
                     x2.areaPdf = secondPdf;
                     captured = rtptGrisCaptureDualNee(sd, x2.directLight, sg, false);
-#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-                    if (canonicalPrimary && x2.directLight.hasWinner)
-                    {
-                        x2.hasNativeDirectF = true;
-                        GrisSpatialRecord direct = {};
-                        rtptGrisApplyDualNeeTerminal(x2.directLight, false, direct);
-                        const float lightProbability = rtptGrisDualLightProbability(direct);
-                        const float proposal = nativeConnectionAreaPdf * lightProbability;
-                        if (proposal > 0.f && isfinite(proposal))
-                        {
-                            // Supported Standard/PBRTDiffuse eval is deterministic.
-                            // Keep the path RNG independent of direct scoring.
-                            SampleGenerator scoringRng = sg;
-                            bool shadowClear;
-                            const float3 incident = rtptGrisEvaluateDualLight(sd, sd, mi, direct,
-                                lightProbability, scoringRng, false, shadowClear);
-                            const float3 value = nativePrefixValue * incident;
-                            if (all(isfinite(value))) x2.nativeDirectF = value;
-                        }
-                    }
-#endif
                 }
             }
             else if (bounce == 3u && x2.deepPdf > 0.f)
@@ -621,28 +562,7 @@ float3 RTPT_CONTINUATION_NAME(
                 captured = rtptGrisCaptureDualNee(sd, x2.deepLight, neeRng, true);
                 if (x2.deepLight.hasWinner)
                 {
-#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-                    // These evaluate a BSDF without consuming the reservoir RNG.
-                    const MaterialType materialType = sd.mtl.getMaterialType();
-                    if (materialType == MaterialType::Standard || materialType == MaterialType::PBRTDiffuse)
-                    {
-                        GrisSpatialRecord proposal = {};
-                        rtptGrisApplyDualNeeTerminal(x2.deepLight, true, proposal);
-                        const float lightProbability = rtptGrisDualLightProbability(proposal);
-                        float3 incident = 0.f;
-                        if (lightProbability > 0.f)
-                        {
-                            SampleGenerator scoringRng = neeRng;
-                            bool shadowClear;
-                            incident = rtptGrisEvaluateDualLight(sd, sd, mi, proposal, lightProbability,
-                                scoringRng, false, shadowClear);
-                        }
-                        deepSample = uint4(asuint(incident), kGrisEvaluatedDeepLight);
-                    }
-                    else deepSample = rtptGrisStoreDeepHit(triangleHit);
-#else
                     deepSample = triangleHit;
-#endif
                 }
             }
             else if (captureExplicit && bounce >= 4u && x2.deepPdf > 0.f)
@@ -714,20 +634,10 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && !RTPT_GRIS_SPATIAL
                 rtptSelectGrisTerminal(terminalPicker, terminalRng, contribution, GrisTerminalKind::GrisNee);
 #endif
-#if RTPT_GRIS_X2_SUFFIX_MODE >= 2 && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
-                const float neeLocalWeight = bounce == 2u ? selectedLocalWeight : localRadianceWeight;
-                radiance += contribution * neeLocalWeight;
-#else
-                radiance += contribution * localRadianceWeight;
-#endif
+                radiance += contribution;
             }
         }
 
-#if defined(RTPT_GRIS_SINGLE_DEEP_PATH) && RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
-        // Retain both x3 endpoints and their NEE/BSDF MIS. Only the selected
-        // path samples x3 -> x4. Keep replay and roulette on physical weights.
-        if (bounce == 3u && deepWeight == 0.f) break;
-#endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_ALTERNATING
         // Only the scheduled component samples x1 -> x2. At x2 the suffix
         // ends with NEE, so there is no competing BSDF sample at that vertex.
@@ -748,18 +658,6 @@ float3 RTPT_CONTINUATION_NAME(
             const float3 numerator = mi.eval(sd, bs.wo, sg);
             bs.weight = numerator / marginalPdf;
             if (!all(isfinite(bs.weight))) break;
-#if RTPT_GRIS_DUAL_FIRST_HIT && defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-            if (bounce == 2u && gParams.maxBounces >= 3u && x2.areaPdf > 0.f &&
-                !bs.isLobe(LobeType::Delta) && nativeConnectionAreaPdf > 0.f)
-            {
-                // Use the represented prefix and raw BSDF numerator from this draw.
-                // A terminal can supply its own incident radiance and MIS later.
-                x2.nativeDeepPrefix = nativePrefixValue;
-                x2.nativeDeepBsdf = numerator;
-                x2.nativeDeepAreaPdf = nativeConnectionAreaPdf * marginalPdf;
-                x2.nativeDeepDirectionPdf = marginalPdf;
-            }
-#endif
         }
 #endif
         previousDelta = bs.isLobe(LobeType::Delta);

@@ -20,13 +20,12 @@ void main(uint3 threadID : SV_DispatchThreadID)
     uint inputCount = 0u;
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0x76b5a2d1u);
 #if RTPT_GRIS_DUAL_FIRST_HIT
-    GrisDualFirstHits sourceHits[kGrisMaxReuseInputs];
     uint sourceIndices[kGrisMaxReuseInputs];
-    rtptGrisGatherSpatialNeighbors(pixel, gScene.camera.getPosition(), inputCount, sourceHits, sourceIndices);
+    rtptGrisGatherSpatialNeighbors(pixel, gScene.camera.getPosition(), inputCount, sourceIndices);
     if (inputCount != 0u && rtptGrisRefDomainValid(canonical))
     {
-        const GrisDualTemporalWinner selection = rtptGrisMergeDualTails(canonical, gGRISDualFirstHits[index],
-            gGRISSpatialInput, sourceIndices, sourceHits, inputCount, rng
+        const GrisDualTemporalWinner selection = rtptGrisMergeDualTails(canonical,
+            gGRISSpatialInput, sourceIndices, inputCount, rng
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
             , gGRISSpatialDeepIncident, index
 #endif

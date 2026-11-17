@@ -150,18 +150,25 @@ bool rtptGrisRefPosition(PackedHitInfo packed, out float3 position, bool previou
     return all(isfinite(position));
 }
 
+bool rtptGrisRefLoad(VertexData vertex, uint materialID, float3 view, out ShadingData sd)
+{
+    sd = {};
+    if (!all(isfinite(view))) return false;
+    const float viewLengthSquared = dot(view, view);
+    if (!(viewLengthSquared > 0.f) || !isfinite(viewLengthSquared)) return false;
+    sd = gScene.materials.prepareShadingData(vertex, materialID, view * rsqrt(viewLengthSquared));
+    sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+    return true;
+}
+
 bool rtptGrisRefLoad(PackedHitInfo packed, float3 view, out ShadingData sd, bool previousGeometry = false)
 {
     sd = {};
     const HitInfo hit = HitInfo(packed);
-    if (hit.getType() != HitType::Triangle || !all(isfinite(view))) return false;
-    const float viewLengthSquared = dot(view, view);
-    if (!(viewLengthSquared > 0.f) || !isfinite(viewLengthSquared)) return false;
+    if (hit.getType() != HitType::Triangle) return false;
     const TriangleHit triangle = hit.getTriangleHit();
-    sd = gScene.materials.prepareShadingData(rtptGrisPrefixVertex(triangle, previousGeometry),
-        gScene.getMaterialID(triangle.instanceID), view * rsqrt(viewLengthSquared));
-    sd.mtl.setActiveLobes(uint(LobeType::Reflection));
-    return true;
+    return rtptGrisRefLoad(rtptGrisPrefixVertex(triangle, previousGeometry),
+        gScene.getMaterialID(triangle.instanceID), view, sd);
 }
 
 bool rtptGrisRefPrimary(PackedHitInfo primaryHit, float3 cameraPosition, out ShadingData primary,

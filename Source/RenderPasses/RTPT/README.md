@@ -26,9 +26,9 @@ PG 现在保留已学习区域并按新的独立观测持续更新。相机移�
 
 模型池扩缩容保留已有 Read/Build、未消费统计和诊断后重新绑定，不重编译仅因容量变化而不变的 shader。相机选择不同 LOD 时保留原 level 的区域；sceneScale 切换用 CPU 命名空间区分同数值 key 对应的不同世界范围。容量压力每批最多替换容量 1/8 的陈旧区域，预算缩小时保留有界子集，不承诺永久保留所有访问过的区域。Read 在本帧采样/PDF 评价期间保持不变，训练写独立 Build，发布仍在本帧及训练完成后进行。
 
-固定 x2 reference-domain GRIS 不再以 PG version、generation 或 lookup 相机锚点判断历史有效性。PG 引起的程序重编译保留符合尺寸、反射布局及 reference 语义的 GRIS 历史，重新建立程序绑定和工作资源；旧 owner 使用保存的上一帧相机评价，目标 owner 使用当前相机。其他阶段按自身规则重建，例如 ENABLE_PG 重编译仍清首表面 ReSTIR DI 历史。
+固定 x1 重连的 GRIS 按帧尺寸、反射布局和采样域判断历史是否可用。PG 引起的程序重编译可以保留满足这些条件的 reference-domain 历史。旧 owner 使用保存的上一帧相机求值，目标 owner 使用当前相机。ENABLE_PG 重编译仍会清除首表面 ReSTIR DI 历史。
 
-固定 x2 的 reference-domain GRIS保留每条历史记录配套的 `F/W/M` 和表示比例 `R=areaPdf/sourceAreaPdf`。fresh 记录的 R 来自实际生成密度，重连赢家则保存新 owner 下配套的 R 与归一化权重。交叉评价使用物理 BSDF 和固定辅助前缀分布，不使用新版 guide 重算旧记录的 R。连续帧、尺寸、记录语义和真实运输/光照域检查继续有效，PG 数据身份不再参与这条路径的历史门控，无需新增逐像素字段或保存旧 PG 树。
+每条历史记录保存候选的 x1 锚点、后缀和配套的 `F/W/M`。单首交的存储前缀路径还会保存当前 owner 下的 proposal 与 reference 密度比例。双首交的固定 x1 路径在 Generate 中计算 D/S 的首交面积密度，并在复用时对候选保存的 x1 重新求值。历史有效性检查仍覆盖连续帧、布局和动态场景中的光路可用性。
 
 `pgStats` 新增 initializations、resetCalls、modelMigrations、lastMigrationPreservedRegions、evictedRegions、namespaceChanges、activeRegions 和 readModelFingerprint；后者描述当前 namespace 的 Read 内容。`stageStats` 提供历史代际/已发布帧及 reference 语义标记；grisPGSnapshotDependent 在 reference 模式为 false，实际引导状态由 grisPGProposalActive 报告。实施契约和验证范围见 [持续更新计划](GRIS_PG_HISTORY_DECOUPLING_PLAN.md)。下文首版和性能实验中的“相机平移重置 PG”“跨 LOD 区域保留暂缓”属于当时行为，当前以上述实现为准。
 

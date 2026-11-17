@@ -14,7 +14,7 @@ uint2 rtptGrisDualExplicitBeginPath()
 uint2 rtptGrisDualExplicitAppendHit(uint2 pathID, PackedHitInfo hit)
 {
     const TriangleHit triangle = HitInfo(hit).getTriangleHit();
-    // The fixed x2 and RNG reconstruct the coordinates. The signature
+    // The stored suffix vertex x2 and RNG reconstruct the coordinates. The signature
     // checks the primitive sequence without relying on bit-exact hit UVs.
     pathID = (pathID ^ triangle.instanceID.index) * uint2(16777619u, 3266489917u);
     return (pathID ^ triangle.primitiveIndex) * uint2(16777619u, 668265263u);

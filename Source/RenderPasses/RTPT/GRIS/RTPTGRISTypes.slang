@@ -143,15 +143,16 @@ struct GrisLocalContributions
 #endif
 };
 
-// A positive area PDF identifies a sampled x2. Its terminal may be empty.
+// Each proposal keeps its own x1 anchor. Longer paths also retain their x2 hit
+// and its continuation data for lighting replay.
 struct GrisSpatialRecord
 {
     GrisCandidate candidate;
     PackedHitInfo ownerPrimaryHit;
     PackedHitInfo sourceX1;
-    PackedHitInfo reconnectHit;
-    float areaPdf;          // Owner proposal/reference ratio, or native x2 area times x2 direction PDF for dual deep tails.
-    float3 suffixDirection; // Fixed direction leaving x2, or light UV for dual direct NEE.
+    PackedHitInfo reconnectHit; // x2 inside the suffix, invalid for a short x1 NEE.
+    float areaPdf;          // Owner proposal/reference ratio, or conditional suffix density for dual proposals.
+    float3 suffixDirection; // Fixed direction leaving x2, or light coordinates for direct NEE.
     float3 suffixLight;     // Tail factor or dual deep light UV.
     uint lightPdfOrIndex; // Light PDF bits or dual NEE light index.
     bool lightIsAnalytic;
@@ -166,7 +167,7 @@ struct GrisSpatialRecord
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng; // Continuation stream after sampling x2's direction.
-    uint dualExplicitBounce; // Zero for fixed x2/x3 NEE, 4 for an x4 SHaRC terminal.
+    uint dualExplicitBounce; // Zero for directly stored NEE, 4 for an x4 SHaRC terminal.
     uint2 dualExplicitPathID;
 #endif
 };
@@ -181,7 +182,7 @@ struct GrisDualNeeTerminal
     bool hasWinner;
 };
 
-// Invocation-local state for the direct and deep events from one native x2 draw.
+// Invocation-local state for short x1 NEE and the longer events from one root walk.
 struct GrisDualX2Sample
 {
     PackedHitInfo hit;
@@ -191,14 +192,8 @@ struct GrisDualX2Sample
     uint4 replayRng;
     GrisDualNeeTerminal directLight;
     GrisDualNeeTerminal deepLight;
-#if defined(RTPT_GRIS_GENERATE_DIFFUSE_ONLY)
-    float3 nativeDirectF;
-    bool hasNativeDirectF;
-    float3 nativeDeepPrefix;
-    float3 nativeDeepBsdf;
-    float nativeDeepAreaPdf;
-    float nativeDeepDirectionPdf; // Zero when the represented path was unavailable.
-#endif
+    float3 rootDirection;
+    GrisDualNeeTerminal firstNee;
 };
 
 struct GrisDualExplicitTerminal
@@ -216,6 +211,7 @@ struct GrisDualExplicitTerminal
 // Extend the existing terminal word, rather than storing a second flags field.
 static const uint kGrisTerminalKindMask = 0xffu;
 static const uint kGrisDeepTail = 0x100u;
+static const uint kGrisFixedX1Nee = 0x1000u;
 #if RTPT_GRIS_SUFFIX_REPLAY
 static const uint kGrisEmissiveNee = 0x200u;
 static const uint kGrisPointNee = 0x400u;
@@ -300,7 +296,7 @@ struct GrisTemporalFreshHistory
     uint rootLobe;
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
-    float3 suffixDirection; // Fixed x2 direction, or light UV for dual direct NEE.
+    float3 suffixDirection; // Direction leaving x2, or light UV for dual direct NEE.
     float3 suffixLight;     // Weighted tail factor, or light UV for dual deep NEE.
     uint lightPdfOrIndex; // Light PDF bits or dual NEE light index.
     uint terminalAndFlags;
@@ -309,7 +305,6 @@ struct GrisTemporalFreshHistory
     float M;
 #if RTPT_GRIS_DUAL_FIRST_HIT
     float3 dualF;
-    GrisDualFirstHits ownerFirstHits;
 #endif
 #if RTPT_GRIS_SUFFIX_REPLAY
     uint suffixInstanceMask;
