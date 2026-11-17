@@ -16,11 +16,16 @@ def _module_enabled(name, default="1"):
 
 def render_graph_RTPTSHARCNRD():
     graph = RenderGraph("RTPTSHARCNRD")
-    delta_reflection = _module_enabled("RTPT_DELTA_REFLECTION_NRD_ENABLED")
+    restir_di = _module_enabled("RTPT_RESTIR_DI_ENABLED", "0")
+    # ReSTIR DI uses its own direct-lighting profile.
+    use_gris = not restir_di
     graph.addPass(createPass("RTPT", {
         "enableNRD": True,
-        "enableDeltaReflectionNRD": delta_reflection,
-        "restirDIEnabled": _module_enabled("RTPT_RESTIR_DI_ENABLED"),
+        "grisEnabled": use_gris,
+        "grisDualFirstHitEnabled": use_gris,
+        "grisTemporalEnabled": use_gris,
+        "grisSpatialEnabled": use_gris,
+        "restirDIEnabled": restir_di,
         "restirDICandidateCount": 8,
         "restirDIBudgetMB": 512,
         "restirDITemporalEnabled": _module_enabled("RTPT_RESTIR_DI_TEMPORAL_ENABLED"),
@@ -29,9 +34,9 @@ def render_graph_RTPTSHARCNRD():
         "restirDISpatialSamples": 4,
         "restirDISpatialRadius": 16.0,
         "samplesPerPixel": 1,
-        "maxBounces": 4,
+        "maxBounces": 5 if use_gris else 4,
         "useNEE": True,
-        "useRussianRoulette": True,
+        "useRussianRoulette": not use_gris,
         "rrStartBounce": 3,
         "accumulate": False,
         "seed": 0,
@@ -83,18 +88,6 @@ def render_graph_RTPTSHARCNRD():
         "diffuseRadianceScale": 256.0,
         "specularRadianceScale": 512.0,
     }), "ModulateIllumination")
-    if delta_reflection:
-        # Filter the reflected virtual scene independently. The material's
-        # actual delta lobe/roughness and all GRIS records remain unchanged.
-        graph.addPass(createPass("NRD", {
-            "enabled": _module_enabled("RTPT_NRD_ENABLED"),
-            "method": "RelaxDiffuse",
-            "worldSpaceMotion": True,
-            "maxIntensity": 250.0,
-            "diffuseMaxAccumulatedFrameNum": 12,
-            "diffuseMaxFastAccumulatedFrameNum": 2,
-            "enableReprojectionTestSkippingWithoutMotion": False,
-        }), "NRDDeltaReflection")
     # Accumulate the fully reconstructed HDR image after NRD. RTPT still feeds
     # independent current-frame signals to SHaRC/NRD rather than PT averages.
     graph.addPass(createPass("AccumulatePass", {
@@ -119,7 +112,7 @@ def render_graph_RTPTSHARCNRD():
         "exposureCompensation": 0.0,
     }), "ToneMapperReference")
 
-    _add_nrd_edges(graph, delta_reflection=delta_reflection)
+    _add_nrd_edges(graph)
     graph.addEdge("ModulateIllumination.output", "FrameAccumulation.input")
     graph.addEdge("FrameAccumulation.output", "ToneMapper.src")
     graph.addEdge("RTPT.noisyColor", "ToneMapperReference.src")

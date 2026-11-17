@@ -32,16 +32,6 @@ const NRDOutput kNRDOutputs[] = {
     {"mvecW", "gNRDMotionW", ResourceFormat::RGBA32Float},
 };
 const char* kSHARCOutputs[] = {"sharcDebug", "sharcCacheRadiance", "sharcStats"};
-const NRDOutput kDeltaNRDOutputs[] = {
-    {"nrdDeltaReflectionRadianceHitDist", "gDeltaRadiance", ResourceFormat::RGBA32Float},
-    {"nrdDeltaReflectionReflectance", "gDeltaReflectance", ResourceFormat::RGBA16Float},
-    {"nrdDeltaReflectionEmission", "gDeltaEmission", ResourceFormat::RGBA32Float},
-    {"nrdDeltaReflectionNormWRoughMaterialID", "gDeltaNormal", ResourceFormat::RGB10A2Unorm},
-    {"nrdDeltaReflectionViewZ", "gDeltaViewZ", ResourceFormat::R32Float},
-    {"nrdDeltaReflectionMotionW", "gDeltaMotion", ResourceFormat::RGBA32Float},
-    // RGB is the unchanged traced contribution; A is an explicit guide state.
-    {"nrdDeltaReflectionRaw", "gDeltaRaw", ResourceFormat::RGBA32Float},
-};
 const Gui::DropdownList kSHARCDebugModes = {
     {0, "Voxel grid"}, {1, "Cached radiance"}, {2, "Sample count"}, {3, "Entry age"},
     {4, "Cache terminations"}, {5, "Traced rays"}, {6, "Update coverage"}, {7, "Hash occupancy"},
@@ -105,9 +95,6 @@ void RTPT::setProperties(const Properties& props)
     uint32_t maxAccumulationFrames = mMaxAccumulationFrames;
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
     bool enableNRD = mEnableNRD;
-    bool enableDeltaReflectionNRD = mEnableDeltaReflectionNRD;
-    bool deltaReflectionNRDInSpecular = mDeltaReflectionNRDInSpecular;
-    bool grisDeltaReuseEnabled = mGRISDeltaReuseEnabled;
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
@@ -141,9 +128,10 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "accumulate") accumulate = value;
         else if (key == "maxAccumulationFrames") maxAccumulationFrames = value;
         else if (key == "enableNRD") enableNRD = value;
-        else if (key == "enableDeltaReflectionNRD") enableDeltaReflectionNRD = value;
-        else if (key == "deltaReflectionNRDInSpecular") deltaReflectionNRDInSpecular = value;
-        else if (key == "grisDeltaReuseEnabled") grisDeltaReuseEnabled = value;
+        else if (key == "enableDeltaReflectionNRD" || key == "deltaReflectionNRDInSpecular")
+            logWarningOnce("RTPT ignores the retired '{}' property. Delta reflections use the NRD specular channel.", key);
+        else if (key == "grisDeltaReuseEnabled")
+            logWarningOnce("RTPT ignores the retired '{}' property. Compatible GRIS specular paths always reuse delta reflections.", key);
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
@@ -243,8 +231,7 @@ void RTPT::setProperties(const Properties& props)
     if (enableSHARC || needsPGResources)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
             "RTPT SHaRC and PG require D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
-    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC ||
-        enableDeltaReflectionNRD != mEnableDeltaReflectionNRD || deltaReflectionNRDInSpecular != mDeltaReflectionNRDInSpecular;
+    const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC;
     const bool pgCompileChanged = needsPGResources != needsPG();
     const bool modeChanged = transportModeChanged || pgCompileChanged;
     const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
@@ -269,7 +256,7 @@ void RTPT::setProperties(const Properties& props)
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     const bool grisModeChanged = grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
         grisTemporalEnabled != mGRISTemporalEnabled || grisDualFirstHitEnabled != mGRISDualFirstHitEnabled ||
-        grisSuffixReplayEnabled != mGRISSuffixReplayEnabled || grisDeltaReuseEnabled != mGRISDeltaReuseEnabled ||
+        grisSuffixReplayEnabled != mGRISSuffixReplayEnabled ||
         (grisEnabled && grisSharcReuseChanged);
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
@@ -301,9 +288,6 @@ void RTPT::setProperties(const Properties& props)
     mAccumulate = accumulate;
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
-    mEnableDeltaReflectionNRD = enableDeltaReflectionNRD;
-    mDeltaReflectionNRDInSpecular = deltaReflectionNRDInSpecular;
-    mGRISDeltaReuseEnabled = grisDeltaReuseEnabled;
     mGRISEnabled = grisEnabled;
     mGRISSpatialEnabled = grisSpatialEnabled;
     mGRISTemporalEnabled = grisTemporalEnabled;
@@ -380,9 +364,6 @@ Properties RTPT::getProperties() const
     props["accumulate"] = mAccumulate;
     props["maxAccumulationFrames"] = mMaxAccumulationFrames;
     props["enableNRD"] = mEnableNRD;
-    props["enableDeltaReflectionNRD"] = mEnableDeltaReflectionNRD;
-    props["deltaReflectionNRDInSpecular"] = mDeltaReflectionNRDInSpecular;
-    props["grisDeltaReuseEnabled"] = mGRISDeltaReuseEnabled;
     props["grisEnabled"] = mGRISEnabled;
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
@@ -510,17 +491,10 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
         .format(ResourceFormat::RGBA32Float)
         .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
     if (mEnableNRD)
-    {
         for (const auto& output : kNRDOutputs)
             reflection.addOutput(output.name, "Current-frame NRD signal or primary-hit guide")
                 .format(output.format)
                 .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
-        if (mEnableDeltaReflectionNRD)
-            for (const auto& output : kDeltaNRDOutputs)
-                reflection.addOutput(output.name, "Independent delta reflection signal / virtual-surface guide")
-                    .format(output.format)
-                    .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
-    }
     if (mEnableSHARC)
         for (const auto* output : kSHARCOutputs)
             reflection.addOutput(output, "SHaRC visualization or current-frame cache diagnostics")
@@ -844,8 +818,6 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
-        defines.add("RTPT_DELTA_NRD", mEnableNRD && mEnableDeltaReflectionNRD ? "1" : "0");
-        defines.add("RTPT_DELTA_NRD_SPECULAR", mEnableNRD && mDeltaReflectionNRDInSpecular && !mEnableDeltaReflectionNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
         defines.add("ENABLE_PG", pg ? "1" : "0");
         if (mEnableSHARC)
@@ -915,10 +887,6 @@ void RTPT::bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData
     for (const auto& output : kNRDOutputs)
         if (rootVar.findMember(output.shaderName).isValid())
             rootVar[output.shaderName] = renderData.getTexture(output.name);
-    if (mEnableDeltaReflectionNRD)
-        for (const auto& output : kDeltaNRDOutputs)
-            if (rootVar.findMember(output.shaderName).isValid())
-                rootVar[output.shaderName] = renderData.getTexture(output.name);
 }
 
 void RTPT::bindSHARCQuery(const ShaderVar& sharc, const float3& cameraPosition,

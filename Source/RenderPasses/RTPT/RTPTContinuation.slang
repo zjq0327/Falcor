@@ -1,16 +1,9 @@
 #pragma once
 
 #include "RTPTFirstHit.slangh"
-#include "RTPTDeltaReflection.slang"
 
 #ifndef RTPT_GRIS_DUAL_FIRST_HIT
 #define RTPT_GRIS_DUAL_FIRST_HIT 0
-#endif
-
-#if RTPT_DELTA_NRD && !RTPT_GRIS_GENERATE
-#define RTPT_CONTINUATION_NAME rtptTraceContinuationWithGuide
-#else
-#define RTPT_CONTINUATION_NAME rtptTraceContinuation
 #endif
 
 #if RTPT_GRIS_GENERATE || RTPT_USE_GRIS
@@ -78,6 +71,65 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisDualNeeTerminal termi
     terminal.hasWinner = true;
     return true;
 }
+
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+struct GrisNativeFreshPrefix
+{
+    GrisDualTailValue root;
+    float firstGeometry;
+    float3 connection;
+    float3 outgoingBsdf;
+    float outgoingPdf;
+};
+
+void rtptGrisOfferNativeFreshEvent(GrisNativeFreshPrefix prefix, uint event, float proposalPdf,
+    float3 incident, float lightPdf, bool deltaRoot, inout GrisFreshSlotReservoir reservoir,
+    inout SampleGenerator selectionRng)
+{
+    if (!(proposalPdf > 0.f) || !isfinite(proposalPdf) || !(prefix.firstGeometry > 0.f)) return;
+    const bool deep = event != kGrisFixedX1NeeEvent && event != kGrisFreshX2NeeEvent;
+    const float3 deepIncident = deep ? incident : float3(0.f);
+    if (deep)
+    {
+        if (!(prefix.outgoingPdf > 0.f) || !all(isfinite(incident)) || !any(incident > 0.f)) return;
+        const float mis = lightPdf > 0.f ? rtptPowerHeuristic(prefix.outgoingPdf, lightPdf) : 1.f;
+        incident = prefix.outgoingBsdf * incident * mis;
+    }
+
+    if (event != kGrisFixedX1NeeEvent) incident *= prefix.connection;
+    GrisDualTailValue value = {};
+    if (deltaRoot)
+    {
+        const float3 specular = prefix.root.specular * incident;
+        if (all(isfinite(specular))) value.specular = specular;
+    }
+    else
+    {
+        const float3 common = incident * prefix.firstGeometry;
+        if (!all(isfinite(common)) || !any(common > 0.f)) return;
+        const float3 diffuse = prefix.root.diffuse * common;
+        const float3 specular = prefix.root.specular * common;
+        if (all(isfinite(diffuse))) value.diffuse = diffuse;
+        if (all(isfinite(specular))) value.specular = specular;
+    }
+    rtptGrisOfferFreshCandidate(reservoir, event, value, proposalPdf, deepIncident, lightPdf, selectionRng);
+}
+
+void rtptGrisOfferNativeFreshNee(GrisNativeFreshPrefix prefix, uint event, float pathPdf,
+    ShadingData surface, IMaterialInstance material, GrisDualNeeTerminal terminal, bool deltaRoot,
+    inout GrisFreshSlotReservoir reservoir, inout SampleGenerator evaluationRng, inout SampleGenerator selectionRng)
+{
+    GrisSpatialRecord proposal = {};
+    rtptGrisApplyDualNeeTerminal(terminal, event == kGrisFreshX3NeeEvent, proposal);
+    const float lightProbability = rtptGrisDualLightProbability(proposal);
+    if (!(lightProbability > 0.f)) return;
+    bool shadowClear;
+    const float3 incident = rtptGrisEvaluateDualLight(surface, surface, material, proposal, lightProbability,
+        evaluationRng, false, shadowClear);
+    rtptGrisOfferNativeFreshEvent(prefix, event, pathPdf * lightProbability, incident, 0.f, deltaRoot,
+        reservoir, selectionRng);
+}
+#endif
 #endif
 
 /** Trace the selected component on the primary surface.
@@ -85,7 +137,7 @@ bool rtptGrisCaptureDualNee(ShadingData surface, inout GrisDualNeeTerminal termi
     passes its explicit root-selection probability and captures the candidate event.
     Later vertices use the mixed reflection estimator.
 */
-float3 RTPT_CONTINUATION_NAME(
+float3 rtptTraceContinuation(
     ShadingData primarySD,
     IMaterialInstance primaryMI,
     uint primaryLobes,
@@ -95,22 +147,26 @@ float3 RTPT_CONTINUATION_NAME(
     out uint firstHitDistanceState,
     inout RTPTSharcStats sharcStats,
     uint rootCoverage
-#if RTPT_DELTA_NRD && !RTPT_GRIS_GENERATE
-    , inout RTPTDeltaGuide deltaGuide
-#endif
 #if RTPT_GRIS_GENERATE
     , float rootProbability
 #if RTPT_GRIS_SPATIAL
     , inout GrisLocalPrefix prefix
 #if RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
     , inout GrisDualX2Sample x2
-    , out TriangleHit deepSample
     , uint lateSlot
     , out GrisDualExplicitTerminal bsdfTerminal
     , out GrisDualExplicitTerminal lateTerminal
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+    , uint freshSlot
+    , uint freshAttemptedMask
+    , bool separateFreshRootMeasures
+    , RTPTSamplingContext freshDiffuseSampling
+    , inout GrisFreshSlotReservoir freshReservoir
+    , inout SampleGenerator freshEvaluationRng
+    , inout SampleGenerator freshSelectionRng
+#endif
 #if RTPT_GRIS_DUAL_SHARC
     , inout GrisSpatialRecord cacheSuffix
-    , out float3 cacheIncident
 #endif
 #else
     , inout GrisSpatialRecord suffix
@@ -137,7 +193,6 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
     const uint currentRoot = prefix.rootLobe;
 #if RTPT_GRIS_DUAL_FIRST_HIT
-    deepSample = {};
     bsdfTerminal = {};
     lateTerminal = {};
     x2.rootDirection = 0.f;
@@ -145,13 +200,14 @@ float3 RTPT_CONTINUATION_NAME(
     uint2 explicitPathID = rtptGrisDualExplicitBeginPath();
     float3 explicitThroughput = 1.f;
     const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+    GrisNativeFreshPrefix nativeFresh = {};
+    float freshRootPdf = 0.f;
+#endif
 #if defined(RTPT_GRIS_DUAL_EXPLICIT_LOCAL_CONTROL)
     const bool captureExplicit = false;
 #else
     const bool captureExplicit = true;
-#endif
-#if RTPT_GRIS_DUAL_SHARC
-    cacheIncident = 0.f;
 #endif
 #else
     rtptGRISBeginWalk(pathBuilder);
@@ -247,11 +303,23 @@ float3 RTPT_CONTINUATION_NAME(
             {
                 const uint2 missID = rtptGrisDualExplicitAppendMiss(explicitPathID);
                 if (bounce == 3u)
+                {
                     rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss),
                         bounce, missID, environment, asuint(lightPdf), bsdfTerminal);
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+                    rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshX3BsdfEvent, freshRootPdf * x2.deepPdf,
+                        bsdfTerminal.incident, lightPdf, deltaPrefix, freshReservoir, freshSelectionRng);
+#endif
+                }
                 else if (lateSlot == 2u * (bounce - 4u))
+                {
                     rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss),
                         bounce, missID, explicitThroughput * environment * (misWeight * float(lateCount)), 0u, lateTerminal);
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+                    rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshLateEvent, freshRootPdf * x2.deepPdf,
+                        lateTerminal.incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng);
+#endif
+                }
                 break;
             }
 #endif
@@ -358,6 +426,15 @@ float3 RTPT_CONTINUATION_NAME(
                     // never ask the guide to evaluate the reconstructed ray.
                     const IMaterialInstance fromMI = gScene.materials.getMaterialInstance(prefixFrom, ExplicitLodTextureSampler(0.f));
                     const float3 edgeValue = fromMI.eval(prefixFrom, direction, sg);
+#if RTPT_GRIS_DUAL_FIRST_HIT
+                    if (bounce == 2u)
+                    {
+                        const float geometry = abs(dot(represented.faceN, direction)) / distanceSquared;
+                        const float pdf = fromMI.evalPdf(prefixFrom, direction);
+                        if (geometry > 0.f && isfinite(geometry) && pdf > 0.f && isfinite(pdf))
+                            nativeFresh.connection = edgeValue * geometry;
+                    }
+#endif
                     throughput = prefixThroughput * edgeValue / previousContinuationPdf;
                     sd = represented;
                 }
@@ -367,9 +444,32 @@ float3 RTPT_CONTINUATION_NAME(
         }
 #endif
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
-#if RTPT_DELTA_NRD && !RTPT_GRIS_GENERATE
-        if (deltaGuide.enabled && bounce == 1u)
-            rtptCaptureDeltaGuide(sd, mi, mi.getProperties(sd), triangleHit, throughput, deltaGuide);
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
+        if (bounce == 1u && representedPrefix && freshAttemptedMask != 0u)
+        {
+            freshRootPdf = rtptGrisFreshRootPdfSumAtVertex(prefix.dualFirstPdf, freshSlot, freshAttemptedMask,
+                x2.rootDirection, vertex.posW, vertex.faceNormalW, primarySD, primaryMI, freshDiffuseSampling,
+                separateFreshRootMeasures);
+            if (deltaPrefix)
+            {
+                nativeFresh.firstGeometry = 1.f;
+                nativeFresh.root.specular = prefix.throughputToX1;
+            }
+            else
+            {
+                float3 direction;
+                float distanceSquared;
+                if (rtptGrisPrefixDirection(ray.origin, sd.posW, direction, distanceSquared))
+                {
+                    const float geometry = abs(dot(sd.faceN, direction)) / distanceSquared;
+                    if (geometry > 0.f && isfinite(geometry))
+                    {
+                        nativeFresh.firstGeometry = geometry;
+                        nativeFresh.root = rtptGrisEvaluateFixedX1Root(primarySD, direction, 1.f, freshEvaluationRng);
+                    }
+                }
+            }
+        }
 #endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_DUAL_FIRST_HIT
 #if !RTPT_GRIS_ALTERNATING
@@ -434,8 +534,9 @@ float3 RTPT_CONTINUATION_NAME(
                     const float3 incident = explicitThroughput * cachedRadiance;
                     if (all(isfinite(incident)) && all(incident >= 0.f))
                     {
-                        cacheIncident = incident;
                         cacheSuffix.dualExplicitRng = x2.replayRng;
+                        rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshSharcEvent, freshRootPdf * cacheSuffix.areaPdf,
+                            incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng);
                         cacheSuffix.dualExplicitBounce = bounce;
                         cacheSuffix.dualExplicitPathID = explicitPathID;
                         cacheSuffix.candidate.terminalKind = uint(GrisTerminalKind::GrisDualSharcTail) | kGrisDeepTail;
@@ -510,11 +611,19 @@ float3 RTPT_CONTINUATION_NAME(
                 if (captureExplicit && bounce >= 3u && x2.deepPdf > 0.f)
                 {
                     if (bounce == 3u)
+                    {
                         rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter),
                             bounce, explicitPathID, emission, asuint(lightPdf), bsdfTerminal);
+                        rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshX3BsdfEvent, freshRootPdf * x2.deepPdf,
+                            bsdfTerminal.incident, lightPdf, deltaPrefix, freshReservoir, freshSelectionRng);
+                    }
                     else if (lateSlot == 2u * (bounce - 4u))
+                    {
                         rtptGrisCaptureDualExplicit(x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter),
                             bounce, explicitPathID, explicitThroughput * emission * (misWeight * float(lateCount)), 0u, lateTerminal);
+                        rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshLateEvent, freshRootPdf * x2.deepPdf,
+                            lateTerminal.incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng);
+                    }
                 }
                 else
 #endif
@@ -564,10 +673,15 @@ float3 RTPT_CONTINUATION_NAME(
             SampleGenerator neeRng = sg;
             if (bounce >= 3u && x2.deepPdf > 0.f)
                 neeRng = rtptGrisForkReplayNEERng(sg, bounce);
+            uint onlineNeeEvent = 0xffffffffu;
             if (bounce == 1u && representedPrefix && prefix.dualFirstPdf > 0.f)
             {
                 captured = rtptGrisCaptureDualNee(sd, x2.firstNee, sg, false);
-                if (captured) x2.firstNee.terminalKind |= kGrisFixedX1Nee;
+                if (captured)
+                {
+                    x2.firstNee.terminalKind |= kGrisFixedX1Nee;
+                    onlineNeeEvent = kGrisFixedX1NeeEvent;
+                }
             }
             else if (bounce == 2u && representedPrefix && !previousDelta && prefix.dualFirstPdf > 0.f)
             {
@@ -578,15 +692,13 @@ float3 RTPT_CONTINUATION_NAME(
                     x2.hit = hit.pack();
                     x2.areaPdf = secondPdf;
                     captured = rtptGrisCaptureDualNee(sd, x2.directLight, sg, false);
+                    if (x2.directLight.hasWinner) onlineNeeEvent = kGrisFreshX2NeeEvent;
                 }
             }
             else if (bounce == 3u && x2.deepPdf > 0.f)
             {
                 captured = rtptGrisCaptureDualNee(sd, x2.deepLight, neeRng, true);
-                if (x2.deepLight.hasWinner)
-                {
-                    deepSample = triangleHit;
-                }
+                if (x2.deepLight.hasWinner) onlineNeeEvent = kGrisFreshX3NeeEvent;
             }
             else if (captureExplicit && bounce >= 4u && x2.deepPdf > 0.f)
             {
@@ -609,8 +721,19 @@ float3 RTPT_CONTINUATION_NAME(
                             evalRng, false, shadowClear);
                         rtptGrisCaptureDualExplicit(light, light.terminalKind, bounce, explicitPathID,
                             explicitThroughput * value * float(lateCount), light.lightPdfOrIndex, lateTerminal);
+                        rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshLateEvent, freshRootPdf * x2.deepPdf * lightProbability,
+                            lateTerminal.incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng);
                     }
                 }
+            }
+            if (onlineNeeEvent != 0xffffffffu)
+            {
+                const bool firstNee = onlineNeeEvent == kGrisFixedX1NeeEvent;
+                const bool secondNee = onlineNeeEvent == kGrisFreshX2NeeEvent;
+                const GrisDualNeeTerminal terminal = firstNee ? x2.firstNee : (secondNee ? x2.directLight : x2.deepLight);
+                const float pathPdf = freshRootPdf * (firstNee ? 1.f : (secondNee ? x2.areaPdf : x2.deepPdf));
+                rtptGrisOfferNativeFreshNee(nativeFresh, onlineNeeEvent, pathPdf, sd, mi, terminal, deltaPrefix,
+                    freshReservoir, freshEvaluationRng, freshSelectionRng);
             }
             if (!captured)
             {
@@ -680,6 +803,13 @@ float3 RTPT_CONTINUATION_NAME(
             if (!(marginalPdf > 0.f) || !isfinite(marginalPdf)) break;
             bs.pdf = marginalPdf;
             const float3 numerator = mi.eval(sd, bs.wo, sg);
+#if RTPT_GRIS_DUAL_FIRST_HIT
+            if (bounce == 2u)
+            {
+                nativeFresh.outgoingBsdf = numerator;
+                nativeFresh.outgoingPdf = marginalPdf;
+            }
+#endif
             bs.weight = numerator / marginalPdf;
             if (!all(isfinite(bs.weight))) break;
         }
@@ -801,52 +931,3 @@ float3 RTPT_CONTINUATION_NAME(
     return all(isfinite(radiance)) ? radiance : float3(0.f);
 #endif
 }
-
-#if !RTPT_GRIS_GENERATE
-#if RTPT_DELTA_NRD
-// Compatibility wrapper: ordinary D/S transport and its RNG are unchanged.
-float3 rtptTraceContinuation(
-    ShadingData primarySD, IMaterialInstance primaryMI, uint primaryLobes,
-    RTPTSamplingContext primarySampling, inout SampleGenerator sg,
-    out float firstHitDistance, out uint firstHitDistanceState,
-    inout RTPTSharcStats sharcStats, uint rootCoverage)
-{
-    RTPTDeltaGuide unused = {};
-    return rtptTraceContinuationWithGuide(primarySD, primaryMI, primaryLobes, primarySampling, sg,
-        firstHitDistance, firstHitDistanceState, sharcStats, rootCoverage, unused);
-}
-#endif
-// Existing callers, including the delta residual, retain the complete old
-// contribution domain. Only the root non-delta D/S calls pass DI ownership.
-float3 rtptTraceContinuation(
-    ShadingData primarySD,
-    IMaterialInstance primaryMI,
-    uint primaryLobes,
-    RTPTSamplingContext primarySampling,
-    inout SampleGenerator sg,
-    out float firstHitDistance,
-    out uint firstHitDistanceState,
-    inout RTPTSharcStats sharcStats
-)
-{
-    return rtptTraceContinuation(primarySD, primaryMI, primaryLobes, primarySampling, sg,
-        firstHitDistance, firstHitDistanceState, sharcStats, 0u);
-}
-
-// Keep the original continuation interface for the inline fallback and delta
-// residual. Its unobserved event-state output is removed by shader compilation.
-float3 rtptTraceContinuation(
-    ShadingData primarySD,
-    IMaterialInstance primaryMI,
-    uint primaryLobes,
-    RTPTSamplingContext primarySampling,
-    inout SampleGenerator sg,
-    out float firstHitDistance,
-    inout RTPTSharcStats sharcStats
-)
-{
-    uint unusedDistanceState;
-    return rtptTraceContinuation(primarySD, primaryMI, primaryLobes, primarySampling, sg,
-        firstHitDistance, unusedDistanceState, sharcStats);
-}
-#endif // !RTPT_GRIS_GENERATE

@@ -84,9 +84,7 @@ bool RTPT::prepareStages()
         {
             ProgramDesc resolveDesc;
             resolveDesc.addShaderLibrary("RenderPasses/RTPT/Signal/RTPTFinalSignalResolve.cs.slang").csEntry("main");
-            DefineList resolveDefines;
-            resolveDefines.add("RTPT_DELTA_NRD", mEnableDeltaReflectionNRD ? "1" : "0");
-            mpFinalSignalResolve = ComputePass::create(mpDevice, resolveDesc, resolveDefines, true);
+            mpFinalSignalResolve = ComputePass::create(mpDevice, resolveDesc);
         }
         const auto primaryVar = mpPrimarySurfacePass->getRootVar()["gPrimarySurfaceOutput"];
         const uint64_t primaryStride = structuredStride(primaryVar);
@@ -222,8 +220,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     if (mGRISTemporalEnabled && !temporalSupported)
         logWarningOnce("RTPT GRIS Temporal requires compatible lighting, internal NRD signals, one sample per pixel, and RR disabled.");
     const bool spatialEnabled = mGRISSpatialEnabled;
-    const bool deltaReuse = mGRISDeltaReuseEnabled && dualFirstHit &&
-        mDeltaReflectionNRDInSpecular && !mEnableDeltaReflectionNRD && mpScene->hasGeometryType(GeometryType::TriangleMesh);
+    const bool deltaReuse = dualFirstHit && mpScene->hasGeometryType(GeometryType::TriangleMesh);
     const bool spatialDeepIncident = !mGRISSpatialDeepIncidentDisabled && dualFirstHit && spatialEnabled &&
         mpScene->hasGeometryType(GeometryType::TriangleMesh);
     const bool referenceReuse = canUseGRISReferenceReuse();
@@ -780,8 +777,6 @@ void RTPT::executePrimarySurface(RenderContext* pRenderContext)
 void RTPT::executeFinalSignalResolve(RenderContext* pRenderContext, const RenderData& renderData)
 {
     pRenderContext->uavBarrier(mpSignalRecords.get());
-    if (mEnableDeltaReflectionNRD)
-        pRenderContext->uavBarrier(renderData.getTexture("nrdDeltaReflectionRaw").get());
     auto var = mpFinalSignalResolve->getRootVar();
     var["gResolveParams"]["frameDim"] = mFrameDim;
     var["gSignalRecords"] = mpSignalRecords;

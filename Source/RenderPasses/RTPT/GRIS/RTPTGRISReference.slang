@@ -736,6 +736,7 @@ GrisSpatialRecord rtptGrisFinalizeDualTail(GrisSpatialRecord center, GrisSpatial
     return center;
 }
 
+#if RTPT_GRIS_GENERATE
 void rtptGrisApplyDualNeeTerminal(GrisDualNeeTerminal terminal, bool deep, inout GrisSpatialRecord record)
 {
     record.candidate.terminalKind = terminal.terminalKind;
@@ -746,30 +747,40 @@ void rtptGrisApplyDualNeeTerminal(GrisDualNeeTerminal terminal, bool deep, inout
     else record.suffixDirection = terminal.coordinates;
 }
 
+static const uint kGrisFreshX2NeeEvent = 0u;
+static const uint kGrisFreshX3NeeEvent = 1u;
+static const uint kGrisFreshX3BsdfEvent = 2u;
+static const uint kGrisFreshLateEvent = 3u;
+static const uint kGrisFreshSharcEvent = 4u;
 static const uint kGrisFixedX1NeeEvent = 5u;
 
-float rtptGrisFixedX1RootPdfSum(GrisDualFirstHits hits, uint slot, float3 direction, ShadingData primary,
-    IMaterialInstance primaryMaterial, RTPTSamplingContext diffuseSampling)
+bool rtptGrisFreshRootPdfValid(float nativePdf, float3 drawDirection)
 {
-    const float nativePdf = hits.firstHitAreaPdf[slot];
-    if (!(nativePdf > 0.f) || !isfinite(nativePdf) || !all(isfinite(direction)) || !(dot(direction, direction) > 0.f))
-        return 0.f;
+    return nativePdf > 0.f && isfinite(nativePdf) && all(isfinite(drawDirection)) &&
+        dot(drawDirection, drawDirection) > 0.f;
+}
+
+float rtptGrisFreshRootPdfSumAtVertex(float nativePdf, uint slot, uint attemptedMask, float3 drawDirection,
+    float3 firstPosition, float3 firstFaceNormal, ShadingData primary, IMaterialInstance primaryMaterial,
+    RTPTSamplingContext diffuseSampling, bool separateRootMeasures)
+{
+    if (separateRootMeasures) return nativePdf;
+    if (!rtptGrisFreshRootPdfValid(nativePdf, drawDirection)) return 0.f;
 
     const uint otherSlot = slot ^ 1u;
-    if ((hits.attemptedMask & (1u << otherSlot)) == 0u) return nativePdf;
+    if ((attemptedMask & (1u << otherSlot)) == 0u) return nativePdf;
 
-    const VertexData first = rtptGrisPrefixVertex(HitInfo(hits.x1[slot]).getTriangleHit());
     float3 representedDirection;
     float distanceSquared;
-    if (!rtptGrisPrefixDirection(primary.computeRayOrigin(), first.posW, representedDirection, distanceSquared)) return 0.f;
-    const float geometry = abs(dot(first.faceNormalW, representedDirection)) / distanceSquared;
+    if (!rtptGrisPrefixDirection(primary.computeRayOrigin(), firstPosition, representedDirection, distanceSquared)) return 0.f;
+    const float geometry = abs(dot(firstFaceNormal, representedDirection)) / distanceSquared;
     primary.mtl.setActiveLobes(otherSlot == 0u ? uint(LobeType::DiffuseReflection) : uint(LobeType::SpecularReflection));
     const RTPTSamplingContext sampling = otherSlot == 0u ? diffuseSampling : rtptBSDFSamplingContext();
-    const float otherPdf = rtptContinuationPdf(primary, primaryMaterial, sampling, direction);
+    const float otherPdf = rtptContinuationPdf(primary, primaryMaterial, sampling, drawDirection);
     return otherPdf >= 0.f && isfinite(otherPdf) ? nativePdf + otherPdf * geometry : 0.f;
 }
 
-// Rebuild the same record for scoring and for publishing the chosen event.
+// Materialize only the candidate selected by the Fresh reservoir.
 GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitInfo firstHit,
     uint event, uint slot, GrisDualX2Sample x2, GrisDualExplicitTerminal terminal
 #if RTPT_GRIS_DUAL_SHARC
@@ -781,7 +792,7 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
     )
 {
 #if RTPT_GRIS_DUAL_SHARC
-    if (event == 4u)
+    if (event == kGrisFreshSharcEvent)
     {
 #ifdef RTPT_GRIS_DELTA_REUSE
         if (deltaRoot) cache.candidate.terminalKind |= kGrisDeltaRoot;
@@ -789,7 +800,7 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
         return cache;
     }
 #endif
-    const bool deep = event != 0u;
+    const bool deep = event != kGrisFreshX2NeeEvent;
     GrisSpatialRecord proposal = {};
     proposal.ownerPrimaryHit = owner;
     proposal.sourceX1 = firstHit;
@@ -814,7 +825,7 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
     }
     const GrisDualNeeTerminal light = deep ? x2.deepLight : x2.directLight;
     rtptGrisApplyDualNeeTerminal(light, deep, proposal);
-    if (event == 2u || event == 3u)
+    if (event == kGrisFreshX3BsdfEvent || event == kGrisFreshLateEvent)
     {
         // Explicit events restore the terminal fields recorded at the original hit.
         proposal.suffixLight = terminal.suffixLight;
@@ -831,132 +842,47 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
     return proposal;
 }
 
-float3 rtptGrisResolveFreshIncident(GrisSpatialRecord proposal, uint event, TriangleHit deepSample,
-    float3 recordedIncident, float lightProbability, inout SampleGenerator rng)
+struct GrisFreshSlotReservoir
 {
-    if (event != 1u || !(lightProbability > 0.f)) return recordedIncident;
-    bool shadowClear;
-    return rtptGrisEvaluateDualDeep(proposal, deepSample, lightProbability, rng, shadowClear);
+    float weightSum;
+    float winnerTarget;
+    float3 winnerDiffuse;
+    float3 winnerSpecular;
+    uint winnerEvent;
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+    float4 winnerDeepIncident;
+#endif
+};
+
+void rtptGrisOfferFreshCandidate(inout GrisFreshSlotReservoir reservoir, uint event, GrisDualTailValue value,
+    float proposalSum, float3 deepIncident, float deepLightPdf, inout SampleGenerator pickRng)
+{
+    if (!(proposalSum > 0.f) || !isfinite(proposalSum)) return;
+    const float target = value.target();
+    const float weight = target / proposalSum;
+    if (!(weight > 0.f) || !isfinite(weight)) return;
+
+    reservoir.weightSum += weight;
+    if (sampleNext1D(pickRng) * reservoir.weightSum < weight)
+    {
+        reservoir.winnerTarget = target;
+        reservoir.winnerDiffuse = value.diffuse;
+        reservoir.winnerSpecular = value.specular;
+        reservoir.winnerEvent = event;
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+        reservoir.winnerDeepIncident = float4(deepIncident, deepLightPdf);
+#endif
+    }
 }
 
-GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirstHits firstHits,
-    GrisDualX2Sample x2Samples[2], TriangleHit deepSamples[2],
-    GrisDualExplicitTerminal bsdfTerminals[2], GrisDualExplicitTerminal lateTerminals[2],
-#if RTPT_GRIS_DUAL_SHARC
-    GrisSpatialRecord cache[2],
-    float3 cacheIncident[2],
-#endif
-    inout SampleGenerator rng, ShadingData primary, IMaterialInstance primaryMaterial, RTPTSamplingContext diffuseSampling
-#ifdef RTPT_GRIS_DELTA_REUSE
-    , bool deltaSpecular, GrisDeltaPrefix deltaPrefix
-#endif
-#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
-    , out float4 spatialDeepIncident
-#endif
-    )
+uint rtptGrisChooseFreshSlot(GrisFreshSlotReservoir diffuse, GrisFreshSlotReservoir specular, inout SampleGenerator mergeRng)
 {
-#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
-    spatialDeepIncident = 0.f;
-#endif
-    const uint rootCount = 2u;
-    const float3 camera = gScene.camera.getPosition();
-    const uint noWinner = 0xffffffffu;
-    uint winnerIndex = noWinner;
-    float sum = 0.f;
-    float3 winnerDiffuse = 0.f, winnerSpecular = 0.f;
-    float winnerTarget = 0.f;
-    uint eventCount = gParams.maxBounces > 3u ? 4u : 3u;
-#if RTPT_GRIS_DUAL_SHARC
-    if (gParams.maxBounces > 4u) eventCount = 5u;
-#endif
-    float2 rootPdfSum;
-#ifdef RTPT_GRIS_DELTA_REUSE
-    if (deltaSpecular)
-    {
-        // The two strata use different first-edge measures. Neither supplies
-        // a proposal density in the other's measure.
-        rootPdfSum = float2(firstHits.firstHitAreaPdf[0], firstHits.firstHitAreaPdf[1]);
-    }
-    else
-#endif
-    {
-        rootPdfSum = float2(
-            rtptGrisFixedX1RootPdfSum(firstHits, 0u, x2Samples[0].rootDirection, primary, primaryMaterial, diffuseSampling),
-            rtptGrisFixedX1RootPdfSum(firstHits, 1u, x2Samples[1].rootDirection, primary, primaryMaterial, diffuseSampling));
-    }
-    const uint totalEvents = eventCount + 1u;
-    [loop] for (uint eventIndex = 0u; eventIndex < totalEvents; ++eventIndex)
-    {
-        const uint event = eventIndex == eventCount ? kGrisFixedX1NeeEvent : eventIndex;
-        [unroll] for (uint slot = 0u; slot < rootCount; ++slot)
-        {
-            const GrisDualExplicitTerminal terminal = event == 2u ? bsdfTerminals[slot] : lateTerminals[slot];
-            const GrisSpatialRecord proposal = rtptGrisMakeDualFreshProposal(center.ownerPrimaryHit,
-                firstHits.x1[slot], event, slot, x2Samples[slot], terminal
-#if RTPT_GRIS_DUAL_SHARC
-                , cache[slot]
-#endif
-#ifdef RTPT_GRIS_DELTA_REUSE
-                , deltaSpecular && slot == 1u
-#endif
-                );
-            if (!rtptGrisDualTailValid(proposal)) continue;
-            float3 recordedIncident = (event == 2u || event == 3u) ? terminal.incident : float3(0.f);
-#if RTPT_GRIS_DUAL_SHARC
-            if (event == 4u) recordedIncident = cacheIncident[slot];
-#endif
-            const float lightProbability = rtptGrisDualLightProbability(proposal);
-            const float3 deepIncident = rtptGrisResolveFreshIncident(proposal, event, deepSamples[slot],
-                recordedIncident, lightProbability, rng);
-            const float deepLightPdf = event == 2u ? asfloat(terminal.lightPdfOrIndex) : 0.f;
-            const float proposalSum = rootPdfSum[slot] * proposal.areaPdf * lightProbability;
-            if (!(proposalSum > 0.f) || !isfinite(proposalSum)) continue;
-            const GrisDualTailValue value = rtptGrisEvaluateFixedX1Tail(center.ownerPrimaryHit, camera, proposal,
-                deepIncident, rng, true, {}, deepLightPdf, false
-#ifdef RTPT_GRIS_DELTA_REUSE
-                , deltaPrefix
-#endif
-            );
-            float weight = value.target() / proposalSum;
-            if (!(weight > 0.f) || !isfinite(weight)) continue;
-            sum += weight;
-            if (sampleNext1D(rng) * sum < weight)
-            {
-                winnerIndex = event * 2u + slot;
-                winnerDiffuse = value.diffuse;
-                winnerSpecular = value.specular;
-                winnerTarget = value.target();
-#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
-                spatialDeepIncident = float4(deepIncident, deepLightPdf);
-#endif
-            }
-        }
-    }
-    GrisSpatialRecord winner = center;
-    const float count = float(countbits(firstHits.attemptedMask));
-    if (winnerIndex != noWinner)
-    {
-        const uint event = winnerIndex / 2u;
-        // Keep lookup indices static to avoid addressable arrays in the shader.
-        [unroll] for (uint slot = 0u; slot < rootCount; ++slot)
-        {
-            if ((winnerIndex & 1u) != slot) continue;
-            const GrisDualExplicitTerminal terminal = event == 2u ? bsdfTerminals[slot] : lateTerminals[slot];
-            winner = rtptGrisMakeDualFreshProposal(center.ownerPrimaryHit, firstHits.x1[slot],
-                event, slot, x2Samples[slot], terminal
-#if RTPT_GRIS_DUAL_SHARC
-                , cache[slot]
-#endif
-#ifdef RTPT_GRIS_DELTA_REUSE
-                , deltaSpecular && slot == 1u
-#endif
-                );
-        }
-        winner.candidate.F = winnerDiffuse;
-        winner.candidate.dualF = winnerSpecular;
-    }
-    return rtptGrisFinalizeDualTail(center, winner, sum, winnerTarget, count);
+    if (!(diffuse.weightSum > 0.f)) return 1u;
+    if (!(specular.weightSum > 0.f)) return 0u;
+    const float total = diffuse.weightSum + specular.weightSum;
+    return sampleNext1D(mergeRng) * total < specular.weightSum ? 1u : 0u;
 }
+#endif
 
 #if defined(RTPT_GRIS_TEMPORAL_REUSE) || RTPT_GRIS_SPATIAL_REUSE
 struct GrisDualTemporalWinner

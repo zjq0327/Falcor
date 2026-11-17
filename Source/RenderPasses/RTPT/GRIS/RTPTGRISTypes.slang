@@ -123,15 +123,6 @@ struct GrisLocalPrefix
 #endif
 };
 
-#if RTPT_GRIS_DUAL_FIRST_HIT
-struct GrisDualFirstHits
-{
-    PackedHitInfo x1[2];
-    float firstHitAreaPdf[2];
-    uint attemptedMask;
-};
-#endif
-
 // Pixel-local estimates from both full root walks. Geometry belongs to the
 // selected path record; each walk's GrisLocalPrefix remains invocation-local.
 struct GrisLocalContributions

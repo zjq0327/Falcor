@@ -4,19 +4,13 @@
 
 `RTPTNRD.py` 与 `RTPTSHARCNRD.py` 的普通 RELAX 使用 D 常规历史上限 16、快速历史上限 2，以及独立的 `diffuseHistoryClampingSigmaScale=4`。较宽的漫反射色盒减少稀疏亮样本被短历史反复截断；`diffuseHistoryClampingDarkThreshold=0.0002` 使用快速历史的 5×5 平均亮度，在接近黑时平滑恢复原来的共享 sigma，避免延长微弱关暗残留。阈值采用去材质化、缩放前的 BT.601 漫反射辐射单位，并与 NRD 输入缩放配对。
 
-该适配仅作用于 NRD 3.1 的普通 D/S 方法；镜面、独立 delta 降噪、FP16 缓存和原有空间权重保留。两个新属性的底层默认值均为 0，其他渲染图沿用 SDK 路径。材质、1 spp 和原始路径估计器不因本修复改变。
+该适配作用于 NRD 3.1 普通 D/S 方法的漫反射历史钳制。两个属性的底层默认值均为 0，其他渲染图沿用 SDK 路径。
 
 同输入逐阶段对照确认历史钳制的长期截断是主要压暗来源，直接关闭亮度权重、仅缩短历史或提高内部精度没有得到同等平衡的结果。新的独立种子在两个静态门位的桌腿局部 RMSE 下降约 15%–16%；亮度波动略增，原有动态光照滞后仍存在，60 fps 还可测到一帧极弱残留差异。完整的收支、15/60 fps 响应、边界检查与验证限制见[修复报告](../../../build/relax-sparse-fix/report.html)。
 
-## 独立 delta 反射降噪
+## δ 镜面反射
 
-`RTPTSHARCNRD.py` 默认启用独立反射 NRD；设置 `RTPT_DELTA_REFLECTION_NRD_ENABLED=0` 可回到原来的 residual 合成。底层 RTPT 属性为 `enableDeltaReflectionNRD`，默认关闭以兼容既有渲染图。`RTPT_NRD_ENABLED=0` 同时旁路普通和反射降噪，保留材质恢复。
-
-镜面仍沿原有独立续接追踪，材质粗糙度、Fresnel 和随机数流保持原定义。当前实现为静止、几何面法线与着色法线一致的镜面首跳生成虚像深度、反射后的表面法线和世界空间运动；运动门的上一帧命中位置参与虚像运动计算。反射辐射与首个反射命中的材质因子成对去除/恢复，发光项独立合成。原始 `noisyColor` 保留完整追踪贡献；仅在最终信号合成中从 residual 移走有效的反射贡献，避免重复计光。
-
-无有效反射命中、超出 NRD 深度范围、移动/法线不匹配镜面以及不支持的纯镜面链保留原 residual；合法的零辐射命中仍为有效引导。反射引导不进入 GRIS，也不扩展 GRIS 的根分量或候选/历史布局。额外资源为反射信号纹理和独立 NRD 的内部缓存；关闭功能的渲染图不分配这些反射输出。
-
-同一 Veach 开关门场景的 [修复前后验证](../../../build/delta-reflection-nrd/report.html) 包含 399 帧捕获、亮点/闪烁/亮度测量、动图与 ABBA GPU 计时。RTX 5070 的 720p 渲染图增加约 0.73 ms（6.3%），公共反射纹理增加约 77.34 MiB，另有 NRD 内部缓存。桌面亮点显著减少，但部分运动帧的局部变暗仍存在；本次不解决原有全局偏暗和桌腿暗斑。
+RTPT 的 NRD 路径将 δ 镜面反射和镜面首跳距离写入普通 NRD S。`RTPTSHARCNRD.py` 默认启用双首交 GRIS 和 Temporal / Spatial。兼容的双首交 GRIS 使用现有 S 槽和 reservoir 复用 δ 光路。未进入 GRIS 的镜面光路在当前像素本地追踪，结果也进入普通 S。`RTPT_NRD_ENABLED=0` 旁路 NRD 滤波，保留材质恢复。
 
 > 自定义测试、历史验证脚本和专用测试场景/GPU 检查代码已清理，Falcor 原生及第三方测试保留。`build/` 中的历史报告、图像和数值结果保留；下文旧测试命令仅作历史记录。具体文件见 [清理清单](../../../build/test-cleanup-20261109.json)。
 
@@ -60,7 +54,7 @@ ReSTIR DI 在首表面对光源目录执行全局 Initial RIS，随后可执行 
 
 DI 接管首表面非 delta 的覆盖域：去掉该域的旧根 NEE 和首段命中发光面的 emission，同时继续原间接续接。环境、方向光及其他解析灯使用剩余域的正确选灯概率；主可见 emission、delta residual、深层 NEE 和独立 PG/SHaRC 训练保留原规则。合法空、黑色、遮挡或选中身份失效保留 DI 域，不根据结果补抽旧 NEE。只有准备或记录元数据失败才能恢复旧域。
 
-裸 RTPT 的 `restirDIEnabled` 默认关闭，正式主图与 `RTPR_START.cmd` 默认开启；设置 `RTPT_RESTIR_DI_ENABLED=0` 可关闭。`restirDICandidateCount` 默认 8（1–128），`restirDIBudgetMB` 默认 512（16–2048）。目前仅 NRD 输入模式、1 spp、NEE 开启时生效，普通积分器保留旧路径。当前新增 120 B/像素（SDK reservoir 24、完整 UV/身份 sidecar 48、D/S 48），加灯目录与剩余解析灯索引，使用独立预算；准备失败保留阶段 1 并回退原选灯。`RTPT.diStats` 报告实际生效状态、代次、覆盖域、字节、步长与原因。
+`restirDIEnabled` 在裸 RTPT、主图和 `RTPR_START.cmd` 中默认关闭。设置 `RTPT_RESTIR_DI_ENABLED=1` 可切换到 ReSTIR DI 配置。`restirDICandidateCount` 默认 8（1–128），`restirDIBudgetMB` 默认 512（16–2048）。目前仅 NRD 输入模式、1 spp、NEE 开启时生效，普通积分器保留旧路径。当前新增 120 B/像素（SDK reservoir 24、完整 UV/身份 sidecar 48、D/S 48），加灯目录与剩余解析灯索引，使用独立预算。准备失败时保留阶段 1 并回退原选灯。`RTPT.diStats` 报告实际生效状态、代次、覆盖域、字节、步长与原因。
 
 Release 构建、16 项 GPU 测试、183 项生命周期检查、720p 144 帧和 NRD 关闭直通检查通过。K=8 的 16 场景及 K=1/32 各 5 场景原始均值通过预设统计区间，关闭 DI 的 98 份源信号与封存基线逐字节一致；格式转换及后处理差异单独记录。协议、完整结果和限制见 [阶段 2 验证说明](../../../build/rtpt-experiment-tests-backup-20261101/tests/rtpt_stage2/README.md)。本阶段不宣称时间/空间复用或性能提升，共享 Material/BSDF、RTXDI、NRDPass、ModulateIllumination 未修改。
 

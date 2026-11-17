@@ -1,9 +1,5 @@
 #pragma once
 
-#ifndef RTPT_DELTA_NRD_SPECULAR
-#define RTPT_DELTA_NRD_SPECULAR 0
-#endif
-
 #include "DirectLighting/RTPTDICoverage.slang"
 #include "RTPTContinuation.slang"
 #include "Signal/RTPTSignalResolve.slang"
@@ -66,16 +62,6 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
     signals.specularReflectance = 1.f;
     signals.normalRoughness = float4(0.5f, 0.5f, 0.f, 0.f);
     signals.viewZ = kRTPTNRDMissDistance;
-#if RTPT_DELTA_NRD
-    // Every invocation clears its lane, including primary misses/no delta.
-    gDeltaRadiance[pixel] = 0.f;
-    gDeltaReflectance[pixel] = 0.f;
-    gDeltaEmission[pixel] = 0.f;
-    gDeltaNormal[pixel] = float4(0.5f, 0.5f, 1.f, 0.f);
-    gDeltaViewZ[pixel] = kRTPTNRDMissDistance;
-    gDeltaMotion[pixel] = 0.f;
-    gDeltaRaw[pixel] = 0.f;
-#endif
 #if RTPT_SEPARATE_SIGNAL_RESOLVE
     float3 indirectDiffuse = 0.f;
     float3 indirectSpecular = 0.f;
@@ -251,7 +237,7 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
                 signals.specularHitDistance = gris.firstHit[1].hitT;
                 diffuseDistanceState = gris.firstHit[0].distanceState;
                 specularDistanceState = gris.firstHit[1].distanceState;
-#if defined(RTPT_GRIS_DELTA_REUSE) && RTPT_DELTA_NRD_SPECULAR
+#ifdef RTPT_GRIS_DELTA_REUSE
                 // Generate filled the same S lane and first-hit guide for either reflection type.
                 grisDeltaPrepared = hasDeltaSpecular && !hasSpecular;
 #endif
@@ -305,63 +291,24 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
 #endif
         if (hasDeltaSpecular && !grisDeltaPrepared)
         {
-#if RTPT_DELTA_NRD
-            float unusedDistance;
-            uint unusedState;
-            RTPTDeltaGuide guide = {};
-            guide.mirrorPosition = sd.posW;
-            guide.mirrorNormal = sd.getOrientedFaceNormal();
-            guide.mirrorPreviousPosition = gScene.getPrevPosW(hit);
-            // Curved/normal-mapped/moving mirrors need a different mapping.
-            guide.enabled = dot(properties.guideNormal, guide.mirrorNormal) > 0.9999f &&
-                length(guide.mirrorPreviousPosition - sd.posW) < 1e-5f;
-            guide.state = guide.enabled ? 2u : 3u;
-            signals.residual = rtptTraceContinuationWithGuide(sd, mi, uint(LobeType::DeltaReflection),
-                rtptBSDFSamplingContext(), sg, unusedDistance, unusedState, sharcStats, 0u, guide);
-            gDeltaRaw[pixel] = float4(signals.residual, float(guide.state));
-            if (guide.state == 1u)
-            {
-                gDeltaRadiance[pixel] = float4(max(0.f, signals.residual - guide.emission) / guide.reflectance, 0.f);
-                gDeltaReflectance[pixel] = float4(guide.reflectance, 0.f);
-                gDeltaEmission[pixel] = float4(guide.emission, 0.f);
-                gDeltaNormal[pixel] = float4(rtptNRDPackNormal(guide.normal), guide.roughness, 0.f);
-                gDeltaViewZ[pixel] = guide.viewZ;
-                gDeltaMotion[pixel] = float4(guide.motion, 0.f);
-            }
-#elif RTPT_DELTA_NRD_SPECULAR
-            // StandardMaterial selects either a rough specular or a delta
-            // primary lobe. Both can therefore share NRD's specular lane while
-            // keeping the same visible-primary guides and effective albedo.
-            // Trace the same physical continuation as the residual path: its
-            // throughput already includes mirror Fresnel and sampling weights.
             float deltaFirstHitDistance;
             uint deltaFirstHitState;
             const float3 deltaRadiance = rtptTraceContinuation(sd, mi, uint(LobeType::DeltaReflection),
-                rtptBSDFSamplingContext(), sg, deltaFirstHitDistance, deltaFirstHitState, sharcStats);
+                rtptBSDFSamplingContext(), sg, deltaFirstHitDistance, deltaFirstHitState, sharcStats, 0u);
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+            indirectSpecular += deltaRadiance;
+#else
+            signals.specular += deltaRadiance;
+#endif
+            // Use the mirror distance for a delta-only lobe. A rough specular
+            // lobe, if present, already supplied the shared hit distance.
             if (!hasSpecular)
             {
-#if RTPT_SEPARATE_SIGNAL_RESOLVE
-                indirectSpecular += deltaRadiance;
-                specularDistanceState = deltaFirstHitState;
-#else
-                signals.specular += deltaRadiance;
-#endif
-                // This is the world-space distance from the visible primary
-                // to its first reflected hit, independently of radiance. Keep
-                // the continuation's finite miss/rejected-sample convention.
                 signals.specularHitDistance = deltaFirstHitDistance;
-            }
-            else
-            {
-                // A material with simultaneous rough and delta lobes needs a
-                // defined joint distance estimator. Preserve its old residual
-                // until that representation is supported.
-                signals.residual = deltaRadiance;
-            }
-#else
-            float unusedDistance;
-            signals.residual = rtptTraceContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+                specularDistanceState = deltaFirstHitState;
 #endif
+            }
         }
 #if !RTPT_SEPARATE_SIGNAL_RESOLVE
         // NRD deliberately excludes surfaces outside its denoising range.
@@ -383,9 +330,6 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
     return 0.f;
 #else
     const float3 fullRadiance = signals.emission + signals.diffuse + signals.specular + signals.residual;
-#if RTPT_DELTA_NRD
-    if (gDeltaRaw[pixel].a == 1.f) signals.residual -= gDeltaRaw[pixel].rgb;
-#endif
     rtptWriteNRDSignals(pixel, signals);
     return fullRadiance;
 #endif

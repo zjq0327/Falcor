@@ -45,6 +45,31 @@ bool rtptGrisReplayDeltaPrefix(ShadingData primary, SampleGenerator rng, out Gri
 }
 #endif
 
+GrisDualTailValue rtptGrisEvaluateFixedX1Root(ShadingData primary, float3 direction, float3 common,
+    inout SampleGenerator rng)
+{
+    GrisDualTailValue result = {};
+    if (!all(isfinite(common)) || !any(common > 0.f)) return result;
+    primary.mtl.setActiveLobes(uint(LobeType::Reflection));
+    const IMaterialInstance material = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
+    const uint lobes = material.getLobeTypes(primary);
+    const uint diffuse = uint(LobeType::DiffuseReflection);
+    const uint specular = uint(LobeType::SpecularReflection);
+    if (rtptGRISSupportsSurface(primary, lobes & diffuse))
+    {
+        primary.mtl.setActiveLobes(diffuse);
+        const float3 value = material.eval(primary, direction, rng) * common;
+        if (all(isfinite(value))) result.diffuse = value;
+    }
+    if (rtptGRISSupportsSurface(primary, lobes & specular))
+    {
+        primary.mtl.setActiveLobes(specular);
+        const float3 value = material.eval(primary, direction, rng) * common;
+        if (all(isfinite(value))) result.specular = value;
+    }
+    return result;
+}
+
 // Continuous roots keep the represented x1. Singular roots reconstruct the
 // evaluation pixel's mirror hit. Both use the same suffix coordinates.
 GrisDualTailValue rtptGrisEvaluateFixedX1Tail(PackedHitInfo ownerPrimaryHit, float3 camera, GrisSpatialRecord tail,
@@ -171,23 +196,5 @@ GrisDualTailValue rtptGrisEvaluateFixedX1Tail(PackedHitInfo ownerPrimaryHit, flo
 
     // The first-edge area density belongs to the Fresh proposal. The physical
     // target here contains only the geometry conversion, with no PG or PDF factor.
-    const float3 common = incident * firstGeometry;
-    if (!all(isfinite(common)) || !any(common > 0.f)) return result;
-    const IMaterialInstance rootMaterial = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
-    const uint lobes = rootMaterial.getLobeTypes(primary);
-    const uint diffuse = uint(LobeType::DiffuseReflection);
-    const uint specular = uint(LobeType::SpecularReflection);
-    if (rtptGRISSupportsSurface(primary, lobes & diffuse))
-    {
-        primary.mtl.setActiveLobes(diffuse);
-        const float3 value = rootMaterial.eval(primary, firstDirection, rng) * common;
-        if (all(isfinite(value))) result.diffuse = value;
-    }
-    if (rtptGRISSupportsSurface(primary, lobes & specular))
-    {
-        primary.mtl.setActiveLobes(specular);
-        const float3 value = rootMaterial.eval(primary, firstDirection, rng) * common;
-        if (all(isfinite(value))) result.specular = value;
-    }
-    return result;
+    return rtptGrisEvaluateFixedX1Root(primary, firstDirection, incident * firstGeometry, rng);
 }

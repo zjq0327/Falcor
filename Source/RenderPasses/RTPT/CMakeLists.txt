@@ -25,7 +25,6 @@ target_sources(RTPT PRIVATE
     RTPTTransport.slangh
     RTPT.cs.slang
     RTPTContinuation.slang
-    RTPTDeltaReflection.slang
     RTPTIntegrator.slang
     RTPTLighting.slang
     RTPTNRD.slang

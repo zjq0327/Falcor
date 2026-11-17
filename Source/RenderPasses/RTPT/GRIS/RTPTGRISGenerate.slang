@@ -40,7 +40,6 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     spatial.candidate.firstHit.distanceState = kRTPTDistanceUntraced;
     GrisLocalContributions local = {};
 #if RTPT_GRIS_DUAL_FIRST_HIT
-    GrisDualFirstHits dualFirstHits = {};
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
     float4 spatialDeepIncident = {};
 #endif
@@ -55,7 +54,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const uint sampleIndex = gParams.sampleOffset + gParams.seed * 0x9e3779b9u;
 #if !RTPT_GRIS_ALTERNATING
     SampleGenerator sg = SampleGenerator(pixel, sampleIndex);
-#if RTPT_GRIS_SPATIAL
+#if RTPT_GRIS_SPATIAL && !RTPT_GRIS_DUAL_FIRST_HIT
     SampleGenerator terminalRng = SampleGenerator(pixel, sampleIndex ^ 0xa511e9b3u);
 #endif
 #endif
@@ -128,7 +127,6 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #ifdef RTPT_GRIS_DELTA_REUSE
             const bool deltaSpecular = !hasSpecular && (lobes & uint(LobeType::DeltaReflection)) != 0u;
             const bool supportsDeltaRoot = deltaSpecular && rtptGRISPathReuseEnabled() && rtptGrisSupportsDeltaRoot(sd, lobes);
-            GrisDeltaPrefix deltaPrefix = {};
 #else
             const bool deltaSpecular = false;
             const bool supportsDeltaRoot = false;
@@ -138,17 +136,23 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 spatial.candidate.prepared = true;
                 spatial.candidate.M = 1.f;
 #if RTPT_GRIS_DUAL_FIRST_HIT
+                PackedHitInfo firstHits[2] = {};
                 GrisDualX2Sample x2Samples[2] = {};
-                TriangleHit deepSamples[2] = {};
                 GrisDualExplicitTerminal bsdfTerminals[2] = {};
                 GrisDualExplicitTerminal lateTerminals[2] = {};
                 SampleGenerator eventRng = SampleGenerator(pixel, sampleIndex ^ 0xf5942b8bu);
                 const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
 #if RTPT_GRIS_DUAL_SHARC
                 GrisSpatialRecord cacheProposals[2] = {};
-                float3 cacheIncident[2] = {};
 #endif
                 RTPTSamplingContext fixedX1DiffuseSampling = {};
+                GrisFreshSlotReservoir freshSlots[2] = {};
+                // The cross proposal needs the other slot's eligibility before either walk.
+                uint attemptedMask = 0u;
+                if (rtptGRISSupportsSurface(sd, lobes & uint(LobeType::DiffuseReflection)))
+                    attemptedMask |= 1u;
+                if (rtptGRISSupportsSurface(sd, lobes & uint(LobeType::SpecularReflection)) || supportsDeltaRoot)
+                    attemptedMask |= 2u;
 #endif
                 [unroll]
                 for (uint slot = 0u; slot < 2u; ++slot)
@@ -169,28 +173,20 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     prefix.rootLobe = currentRoot;
                     GrisFirstHit firstHit;
 #if RTPT_GRIS_DUAL_FIRST_HIT
-                    if (rtptGRISSupportsSurface(component, lobes & activeLobe) || (slot == 1u && supportsDeltaRoot))
-                        dualFirstHits.attemptedMask |= 1u << slot;
+                    SampleGenerator freshEvaluationRng = SampleGenerator(pixel, sampleIndex ^ (0x517cc1b7u + slot));
+                    SampleGenerator freshSelectionRng = SampleGenerator(pixel, sampleIndex ^ (0x3c6ef373u + slot));
                     const uint lateSlot = lateCount == 0u ? 0u : min(uint(sampleNext1D(eventRng) * lateCount), lateCount - 1u);
                     const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
                         firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix,
-                        x2Samples[slot], deepSamples[slot], lateSlot,
-                        bsdfTerminals[slot], lateTerminals[slot]
+                        x2Samples[slot], lateSlot, bsdfTerminals[slot], lateTerminals[slot],
+                        slot, canonicalPrimary ? attemptedMask : 0u, supportsDeltaRoot,
+                        fixedX1DiffuseSampling, freshSlots[slot], freshEvaluationRng, freshSelectionRng
 #if RTPT_GRIS_DUAL_SHARC
-                        , cacheProposals[slot], cacheIncident[slot]
+                        , cacheProposals[slot]
 #endif
                     );
-                    dualFirstHits.x1[slot] = prefix.dualX1;
-                    dualFirstHits.firstHitAreaPdf[slot] = prefix.dualFirstPdf;
+                    firstHits[slot] = prefix.dualX1;
                     local.firstHit[slot] = firstHit;
-#ifdef RTPT_GRIS_DELTA_REUSE
-                    if (slot == 1u && supportsDeltaRoot)
-                    {
-                        deltaPrefix.x1 = prefix.dualX1;
-                        deltaPrefix.direction = x2Samples[slot].rootDirection;
-                        deltaPrefix.throughput = prefix.throughputToX1;
-                    }
-#endif
 #else
                     const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
                         firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f,
@@ -202,19 +198,37 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     else local.specular += localRadiance;
                 }
 #if RTPT_GRIS_DUAL_FIRST_HIT
-                spatial = rtptGrisBuildDualFresh(spatial, dualFirstHits, x2Samples, deepSamples,
-                    bsdfTerminals, lateTerminals,
+                const float total = freshSlots[0].weightSum + freshSlots[1].weightSum;
+                GrisSpatialRecord winner = spatial;
+                float winnerTarget = 0.f;
+                if (total > 0.f && isfinite(total))
+                {
+                    SampleGenerator mergeRng = SampleGenerator(pixel, sampleIndex ^ 0xd1b54a35u);
+                    const uint winnerSlot = rtptGrisChooseFreshSlot(freshSlots[0], freshSlots[1], mergeRng);
+                    [unroll] for (uint slot = 0u; slot < 2u; ++slot)
+                    {
+                        if (winnerSlot != slot) continue;
+                        const GrisFreshSlotReservoir selected = freshSlots[slot];
+                        const uint event = selected.winnerEvent;
+                        winner = rtptGrisMakeDualFreshProposal(spatial.ownerPrimaryHit, firstHits[slot], event, slot,
+                            x2Samples[slot], event == kGrisFreshX3BsdfEvent ? bsdfTerminals[slot] : lateTerminals[slot]
 #if RTPT_GRIS_DUAL_SHARC
-                    cacheProposals, cacheIncident,
+                            , cacheProposals[slot]
 #endif
-                    terminalRng, sd, mi, fixedX1DiffuseSampling
 #ifdef RTPT_GRIS_DELTA_REUSE
-                    , supportsDeltaRoot, deltaPrefix
+                            , slot == 1u && supportsDeltaRoot
 #endif
+                        );
+                        winner.candidate.F = selected.winnerDiffuse;
+                        winner.candidate.dualF = selected.winnerSpecular;
+                        winnerTarget = selected.winnerTarget;
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
-                    , spatialDeepIncident
+                        spatialDeepIncident = selected.winnerDeepIncident;
 #endif
-                );
+                    }
+                }
+                const float count = float(countbits(attemptedMask));
+                spatial = rtptGrisFinalizeDualTail(spatial, winner, total, winnerTarget, count);
 #else
                 // One stratified D+S group, one shared terminal winner, M=1.
                 rtptGRISFinalizePath(pathBuilder, spatial);
