@@ -290,7 +290,7 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
     bool canonicalInHistorySupported = false;
 #endif
     float totalM = canonical.candidate.M;
-    bool hasSource = false;
+    uint acceptedCount = 0u;
     for (uint j = 0u; j < inputCount; ++j)
     {
         domainValid[j] = rtptGrisRefDomainValid(inputs[j]) &&
@@ -317,10 +317,10 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
         if (domainValid[j])
         {
             totalM += inputs[j].candidate.M;
-            hasSource = true;
+            ++acceptedCount;
         }
     }
-    if (!hasSource) return canonical;
+    if (acceptedCount == 0u) return canonical;
 
     GrisSpatialRecord winner = canonical;
     float3 winnerValue = 0.f;
@@ -362,33 +362,48 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
         const float target = rtptGrisRefTarget(targetValue);
         if (!(target > 0.f) || !(targetRatio > 0.f)) continue;
 
-        // Equal domain coefficients. Even an empty source contributes a
-        // cross term if it supports this candidate.
-        float denominator = center ? ownTarget : ownTarget + target;
-        for (uint j = 0u; j < inputCount; ++j)
+        float misWeight;
+        if (center)
         {
-            if (!domainValid[j] || j == i) continue;
-            GrisSpatialRecord crossTail = targetTail;
-            bool previousGeometry = false;
-#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
-            if (j == replay.historyIndex)
+            // Spatial starts with the center's standalone share. Temporal
+            // starts at one in case the reverse shift has no support.
+            misWeight = 1.f;
+            for (uint j = 0u; j < inputCount; ++j)
             {
-                if (center)
+                // An accepted empty reservoir can still support this path.
+                if (!domainValid[j]) continue;
+                GrisSpatialRecord crossTail = targetTail;
+                bool previousGeometry = false;
+#if RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_TEMPORAL_REUSE)
+                if (j == replay.historyIndex)
                 {
                     if (!canonicalInHistorySupported) continue;
                     crossTail = canonicalInHistory;
+                    previousGeometry = replay.geometryChanged;
                 }
-                previousGeometry = replay.geometryChanged;
-            }
 #endif
-            float crossRatio, crossDistance;
-            const float3 cross = rtptGrisRefEvaluate(inputs[j].ownerPrimaryHit, sourceCameras[j], prefix, crossTail,
-                rng, crossRatio, crossDistance, previousGeometry, previousGeometry);
-            denominator += rtptGrisRefTarget(cross);
+                float crossRatio, crossDistance;
+                const float3 cross = rtptGrisRefEvaluate(inputs[j].ownerPrimaryHit, sourceCameras[j], prefix, crossTail,
+                    rng, crossRatio, crossDistance, previousGeometry, previousGeometry);
+#if RTPT_GRIS_SPATIAL_REUSE
+                misWeight += rtptGrisPairwiseCenterWeight(target, canonical.candidate.M,
+                    rtptGrisRefTarget(cross), inputs[j].candidate.M);
+#else
+                misWeight = rtptGrisTalbotWeight(target, canonical.candidate.M, rtptGrisRefTarget(cross), inputs[j].candidate.M);
+#endif
+            }
+        }
+        else
+        {
+#if RTPT_GRIS_SPATIAL_REUSE
+            misWeight = rtptGrisPairwiseNeighborWeight(target, canonical.candidate.M, ownTarget, candidate.candidate.M);
+#else
+            misWeight = rtptGrisTalbotWeight(ownTarget, candidate.candidate.M, target, canonical.candidate.M);
+#endif
         }
 
         const float sourceWeight = candidate.candidate.W / candidate.areaPdf;
-        const float weight = (ownTarget / denominator) * target * sourceWeight;
+        const float weight = target * misWeight * sourceWeight;
         if (!(weight > 0.f) || !isfinite(weight)) continue;
         weightSum += weight;
         if (!isfinite(weightSum)) return canonical;
@@ -414,6 +429,9 @@ GrisSpatialRecord rtptGrisMergeStoredPrefix(GrisSpatialRecord canonical, GrisSpa
         return canonical;
     }
 
+#if RTPT_GRIS_SPATIAL_REUSE
+    weightSum /= float(acceptedCount) + 1.f;
+#endif
     const float3 F = winnerValue / winnerRatio;
     const float W = winnerRatio * (weightSum / rtptGrisRefTarget(winnerValue));
     if (!(W > 0.f) || !isfinite(W) || !all(isfinite(F * W))) return canonical;
@@ -1406,6 +1424,7 @@ GrisDualTemporalWinner rtptGrisMergeDualTails(GrisSpatialRecord canonical, GrisD
     bool accepted[kGrisMaxReuseInputs];
 #if RTPT_GRIS_SPATIAL_REUSE
     PackedHitInfo sourcePrimaryHits[kGrisMaxReuseInputs];
+    float sourceCounts[kGrisMaxReuseInputs];
     uint acceptedCount = 0u;
 #endif
     [loop] for (uint j = 0u; j < inputCount; ++j)
@@ -1413,6 +1432,7 @@ GrisDualTemporalWinner rtptGrisMergeDualTails(GrisSpatialRecord canonical, GrisD
 #if RTPT_GRIS_SPATIAL_REUSE
         const GrisSpatialRecord neighbor = spatialInput[sourceIndices[j]];
         sourcePrimaryHits[j] = neighbor.ownerPrimaryHit;
+        sourceCounts[j] = neighbor.candidate.M;
 #else
         const GrisSpatialRecord neighbor = inputs[j];
 #endif
@@ -1473,57 +1493,44 @@ GrisDualTemporalWinner rtptGrisMergeDualTails(GrisSpatialRecord canonical, GrisD
         const float target = targetValue.target();
         if (!(target > 0.f)) continue;
 
-#if RTPT_GRIS_SPATIAL_REUSE
-        // Average one balance partition for each accepted center-neighbor pair.
-        // The center receives its share in every pair. A neighbor receives a
-        // share only from its pair, using its original target on the diagonal.
         float misWeight;
+#if RTPT_GRIS_SPATIAL_REUSE
         if (center)
         {
-            misWeight = target / target;
-            if (acceptedCount != 0u)
+            misWeight = 1.f;
+            [loop] for (uint j = 0u; j < inputCount; ++j)
             {
-                misWeight = 0.f;
-                [loop] for (uint j = 0u; j < inputCount; ++j)
-                {
-                    // An accepted empty reservoir still has a proposal domain.
-                    if (!accepted[j]) continue;
-                    const float cross = rtptGrisEvaluateDualTail(sourcePrimaryHits[j], sourceHits[j], camera,
-                        proposal, deepIncident.previous, evaluationRng, 2u, sourceDomain,
-                        deepIncident.lightPdf, knownVisible).target();
-                    misWeight += target / (target + cross);
-                }
-                misWeight /= float(acceptedCount);
+                // An accepted empty reservoir can still support this path.
+                if (!accepted[j]) continue;
+                const float cross = rtptGrisEvaluateDualTail(sourcePrimaryHits[j], sourceHits[j], camera,
+                    proposal, deepIncident.previous, evaluationRng, 2u, sourceDomain,
+                    deepIncident.lightPdf, knownVisible).target();
+                misWeight += rtptGrisPairwiseCenterWeight(target, canonical.candidate.M, cross, sourceCounts[j]);
             }
         }
         else
         {
             const float sourceTarget = rtptGrisNativeDualTail(proposal).target();
-            misWeight = (sourceTarget / (target + sourceTarget)) / float(acceptedCount);
+            misWeight = rtptGrisPairwiseNeighborWeight(target, canonical.candidate.M, sourceTarget, proposal.candidate.M);
         }
-        const float weight = target * misWeight * proposal.candidate.W;
 #else
-        float denominator = target;
-        float sourceTarget = center ? target : 0.f;
-        [loop] for (uint j = 0u; j < inputCount; ++j)
+        float historyTarget = 0.f;
+        float historyCount = 0.f;
+        if (inputCount != 0u && accepted[0])
         {
-            // Domain support is independent of its realized winning sample.
-            if (!accepted[j]) continue;
             // On motion, apply the same old-domain visibility rule to both
             // directions of MIS, including the old domain's own winner.
-            const bool useNative = !center && j == i && rtptGrisUseNativeDualHistory(proposal, sourceDomain);
-            const float cross = useNative ? rtptGrisNativeDualTail(proposal).target() :
-#if RTPT_GRIS_SPATIAL_REUSE
-                rtptGrisEvaluateDualTail(sourcePrimaryHits[j], sourceHits[j], camera, proposal, deepIncident.previous,
-#else
-                rtptGrisEvaluateDualTail(inputs[j], sourceHits[j], sourceCameras[j], proposal, deepIncident.previous,
-#endif
+            const bool useNative = !center && rtptGrisUseNativeDualHistory(proposal, sourceDomain);
+            historyTarget = useNative ? rtptGrisNativeDualTail(proposal).target() :
+                rtptGrisEvaluateDualTail(inputs[0], sourceHits[0], sourceCameras[0], proposal, deepIncident.previous,
                     evaluationRng, 2u, sourceDomain, deepIncident.lightPdf, knownVisible).target();
-            denominator += cross;
-            if (!center && j == i) sourceTarget = cross;
+            historyCount = inputs[0].candidate.M;
         }
-        const float weight = target * (sourceTarget / denominator) * proposal.candidate.W;
+        misWeight = center
+            ? rtptGrisTalbotWeight(target, canonical.candidate.M, historyTarget, historyCount)
+            : rtptGrisTalbotWeight(historyTarget, historyCount, target, canonical.candidate.M);
 #endif
+        const float weight = target * misWeight * proposal.candidate.W;
         if (weight > 0.f && isfinite(weight))
         {
             winner.sum += weight;
@@ -1541,6 +1548,10 @@ GrisDualTemporalWinner rtptGrisMergeDualTails(GrisSpatialRecord canonical, GrisD
     }
 #if !defined(RTPT_GRIS_TEMPORAL_REUSE)
 #undef evaluationRng
+#endif
+#if RTPT_GRIS_SPATIAL_REUSE
+    // Every accepted pair and the standalone center share contribute once.
+    winner.sum /= float(acceptedCount) + 1.f;
 #endif
     return winner;
 }

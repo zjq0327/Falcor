@@ -9,6 +9,28 @@
 static const uint kGrisSpatialNeighborCount = 3u;
 static const uint kGrisMaxReuseInputs = 1u + (RTPT_GRIS_SPATIAL_REUSE ? kGrisSpatialNeighborCount : 0u);
 
+float rtptGrisBalanceWeight(float own, float other)
+{
+    const float total = own + other;
+    return total > 0.f && isfinite(total) ? own / total : 0.f;
+}
+
+// Both shifted targets are evaluated in the common area measure (J = 1).
+float rtptGrisTalbotWeight(float ownTarget, float ownCount, float otherTarget, float otherCount)
+{
+    return rtptGrisBalanceWeight(ownTarget * ownCount, otherTarget * otherCount);
+}
+
+float rtptGrisPairwiseCenterWeight(float centerTarget, float centerCount, float neighborTarget, float neighborCount)
+{
+    return rtptGrisTalbotWeight(centerTarget, centerCount / float(kGrisSpatialNeighborCount), neighborTarget, neighborCount);
+}
+
+float rtptGrisPairwiseNeighborWeight(float centerTarget, float centerCount, float neighborTarget, float neighborCount)
+{
+    return rtptGrisTalbotWeight(neighborTarget, neighborCount, centerTarget, centerCount / float(kGrisSpatialNeighborCount));
+}
+
 #if RTPT_GRIS_DUAL_FIRST_HIT && (RTPT_GRIS_SPATIAL_REUSE || defined(RTPT_GRIS_TEMPORAL_REUSE))
 StructuredBuffer<GrisDualFirstHits> gGRISDualFirstHits;
 #endif

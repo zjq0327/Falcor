@@ -53,7 +53,7 @@ uint rtptGrisReprojectHistory(uint2 pixel)
     return uint(previousIndex.y) * previousDim.x + uint(previousIndex.x);
 }
 
-bool rtptGrisLoadHistory(uint historyPixel, out GrisSpatialRecord source
+bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecord source
 #if RTPT_GRIS_DUAL_FIRST_HIT
     , out GrisDualFirstHits sourceHits
 #endif
@@ -92,9 +92,8 @@ bool rtptGrisLoadHistory(uint historyPixel, out GrisSpatialRecord source
     source.candidate.rootLobe = h.rootLobe;
     source.candidate.F = h.F;
     source.candidate.W = h.W;
-    // Dual reuse uses deterministic domain coefficients. The cap only limits
-    // the effective count and does not renormalize its tail-domain W.
-    source.candidate.M = min(h.M, 20.f);
+    // The Talbot history limit is relative to the current Fresh count.
+    source.candidate.M = min(h.M, 20.f * currentM);
 #if RTPT_GRIS_DUAL_FIRST_HIT
     source.candidate.dualF = h.dualF;
     sourceHits = h.ownerFirstHits;
@@ -121,7 +120,8 @@ void main(uint3 threadID : SV_DispatchThreadID)
     const uint historyPixel = rtptGrisReprojectHistory(pixel);
 #if RTPT_GRIS_DUAL_FIRST_HIT
     GrisDualFirstHits sourceHits[kGrisMaxReuseInputs];
-    if (rtptGrisLoadHistory(historyPixel, inputs[0], sourceHits[0]) && rtptGrisRefDomainValid(canonical))
+    if (rtptGrisRefDomainValid(canonical) &&
+        rtptGrisLoadHistory(historyPixel, canonical.candidate.M, inputs[0], sourceHits[0]))
     {
         sourceCameras[0] = gGRISTemporalSettings.previousCameraPosition;
         inputCount = 1u;
@@ -141,7 +141,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
         if (selection.inputIndex == 0u)
         {
             GrisDualFirstHits unusedHits;
-            rtptGrisLoadHistory(historyPixel, winner, unusedHits);
+            rtptGrisLoadHistory(historyPixel, center.candidate.M, winner, unusedHits);
         }
         winner.candidate.F = selection.diffuse;
         winner.candidate.dualF = selection.specular;
@@ -166,7 +166,8 @@ void main(uint3 threadID : SV_DispatchThreadID)
     replay.sharcChanges = gGRISTemporalSettings.suffixReplaySharcChange;
 #endif
 #endif
-    if (rtptGrisLoadHistory(historyPixel, inputs[inputCount]))
+    if (rtptGrisRefDomainValid(canonical) &&
+        rtptGrisLoadHistory(historyPixel, canonical.candidate.M, inputs[inputCount]))
     {
 #if RTPT_GRIS_SUFFIX_REPLAY
         replay.historyIndex = inputCount;
