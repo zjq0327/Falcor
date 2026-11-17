@@ -1,12 +1,11 @@
 #pragma once
 
-/** Project with the actual jittered camera matrix saved with the history bank.
+/** Project a world position to pixel-center coordinates in the supplied camera domain.
 
     Falcor's pinhole ray samples (pixel + .5) / dim + (-jitterX, +jitterY).
     Camera::calculateCameraParameters() applies (+2*jitterX, +2*jitterY)
-    to clip/NDC XY. The full jittered VP therefore projects that ray back onto
-    its integer pixel index after the half-pixel subtraction below. Replacing
-    this matrix with prevViewProjMatNoJitter would omit the previous Halton jitter.
+    to clip/NDC XY. A jittered VP maps that ray back to its integer pixel;
+    an unjittered VP retains the subpixel position in a stable screen domain.
 
     linearDepth is clip.w for the perspective camera used by RTPT, matching the
     primary viewZ contract. D3D clip depth is [0,w].

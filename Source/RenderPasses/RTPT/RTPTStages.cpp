@@ -583,7 +583,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         }
         mGRISHistoryReplayActive = sharcChange != 0u;
         const auto settings = reuseVar["gGRISTemporalSettings"];
-        settings["previousViewProj"] = history.previousViewProj;
+        settings["previousViewProjNoJitter"] = history.previousViewProjNoJitter;
         settings["previousCameraPosition"] = history.previousCameraPosition;
         settings["previousFrameDim"] = history.previousFrameDim;
         settings["historyValid"] = mGRISHistoryReadValid ? 1u : 0u;
@@ -708,7 +708,7 @@ void RTPT::executeGRIS(RenderContext* pRenderContext, const RenderData& renderDa
         FALCOR_PROFILE(pRenderContext, "GRISPublishHistory");
         mpGRISPublishHistoryPass->execute(pRenderContext, uint3(mFrameDim, 1u));
         pRenderContext->uavBarrier(mpGRISHistory.get());
-        mGRISHistoryFrame = {mpScene->getCamera()->getViewProjMatrix(), cameraPosition, mFrameDim, mPrimaryFrameStamp,
+        mGRISHistoryFrame = {mpScene->getCamera()->getViewProjMatrixNoJitter(), cameraPosition, mFrameDim, mPrimaryFrameStamp,
             mGRISHistoryGeneration, true, snapshot};
         if (snapshot.hasDynamicReplay())
         {

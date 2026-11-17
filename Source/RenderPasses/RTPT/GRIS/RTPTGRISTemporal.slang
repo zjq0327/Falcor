@@ -4,7 +4,7 @@
 
 struct GrisTemporalSettings
 {
-    float4x4 previousViewProj;
+    float4x4 previousViewProjNoJitter;
     uint2 previousFrameDim;
     uint historyValid;
     float3 previousCameraPosition;
@@ -43,12 +43,20 @@ uint rtptGrisReprojectHistory(uint2 pixel)
     if (gGRISTemporalSettings.historyValid == 0u) return kGrisInvalidReprojectedPixel;
     RTPTPrimarySurface primary;
     if (!rtptTryLoadPrimary(pixel, gPrimarySettings.sampleIndex, primary)) return kGrisInvalidReprojectedPixel;
+    float2 currentPixel;
     float2 previousPixel;
-    float previousDepth;
+    float depth;
     const uint2 previousDim = gGRISTemporalSettings.previousFrameDim;
-    if (!rtptProjectPreviousPixel(primary.position + primary.motionW, previousDim,
-        gGRISTemporalSettings.previousViewProj, previousPixel, previousDepth)) return kGrisInvalidReprojectedPixel;
-    const int2 previousIndex = int2(round(previousPixel));
+    if (!rtptProjectPreviousPixel(primary.position, gPrimarySettings.frameDim,
+        gScene.camera.data.viewProjMatNoJitter, currentPixel, depth) ||
+        !rtptProjectPreviousPixel(primary.position + primary.motionW, previousDim,
+            gGRISTemporalSettings.previousViewProjNoJitter, previousPixel, depth)) return kGrisInvalidReprojectedPixel;
+
+    // Apply only physical motion to the integer pixel. Stochastic rounding
+    // leaves a zero offset at zero motion and preserves fractional motion in expectation.
+    const float2 motion = previousPixel - currentPixel;
+    SampleGenerator reprojectionRng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0x165667b1u);
+    const int2 previousIndex = int2(pixel) + int2(floor(motion + sampleNext2D(reprojectionRng)));
     if (any(previousIndex < 0) || any(uint2(previousIndex) >= previousDim)) return kGrisInvalidReprojectedPixel;
     return uint(previousIndex.y) * previousDim.x + uint(previousIndex.x);
 }

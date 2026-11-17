@@ -155,7 +155,7 @@ private:
     };
     struct GrisTemporalHistoryFrame
     {
-        float4x4 previousViewProj = float4x4::identity();
+        float4x4 previousViewProjNoJitter = float4x4::identity();
         float3 previousCameraPosition = float3(0.f);
         uint2 previousFrameDim = uint2(0u);
         uint32_t previousFrameStamp = 0u;
