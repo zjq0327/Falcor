@@ -345,4 +345,6 @@ private:
     uint32_t mLightingMask = ~0u;
     bool mOptionsChanged = true;
     bool mEnableDeltaReflectionNRD = false;
+    bool mDeltaReflectionNRDInSpecular = true;
+    bool mGRISDeltaReuseEnabled = false;
 };

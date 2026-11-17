@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef RTPT_DELTA_NRD_SPECULAR
+#define RTPT_DELTA_NRD_SPECULAR 0
+#endif
+
 #include "DirectLighting/RTPTDICoverage.slang"
 #include "RTPTContinuation.slang"
 #include "Signal/RTPTSignalResolve.slang"
@@ -158,6 +162,7 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
         const bool hasDiffuse = (lobes & uint(LobeType::DiffuseReflection)) != 0;
         const bool hasSpecular = (lobes & uint(LobeType::SpecularReflection)) != 0;
         const bool hasDeltaSpecular = (lobes & uint(LobeType::DeltaReflection)) != 0;
+        bool grisDeltaPrepared = false;
         ShadingData diffuseSD = sd;
         diffuseSD.mtl.setActiveLobes(uint(LobeType::DiffuseReflection));
         ShadingData specularSD = sd;
@@ -246,6 +251,10 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
                 signals.specularHitDistance = gris.firstHit[1].hitT;
                 diffuseDistanceState = gris.firstHit[0].distanceState;
                 specularDistanceState = gris.firstHit[1].distanceState;
+#if defined(RTPT_GRIS_DELTA_REUSE) && RTPT_DELTA_NRD_SPECULAR
+                // Generate filled the same S lane and first-hit guide for either reflection type.
+                grisDeltaPrepared = hasDeltaSpecular && !hasSpecular;
+#endif
 #else
                 if (gris.rootLobe == uint(GrisRootComponent::GrisDiffuse)) indirectDiffuse = gris.radiance;
                 if (gris.rootLobe == uint(GrisRootComponent::GrisSpecular)) indirectSpecular = gris.radiance;
@@ -294,10 +303,10 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
             signals.specular += rtptTraceContinuation(sd, mi, uint(LobeType::SpecularReflection), specularSampling, sg,
                 signals.specularHitDistance, unusedSpecularState, sharcStats, rootCoverage);
 #endif
-        if (hasDeltaSpecular)
+        if (hasDeltaSpecular && !grisDeltaPrepared)
         {
-            float unusedDistance;
 #if RTPT_DELTA_NRD
+            float unusedDistance;
             uint unusedState;
             RTPTDeltaGuide guide = {};
             guide.mirrorPosition = sd.posW;
@@ -319,7 +328,38 @@ float3 rtptTraceNRD(uint2 pixel, uint sampleIndex, inout SampleGenerator sg, ino
                 gDeltaViewZ[pixel] = guide.viewZ;
                 gDeltaMotion[pixel] = float4(guide.motion, 0.f);
             }
+#elif RTPT_DELTA_NRD_SPECULAR
+            // StandardMaterial selects either a rough specular or a delta
+            // primary lobe. Both can therefore share NRD's specular lane while
+            // keeping the same visible-primary guides and effective albedo.
+            // Trace the same physical continuation as the residual path: its
+            // throughput already includes mirror Fresnel and sampling weights.
+            float deltaFirstHitDistance;
+            uint deltaFirstHitState;
+            const float3 deltaRadiance = rtptTraceContinuation(sd, mi, uint(LobeType::DeltaReflection),
+                rtptBSDFSamplingContext(), sg, deltaFirstHitDistance, deltaFirstHitState, sharcStats);
+            if (!hasSpecular)
+            {
+#if RTPT_SEPARATE_SIGNAL_RESOLVE
+                indirectSpecular += deltaRadiance;
+                specularDistanceState = deltaFirstHitState;
 #else
+                signals.specular += deltaRadiance;
+#endif
+                // This is the world-space distance from the visible primary
+                // to its first reflected hit, independently of radiance. Keep
+                // the continuation's finite miss/rejected-sample convention.
+                signals.specularHitDistance = deltaFirstHitDistance;
+            }
+            else
+            {
+                // A material with simultaneous rough and delta lobes needs a
+                // defined joint distance estimator. Preserve its old residual
+                // until that representation is supported.
+                signals.residual = deltaRadiance;
+            }
+#else
+            float unusedDistance;
             signals.residual = rtptTraceContinuation(sd, mi, uint(LobeType::DeltaReflection), rtptBSDFSamplingContext(), sg, unusedDistance, sharcStats);
 #endif
         }

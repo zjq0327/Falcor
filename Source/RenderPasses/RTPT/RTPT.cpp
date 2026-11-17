@@ -106,6 +106,8 @@ void RTPT::setProperties(const Properties& props)
     bool useNEE = mUseNEE, useRussianRoulette = mUseRussianRoulette, accumulate = mAccumulate;
     bool enableNRD = mEnableNRD;
     bool enableDeltaReflectionNRD = mEnableDeltaReflectionNRD;
+    bool deltaReflectionNRDInSpecular = mDeltaReflectionNRDInSpecular;
+    bool grisDeltaReuseEnabled = mGRISDeltaReuseEnabled;
     bool grisEnabled = mGRISEnabled;
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
@@ -140,6 +142,8 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "maxAccumulationFrames") maxAccumulationFrames = value;
         else if (key == "enableNRD") enableNRD = value;
         else if (key == "enableDeltaReflectionNRD") enableDeltaReflectionNRD = value;
+        else if (key == "deltaReflectionNRDInSpecular") deltaReflectionNRDInSpecular = value;
+        else if (key == "grisDeltaReuseEnabled") grisDeltaReuseEnabled = value;
         else if (key == "grisEnabled") grisEnabled = value;
         else if (key == "grisSpatialEnabled") grisSpatialEnabled = value;
         else if (key == "grisTemporalEnabled") grisTemporalEnabled = value;
@@ -240,7 +244,7 @@ void RTPT::setProperties(const Properties& props)
         FALCOR_CHECK(mpDevice->getType() == Device::Type::D3D12 && mpDevice->isShaderModelSupported(ShaderModel::SM6_6),
             "RTPT SHaRC and PG require D3D12 and Shader Model 6.6 for native 16-bit types and 64-bit buffer atomics.");
     const bool transportModeChanged = enableNRD != mEnableNRD || enableSHARC != mEnableSHARC ||
-        enableDeltaReflectionNRD != mEnableDeltaReflectionNRD;
+        enableDeltaReflectionNRD != mEnableDeltaReflectionNRD || deltaReflectionNRDInSpecular != mDeltaReflectionNRDInSpecular;
     const bool pgCompileChanged = needsPGResources != needsPG();
     const bool modeChanged = transportModeChanged || pgCompileChanged;
     const bool diChanged = restirDIEnabled != mRestirDIEnabled || restirDICandidateCount != mRestirDICandidateCount ||
@@ -265,7 +269,7 @@ void RTPT::setProperties(const Properties& props)
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     const bool grisModeChanged = grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
         grisTemporalEnabled != mGRISTemporalEnabled || grisDualFirstHitEnabled != mGRISDualFirstHitEnabled ||
-        grisSuffixReplayEnabled != mGRISSuffixReplayEnabled ||
+        grisSuffixReplayEnabled != mGRISSuffixReplayEnabled || grisDeltaReuseEnabled != mGRISDeltaReuseEnabled ||
         (grisEnabled && grisSharcReuseChanged);
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
         trainingSamplingChanged || accumulate != mAccumulate || maxAccumulationFrames != mMaxAccumulationFrames ||
@@ -298,6 +302,8 @@ void RTPT::setProperties(const Properties& props)
     mMaxAccumulationFrames = maxAccumulationFrames;
     mEnableNRD = enableNRD;
     mEnableDeltaReflectionNRD = enableDeltaReflectionNRD;
+    mDeltaReflectionNRDInSpecular = deltaReflectionNRDInSpecular;
+    mGRISDeltaReuseEnabled = grisDeltaReuseEnabled;
     mGRISEnabled = grisEnabled;
     mGRISSpatialEnabled = grisSpatialEnabled;
     mGRISTemporalEnabled = grisTemporalEnabled;
@@ -375,6 +381,8 @@ Properties RTPT::getProperties() const
     props["maxAccumulationFrames"] = mMaxAccumulationFrames;
     props["enableNRD"] = mEnableNRD;
     props["enableDeltaReflectionNRD"] = mEnableDeltaReflectionNRD;
+    props["deltaReflectionNRDInSpecular"] = mDeltaReflectionNRDInSpecular;
+    props["grisDeltaReuseEnabled"] = mGRISDeltaReuseEnabled;
     props["grisEnabled"] = mGRISEnabled;
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
@@ -837,6 +845,7 @@ void RTPT::prepareProgram(RenderContext* pRenderContext)
         defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
         defines.add("ENABLE_NRD", mEnableNRD ? "1" : "0");
         defines.add("RTPT_DELTA_NRD", mEnableNRD && mEnableDeltaReflectionNRD ? "1" : "0");
+        defines.add("RTPT_DELTA_NRD_SPECULAR", mEnableNRD && mDeltaReflectionNRDInSpecular && !mEnableDeltaReflectionNRD ? "1" : "0");
         defines.add("ENABLE_SHARC", mEnableSHARC ? "1" : "0");
         defines.add("ENABLE_PG", pg ? "1" : "0");
         if (mEnableSHARC)

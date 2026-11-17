@@ -222,6 +222,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     if (mGRISTemporalEnabled && !temporalSupported)
         logWarningOnce("RTPT GRIS Temporal requires compatible lighting, internal NRD signals, one sample per pixel, and RR disabled.");
     const bool spatialEnabled = mGRISSpatialEnabled;
+    const bool deltaReuse = mGRISDeltaReuseEnabled && dualFirstHit &&
+        mDeltaReflectionNRDInSpecular && !mEnableDeltaReflectionNRD && mpScene->hasGeometryType(GeometryType::TriangleMesh);
     const bool spatialDeepIncident = !mGRISSpatialDeepIncidentDisabled && dualFirstHit && spatialEnabled &&
         mpScene->hasGeometryType(GeometryType::TriangleMesh);
     const bool referenceReuse = canUseGRISReferenceReuse();
@@ -232,7 +234,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
     // Local-only GRIS uses the same full-path record as spatial and temporal reuse.
     const bool captureSuffix = true;
     const bool blendX1Cache = false;
-    const auto matchesTailDefines = [cacheTail, suffixReplay, replaySharc, dualFirstHit, dualSharc](
+    const auto matchesTailDefines = [cacheTail, suffixReplay, replaySharc, dualFirstHit, dualSharc, deltaReuse](
         const ref<ComputePass>& pass)
     {
         if (!pass) return true;
@@ -242,7 +244,8 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
             (defines.count("RTPT_GRIS_SUFFIX_REPLAY") != 0) == suffixReplay &&
             (defines.count("RTPT_GRIS_SHARC_REPLAY") != 0) == replaySharc &&
             (defines.count("RTPT_GRIS_DUAL_FIRST_HIT") != 0) == dualFirstHit &&
-            (defines.count("RTPT_GRIS_DUAL_SHARC") != 0) == dualSharc;
+            (defines.count("RTPT_GRIS_DUAL_SHARC") != 0) == dualSharc &&
+            (defines.count("RTPT_GRIS_DELTA_REUSE") != 0) == deltaReuse;
     };
     const bool matchesTemporalReplay = !mpGRISTemporalPass ||
         (mpGRISTemporalPass->getProgram()->getDefines().count("RTPT_GRIS_DUAL_DYNAMIC_REPLAY") != 0) == dualDynamicReplay;
@@ -275,6 +278,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         auto baseDefines = baseMainPass->getProgram()->getDefines();
         baseDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
         baseDefines.add("RTPT_GRIS_CACHE_TAIL", cacheTail ? "1" : "0");
+        if (deltaReuse) baseDefines.add("RTPT_GRIS_DELTA_REUSE", "1");
         if (suffixReplay) baseDefines.add("RTPT_GRIS_SUFFIX_REPLAY", "1");
         if (replaySharc) baseDefines.add("RTPT_GRIS_SHARC_REPLAY", "1");
         if (dualFirstHit) baseDefines.add("RTPT_GRIS_DUAL_FIRST_HIT", "1");
@@ -290,6 +294,7 @@ bool RTPT::prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive)
         DefineList shadeDefines;
         shadeDefines.add("RTPT_GRIS_REFERENCE_REUSE", referenceReuse ? "1" : "0");
         shadeDefines.add("RTPT_GRIS_CACHE_TAIL", cacheTail ? "1" : "0");
+        if (deltaReuse) shadeDefines.add("RTPT_GRIS_DELTA_REUSE", "1");
         if (suffixReplay) shadeDefines.add("RTPT_GRIS_SUFFIX_REPLAY", "1");
         if (replaySharc) shadeDefines.add("RTPT_GRIS_SHARC_REPLAY", "1");
         if (dualFirstHit) shadeDefines.add("RTPT_GRIS_DUAL_FIRST_HIT", "1");
@@ -854,6 +859,8 @@ Properties RTPT::getStageStatistics() const
     props["grisTemporalActive"] = bool(mpGRISTemporalPass);
     props["grisHistoryReadValid"] = mGRISHistoryReadValid;
     props["grisHistoryPublishedValid"] = mGRISHistoryFrame.historyValid;
+    props["grisDeltaReuseActive"] = mpGRISMainPass && mpGRISMainPass->getProgram()->getDefines().count("RTPT_GRIS_DELTA_REUSE") != 0;
+    props["grisDeltaBytes"] = uint64_t(0u);
     props["grisHistoryGeneration"] = mGRISHistoryGeneration;
     props["grisHistoryStoredGeneration"] = mGRISHistoryFrame.historyGeneration;
     props["grisHistoryStoredFrameStamp"] = mGRISHistoryFrame.previousFrameStamp;

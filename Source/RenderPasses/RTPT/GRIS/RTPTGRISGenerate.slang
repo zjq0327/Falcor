@@ -125,7 +125,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             const bool hasSpecular = (lobes & uint(LobeType::SpecularReflection)) != 0u;
 
 #if RTPT_GRIS_SPATIAL
-            if (hasDiffuse || hasSpecular)
+#ifdef RTPT_GRIS_DELTA_REUSE
+            const bool deltaSpecular = !hasSpecular && (lobes & uint(LobeType::DeltaReflection)) != 0u;
+            const bool supportsDeltaRoot = deltaSpecular && rtptGRISPathReuseEnabled() && rtptGrisSupportsDeltaRoot(sd, lobes);
+            GrisDeltaPrefix deltaPrefix = {};
+#else
+            const bool deltaSpecular = false;
+            const bool supportsDeltaRoot = false;
+#endif
+            if (hasDiffuse || hasSpecular || deltaSpecular)
             {
                 spatial.candidate.prepared = true;
                 spatial.candidate.M = 1.f;
@@ -145,7 +153,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 [unroll]
                 for (uint slot = 0u; slot < 2u; ++slot)
                 {
-                    const uint activeLobe = slot == 0u ? uint(LobeType::DiffuseReflection) : uint(LobeType::SpecularReflection);
+                    const uint activeLobe = slot == 0u ? uint(LobeType::DiffuseReflection) :
+                        uint(deltaSpecular ? LobeType::DeltaReflection : LobeType::SpecularReflection);
                     if ((lobes & activeLobe) == 0u) continue;
                     const uint currentRoot = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
                     ShadingData component = sd;
@@ -160,7 +169,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     prefix.rootLobe = currentRoot;
                     GrisFirstHit firstHit;
 #if RTPT_GRIS_DUAL_FIRST_HIT
-                    if (rtptGRISSupportsSurface(component, lobes & activeLobe))
+                    if (rtptGRISSupportsSurface(component, lobes & activeLobe) || (slot == 1u && supportsDeltaRoot))
                         dualFirstHits.attemptedMask |= 1u << slot;
                     const uint lateSlot = lateCount == 0u ? 0u : min(uint(sampleNext1D(eventRng) * lateCount), lateCount - 1u);
                     const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
@@ -174,6 +183,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     dualFirstHits.x1[slot] = prefix.dualX1;
                     dualFirstHits.firstHitAreaPdf[slot] = prefix.dualFirstPdf;
                     local.firstHit[slot] = firstHit;
+#ifdef RTPT_GRIS_DELTA_REUSE
+                    if (slot == 1u && supportsDeltaRoot)
+                    {
+                        deltaPrefix.x1 = prefix.dualX1;
+                        deltaPrefix.direction = x2Samples[slot].rootDirection;
+                        deltaPrefix.throughput = prefix.throughputToX1;
+                    }
+#endif
 #else
                     const float3 localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
                         firstHit.hitT, firstHit.distanceState, sharcStats, rootCoverage, 1.f,
@@ -191,6 +208,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                     cacheProposals, cacheIncident,
 #endif
                     terminalRng, sd, mi, fixedX1DiffuseSampling
+#ifdef RTPT_GRIS_DELTA_REUSE
+                    , supportsDeltaRoot, deltaPrefix
+#endif
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
                     , spatialDeepIncident
 #endif

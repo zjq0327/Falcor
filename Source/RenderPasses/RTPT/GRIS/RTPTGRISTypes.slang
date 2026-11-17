@@ -212,6 +212,7 @@ struct GrisDualExplicitTerminal
 static const uint kGrisTerminalKindMask = 0xffu;
 static const uint kGrisDeepTail = 0x100u;
 static const uint kGrisFixedX1Nee = 0x1000u;
+static const uint kGrisDeltaRoot = 0x2000u;
 #if RTPT_GRIS_SUFFIX_REPLAY
 static const uint kGrisEmissiveNee = 0x200u;
 static const uint kGrisPointNee = 0x400u;

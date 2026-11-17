@@ -175,8 +175,16 @@ float3 RTPT_CONTINUATION_NAME(
     throughput /= rootProbability;
 #endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
-    bool representedPrefix = rtptGRISPathReuseEnabled() && !previousDelta &&
-        rtptGRISSupportsSurface(primarySD, primaryMI.getLobeTypes(primarySD) & primaryLobes);
+    const uint rootLobes = primaryMI.getLobeTypes(primarySD);
+    const bool deltaPrefix =
+#ifdef RTPT_GRIS_DELTA_REUSE
+        primaryLobes == uint(LobeType::DeltaReflection) && previousDelta &&
+        rtptGrisSupportsDeltaRoot(primarySD, rootLobes);
+#else
+        false;
+#endif
+    bool representedPrefix = rtptGRISPathReuseEnabled() && (deltaPrefix ||
+        (!previousDelta && rtptGRISSupportsSurface(primarySD, rootLobes & primaryLobes)));
 #if RTPT_GRIS_DUAL_FIRST_HIT
     x2.rootDirection = bs.wo;
 #endif
@@ -308,7 +316,22 @@ float3 RTPT_CONTINUATION_NAME(
 #if RTPT_GRIS_DUAL_FIRST_HIT
             // The triangle was decoded from hit.pack() already. Reuse its
             // canonical attributes while shading the reconstructed view.
-            if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
+            if (deltaPrefix && bounce == 1u)
+            {
+                prefix.dualX1 = hit.pack();
+                // Discrete probability mass of the restricted mirror root.
+                prefix.dualFirstPdf = 1.f;
+                prefix.throughputToX1 = throughput;
+                representedPrefix = rtptGrisRefLoad(vertex, materialID, -ray.dir, represented);
+                if (representedPrefix)
+                {
+                    const IMaterialInstance representedMI =
+                        gScene.materials.getMaterialInstance(represented, ExplicitLodTextureSampler(0.f));
+                    representedPrefix = rtptGRISSupportsSurface(represented, representedMI.getLobeTypes(represented));
+                    if (representedPrefix) sd = represented;
+                }
+            }
+            else if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
                 rtptGrisRefLoad(vertex, materialID, -direction, represented))
 #else
             if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
@@ -647,7 +670,8 @@ float3 RTPT_CONTINUATION_NAME(
         if (!rtptSampleContinuation(sd, mi, sampling, sg, bs, previousGuideSelected)) break;
         if (bs.isLobe(LobeType::Transmission) || !all(isfinite(bs.wo)) || !all(isfinite(bs.weight))) break;
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
-        if (rtptGRISPathReuseEnabled() && bounce <= 2u && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
+        if (rtptGRISPathReuseEnabled() && (!deltaPrefix || representedPrefix) && bounce <= 2u &&
+            rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd)))
         {
             // Both interfaces after the root are BSDF-only. Reconnection
             // requires the full numerator and marginal direction density,

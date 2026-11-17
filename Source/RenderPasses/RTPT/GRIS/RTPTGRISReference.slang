@@ -775,10 +775,19 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
 #if RTPT_GRIS_DUAL_SHARC
     , GrisSpatialRecord cache
 #endif
+#ifdef RTPT_GRIS_DELTA_REUSE
+    , bool deltaRoot
+#endif
     )
 {
 #if RTPT_GRIS_DUAL_SHARC
-    if (event == 4u) return cache;
+    if (event == 4u)
+    {
+#ifdef RTPT_GRIS_DELTA_REUSE
+        if (deltaRoot) cache.candidate.terminalKind |= kGrisDeltaRoot;
+#endif
+        return cache;
+    }
 #endif
     const bool deep = event != 0u;
     GrisSpatialRecord proposal = {};
@@ -792,6 +801,9 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
         proposal.areaPdf = 1.f;
         rtptGrisApplyDualNeeTerminal(x2.firstNee, false, proposal);
         proposal.candidate.terminalKind |= kGrisFixedX1Nee;
+#ifdef RTPT_GRIS_DELTA_REUSE
+        if (deltaRoot) proposal.candidate.terminalKind |= kGrisDeltaRoot;
+#endif
         return proposal;
     }
     proposal.areaPdf = deep ? x2.deepPdf : x2.areaPdf;
@@ -813,6 +825,9 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
         proposal.lightPdfOrIndex = terminal.lightPdfOrIndex;
         proposal.lightIsAnalytic = terminal.lightIsAnalytic;
     }
+#ifdef RTPT_GRIS_DELTA_REUSE
+    if (deltaRoot) proposal.candidate.terminalKind |= kGrisDeltaRoot;
+#endif
     return proposal;
 }
 
@@ -832,6 +847,9 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
     float3 cacheIncident[2],
 #endif
     inout SampleGenerator rng, ShadingData primary, IMaterialInstance primaryMaterial, RTPTSamplingContext diffuseSampling
+#ifdef RTPT_GRIS_DELTA_REUSE
+    , bool deltaSpecular, GrisDeltaPrefix deltaPrefix
+#endif
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
     , out float4 spatialDeepIncident
 #endif
@@ -851,9 +869,21 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
 #if RTPT_GRIS_DUAL_SHARC
     if (gParams.maxBounces > 4u) eventCount = 5u;
 #endif
-    const float2 rootPdfSum = float2(
-        rtptGrisFixedX1RootPdfSum(firstHits, 0u, x2Samples[0].rootDirection, primary, primaryMaterial, diffuseSampling),
-        rtptGrisFixedX1RootPdfSum(firstHits, 1u, x2Samples[1].rootDirection, primary, primaryMaterial, diffuseSampling));
+    float2 rootPdfSum;
+#ifdef RTPT_GRIS_DELTA_REUSE
+    if (deltaSpecular)
+    {
+        // The two strata use different first-edge measures. Neither supplies
+        // a proposal density in the other's measure.
+        rootPdfSum = float2(firstHits.firstHitAreaPdf[0], firstHits.firstHitAreaPdf[1]);
+    }
+    else
+#endif
+    {
+        rootPdfSum = float2(
+            rtptGrisFixedX1RootPdfSum(firstHits, 0u, x2Samples[0].rootDirection, primary, primaryMaterial, diffuseSampling),
+            rtptGrisFixedX1RootPdfSum(firstHits, 1u, x2Samples[1].rootDirection, primary, primaryMaterial, diffuseSampling));
+    }
     const uint totalEvents = eventCount + 1u;
     [loop] for (uint eventIndex = 0u; eventIndex < totalEvents; ++eventIndex)
     {
@@ -865,6 +895,9 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
                 firstHits.x1[slot], event, slot, x2Samples[slot], terminal
 #if RTPT_GRIS_DUAL_SHARC
                 , cache[slot]
+#endif
+#ifdef RTPT_GRIS_DELTA_REUSE
+                , deltaSpecular && slot == 1u
 #endif
                 );
             if (!rtptGrisDualTailValid(proposal)) continue;
@@ -879,7 +912,11 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
             const float proposalSum = rootPdfSum[slot] * proposal.areaPdf * lightProbability;
             if (!(proposalSum > 0.f) || !isfinite(proposalSum)) continue;
             const GrisDualTailValue value = rtptGrisEvaluateFixedX1Tail(center.ownerPrimaryHit, camera, proposal,
-                deepIncident, rng, true, {}, deepLightPdf);
+                deepIncident, rng, true, {}, deepLightPdf, false
+#ifdef RTPT_GRIS_DELTA_REUSE
+                , deltaPrefix
+#endif
+            );
             float weight = value.target() / proposalSum;
             if (!(weight > 0.f) || !isfinite(weight)) continue;
             sum += weight;
@@ -909,6 +946,9 @@ GrisSpatialRecord rtptGrisBuildDualFresh(GrisSpatialRecord center, GrisDualFirst
                 event, slot, x2Samples[slot], terminal
 #if RTPT_GRIS_DUAL_SHARC
                 , cache[slot]
+#endif
+#ifdef RTPT_GRIS_DELTA_REUSE
+                , deltaSpecular && slot == 1u
 #endif
                 );
         }

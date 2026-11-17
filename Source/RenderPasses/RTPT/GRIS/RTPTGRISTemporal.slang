@@ -122,6 +122,17 @@ void main(uint3 threadID : SV_DispatchThreadID)
     if (rtptGrisRefDomainValid(canonical) &&
         rtptGrisLoadHistory(historyPixel, canonical.candidate.M, inputs[0]))
     {
+#if defined(RTPT_GRIS_DELTA_REUSE) && RTPT_GRIS_DUAL_DYNAMIC_REPLAY
+        // The previous mirror edge cannot be certified with the current TLAS.
+        // Skip the whole pair before MIS, regardless of which lobe won.
+        if (gGRISTemporalSettings.suffixReplayGeometryChange != 0u &&
+            (rtptGrisOwnerHasDeltaRoot(canonical.ownerPrimaryHit, gScene.camera.getPosition()) ||
+             rtptGrisOwnerHasDeltaRoot(inputs[0].ownerPrimaryHit, gGRISTemporalSettings.previousCameraPosition)))
+        {
+            gGRISSpatialOutput[index] = canonical;
+            return;
+        }
+#endif
         sourceCameras[0] = gGRISTemporalSettings.previousCameraPosition;
         inputCount = 1u;
         const GrisDualTemporalWinner selection = rtptGrisMergeDualTails(canonical,

@@ -1,10 +1,59 @@
 #pragma once
 
-// The represented sample keeps both surface hits and the terminal coordinates
-// fixed. Only the edge from the evaluation pixel's primary hit changes.
+#ifdef RTPT_GRIS_DELTA_REUSE
+struct GrisDeltaPrefix
+{
+    PackedHitInfo x1;
+    float3 direction;
+    float3 throughput;
+};
+
+bool rtptGrisSupportsDeltaRoot(ShadingData primary, uint lobes)
+{
+    return primary.frontFacing && primary.mtl.getMaterialType() == MaterialType::Standard &&
+        (lobes & uint(LobeType::DeltaReflection)) != 0u &&
+        (lobes & (uint(LobeType::SpecularReflection) | uint(LobeType::Transmission))) == 0u;
+}
+
+bool rtptGrisOwnerHasDeltaRoot(PackedHitInfo owner, float3 camera)
+{
+    ShadingData primary;
+    if (!rtptGrisRefPrimary(owner, camera, primary)) return false;
+    const IMaterialInstance material = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
+    return rtptGrisSupportsDeltaRoot(primary, material.getLobeTypes(primary));
+}
+
+// The restricted StandardMaterial reflection is deterministic. Reconstruct
+// the owner's anchor even when its shared reservoir selected a diffuse path.
+bool rtptGrisReplayDeltaPrefix(ShadingData primary, SampleGenerator rng, out GrisDeltaPrefix prefix)
+{
+    prefix = {};
+    const IMaterialInstance material = gScene.materials.getMaterialInstance(primary, ExplicitLodTextureSampler(0.f));
+    if (!rtptGrisSupportsDeltaRoot(primary, material.getLobeTypes(primary))) return false;
+    primary.mtl.setActiveLobes(uint(LobeType::DeltaReflection));
+    BSDFSample bs = {};
+    if (!material.sample(primary, rng, bs) || !bs.isLobe(LobeType::DeltaReflection) ||
+        !all(isfinite(bs.wo)) || !all(isfinite(bs.weight)) || !any(bs.weight > 0.f)) return false;
+    SceneRayQuery<true> query;
+    float distance;
+    const HitInfo hit = query.traceRay(Ray(primary.computeRayOrigin(), bs.wo), distance);
+    if (hit.getType() != HitType::Triangle) return false;
+    prefix.x1 = hit.pack();
+    prefix.direction = bs.wo;
+    prefix.throughput = bs.weight;
+    return true;
+}
+#endif
+
+// Continuous roots keep the represented x1. Singular roots reconstruct the
+// evaluation pixel's mirror hit. Both use the same suffix coordinates.
 GrisDualTailValue rtptGrisEvaluateFixedX1Tail(PackedHitInfo ownerPrimaryHit, float3 camera, GrisSpatialRecord tail,
     float3 deepIncident, inout SampleGenerator rng, bool nativeConnection = false,
-    GrisDualReplayDomain domain = {}, float deepLightPdf = 0.f, bool knownLightVisible = false)
+    GrisDualReplayDomain domain = {}, float deepLightPdf = 0.f, bool knownLightVisible = false
+#ifdef RTPT_GRIS_DELTA_REUSE
+    , GrisDeltaPrefix deltaPrefix = {}
+#endif
+    )
 {
     GrisDualTailValue result = {};
     const bool shortNee = (tail.candidate.terminalKind & kGrisFixedX1Nee) != 0u;
@@ -27,26 +76,45 @@ GrisDualTailValue rtptGrisEvaluateFixedX1Tail(PackedHitInfo ownerPrimaryHit, flo
     }
 #endif
     ShadingData primary;
-    float3 firstPosition;
-    if (!rtptGrisRefPrimary(ownerPrimaryHit, camera, primary) ||
-        !rtptGrisRefPosition(tail.sourceX1, firstPosition)) return result;
-
-    float3 firstDirection;
-    float firstDistanceSquared;
+    if (!rtptGrisRefPrimary(ownerPrimaryHit, camera, primary)) return result;
+    float3 firstDirection = 0.f;
+    float firstGeometry = 1.f;
     ShadingData first;
-    if (!rtptGrisPrefixDirection(primary.computeRayOrigin(), firstPosition, firstDirection, firstDistanceSquared) ||
-        !rtptGrisRefLoad(tail.sourceX1, -firstDirection, first)) return result;
+    const bool mustCheckConnections = !nativeConnection || movedBoundsCount != 0u;
+#ifdef RTPT_GRIS_DELTA_REUSE
+    const bool deltaRoot = (tail.candidate.terminalKind & kGrisDeltaRoot) != 0u;
+    if (deltaRoot)
+    {
+        // The old deterministic edge cannot be recovered from the current TLAS.
+        if (domain.previousGeometry ||
+            (!nativeConnection && !rtptGrisReplayDeltaPrefix(primary, rng, deltaPrefix)) ||
+            !rtptGrisRefLoad(deltaPrefix.x1, -deltaPrefix.direction, first)) return result;
+    }
+    else
+#endif
+    {
+        float3 firstPosition;
+        float firstDistanceSquared;
+        if (!rtptGrisRefPosition(tail.sourceX1, firstPosition) ||
+            !rtptGrisPrefixDirection(primary.computeRayOrigin(), firstPosition, firstDirection, firstDistanceSquared) ||
+            !rtptGrisRefLoad(tail.sourceX1, -firstDirection, first)) return result;
+        firstGeometry = abs(dot(first.faceN, firstDirection)) / firstDistanceSquared;
+        if (!(firstGeometry > 0.f) || !isfinite(firstGeometry)) return result;
+    }
     const IMaterialInstance firstMaterial = gScene.materials.getMaterialInstance(first, ExplicitLodTextureSampler(0.f));
     if (!rtptGRISSupportsSurface(first, firstMaterial.getLobeTypes(first))) return result;
-
-    const float firstGeometry = abs(dot(first.faceN, firstDirection)) / firstDistanceSquared;
-    if (!(firstGeometry > 0.f) || !isfinite(firstGeometry)) return result;
-    const bool mustCheckConnections = !nativeConnection || movedBoundsCount != 0u;
-    if (mustCheckConnections && !rtptGrisRefVisible(primary, first, movedBoundsCount)) return result;
+#ifdef RTPT_GRIS_DELTA_REUSE
+    if (!deltaRoot)
+#endif
+        if (mustCheckConnections && !rtptGrisRefVisible(primary, first, movedBoundsCount)) return result;
 
     // A known-visible terminal certifies only its light ray. In particular it
     // never certifies the new edge between the target primary surface and x1.
-    const bool skipLightVisibility = knownLightVisible && movedBoundsCount == 0u && !domain.previousLights;
+    const bool skipLightVisibility = knownLightVisible && movedBoundsCount == 0u && !domain.previousLights
+#ifdef RTPT_GRIS_DELTA_REUSE
+        && !(deltaRoot && shortNee)
+#endif
+        ;
     float3 incident;
     bool shadowClear;
     if (shortNee)
@@ -91,6 +159,15 @@ GrisDualTailValue rtptGrisEvaluateFixedX1Tail(PackedHitInfo ownerPrimaryHit, flo
         }
         incident *= firstMaterial.eval(first, connectionDirection, rng) * connectionGeometry;
     }
+
+#ifdef RTPT_GRIS_DELTA_REUSE
+    if (deltaRoot)
+    {
+        const float3 value = deltaPrefix.throughput * incident;
+        if (all(isfinite(value))) result.specular = value;
+        return result;
+    }
+#endif
 
     // The first-edge area density belongs to the Fresh proposal. The physical
     // target here contains only the geometry conversion, with no PG or PDF factor.
