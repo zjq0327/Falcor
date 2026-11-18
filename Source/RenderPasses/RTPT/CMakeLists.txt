@@ -31,7 +31,7 @@ target_sources(RTPT PRIVATE
     GRIS/RTPTGRISCapture.slang
     GRIS/RTPTGRISFixedX1.slang
     GRIS/RTPTGRISGenerate.cs.slang
-    GRIS/RTPTGRISGenerate.slang
+    GRIS/RTPTGRISGenerateSplit.slang
     GRIS/RTPTGRISIndirect.slang
     GRIS/RTPTGRISPathBuilder.slang
     GRIS/RTPTGRISPublishHistory.cs.slang

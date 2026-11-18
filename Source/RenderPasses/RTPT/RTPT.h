@@ -35,7 +35,8 @@ public:
     // The legacy "prefix" entry now contains local diffuse/specular RGB contributions.
     std::vector<ref<Buffer>> getGRISValidationBuffers() const
     {
-        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput};
+        return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput,
+            mpGRISSpatialDeepIncident};
     }
     // Explicit diagnostic access to existing resources only; no GPU readback.
     std::vector<ref<Buffer>> getSHARCValidationBuffers() const
@@ -54,7 +55,6 @@ private:
     void reset();
     void resetAccumulation();
     void resetAccumulationAndNRDHistory();
-    bool canUseGRISSuffixReplay() const;
     bool canUseGRISDualDynamicReplay() const;
     bool canPreserveGRISSuffixReplayForPointLightChange() const;
     bool prepareGRISSuffixReplayGeometryChange();
@@ -73,8 +73,8 @@ private:
     bool isGRISDualFirstHitActive() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
-    bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool diActive);
-    void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData, bool diActive);
+    bool prepareGRIS(const ref<ComputePass>& baseMainPass);
+    void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData);
     void bindMainParams(const ShaderVar& rootVar) const;
     void bindPrimarySettings(const ShaderVar& rootVar) const;
     void bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const;
@@ -116,6 +116,7 @@ private:
     ref<Buffer> mpPrimarySurfaces;
     ref<Buffer> mpSignalRecords;
     ref<ComputePass> mpGRISGeneratePass;
+    ref<ComputePass> mpGRISGenerateDiffusePass;
     ref<ComputePass> mpGRISSpatialPass;
     ref<ComputePass> mpGRISLocalPass;
     ref<ComputePass> mpGRISTemporalPass;
@@ -188,7 +189,7 @@ private:
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
-    bool mGRISDualFirstHitEnabled = false;
+    bool mGRISDualFirstHitEnabled = true;
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);
     uint32_t mPrimaryFrameStamp = 0u;

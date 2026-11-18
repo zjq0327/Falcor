@@ -1,3 +1,13 @@
 #define RTPT_GRIS_GENERATE 1
 #include "../RTPTTransport.slangh"
-#include "RTPTGRISGenerate.slang"
+#include "../DirectLighting/RTPTDICoverage.slang"
+#include "../RTPTContinuation.slang"
+#include "RTPTGRISReference.slang"
+
+RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
+RWStructuredBuffer<GrisLocalContributions> gGRISLocalPrefixes;
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+RWStructuredBuffer<float4> gGRISSpatialDeepIncident;
+#endif
+
+#include "RTPTGRISGenerateSplit.slang"

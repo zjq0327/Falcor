@@ -61,6 +61,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             result["history"] = buffers[2];
             result["prefix"] = buffers[3];
             if (buffers[4]) result["temporal"] = buffers[4];
+            if (buffers[5]) result["deepIncident"] = buffers[5];
             return result;
         });
         pass.def("getSHARCValidationBuffers", [](const RTPT& self)
@@ -528,6 +529,7 @@ void RTPT::resetAccumulationAndNRDHistory()
 bool RTPT::canUseGRISDualFirstHit() const
 {
     if (!mGRISDualFirstHitEnabled || !mpScene || !canUseGRIS() || !mUseNEE || mMaxBounces <= 2u ||
+        !mpScene->hasGeometryType(GeometryType::TriangleMesh) ||
         mRestirDIEnabled ||
         (mLightingMask & (kEnvLighting | kEmissiveLighting | kAnalyticLighting)) == 0u) return false;
     if (mEnableSHARC && mSHARCEnabled && mSHARCUseCache && mMaxBounces <= 4u) return false;
@@ -542,23 +544,15 @@ bool RTPT::canUseGRISDualFirstHit() const
     return true;
 }
 
-bool RTPT::canUseGRISSuffixReplay() const
-{
-    if (canUseGRISDualFirstHit()) return false;
-    const bool replay = mpScene && mGRISSuffixReplayEnabled && canUseGRISTemporal() && !mRestirDIEnabled;
-    return replay && canUseGRISReferenceReuse();
-}
-
 bool RTPT::canUseGRISDualDynamicReplay() const
 {
-    return mGRISSuffixReplayEnabled && canUseGRISTemporal() && canUseGRISDualFirstHit();
+    return mGRISSuffixReplayEnabled && canUseGRISTemporal();
 }
 
 bool RTPT::canPreserveGRISSuffixReplayForPointLightChange() const
 {
     const auto& snapshot = mGRISHistoryFrame.snapshot;
-    const bool compatibleReplay = (snapshot.suffixReplayDomain && canUseGRISSuffixReplay()) ||
-        (snapshot.dualDynamicReplayDomain && canUseGRISDualDynamicReplay());
+    const bool compatibleReplay = snapshot.dualDynamicReplayDomain && canUseGRISDualDynamicReplay();
     if (!compatibleReplay || !mUseNEE || !mpScene->useAnalyticLights() || mOptionsChanged ||
         !mGRISHistoryFrame.historyValid ||
         !mpGRISReplayPreviousLights) return false;
@@ -648,8 +642,7 @@ AABB getPaddedGRISReplayBounds(const AABB& meshBounds, const float4x4& transform
 bool RTPT::prepareGRISSuffixReplayGeometryChange()
 {
     const auto& snapshot = mGRISHistoryFrame.snapshot;
-    const bool compatibleReplay = (snapshot.suffixReplayDomain && canUseGRISSuffixReplay()) ||
-        (snapshot.dualDynamicReplayDomain && canUseGRISDualDynamicReplay());
+    const bool compatibleReplay = snapshot.dualDynamicReplayDomain && canUseGRISDualDynamicReplay();
     if (!compatibleReplay || mOptionsChanged || !mGRISHistoryFrame.historyValid) return false;
 
     const auto updates = mpScene->getUpdates();
@@ -761,7 +754,8 @@ void RTPT::releasePGProgramBindings()
     // Manager still owns the buffers until its migration fence completes.
     // Drop all pass references without throwing away compiled programs or history.
     for (const auto& pass : {mpComputePass, mpStageComputePass, mpDIComputePass, mpGRISMainPass,
-                            mpGRISGeneratePass, mpGRISTemporalPass, mpSparseUpdate, mpPGPrepare, mpPGTrain})
+                            mpGRISGeneratePass, mpGRISGenerateDiffusePass, mpGRISTemporalPass,
+                            mpSparseUpdate, mpPGPrepare, mpPGTrain})
     {
         if (!pass) continue;
         const auto root = pass->getRootVar();
@@ -1336,8 +1330,8 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const bool diActive = prepareDirectLighting(catalogReady);
     if (diActive) executeDirectLighting(pRenderContext);
     const auto& baseMainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
-    const bool grisActive = prepareGRIS(baseMainPass, diActive);
-    if (grisActive) executeGRIS(pRenderContext, renderData, diActive);
+    const bool grisActive = prepareGRIS(baseMainPass);
+    if (grisActive) executeGRIS(pRenderContext, renderData);
     const auto& mainPass = grisActive ? mpGRISMainPass : baseMainPass;
     auto var = mainPass->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);

@@ -369,55 +369,82 @@ float3 rtptTraceContinuation(
         if (!any(throughput > 0.f)) break;
 #endif
         const uint materialID = gScene.getMaterialID(triangleHit.instanceID);
-        ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
-        sd.mtl.setActiveLobes(uint(LobeType::Reflection));
-#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
-#if RTPT_GRIS_DUAL_FIRST_HIT
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
+        ShadingData sd = {};
+        bool canonicalHit = false;
+        const bool deltaX1 = deltaPrefix && bounce == 1u;
+        float3 direction;
+        float distanceSquared;
         if (rebuildPrefix)
-#else
-        if (representedPrefix && bounce <= 2u)
-#endif
         {
-            float3 direction;
-            float distanceSquared;
-            ShadingData represented;
-#if RTPT_GRIS_DUAL_FIRST_HIT
             // The triangle was decoded from hit.pack() already. Reuse its
             // canonical attributes while shading the reconstructed view.
-            if (deltaPrefix && bounce == 1u)
+            if (deltaX1)
             {
                 prefix.dualX1 = hit.pack();
                 // Discrete probability mass of the restricted mirror root.
                 prefix.dualFirstPdf = 1.f;
                 prefix.throughputToX1 = throughput;
-                representedPrefix = rtptGrisRefLoad(vertex, materialID, -ray.dir, represented);
-                if (representedPrefix)
-                {
-                    const IMaterialInstance representedMI =
-                        gScene.materials.getMaterialInstance(represented, ExplicitLodTextureSampler(0.f));
-                    representedPrefix = rtptGRISSupportsSurface(represented, representedMI.getLobeTypes(represented));
-                    if (representedPrefix) sd = represented;
-                }
+                canonicalHit = rtptGrisRefLoad(vertex, materialID, -ray.dir, sd);
             }
-            else if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
-                rtptGrisRefLoad(vertex, materialID, -direction, represented))
-#else
-            if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
-                rtptGrisRefLoad(hit.pack(), -direction, represented))
-#endif
+            else
             {
-#if RTPT_GRIS_DUAL_FIRST_HIT
+                canonicalHit = rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
+                    rtptGrisRefLoad(vertex, materialID, -direction, sd);
                 // Keep the actual draw even if this walk cannot represent its second edge.
-                if (bounce == 1u)
+                if (canonicalHit && bounce == 1u)
                 {
-                    const float firstPdf = rtptGRISAreaPdf(represented, ray, previousContinuationPdf);
+                    const float firstPdf = rtptGRISAreaPdf(sd, ray, previousContinuationPdf);
                     if (firstPdf > 0.f && isfinite(firstPdf))
                     {
                         prefix.dualX1 = hit.pack();
                         prefix.dualFirstPdf = firstPdf;
                     }
                 }
-#endif
+            }
+        }
+        if (!canonicalHit)
+        {
+            sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
+            sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+        }
+        IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+        if (rebuildPrefix)
+        {
+            representedPrefix = canonicalHit && rtptGRISSupportsSurface(sd, mi.getLobeTypes(sd));
+            if (representedPrefix && !deltaX1)
+            {
+                // Retain q from the actual draw, including its guide leaf.
+                const IMaterialInstance fromMI = gScene.materials.getMaterialInstance(prefixFrom, ExplicitLodTextureSampler(0.f));
+                const float3 edgeValue = fromMI.eval(prefixFrom, direction, sg);
+                if (bounce == 2u)
+                {
+                    const float geometry = abs(dot(sd.faceN, direction)) / distanceSquared;
+                    const float pdf = fromMI.evalPdf(prefixFrom, direction);
+                    if (geometry > 0.f && isfinite(geometry) && pdf > 0.f && isfinite(pdf))
+                        nativeFresh.connection = edgeValue * geometry;
+                }
+                throughput = prefixThroughput * edgeValue / previousContinuationPdf;
+            }
+            else if (canonicalHit && !representedPrefix)
+            {
+                sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
+                sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+                mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+            }
+        }
+#else
+        ShadingData sd = gScene.materials.prepareShadingData(vertex, materialID, -ray.dir);
+        sd.mtl.setActiveLobes(uint(LobeType::Reflection));
+#if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING
+        if (representedPrefix && bounce <= 2u)
+        {
+            float3 direction;
+            float distanceSquared;
+            ShadingData represented;
+            if (rtptGrisPrefixDirection(ray.origin, vertex.posW, direction, distanceSquared) &&
+                rtptGrisRefLoad(hit.pack(), -direction, represented))
+            {
                 const IMaterialInstance representedMI = gScene.materials.getMaterialInstance(represented, ExplicitLodTextureSampler(0.f));
                 if (rtptGRISSupportsSurface(represented, representedMI.getLobeTypes(represented)))
                 {
@@ -426,15 +453,6 @@ float3 rtptTraceContinuation(
                     // never ask the guide to evaluate the reconstructed ray.
                     const IMaterialInstance fromMI = gScene.materials.getMaterialInstance(prefixFrom, ExplicitLodTextureSampler(0.f));
                     const float3 edgeValue = fromMI.eval(prefixFrom, direction, sg);
-#if RTPT_GRIS_DUAL_FIRST_HIT
-                    if (bounce == 2u)
-                    {
-                        const float geometry = abs(dot(represented.faceN, direction)) / distanceSquared;
-                        const float pdf = fromMI.evalPdf(prefixFrom, direction);
-                        if (geometry > 0.f && isfinite(geometry) && pdf > 0.f && isfinite(pdf))
-                            nativeFresh.connection = edgeValue * geometry;
-                    }
-#endif
                     throughput = prefixThroughput * edgeValue / previousContinuationPdf;
                     sd = represented;
                 }
@@ -444,6 +462,7 @@ float3 rtptTraceContinuation(
         }
 #endif
         const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+#endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_FIRST_HIT
         if (bounce == 1u && representedPrefix && freshAttemptedMask != 0u)
         {
