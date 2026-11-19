@@ -18,7 +18,7 @@ struct Settings
     bool detailedDiagnostics = false;
     uint32_t treeBudgetMiB = 64;
     uint32_t recordBudgetMiB = 128;
-    uint32_t coarseLevels = 2;
+    uint32_t coarseLevels = 3;
     uint32_t pollFrames = 16;
     uint32_t maxRegions = 16384;
     float guideFraction = 0.5f;

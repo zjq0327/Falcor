@@ -26,6 +26,7 @@ public:
     RenderPassReflection reflect(const CompileData& compileData) override;
     void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
     void renderUI(Gui::Widgets& widget) override;
+    void onHotReload(HotReloadFlags reloaded) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     Properties getPGStatistics() const;
     Properties getPGAsyncStatistics() const;
@@ -73,8 +74,8 @@ private:
     bool isGRISDualFirstHitActive() const;
     bool canUseGRISTemporal() const;
     bool canUseGRISAlternating() const;
-    bool prepareGRIS(const ref<ComputePass>& baseMainPass);
-    void executeGRIS(RenderContext* pRenderContext, const RenderData& renderData);
+    bool prepareGRIS(const ref<ComputePass>& baseMainPass, bool collectGenerateStats);
+    void executeGRIS(RenderContext* pRenderContext, const ref<Texture>& generateStats);
     void bindMainParams(const ShaderVar& rootVar) const;
     void bindPrimarySettings(const ShaderVar& rootVar) const;
     void bindNRDOutputs(const ShaderVar& rootVar, const RenderData& renderData) const;
@@ -243,6 +244,8 @@ private:
     ref<ComputePass> mpPGPrepare;
     ref<ComputePass> mpPGTrain;
     std::unique_ptr<RTPTPG::Manager> mpPG;
+    // PG uses its own base scale before applying coarseLevels.
+    static constexpr float kPGSceneScale = 64.f;
     RTPTPG::Settings mPGSettings;
     bool mEnablePG = false;
     bool needsPG() const { return mEnablePG || canUseGRIS(); }
@@ -335,7 +338,7 @@ private:
     uint32_t mSHARCDebugMode = 0;
     uint32_t mSHARCFrameIndex = 0;
     uint64_t mSHARCResolveVersion = 0u;
-    float mSHARCSceneScale = 64.f;
+    float mSHARCSceneScale = 16.f;
     float mSHARCMinRoughness = 0.4f;
     float3 mSHARCCameraPositionPrev = float3(0.f);
 

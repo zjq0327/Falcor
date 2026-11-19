@@ -37,8 +37,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     float3 frameAverage = 0.f;
     RTPTSharcStats sharcStats = {};
-#if ENABLE_SHARC && SHARC_QUERY && RTPT_USE_GRIS
-    const float3 generateStats = gSharcStats[pixel].xyz;
+#if RTPT_GRIS_GENERATE_STATS
+    // With only a counter visualization connected, Generate uses its output as scratch.
+    float3 generateStats;
+    [branch]
+    if (gSharcSettings.writeStats != 0u)
+        generateStats = gSharcStats[pixel].xyz;
+    else
+        generateStats = gSharcDebug[pixel].xyz;
     sharcStats.cacheTerminations = uint(generateStats.x);
     sharcStats.radianceRays = uint(generateStats.y);
     sharcStats.attemptedQueries = uint(generateStats.z);

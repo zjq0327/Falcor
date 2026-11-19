@@ -45,6 +45,7 @@ struct RTPTSharcSettings
     uint accumulationFrames;
     uint staleFrames;
     uint motionResponsive;
+    uint writeStats;
 };
 
 ParameterBlock<SharcParameters> gSharc;
@@ -142,6 +143,13 @@ void rtptCaptureSharcPrimary(ShadingData sd, BSDFProperties properties, inout RT
         stats.primaryCachedRadiance = cachedRadiance;
 }
 
+#if RTPT_GRIS_DUAL_SHARC
+bool rtptGrisDualSharcBounceAllowed(uint bounce)
+{
+    return bounce >= 3u && bounce <= gParams.maxBounces;
+}
+#endif
+
 bool rtptTrySharcQueryOnEdgeFrom(
     SharcParameters cache,
     ShadingData sd,
@@ -163,6 +171,9 @@ bool rtptTrySharcQueryOnEdgeFrom(
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
     , bool probeX1 = false
 #endif
+#if RTPT_GRIS_DUAL_SHARC
+    , bool dualGrisEdge = false
+#endif
 )
 {
     cachedRadiance = 0.f;
@@ -170,23 +181,31 @@ bool rtptTrySharcQueryOnEdgeFrom(
     tailQuery = {};
 #endif
 #if RTPT_GRIS_CACHE_TAIL
-    // x2 uses the full mixed BSDF, so its selected-lobe label cannot gate a
-    // reusable cache endpoint at x3. From x4 the ordinary fixed tail owns
-    // the incoming diffuse label, independently of the reconnected prefix.
+    // Dual GRIS classifies the x2 edge from its material, independently of
+    // the selected sub-lobe. Mixed edges use the roughness footprint below.
+#if RTPT_GRIS_DUAL_SHARC
+    if (!(dualGrisEdge && bounce == 3u) && (bounce < 4u || !previousDiffuse)) return false;
+#else
     if (bounce < 4u || !previousDiffuse) return false;
+#endif
     const uint lobes = mi.getLobeTypes(sd);
     const uint continuous = uint(LobeType::NonDeltaReflection);
     const MaterialType material = sd.mtl.getMaterialType();
     if (!sd.frontFacing || (material != MaterialType::PBRTDiffuse && material != MaterialType::Standard) ||
         lobes == 0u || (lobes & ~continuous) != 0u) return false;
 #endif
-    if (gSharcSettings.useCache == 0 || bounce == 0 ||
+#if RTPT_GRIS_DUAL_SHARC
+    const bool bounceInBudget = dualGrisEdge ? rtptGrisDualSharcBounceAllowed(bounce) : bounce < gParams.maxBounces;
+#else
+    const bool bounceInBudget = bounce < gParams.maxBounces;
+#endif
+    if (gSharcSettings.useCache == 0 || bounce == 0 || !bounceInBudget ||
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
         (bounce < gSharcSettings.minBounce && !probeX1) ||
 #else
         bounce < gSharcSettings.minBounce ||
 #endif
-        bounce >= gParams.maxBounces || previousDelta || properties.roughness < gSharcSettings.minRoughness ||
+        previousDelta || properties.roughness < gSharcSettings.minRoughness ||
         any(properties.emission > 0.f) || (mi.getLobeTypes(sd) & uint(LobeType::DeltaReflection)) != 0)
         return false;
 
@@ -245,6 +264,30 @@ bool rtptTrySharcQueryOnEdgeFrom(
     ++stats.cacheTerminations;
     return true;
 }
+
+#if RTPT_GRIS_DUAL_SHARC
+bool rtptTryGrisDualSharcQueryOnEdgeFrom(
+    SharcParameters cache, ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce,
+    bool previousDelta, bool previousGuideSelected, bool previousDiffuse, float previousRoughness,
+    float segmentLength, RTPTSamplingContext previousSampling, float3 direction,
+    inout RTPTSharcStats stats, out float3 cachedRadiance)
+{
+#if RTPT_GRIS_SHARC_REPLAY
+    RTPTSharcTailQuery unusedTailQuery;
+#endif
+    // This ray is already traced. At the budget boundary we can replace its
+    // remaining radiance with the cache without generating another ray.
+    return rtptTrySharcQueryOnEdgeFrom(cache, sd, mi, properties, bounce, previousDelta, previousGuideSelected,
+        previousDiffuse, previousRoughness, segmentLength, previousSampling, direction, stats, cachedRadiance
+#if RTPT_GRIS_SHARC_REPLAY
+        , unusedTailQuery
+#endif
+#ifdef RTPT_GRIS_SHARC_X1_BLEND
+        , false
+#endif
+        , true);
+}
+#endif
 
 bool rtptTrySharcQueryOnEdge(
     ShadingData sd, IMaterialInstance mi, BSDFProperties properties, uint bounce, bool previousDelta,
@@ -305,6 +348,10 @@ float3 rtptSharcOccupancy(uint2 pixel)
 
 void rtptWriteSharcDebug(uint2 pixel, RTPTSharcStats stats)
 {
+    gSharcCacheRadiance[pixel] = float4(stats.primaryCachedRadiance, 1.f);
+    if (gSharcSettings.writeStats != 0u)
+        gSharcStats[pixel] = float4(float(stats.cacheTerminations), float(stats.radianceRays), float(stats.attemptedQueries), stats.primarySampleCount);
+
     float3 debug = 0.f;
     switch (gSharcSettings.debugMode)
     {
@@ -345,10 +392,10 @@ void rtptWriteSharcDebug(uint2 pixel, RTPTSharcStats stats)
     case 7:
         debug = rtptSharcOccupancy(pixel);
         break;
+    default:
+        return;
     }
     gSharcDebug[pixel] = float4(debug, 1.f);
-    gSharcCacheRadiance[pixel] = float4(stats.primaryCachedRadiance, 1.f);
-    gSharcStats[pixel] = float4(float(stats.cacheTerminations), float(stats.radianceRays), float(stats.attemptedQueries), stats.primarySampleCount);
 }
 #endif
 #endif

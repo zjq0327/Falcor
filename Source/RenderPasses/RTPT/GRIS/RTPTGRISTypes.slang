@@ -158,7 +158,7 @@ struct GrisSpatialRecord
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng; // Continuation stream after sampling x2's direction.
-    uint dualExplicitBounce; // Zero for directly stored NEE, 4 for an x4 SHaRC terminal.
+    uint dualExplicitBounce; // Terminal bounce of a replayed suffix, or zero for directly stored NEE.
     uint2 dualExplicitPathID;
 #endif
 };
@@ -191,6 +191,7 @@ struct GrisDualExplicitTerminal
 {
     float3 suffixLight;
     uint2 dualExplicitPathID;
+    uint bounce;
     uint terminalKind;
     uint lightPdfOrIndex;
     bool lightIsAnalytic;

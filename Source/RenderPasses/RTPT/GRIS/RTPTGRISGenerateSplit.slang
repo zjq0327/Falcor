@@ -5,7 +5,7 @@ struct GrisGenerateRootResult
     float winnerTarget;
     float3 localRadiance;
     GrisFirstHit localFirstHit;
-#if ENABLE_SHARC && SHARC_QUERY
+#if RTPT_GRIS_GENERATE_STATS
     float3 sharcStats;
 #endif
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
@@ -83,17 +83,6 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     SampleGenerator pathRng = SampleGenerator(pixel, sampleIndex ^ (slot == 0u ? 0x87fb1a4du : 0x98d6d257u));
     SampleGenerator freshEvaluationRng = SampleGenerator(pixel, sampleIndex ^ (0x517cc1b7u + slot));
     SampleGenerator freshSelectionRng = SampleGenerator(pixel, sampleIndex ^ (0x3c6ef373u + slot));
-    SampleGenerator eventRng = SampleGenerator(pixel, sampleIndex ^ 0xf5942b8bu);
-    const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
-    uint lateSlot = 0u;
-    if (lateCount > 0u)
-    {
-        // The serial loop consumes a late-event draw if the D lobe exists,
-        // including when its walk gets no reusable candidate.
-        if (slot == 1u && hasDiffuse) sampleNext1D(eventRng);
-        lateSlot = min(uint(sampleNext1D(eventRng) * lateCount), lateCount - 1u);
-    }
-
     GrisLocalPrefix prefix = {};
     prefix.rootLobe = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
     GrisDualX2Sample x2Sample = {};
@@ -107,13 +96,13 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     const uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
     result.localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
         result.localFirstHit.hitT, result.localFirstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix,
-        x2Sample, lateSlot, explicitWinner, slot, canonicalPrimary ? attemptedMask : 0u,
+        x2Sample, explicitWinner, slot, canonicalPrimary ? attemptedMask : 0u,
         supportsDeltaRoot, diffuseSampling, freshSlot, freshEvaluationRng, freshSelectionRng
 #if RTPT_GRIS_DUAL_SHARC
         , cacheProposal
 #endif
     );
-#if ENABLE_SHARC && SHARC_QUERY
+#if RTPT_GRIS_GENERATE_STATS
     result.sharcStats = float3(sharcStats.cacheTerminations, sharcStats.radianceRays, sharcStats.attemptedQueries);
 #endif
     result.weightSum = freshSlot.weightSum;
@@ -121,7 +110,7 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     {
         const uint event = freshSlot.winnerEvent;
         result.winner = rtptGrisMakeDualFreshProposal(center.ownerPrimaryHit, prefix.dualX1, event, slot,
-            x2Sample, explicitWinner, lateSlot
+            x2Sample, explicitWinner
 #if RTPT_GRIS_DUAL_SHARC
             , cacheProposal
 #endif
@@ -154,7 +143,7 @@ void generateDiffuse(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     gGRISLocalPrefixes[index].diffuse = float3(0.f) + diffuse.localRadiance;
     gGRISLocalPrefixes[index].firstHit[0] = diffuse.localFirstHit;
-#if ENABLE_SHARC && SHARC_QUERY
+#if RTPT_GRIS_GENERATE_STATS
     gSharcStats[pixel] = float4(diffuse.sharcStats, 0.f);
 #endif
 
@@ -189,7 +178,7 @@ void generateSpecularMerge(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     gGRISLocalPrefixes[index].specular = float3(0.f) + specular.localRadiance;
     gGRISLocalPrefixes[index].firstHit[1] = specular.localFirstHit;
-#if ENABLE_SHARC && SHARC_QUERY
+#if RTPT_GRIS_GENERATE_STATS
     // MainRender consumes the combined D and S counters.
     gSharcStats[pixel] = float4(gSharcStats[pixel].xyz + specular.sharcStats, 0.f);
 #endif

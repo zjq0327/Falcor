@@ -217,7 +217,7 @@ void RTPT::recordPGAsyncTraining(RenderContext* pMain)
     beginPGAsyncTiming(pMain, nullptr);
 #if FALCOR_HAS_D3D12
     auto queries = mPGTimingThisFrame ? mPGAsyncTimings[mPGAsyncCurrentTimingSlot].resources->queries.Get() : nullptr;
-    mpPGAsyncTrainer->record(mpPG->getNativeTrainingData(mpScene->getCamera()->getPosition(), mSHARCSceneScale,
+    mpPGAsyncTrainer->record(mpPG->getNativeTrainingData(mpScene->getCamera()->getPosition(), kPGSceneScale,
         mPGFrameIndex, true), queries, 0, 1);
 #endif
     mPGAsyncRecorded = true;

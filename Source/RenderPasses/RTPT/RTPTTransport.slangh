@@ -9,6 +9,9 @@
 #ifndef RTPT_GRIS_GENERATE
 #define RTPT_GRIS_GENERATE 0
 #endif
+#ifndef RTPT_GRIS_GENERATE_STATS
+#define RTPT_GRIS_GENERATE_STATS 0
+#endif
 #ifndef RTPT_GRIS_SPATIAL
 #define RTPT_GRIS_SPATIAL 0
 #endif

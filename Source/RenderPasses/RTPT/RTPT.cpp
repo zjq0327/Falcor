@@ -31,7 +31,12 @@ const NRDOutput kNRDOutputs[] = {
     {"viewZ", "gNRDViewZ", ResourceFormat::R32Float},
     {"mvecW", "gNRDMotionW", ResourceFormat::RGBA32Float},
 };
-const char* kSHARCOutputs[] = {"sharcDebug", "sharcCacheRadiance", "sharcStats"};
+struct SHARCOutput
+{
+    const char* name;
+    bool optional;
+};
+const SHARCOutput kSHARCOutputs[] = {{"sharcDebug", true}, {"sharcCacheRadiance", false}, {"sharcStats", true}};
 const Gui::DropdownList kSHARCDebugModes = {
     {0, "Voxel grid"}, {1, "Cached radiance"}, {2, "Sample count"}, {3, "Entry age"},
     {4, "Cache terminations"}, {5, "Traced rays"}, {6, "Update coverage"}, {7, "Hash occupancy"},
@@ -245,7 +250,7 @@ void RTPT::setProperties(const Properties& props)
     const bool diEligibilityChanged = neeChanged || sampleCountChanged;
     const bool pgStructureChanged = pgCompileChanged || pg.coarseLevels != mPGSettings.coarseLevels ||
         pg.treeBudgetMiB != mPGSettings.treeBudgetMiB || pg.maxRegions != mPGSettings.maxRegions ||
-        pgUpdateBounces != mPGUpdateBounces || sharcSceneScale != mSHARCSceneScale;
+        pgUpdateBounces != mPGUpdateBounces;
     const bool pgRecordsChanged = pg.recordBudgetMiB != mPGSettings.recordBudgetMiB || pgUpdateStride != mPGUpdateStride;
     const bool sharcStructureChanged = enableSHARC != mEnableSHARC || sharcEntries != mSHARCEntries ||
         sharcSceneScale != mSHARCSceneScale || sharcUpdateBounces != mSHARCUpdateBounces;
@@ -497,11 +502,23 @@ RenderPassReflection RTPT::reflect(const CompileData& compileData)
                 .format(output.format)
                 .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
     if (mEnableSHARC)
-        for (const auto* output : kSHARCOutputs)
-            reflection.addOutput(output, "SHaRC visualization or current-frame cache diagnostics")
+        for (const auto& output : kSHARCOutputs)
+        {
+            auto& field = reflection.addOutput(output.name, "SHaRC visualization or current-frame cache diagnostics")
                 .format(ResourceFormat::RGBA32Float)
                 .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+            if (output.optional) field.flags(RenderPassReflection::Field::Flags::Optional);
+        }
     return reflection;
+}
+
+void RTPT::onHotReload(HotReloadFlags reloaded)
+{
+    if (is_set(reloaded, HotReloadFlags::Program))
+    {
+        resetGRISHistory();
+        resetAccumulationAndNRDHistory();
+    }
 }
 
 void RTPT::reset()
@@ -532,7 +549,6 @@ bool RTPT::canUseGRISDualFirstHit() const
         !mpScene->hasGeometryType(GeometryType::TriangleMesh) ||
         mRestirDIEnabled ||
         (mLightingMask & (kEnvLighting | kEmissiveLighting | kAnalyticLighting)) == 0u) return false;
-    if (mEnableSHARC && mSHARCEnabled && mSHARCUseCache && mMaxBounces <= 4u) return false;
 
     if ((mLightingMask & kAnalyticLighting) != 0u)
     {
@@ -909,7 +925,6 @@ void RTPT::bindSHARC(const ShaderVar& rootVar)
     settings["updateBounces"] = mSHARCUpdateBounces;
     settings["minBounce"] = mSHARCMinBounce;
     settings["useCache"] = mSHARCEnabled && mSHARCUseCache ? 1u : 0u;
-    settings["debugMode"] = mSHARCDebugMode;
     settings["minRoughness"] = mSHARCMinRoughness;
     settings["cameraPositionPrev"] = mSHARCCameraPositionPrev;
     settings["accumulationFrames"] = mSHARCAccumulationFrames;
@@ -1037,7 +1052,7 @@ void RTPT::dispatchSparse(RenderContext* pRenderContext, uint32_t stride, uint32
     params["useRussianRoulette"] = mUseRussianRoulette ? 1u : 0u;
     params["accumulate"] = 0u;
     if (mEnableSHARC) bindSHARC(var);
-    if (needsPG()) mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, frameIndex, pg);
+    if (needsPG()) mpPG->bind(var, mpScene->getCamera()->getPosition(), kPGSceneScale, frameIndex, pg);
     auto sparse = var["gSparseSettings"];
     sparse["frameDim"] = mFrameDim;
     sparse["updateStride"] = stride;
@@ -1102,7 +1117,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
         const bool hadModel = mpPG->getStatistics().modelReservedBytes != 0u;
         auto settings = mPGSettings;
         if (canUseGRIS()) settings.enabled = settings.useGuiding = true;
-        mpPG->prepare(pRenderContext, settings, mFrameDim, mPGUpdateBounces, mPGUpdateStride, mSHARCSceneScale);
+        mpPG->prepare(pRenderContext, settings, mFrameDim, mPGUpdateBounces, mPGUpdateStride, kPGSceneScale);
         if (mResetPG)
         {
             // Allocation initializes a first model. Existing models are cleared
@@ -1120,7 +1135,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
         {
             FALCOR_PROFILE(pRenderContext, "PGPrepare");
             mpPG->beginFrame(pRenderContext);
-            mpPG->bind(mpPGPrepare->getRootVar(), mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, true);
+            mpPG->bind(mpPGPrepare->getRootVar(), mpScene->getCamera()->getPosition(), kPGSceneScale, mPGFrameIndex, true);
             mpPGPrepare->execute(pRenderContext, uint3(mpPG->getPathCapacity(), 1, 1));
             mpPG->barrierTraining(pRenderContext);
         }
@@ -1145,7 +1160,7 @@ void RTPT::executeTraining(RenderContext* pRenderContext)
             beginPGAsyncTiming(pRenderContext, pRenderContext);
             writePGAsyncTimestamp(pRenderContext, 0);
             pRenderContext->getLowLevelData()->beginDebugEvent("PGTrainSerial");
-            mpPG->bind(mpPGTrain->getRootVar(), mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, true);
+            mpPG->bind(mpPGTrain->getRootVar(), mpScene->getCamera()->getPosition(), kPGSceneScale, mPGFrameIndex, true);
             mpPGTrain->execute(pRenderContext, uint3(mpPG->getPathCapacity(), 1, 1));
             mpPG->barrierTraining(pRenderContext);
             pRenderContext->getLowLevelData()->endDebugEvent();
@@ -1195,8 +1210,9 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
             for (const auto& output : kNRDOutputs)
                 pRenderContext->clearTexture(renderData.getTexture(output.name).get());
         if (mEnableSHARC)
-            for (const auto* output : kSHARCOutputs)
-                pRenderContext->clearTexture(renderData.getTexture(output).get());
+            for (const auto& output : kSHARCOutputs)
+                if (const auto texture = renderData.getTexture(output.name))
+                    pRenderContext->clearTexture(texture.get());
         return;
     }
 
@@ -1330,8 +1346,13 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     const bool diActive = prepareDirectLighting(catalogReady);
     if (diActive) executeDirectLighting(pRenderContext);
     const auto& baseMainPass = diActive ? mpDIComputePass : (stagesActive ? mpStageComputePass : mpComputePass);
-    const bool grisActive = prepareGRIS(baseMainPass);
-    if (grisActive) executeGRIS(pRenderContext, renderData);
+    const auto sharcStats = mEnableSHARC ? renderData.getTexture("sharcStats") : nullptr;
+    const auto sharcDebug = mEnableSHARC ? renderData.getTexture("sharcDebug") : nullptr;
+    const bool debugUsesCounters = mSHARCDebugMode == 4u || mSHARCDebugMode == 5u;
+    // Generate can stage counters in the debug image until Main replaces them with the visualization.
+    const auto generateStats = sharcStats ? sharcStats : (debugUsesCounters ? sharcDebug : nullptr);
+    const bool grisActive = prepareGRIS(baseMainPass, bool(generateStats));
+    if (grisActive) executeGRIS(pRenderContext, generateStats);
     const auto& mainPass = grisActive ? mpGRISMainPass : baseMainPass;
     auto var = mainPass->getRootVar();
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
@@ -1357,14 +1378,16 @@ void RTPT::execute(RenderContext* pRenderContext, const RenderData& renderData)
     if (mEnableSHARC)
     {
         bindSHARC(var);
-        var["gSharcDebug"] = renderData.getTexture("sharcDebug");
+        var["gSharcSettings"]["debugMode"] = sharcDebug ? mSHARCDebugMode : std::numeric_limits<uint32_t>::max();
+        var["gSharcSettings"]["writeStats"] = sharcStats ? 1u : 0u;
+        var["gSharcDebug"] = sharcDebug;
         var["gSharcCacheRadiance"] = renderData.getTexture("sharcCacheRadiance");
-        var["gSharcStats"] = renderData.getTexture("sharcStats");
+        var["gSharcStats"] = sharcStats;
     }
     if (needsPG())
     {
         const bool useGuiding = grisActive || (mEnablePG && mPGSettings.enabled && mPGSettings.useGuiding);
-        mpPG->bind(var, mpScene->getCamera()->getPosition(), mSHARCSceneScale, mPGFrameIndex, false, false, true, useGuiding);
+        mpPG->bind(var, mpScene->getCamera()->getPosition(), kPGSceneScale, mPGFrameIndex, false, false, true, useGuiding);
     }
     pRenderContext->uavBarrier(mpAccumulation.get());
     if (mPGAsyncRecorded)
@@ -1414,7 +1437,7 @@ void RTPT::renderUI(Gui::Widgets& widget)
     }
     uint32_t maxBounces = mMaxBounces;
     if (widget.var("Max BSDF bounces", maxBounces, 1u, 64u)) baseProps["maxBounces"] = maxBounces;
-    widget.tooltip("Number of BSDF scatter events. The final ray only collects emission or environment light.", true);
+    widget.tooltip("Number of BSDF scatter events. The final ray collects emission, environment light, or a SHaRC cache hit in dual GRIS.", true);
     bool useNEE = mUseNEE;
     if (widget.checkbox("Next-event estimation", useNEE)) baseProps["useNEE"] = useNEE;
     widget.tooltip("Sample analytic, mesh and environment lights. Analytic lights require NEE because rays cannot hit them.", true);

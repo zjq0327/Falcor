@@ -1,11 +1,5 @@
 #pragma once
 
-uint rtptGrisDualExplicitLateCount(uint maxBounces)
-{
-    // NEE at x4..x(max-1), plus BSDF endpoints at x4..x(max).
-    return maxBounces > 3u ? 2u * (maxBounces - 3u) - 1u : 0u;
-}
-
 uint2 rtptGrisDualExplicitBeginPath()
 {
     return uint2(2166136261u, 2246822519u);

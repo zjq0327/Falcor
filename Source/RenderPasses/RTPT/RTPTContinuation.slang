@@ -69,16 +69,16 @@ struct GrisNativeFreshPrefix
     float outgoingPdf;
 };
 
-void rtptGrisOfferNativeFreshEvent(GrisNativeFreshPrefix prefix, uint event, float proposalPdf,
+bool rtptGrisOfferNativeFreshEvent(GrisNativeFreshPrefix prefix, uint event, float proposalPdf,
     float3 incident, float lightPdf, bool deltaRoot, inout GrisFreshSlotReservoir reservoir,
     inout SampleGenerator selectionRng)
 {
-    if (!(proposalPdf > 0.f) || !isfinite(proposalPdf) || !(prefix.firstGeometry > 0.f)) return;
+    if (!(proposalPdf > 0.f) || !isfinite(proposalPdf) || !(prefix.firstGeometry > 0.f)) return false;
     const bool deep = event != kGrisFixedX1NeeEvent && event != kGrisFreshX2NeeEvent;
     const float3 deepIncident = deep ? incident : float3(0.f);
     if (deep)
     {
-        if (!(prefix.outgoingPdf > 0.f) || !all(isfinite(incident)) || !any(incident > 0.f)) return;
+        if (!(prefix.outgoingPdf > 0.f) || !all(isfinite(incident)) || !any(incident > 0.f)) return false;
         const float mis = lightPdf > 0.f ? rtptPowerHeuristic(prefix.outgoingPdf, lightPdf) : 1.f;
         incident = prefix.outgoingBsdf * incident * mis;
     }
@@ -93,27 +93,26 @@ void rtptGrisOfferNativeFreshEvent(GrisNativeFreshPrefix prefix, uint event, flo
     else
     {
         const float3 common = incident * prefix.firstGeometry;
-        if (!all(isfinite(common)) || !any(common > 0.f)) return;
+        if (!all(isfinite(common)) || !any(common > 0.f)) return false;
         const float3 diffuse = prefix.root.diffuse * common;
         const float3 specular = prefix.root.specular * common;
         if (all(isfinite(diffuse))) value.diffuse = diffuse;
         if (all(isfinite(specular))) value.specular = specular;
     }
-    rtptGrisOfferFreshCandidate(reservoir, event, value, proposalPdf, deepIncident, lightPdf, selectionRng);
+    return rtptGrisOfferFreshCandidate(reservoir, event, value, proposalPdf, deepIncident, lightPdf, selectionRng);
 }
 
 void rtptGrisOfferNativeExplicitEvent(GrisNativeFreshPrefix prefix, uint event, float proposalPdf,
     float3 incident, float lightPdf, bool deltaRoot, inout GrisFreshSlotReservoir reservoir,
-    inout SampleGenerator selectionRng, GrisDualNeeTerminal light, uint kind, uint2 pathID,
+    inout SampleGenerator selectionRng, GrisDualNeeTerminal light, uint kind, uint bounce, uint2 pathID,
     uint lightPdfOrIndex, inout GrisDualExplicitTerminal terminal)
 {
-    rtptGrisOfferNativeFreshEvent(prefix, event, proposalPdf, incident, lightPdf, deltaRoot, reservoir, selectionRng);
-    // Each explicit event is offered at most once. Only its metadata survives if it wins.
-    if (reservoir.winnerEvent == event)
+    if (rtptGrisOfferNativeFreshEvent(prefix, event, proposalPdf, incident, lightPdf, deltaRoot, reservoir, selectionRng))
     {
         terminal.suffixLight = light.coordinates;
         terminal.dualExplicitPathID = pathID;
         terminal.terminalKind = kind | kGrisDeepTail;
+        terminal.bounce = bounce;
         terminal.lightPdfOrIndex = lightPdfOrIndex;
         terminal.lightIsAnalytic = light.lightIsAnalytic;
     }
@@ -143,7 +142,6 @@ float3 rtptTraceContinuation(
     , inout GrisLocalPrefix prefix
 #if RTPT_GRIS_DUAL_FIRST_HIT && !RTPT_GRIS_ALTERNATING
     , inout GrisDualX2Sample x2
-    , uint lateSlot
     , out GrisDualExplicitTerminal explicitWinner
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
     , uint freshSlot
@@ -186,7 +184,6 @@ float3 rtptTraceContinuation(
     x2.rootDirection = 0.f;
     x2.firstNee = {};
     uint2 explicitPathID = rtptGrisDualExplicitBeginPath();
-    const uint lateCount = rtptGrisDualExplicitLateCount(gParams.maxBounces);
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
     GrisNativeFreshPrefix nativeFresh = {};
     float freshRootPdf = 0.f;
@@ -250,8 +247,13 @@ float3 rtptTraceContinuation(
     bool previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
     float previousRoughness = primaryMI.getProperties(primarySD).roughness;
 #if RTPT_GRIS_GENERATE
+#if RTPT_GRIS_DUAL_SHARC
+    // Dual Generate first probes at x3. Only the primary edge can sample the guide.
+    const RTPTSamplingContext previousSharcSampling = rtptBSDFSamplingContext();
+#else
     RTPTSamplingContext previousSharcSampling = primaryLobes == uint(LobeType::DiffuseReflection)
         ? primarySampling : rtptBSDFSamplingContext();
+#endif
 #endif
 #endif
     Ray ray = Ray(primarySD.computeRayOrigin(), bs.wo);
@@ -294,16 +296,16 @@ float3 rtptTraceContinuation(
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
                     rtptGrisOfferNativeExplicitEvent(nativeFresh, kGrisFreshX3BsdfEvent, freshRootPdf * x2.deepPdf,
                         environment, lightPdf, deltaPrefix, freshReservoir, freshSelectionRng,
-                        x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss), missID, asuint(lightPdf), explicitWinner);
+                        x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss), bounce, missID, asuint(lightPdf), explicitWinner);
 #endif
                 }
-                else if (lateSlot == 2u * (bounce - 4u))
+                else
                 {
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
-                    const float3 incident = segmentThroughput * environment * (misWeight * float(lateCount));
+                    const float3 incident = segmentThroughput * environment * misWeight;
                     rtptGrisOfferNativeExplicitEvent(nativeFresh, kGrisFreshLateEvent, freshRootPdf * x2.deepPdf,
                         incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng,
-                        x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss), missID, 0u, explicitWinner);
+                        x2.deepLight, uint(GrisTerminalKind::GrisDualEnvironmentMiss), bounce, missID, 0u, explicitWinner);
 #endif
                 }
                 break;
@@ -499,22 +501,34 @@ float3 rtptTraceContinuation(
         const BSDFProperties sharcProperties = mi.getProperties(sd);
         float3 cachedRadiance;
 #if RTPT_GRIS_GENERATE
-#if RTPT_GRIS_SHARC_REPLAY
+#if RTPT_GRIS_SHARC_REPLAY && !RTPT_GRIS_DUAL_SHARC
         RTPTSharcTailQuery tailQuery;
 #endif
+#if !RTPT_GRIS_DUAL_SHARC
         // The guided and BSDF techniques share one continuation on the supported diffuse edges.
         const bool sharedDiffuse = previousSharcSampling.alpha > 0.f;
+#endif
 #ifdef RTPT_GRIS_SHARC_X1_BLEND
         // A blend probe keeps the x1 prefix available for x2 reuse.
         const bool probeX1 = bounce == 1u && HitInfo(prefix.x1Hit).isValid();
 #endif
+#if RTPT_GRIS_DUAL_SHARC
+        const bool x3EdgeValid = bounce == 3u && x2.deepPdf > 0.f &&
+            (previousDiffuse || (previousRoughness > 0.f && isfinite(previousRoughness)));
+        const bool cacheEdgeValid = bounce >= 4u || x3EdgeValid;
+        const bool cacheDiffuse = previousDiffuse;
+        const float cacheRoughness = previousRoughness;
+        if (cacheEdgeValid && rtptTryGrisDualSharcQueryOnEdgeFrom(gSharc, sd, mi, sharcProperties, bounce, previousDelta,
+            false, cacheDiffuse, cacheRoughness,
+#else
         if (rtptTrySharcQueryOnEdge(sd, mi, sharcProperties, bounce, previousDelta,
             previousGuideSelected && !sharedDiffuse, previousDiffuse || sharedDiffuse, previousRoughness,
+#endif
             length(sd.posW - previousPosition), previousSharcSampling, ray.dir, sharcStats, cachedRadiance
-#if RTPT_GRIS_SHARC_REPLAY
+#if RTPT_GRIS_SHARC_REPLAY && !RTPT_GRIS_DUAL_SHARC
             , tailQuery
 #endif
-#ifdef RTPT_GRIS_SHARC_X1_BLEND
+#if defined(RTPT_GRIS_SHARC_X1_BLEND) && !RTPT_GRIS_DUAL_SHARC
             , probeX1
 #endif
             ))
@@ -534,18 +548,26 @@ float3 rtptTraceContinuation(
 #endif
             {
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && RTPT_GRIS_DUAL_SHARC
-                if (bounce == 4u && cacheSuffix.areaPdf > 0.f)
+                if (x2.deepPdf > 0.f)
                 {
-                    const float3 incident = segmentThroughput * cachedRadiance;
+                    // x2's BSDF is applied by the shared prefix evaluation.
+                    const float3 incident = bounce == 3u ? cachedRadiance : segmentThroughput * cachedRadiance;
                     if (all(isfinite(incident)) && all(incident >= 0.f))
                     {
-                        cacheSuffix.dualExplicitRng = x2.replayRng;
-                        rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshSharcEvent, freshRootPdf * cacheSuffix.areaPdf,
-                            incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng);
-                        cacheSuffix.dualExplicitBounce = bounce;
-                        cacheSuffix.dualExplicitPathID = explicitPathID;
-                        cacheSuffix.candidate.terminalKind = uint(GrisTerminalKind::GrisDualSharcTail) | kGrisDeepTail;
-                        cacheSuffix.candidate.hasWinner = true;
+                        if (rtptGrisOfferNativeFreshEvent(nativeFresh, kGrisFreshSharcEvent, freshRootPdf * x2.deepPdf,
+                            incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng))
+                        {
+                            cacheSuffix.candidate.rootLobe = currentRoot;
+                            cacheSuffix.candidate.terminalKind = uint(GrisTerminalKind::GrisDualSharcTail) | kGrisDeepTail;
+                            cacheSuffix.candidate.hasWinner = true;
+                            cacheSuffix.sourceX1 = prefix.dualX1;
+                            cacheSuffix.reconnectHit = x2.hit;
+                            cacheSuffix.areaPdf = x2.deepPdf;
+                            cacheSuffix.suffixDirection = x2.direction;
+                            cacheSuffix.dualExplicitRng = x2.replayRng;
+                            cacheSuffix.dualExplicitBounce = bounce;
+                            cacheSuffix.dualExplicitPathID = explicitPathID;
+                        }
                         break;
                     }
                 }
@@ -619,14 +641,14 @@ float3 rtptTraceContinuation(
                     {
                         rtptGrisOfferNativeExplicitEvent(nativeFresh, kGrisFreshX3BsdfEvent, freshRootPdf * x2.deepPdf,
                             emission, lightPdf, deltaPrefix, freshReservoir, freshSelectionRng,
-                            x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter), explicitPathID, asuint(lightPdf), explicitWinner);
+                            x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter), bounce, explicitPathID, asuint(lightPdf), explicitWinner);
                     }
-                    else if (lateSlot == 2u * (bounce - 4u))
+                    else
                     {
-                        const float3 incident = segmentThroughput * emission * (misWeight * float(lateCount));
+                        const float3 incident = segmentThroughput * emission * misWeight;
                         rtptGrisOfferNativeExplicitEvent(nativeFresh, kGrisFreshLateEvent, freshRootPdf * x2.deepPdf,
                             incident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng,
-                            x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter), explicitPathID, 0u, explicitWinner);
+                            x2.deepLight, uint(GrisTerminalKind::GrisDualEmitter), bounce, explicitPathID, 0u, explicitWinner);
                     }
                 }
                 else
@@ -708,18 +730,10 @@ float3 rtptTraceContinuation(
             }
             else if (captureExplicit && bounce >= 4u && x2.deepPdf > 0.f)
             {
-                // One uniform slot covers all late explicit events, including
-                // slots skipped by misses, unsupported lobes or cache hits.
-                captured = true;
-                if (lateSlot == 2u * (bounce - 4u) + 1u)
-                {
-                    lateLight = x2.deepLight;
-                    lateLight.hasWinner = false;
-                    // Evaluate late NEE from the replay stream before the light draw.
-                    evaluationRng = neeRng;
-                    captured = rtptGrisCaptureDualNee(sd, lateLight, neeRng, true);
-                    if (lateLight.hasWinner) onlineNeeEvent = kGrisFreshLateEvent;
-                }
+                // Evaluate late NEE from the replay stream before the light draw.
+                evaluationRng = neeRng;
+                captured = rtptGrisCaptureDualNee(sd, lateLight, neeRng, true);
+                if (lateLight.hasWinner) onlineNeeEvent = kGrisFreshLateEvent;
             }
             if (onlineNeeEvent != 0xffffffffu)
             {
@@ -738,10 +752,10 @@ float3 rtptTraceContinuation(
                         evaluationRng, false, shadowClear);
                     if (lateNee)
                     {
-                        const float3 tailIncident = segmentThroughput * incident * float(lateCount);
+                        const float3 tailIncident = segmentThroughput * incident;
                         rtptGrisOfferNativeExplicitEvent(nativeFresh, kGrisFreshLateEvent, freshRootPdf * x2.deepPdf * lightProbability,
                             tailIncident, 0.f, deltaPrefix, freshReservoir, freshSelectionRng,
-                            terminal, terminal.terminalKind, explicitPathID, terminal.lightPdfOrIndex, explicitWinner);
+                            terminal, terminal.terminalKind, bounce, explicitPathID, terminal.lightPdfOrIndex, explicitWinner);
                     }
                     else
                     {
@@ -835,7 +849,7 @@ float3 rtptTraceContinuation(
 #if ENABLE_SHARC && SHARC_QUERY
         previousDiffuse = !previousGuideSelected && bs.isLobe(LobeType::DiffuseReflection);
         previousRoughness = sharcProperties.roughness;
-#if RTPT_GRIS_GENERATE
+#if RTPT_GRIS_GENERATE && !RTPT_GRIS_DUAL_SHARC
         previousSharcSampling = sampling;
 #endif
 #endif
@@ -847,6 +861,17 @@ float3 rtptTraceContinuation(
             if (deepPdf > 0.f && isfinite(deepPdf))
             {
                 x2.deepPdf = deepPdf;
+#if ENABLE_SHARC && SHARC_QUERY && RTPT_GRIS_DUAL_SHARC
+                // A represented x2 already has the packed hit's UV, explicit LOD and
+                // supported front-facing material. Its full lobes and roughness are
+                // view independent for PBRTDiffuse and Standard. Reuse the edge
+                // state for x3; the next BSDF draw replaces it for x4 and later.
+                const float faceLengthSquared = dot(vertex.faceNormalW, vertex.faceNormalW);
+                const bool canProbeX3 = gSharcSettings.useCache != 0u && gSharcSettings.minBounce <= 3u &&
+                    faceLengthSquared > 0.f && isfinite(faceLengthSquared);
+                previousDiffuse = canProbeX3 && mi.getLobeTypes(sd) == uint(LobeType::DiffuseReflection);
+                previousRoughness = canProbeX3 ? sharcProperties.roughness : 0.f;
+#endif
                 x2.direction = bs.wo;
                 x2.replayRng = rtptGrisCaptureReplayRng(sg);
             }
@@ -856,17 +881,6 @@ float3 rtptTraceContinuation(
             // x2 consumed the last canonical prefix weight. Start the suffix on the outgoing x3 edge.
             segmentThroughput = bounce == 3u ? bs.weight : segmentThroughput * bs.weight;
         }
-#if RTPT_GRIS_DUAL_SHARC
-        if (bounce == 3u && gParams.maxBounces > 4u && x2.deepPdf > 0.f &&
-            !previousDelta && previousDiffuse)
-        {
-            cacheSuffix.candidate.rootLobe = currentRoot;
-            cacheSuffix.sourceX1 = prefix.dualX1;
-            cacheSuffix.reconnectHit = x2.hit;
-            cacheSuffix.areaPdf = x2.deepPdf;
-            cacheSuffix.suffixDirection = x2.direction;
-        }
-#endif
 #endif
 #if RTPT_GRIS_GENERATE && RTPT_GRIS_SPATIAL && !RTPT_GRIS_ALTERNATING && !RTPT_GRIS_DUAL_FIRST_HIT
         if (bounce == 2u && pathBuilder.hasInterface)
@@ -911,9 +925,6 @@ float3 rtptTraceContinuation(
 #if RTPT_GRIS_DUAL_FIRST_HIT
             // A zero native route can still propose a tail for the other lobe.
             !(bounce >= 2u && x2.deepPdf > 0.f && (bounce == 2u || any(segmentThroughput > 0.f))) &&
-#if RTPT_GRIS_DUAL_SHARC
-            !(bounce == 3u && cacheSuffix.areaPdf > 0.f) &&
-#endif
 #endif
             !any(throughput > 0.f)) break;
 #else
