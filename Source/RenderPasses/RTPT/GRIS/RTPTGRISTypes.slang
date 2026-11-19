@@ -189,10 +189,8 @@ struct GrisDualX2Sample
 
 struct GrisDualExplicitTerminal
 {
-    float3 incident;
     float3 suffixLight;
     uint2 dualExplicitPathID;
-    uint dualExplicitBounce; // Zero denotes an empty terminal.
     uint terminalKind;
     uint lightPdfOrIndex;
     bool lightIsAnalytic;

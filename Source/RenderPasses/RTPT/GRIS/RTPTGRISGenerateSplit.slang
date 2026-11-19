@@ -97,7 +97,7 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     GrisLocalPrefix prefix = {};
     prefix.rootLobe = slot == 0u ? uint(GrisRootComponent::GrisDiffuse) : uint(GrisRootComponent::GrisSpecular);
     GrisDualX2Sample x2Sample = {};
-    GrisDualExplicitTerminal bsdfTerminal, lateTerminal;
+    GrisDualExplicitTerminal explicitWinner;
     GrisFreshSlotReservoir freshSlot = {};
 #if RTPT_GRIS_DUAL_SHARC
     GrisSpatialRecord cacheProposal = {};
@@ -107,7 +107,7 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     const uint rootCoverage = rtptLoadPrimaryDICoverage(pixel, sampleIndex, diDiffuse, diSpecular);
     result.localRadiance = rtptTraceContinuation(component, mi, activeLobe, sampling, pathRng,
         result.localFirstHit.hitT, result.localFirstHit.distanceState, sharcStats, rootCoverage, 1.f, prefix,
-        x2Sample, lateSlot, bsdfTerminal, lateTerminal, slot, canonicalPrimary ? attemptedMask : 0u,
+        x2Sample, lateSlot, explicitWinner, slot, canonicalPrimary ? attemptedMask : 0u,
         supportsDeltaRoot, diffuseSampling, freshSlot, freshEvaluationRng, freshSelectionRng
 #if RTPT_GRIS_DUAL_SHARC
         , cacheProposal
@@ -121,7 +121,7 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     {
         const uint event = freshSlot.winnerEvent;
         result.winner = rtptGrisMakeDualFreshProposal(center.ownerPrimaryHit, prefix.dualX1, event, slot,
-            x2Sample, event == kGrisFreshX3BsdfEvent ? bsdfTerminal : lateTerminal
+            x2Sample, explicitWinner, lateSlot
 #if RTPT_GRIS_DUAL_SHARC
             , cacheProposal
 #endif

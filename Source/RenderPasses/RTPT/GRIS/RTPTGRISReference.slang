@@ -782,7 +782,7 @@ float rtptGrisFreshRootPdfSumAtVertex(float nativePdf, uint slot, uint attempted
 
 // Materialize only the candidate selected by the Fresh reservoir.
 GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitInfo firstHit,
-    uint event, uint slot, GrisDualX2Sample x2, GrisDualExplicitTerminal terminal
+    uint event, uint slot, GrisDualX2Sample x2, GrisDualExplicitTerminal terminal, uint lateSlot
 #if RTPT_GRIS_DUAL_SHARC
     , GrisSpatialRecord cache
 #endif
@@ -830,9 +830,9 @@ GrisSpatialRecord rtptGrisMakeDualFreshProposal(PackedHitInfo owner, PackedHitIn
         // Explicit events restore the terminal fields recorded at the original hit.
         proposal.suffixLight = terminal.suffixLight;
         proposal.dualExplicitPathID = terminal.dualExplicitPathID;
-        proposal.dualExplicitBounce = terminal.dualExplicitBounce;
+        proposal.dualExplicitBounce = event == kGrisFreshX3BsdfEvent ? 3u : 4u + (lateSlot >> 1u);
         proposal.candidate.terminalKind = terminal.terminalKind;
-        proposal.candidate.hasWinner = terminal.dualExplicitBounce != 0u;
+        proposal.candidate.hasWinner = true;
         proposal.lightPdfOrIndex = terminal.lightPdfOrIndex;
         proposal.lightIsAnalytic = terminal.lightIsAnalytic;
     }
