@@ -1,5 +1,6 @@
 #include "../PrimarySurface/RTPTPrimarySurfaceTypes.slang"
 #include "RTPTGRISTypes.slang"
+#include "RTPTGRISStorage.slang"
 
 ConstantBuffer<RTPTPrimarySettings> gPrimarySettings;
 #if RTPT_GRIS_ALTERNATING
@@ -8,7 +9,7 @@ StructuredBuffer<GrisAlternatingFresh> gGRISFresh;
 RWStructuredBuffer<GrisDualShadedIndirect> gGRISShadedIndirect;
 #else
 #if RTPT_GRIS_SPATIAL
-StructuredBuffer<GrisSpatialRecord> gGRISCandidates;
+StructuredBuffer<GrisStoredRecord> gGRISCandidates;
 #else
 StructuredBuffer<GrisCandidate> gGRISCandidates;
 #endif

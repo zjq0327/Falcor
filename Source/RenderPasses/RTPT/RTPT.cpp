@@ -67,6 +67,8 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
             result["prefix"] = buffers[3];
             if (buffers[4]) result["temporal"] = buffers[4];
             if (buffers[5]) result["deepIncident"] = buffers[5];
+            if (buffers[6]) result["historyOwner"] = buffers[6];
+            if (buffers[7]) result["currentPrimary"] = buffers[7];
             return result;
         });
         pass.def("getSHARCValidationBuffers", [](const RTPT& self)
@@ -105,6 +107,8 @@ void RTPT::setProperties(const Properties& props)
     bool grisSpatialEnabled = mGRISSpatialEnabled;
     bool grisTemporalEnabled = mGRISTemporalEnabled;
     bool grisDualFirstHitEnabled = mGRISDualFirstHitEnabled;
+    bool grisReferenceBSDF = mGrisReferenceBSDF;
+    bool grisSeparateOwner = mGrisSeparateOwner;
     bool grisSuffixReplayEnabled = mGRISSuffixReplayEnabled;
     bool grisSuffixReplayValidateUnchanged = mGRISSuffixReplayValidateUnchanged;
     float grisSharcX1Blend = mGRISSharcX1Blend;
@@ -144,6 +148,8 @@ void RTPT::setProperties(const Properties& props)
         else if (key == "grisTemporalSuffixSplit" || key == "grisTemporalSuffixCombine" || key == "grisTemporalSuffixDiagnostics")
             logWarningOnce("RTPT ignores the retired '{}' property. GRIS Temporal uses a single pass.", key);
         else if (key == "grisDualFirstHitEnabled") grisDualFirstHitEnabled = value;
+        else if (key == "grisReferenceBSDF") grisReferenceBSDF = value;
+        else if (key == "grisSeparateOwner") grisSeparateOwner = value;
         else if (key == "grisSpatialStoredPrefixReuse" || key == "grisTemporalStoredPrefixReuse")
             logWarningOnce("RTPT ignores the retired '{}' property. GRIS selects stored-prefix reuse automatically.", key);
         else if (key == "grisSuffixReplayEnabled") grisSuffixReplayEnabled = value;
@@ -262,6 +268,7 @@ void RTPT::setProperties(const Properties& props)
     const bool grisSharcReuseChanged = sharcQuery != (mEnableSHARC && mSHARCEnabled && mSHARCUseCache);
     const bool grisModeChanged = grisEnabled != mGRISEnabled || grisSpatialEnabled != mGRISSpatialEnabled ||
         grisTemporalEnabled != mGRISTemporalEnabled || grisDualFirstHitEnabled != mGRISDualFirstHitEnabled ||
+        grisReferenceBSDF != mGrisReferenceBSDF || grisSeparateOwner != mGrisSeparateOwner ||
         grisSuffixReplayEnabled != mGRISSuffixReplayEnabled ||
         (grisEnabled && grisSharcReuseChanged);
     mOptionsChanged |= sampleCountChanged || maxBounces != mMaxBounces || rrStartBounce != mRRStartBounce ||
@@ -298,6 +305,8 @@ void RTPT::setProperties(const Properties& props)
     mGRISSpatialEnabled = grisSpatialEnabled;
     mGRISTemporalEnabled = grisTemporalEnabled;
     mGRISDualFirstHitEnabled = grisDualFirstHitEnabled;
+    mGrisReferenceBSDF = grisReferenceBSDF;
+    mGrisSeparateOwner = grisSeparateOwner;
     mGRISSuffixReplayEnabled = grisSuffixReplayEnabled;
     mGRISSuffixReplayValidateUnchanged = grisSuffixReplayValidateUnchanged;
     mGRISSharcX1Blend = grisSharcX1Blend;
@@ -374,6 +383,8 @@ Properties RTPT::getProperties() const
     props["grisSpatialEnabled"] = mGRISSpatialEnabled;
     props["grisTemporalEnabled"] = mGRISTemporalEnabled;
     props["grisDualFirstHitEnabled"] = mGRISDualFirstHitEnabled;
+    props["grisReferenceBSDF"] = mGrisReferenceBSDF;
+    props["grisSeparateOwner"] = mGrisSeparateOwner;
     props["grisSuffixReplayEnabled"] = mGRISSuffixReplayEnabled;
     props["grisSuffixReplayValidateUnchanged"] = mGRISSuffixReplayValidateUnchanged;
     props["grisSharcX1Blend"] = mGRISSharcX1Blend;

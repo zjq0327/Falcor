@@ -4,7 +4,7 @@
 #include "../RTPTContinuation.slang"
 #include "RTPTGRISReference.slang"
 
-RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
+RWStructuredBuffer<GrisStoredRecord> gGRISSpatialInput;
 RWStructuredBuffer<GrisLocalContributions> gGRISLocalPrefixes;
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
 RWStructuredBuffer<float4> gGRISSpatialDeepIncident;

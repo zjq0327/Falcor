@@ -3,7 +3,12 @@
 #include "../PrimarySurface/RTPTPrimarySurfaceTypes.slang"
 
 ConstantBuffer<RTPTPrimarySettings> gPrimarySettings;
-StructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
+#if RTPT_GRIS_SEPARATE_OWNER
+StructuredBuffer<RTPTPrimarySurface> gPrimarySurfaces;
+RWStructuredBuffer<PackedHitInfo> gGRISPreviousPrimaryHits;
+#endif
+#include "RTPTGRISStorage.slang"
+StructuredBuffer<GrisStoredRecord> gGRISSpatialInput;
 RWStructuredBuffer<GrisTemporalFreshHistory> gGRISHistory;
 
 [numthreads(8, 8, 1)]
@@ -12,24 +17,28 @@ void main(uint3 threadID : SV_DispatchThreadID)
     const uint2 pixel = threadID.xy;
     if (any(pixel >= gPrimarySettings.frameDim)) return;
     const uint index = pixel.y * gPrimarySettings.frameDim.x + pixel.x;
-    const GrisSpatialRecord source = gGRISSpatialInput[index];
+    const GrisStoredRecord source = gGRISSpatialInput[index];
     GrisTemporalFreshHistory history = {};
     history.sourceX1 = source.sourceX1;
+#if RTPT_GRIS_SEPARATE_OWNER
+    gGRISPreviousPrimaryHits[index] = gPrimarySurfaces[index].packedHit;
+#else
     history.ownerPrimaryHit = source.ownerPrimaryHit;
-    history.rootLobe = source.candidate.rootLobe;
+#endif
     history.reconnectHit = source.reconnectHit;
     history.sourceAreaPdf = source.areaPdf;
     history.suffixDirection = source.suffixDirection;
     history.suffixLight = source.suffixLight;
     history.lightPdfOrIndex = source.lightPdfOrIndex;
-    history.terminalAndFlags = source.candidate.terminalKind |
-        (source.lightIsAnalytic ? kGrisHistoryAnalytic : 0u);
     history.F = source.candidate.F;
 #if RTPT_GRIS_DUAL_FIRST_HIT
+    history.terminalAndFlags = source.candidate.packedFlags;
     history.dualF = source.candidate.dualF;
     history.dualExplicitRng = source.dualExplicitRng;
-    history.dualExplicitBounce = source.dualExplicitBounce;
-    history.dualExplicitPathID = source.dualExplicitPathID;
+#else
+    history.rootLobe = source.candidate.rootLobe;
+    history.terminalAndFlags = source.candidate.terminalKind |
+        (source.lightIsAnalytic ? kGrisHistoryAnalytic : 0u);
 #endif
     history.W = source.candidate.W;
     history.M = source.candidate.M;

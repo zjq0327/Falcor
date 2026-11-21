@@ -15,7 +15,7 @@ float rtptGrisBalanceWeight(float own, float other)
     return total > 0.f && isfinite(total) ? own / total : 0.f;
 }
 
-// Both shifted targets are evaluated in the common area measure (J = 1).
+// Both arguments must be densities in the same measure for this candidate.
 float rtptGrisTalbotWeight(float ownTarget, float ownCount, float otherTarget, float otherCount)
 {
     return rtptGrisBalanceWeight(ownTarget * ownCount, otherTarget * otherCount);

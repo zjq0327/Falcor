@@ -13,6 +13,9 @@
 #ifndef RTPT_GRIS_DUAL_FIRST_HIT
 #define RTPT_GRIS_DUAL_FIRST_HIT 0
 #endif
+#ifndef RTPT_GRIS_SEPARATE_OWNER
+#define RTPT_GRIS_SEPARATE_OWNER 0
+#endif
 #ifndef RTPT_GRIS_DUAL_SHARC
 #define RTPT_GRIS_DUAL_SHARC 0
 #endif
@@ -57,18 +60,54 @@ struct GrisFirstHit
     uint distanceState;
 };
 
+#if RTPT_GRIS_DUAL_FIRST_HIT
+// Preserve the low 14 bits used by terminalKind and the existing analytic-light bit.
+static const uint kGrisPackedTerminalMask = 0x3fffu;
+static const uint kGrisPackedRootShift = 14u;
+static const uint kGrisPackedPrepared = 1u << 16u;
+static const uint kGrisPackedWinner = 1u << 17u;
+static const uint kGrisPackedBounceShift = 18u; // maxBounces <= 64.
+static const uint kGrisPackedBounceMask = 0x7fu;
+#endif
+static const uint kGrisHistoryAnalytic = 0x80000000u;
+
 struct GrisCandidate
 {
     float3 F;
     float W;
     float M;
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    uint packedFlags;
+    float3 dualF;
+    property uint terminalKind
+    {
+        get { return packedFlags & kGrisPackedTerminalMask; }
+        set { packedFlags = (packedFlags & ~kGrisPackedTerminalMask) | (newValue & kGrisPackedTerminalMask); }
+    }
+    property uint rootLobe
+    {
+        get { return (packedFlags >> kGrisPackedRootShift) & 3u; }
+        set { packedFlags = (packedFlags & ~(3u << kGrisPackedRootShift)) | ((newValue & 3u) << kGrisPackedRootShift); }
+    }
+    property bool prepared
+    {
+        get { return (packedFlags & kGrisPackedPrepared) != 0u; }
+        set { packedFlags = (packedFlags & ~kGrisPackedPrepared) | (newValue ? kGrisPackedPrepared : 0u); }
+    }
+    property bool hasWinner
+    {
+        get { return (packedFlags & kGrisPackedWinner) != 0u; }
+        set { packedFlags = (packedFlags & ~kGrisPackedWinner) | (newValue ? kGrisPackedWinner : 0u); }
+    }
+#if RTPT_GRIS_ALTERNATING
+    GrisFirstHit firstHit;
+#endif
+#else
     uint rootLobe;
     uint terminalKind;
     bool prepared;
     bool hasWinner;
     GrisFirstHit firstHit;
-#if RTPT_GRIS_DUAL_FIRST_HIT
-    float3 dualF;
 #endif
 };
 
@@ -146,7 +185,15 @@ struct GrisSpatialRecord
     float3 suffixDirection; // Fixed direction leaving x2, or light coordinates for direct NEE.
     float3 suffixLight;     // Tail factor or dual deep light UV.
     uint lightPdfOrIndex; // Light PDF bits or dual NEE light index.
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    property bool lightIsAnalytic
+    {
+        get { return (candidate.packedFlags & kGrisHistoryAnalytic) != 0u; }
+        set { candidate.packedFlags = (candidate.packedFlags & ~kGrisHistoryAnalytic) | (newValue ? kGrisHistoryAnalytic : 0u); }
+    }
+#else
     bool lightIsAnalytic;
+#endif
 #if RTPT_GRIS_SUFFIX_REPLAY
     uint suffixInstanceMask;
     uint terminalBounce; // Continuation bounce of the selected event; zero means unavailable.
@@ -158,8 +205,15 @@ struct GrisSpatialRecord
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng; // Continuation stream after sampling x2's direction.
-    uint dualExplicitBounce; // Terminal bounce of a replayed suffix, or zero for directly stored NEE.
-    uint2 dualExplicitPathID;
+    property uint dualExplicitBounce
+    {
+        get { return (candidate.packedFlags >> kGrisPackedBounceShift) & kGrisPackedBounceMask; }
+        set
+        {
+            candidate.packedFlags = (candidate.packedFlags & ~(kGrisPackedBounceMask << kGrisPackedBounceShift))
+                | ((newValue & kGrisPackedBounceMask) << kGrisPackedBounceShift);
+        }
+    }
 #endif
 };
 
@@ -190,7 +244,6 @@ struct GrisDualX2Sample
 struct GrisDualExplicitTerminal
 {
     float3 suffixLight;
-    uint2 dualExplicitPathID;
     uint bounce;
     uint terminalKind;
     uint lightPdfOrIndex;
@@ -283,8 +336,12 @@ uint rtptGrisSourceSlot(uint rootLobe)
 struct GrisTemporalFreshHistory
 {
     PackedHitInfo sourceX1;
+#if !RTPT_GRIS_SEPARATE_OWNER
     PackedHitInfo ownerPrimaryHit; // Replaces the reconstructible first-edge direction.
+#endif
+#if !RTPT_GRIS_DUAL_FIRST_HIT
     uint rootLobe;
+#endif
     PackedHitInfo reconnectHit;
     float sourceAreaPdf;
     float3 suffixDirection; // Direction leaving x2, or light UV for dual direct NEE.
@@ -308,12 +365,9 @@ struct GrisTemporalFreshHistory
 #endif
 #if RTPT_GRIS_DUAL_FIRST_HIT
     uint4 dualExplicitRng;
-    uint dualExplicitBounce;
-    uint2 dualExplicitPathID;
 #endif
 };
 
-static const uint kGrisHistoryAnalytic = 0x80000000u;
 #endif
 
 struct TerminalPicker

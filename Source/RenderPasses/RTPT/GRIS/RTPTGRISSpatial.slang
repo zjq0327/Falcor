@@ -1,8 +1,8 @@
 #include "RTPTGRISReuse.slang"
 #include "RTPTGRISReference.slang"
 
-StructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
-RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialOutput;
+StructuredBuffer<GrisStoredRecord> gGRISSpatialInput;
+RWStructuredBuffer<GrisStoredRecord> gGRISSpatialOutput;
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
 StructuredBuffer<float4> gGRISSpatialDeepIncident;
 #endif
@@ -13,7 +13,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     const uint2 pixel = threadID.xy;
     if (any(pixel >= gPrimarySettings.frameDim)) return;
     const uint index = pixel.y * gPrimarySettings.frameDim.x + pixel.x;
-    GrisSpatialRecord canonical = gGRISSpatialInput[index];
+    GrisSpatialRecord canonical = rtptGrisLoadCurrentRecord(gGRISSpatialInput[index], index);
     GrisSpatialRecord result = canonical;
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH) && RTPT_GRIS_SPATIAL_REUSE && \
     (RTPT_GRIS_DUAL_FIRST_HIT || defined(RTPT_GRIS_STORED_PREFIX_REUSE))
@@ -31,9 +31,10 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #endif
         );
         // Reload the payload after selection to keep it out of the MIS loop.
-        const GrisSpatialRecord center = gGRISSpatialInput[index];
+        const GrisSpatialRecord center = rtptGrisLoadCurrentRecord(gGRISSpatialInput[index], index);
         const uint winnerIndex = selection.inputIndex == inputCount ? index : sourceIndices[selection.inputIndex];
-        GrisSpatialRecord winner = gGRISSpatialInput[winnerIndex];
+        GrisSpatialRecord winner = rtptGrisLoadCurrentRecord(gGRISSpatialInput[winnerIndex], winnerIndex);
+        rtptGrisApplyDualWinnerTerminal(selection, winner);
         winner.candidate.F = selection.diffuse;
         winner.candidate.dualF = selection.specular;
         result = rtptGrisFinalizeDualTail(center, winner, selection.sum, selection.target, selection.count);
@@ -46,5 +47,5 @@ void main(uint3 threadID : SV_DispatchThreadID)
     result = rtptGrisMergeStoredPrefix(canonical, inputs, sourceCameras, inputCount, rng);
 #endif
 #endif
-    gGRISSpatialOutput[index] = result;
+    gGRISSpatialOutput[index] = rtptGrisStoreRecord(result);
 }

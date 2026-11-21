@@ -40,12 +40,12 @@ target_sources(RTPT PRIVATE
     GRIS/RTPTGRISShade.cs.slang
     GRIS/RTPTGRISSpatial.cs.slang
     GRIS/RTPTGRISSpatial.slang
+    GRIS/RTPTGRISStorage.slang
     GRIS/RTPTGRISSuffixReplay.slang
     GRIS/RTPTGRISSupport.slang
     GRIS/RTPTGRISTemporal.cs.slang
     GRIS/RTPTGRISTemporal.slang
     GRIS/RTPTGRISTypes.slang
-    GRIS/RTPTGRISDualExplicitPath.slang
     GRIS/RTPTGRISDualExplicitReplay.slang
     GRIS/RTPTGRISTerminalPicker.slang
     PrimarySurface/RTPTCamera.slang

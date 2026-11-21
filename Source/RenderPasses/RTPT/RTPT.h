@@ -37,7 +37,7 @@ public:
     std::vector<ref<Buffer>> getGRISValidationBuffers() const
     {
         return {mpGRISSpatialInput, mpGRISCandidates, mpGRISHistory, mpGRISLocalPrefixes, mpGRISTemporalOutput,
-            mpGRISSpatialDeepIncident};
+            mpGRISSpatialDeepIncident, mpGRISPreviousPrimaryHits, mGrisSeparateOwner ? mpPrimarySurfaces : nullptr};
     }
     // Explicit diagnostic access to existing resources only; no GPU readback.
     std::vector<ref<Buffer>> getSHARCValidationBuffers() const
@@ -132,6 +132,7 @@ private:
     ref<Buffer> mpGRISSpatialDeepIncident;
     ref<Buffer> mpGRISShadedIndirect;
     ref<Buffer> mpGRISHistory;
+    ref<Buffer> mpGRISPreviousPrimaryHits;
     struct GrisTemporalSnapshot
     {
         float3 cameraPosition = float3(0.f);
@@ -141,6 +142,8 @@ private:
         bool suffixReplayDomain = false;
         bool dualFirstHitDomain = false;
         bool dualDynamicReplayDomain = false;
+        bool referenceBSDF = false;
+        bool separateOwner = false;
 
         bool hasDynamicReplay() const { return suffixReplayDomain || dualDynamicReplayDomain; }
 
@@ -152,7 +155,8 @@ private:
                 pgGeneration == other.pgGeneration)) &&
                 (sharcVersion == other.sharcVersion || (allowSharcVersionChange && sharcVersion != 0u && other.sharcVersion != 0u)) &&
                 suffixReplayDomain == other.suffixReplayDomain && dualFirstHitDomain == other.dualFirstHitDomain &&
-                dualDynamicReplayDomain == other.dualDynamicReplayDomain;
+                dualDynamicReplayDomain == other.dualDynamicReplayDomain && referenceBSDF == other.referenceBSDF &&
+                separateOwner == other.separateOwner;
         }
     };
     struct GrisTemporalHistoryFrame
@@ -190,6 +194,8 @@ private:
     bool mGRISEnabled = false;
     bool mGRISSpatialEnabled = false;
     bool mGRISTemporalEnabled = false;
+    bool mGrisReferenceBSDF = false;
+    bool mGrisSeparateOwner = true;
     bool mGRISDualFirstHitEnabled = true;
     float mGRISSharcX1Blend = 0.f;
     uint2 mStageResourceDim = uint2(0u);

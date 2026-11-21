@@ -90,6 +90,28 @@ bool rtptGrisReplayRayClear(Ray ray, uint count)
     }
     return true;
 }
+
+bool rtptGrisDualExplicitInfiniteRayClear(Ray ray, uint count)
+{
+    if (count == 0u) return false;
+    // Restrict the certificate to the distance spanned by moved bounds.
+    // Using FLT_MAX for its padding would cover the whole scene.
+    const float3 absoluteDirection = abs(ray.dir);
+    const float largest = max(absoluteDirection.x, max(absoluteDirection.y, absoluteDirection.z));
+    if (!(largest > 0.f) || !isfinite(largest)) return false;
+    const uint axis = largest == absoluteDirection.x ? 0u : (largest == absoluteDirection.y ? 1u : 2u);
+    float farT = ray.tMin;
+    [loop] for (uint i = 0u; i < count; ++i)
+    {
+        const GrisReplayMovedBounds bounds = gGRISReplayMovedBounds[i];
+        const float extent = max(abs(bounds.minPoint[axis] - ray.origin[axis]),
+            abs(bounds.maxPoint[axis] - ray.origin[axis]));
+        farT = max(farT, extent / largest);
+    }
+    const float padding = max(1.f, max(abs(ray.origin[axis]) / largest, farT)) * 1.52587890625e-5f;
+    ray.tMax = min(ray.tMax, farT + padding);
+    return rtptGrisReplayRayClear(ray, count);
+}
 #endif
 
 #if defined(RTPT_GRIS_TEMPORAL_REUSE) && ((RTPT_GRIS_SUFFIX_REPLAY && defined(RTPT_GRIS_STORED_PREFIX_REUSE)) || RTPT_GRIS_DUAL_DYNAMIC_REPLAY)

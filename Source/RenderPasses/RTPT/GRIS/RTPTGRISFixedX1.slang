@@ -160,7 +160,10 @@ GrisDualTailValue rtptGrisEvaluateFixedX1Tail(PackedHitInfo ownerPrimaryHit, flo
         const IMaterialInstance reconnectMaterial =
             gScene.materials.getMaterialInstance(reconnect, ExplicitLodTextureSampler(0.f));
         if (!rtptGRISSupportsSurface(reconnect, reconnectMaterial.getLobeTypes(reconnect))) return result;
-        if (mustCheckConnections && !rtptGrisRefVisible(first, reconnect, movedBoundsCount)) return result;
+        if (mustCheckConnections)
+        {
+            if (!rtptGrisRefVisible(first, reconnect, movedBoundsCount)) return result;
+        }
 
         const float connectionGeometry = abs(dot(reconnect.faceN, connectionDirection)) / connectionDistanceSquared;
         const float connectionPdf = firstMaterial.evalPdf(first, connectionDirection);

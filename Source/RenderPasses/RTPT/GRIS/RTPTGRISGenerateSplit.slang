@@ -19,7 +19,6 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
     GrisGenerateRootResult result = {};
     result.localFirstHit.distanceState = kRTPTDistanceUntraced;
     center = {};
-    center.candidate.firstHit.distanceState = kRTPTDistanceUntraced;
     attemptedMask = 0u;
 
     RTPTPrimarySurface primary;
@@ -70,13 +69,15 @@ GrisGenerateRootResult rtptGrisGenerateRoot(
 
     // The S worker evaluates the D proposal with the same guide lookup inputs
     // as the D worker, independently of the D path's sampled vertices.
-    RTPTSamplingContext diffuseSampling = {};
+    RTPTSamplingContext diffuseSampling = rtptBSDFSamplingContext();
+#if !RTPT_GRIS_REFERENCE_BSDF
     if (hasDiffuse)
     {
         ShadingData diffuse = sd;
         diffuse.mtl.setActiveLobes(uint(LobeType::DiffuseReflection));
         diffuseSampling = rtptMakeSamplingContext(diffuse, mi);
     }
+#endif
     ShadingData component = sd;
     component.mtl.setActiveLobes(activeLobe);
     const RTPTSamplingContext sampling = slot == 0u ? diffuseSampling : rtptBSDFSamplingContext();
@@ -152,7 +153,7 @@ void generateDiffuse(uint3 dispatchThreadID : SV_DispatchThreadID)
         GrisSpatialRecord pending = diffuse.winner;
         pending.candidate.W = diffuse.weightSum;
         pending.candidate.M = diffuse.winnerTarget;
-        gGRISSpatialInput[index] = pending;
+        gGRISSpatialInput[index] = rtptGrisStoreRecord(pending);
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
         gGRISSpatialDeepIncident[index] = diffuse.deepIncident;
 #endif
@@ -201,7 +202,7 @@ void generateSpecularMerge(uint3 dispatchThreadID : SV_DispatchThreadID)
             SampleGenerator mergeRng = SampleGenerator(pixel, sampleIndex ^ 0xd1b54a35u);
             if (rtptGrisChooseFreshSlot(diffuseWeight, specularWeight, mergeRng) == 0u)
             {
-                winner = gGRISSpatialInput[index];
+                winner = rtptGrisLoadCurrentRecord(gGRISSpatialInput[index], index);
                 winnerTarget = winner.candidate.M;
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
                 keepDiffuseIncident = true;
@@ -219,7 +220,7 @@ void generateSpecularMerge(uint3 dispatchThreadID : SV_DispatchThreadID)
         center = rtptGrisFinalizeDualTail(center, winner, total, winnerTarget, float(countbits(attemptedMask)));
     }
 
-    gGRISSpatialInput[index] = center;
+    gGRISSpatialInput[index] = rtptGrisStoreRecord(center);
 #if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
     if (!keepDiffuseIncident)
         gGRISSpatialDeepIncident[index] = deepIncident;

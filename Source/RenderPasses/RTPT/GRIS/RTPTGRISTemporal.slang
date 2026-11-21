@@ -29,8 +29,11 @@ struct GrisTemporalSettings
 
 ConstantBuffer<GrisTemporalSettings> gGRISTemporalSettings;
 StructuredBuffer<GrisTemporalFreshHistory> gGRISHistory;
-StructuredBuffer<GrisSpatialRecord> gGRISSpatialInput;
-RWStructuredBuffer<GrisSpatialRecord> gGRISSpatialOutput;
+#if RTPT_GRIS_SEPARATE_OWNER
+StructuredBuffer<PackedHitInfo> gGRISPreviousPrimaryHits;
+#endif
+StructuredBuffer<GrisStoredRecord> gGRISSpatialInput;
+RWStructuredBuffer<GrisStoredRecord> gGRISSpatialOutput;
 #if RTPT_GRIS_DUAL_FIRST_HIT && RTPT_GRIS_SPATIAL_DEEP_INCIDENT && SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
 RWStructuredBuffer<float4> gGRISSpatialDeepIncident;
 #endif
@@ -66,8 +69,13 @@ bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecor
     source = {};
     if (historyPixel == kGrisInvalidReprojectedPixel) return false;
     const GrisTemporalFreshHistory h = gGRISHistory[historyPixel];
-    if (!(h.M > 0.f) || !HitInfo(h.ownerPrimaryHit).isValid()) return false;
-    source.ownerPrimaryHit = h.ownerPrimaryHit;
+#if RTPT_GRIS_SEPARATE_OWNER
+    const PackedHitInfo owner = gGRISPreviousPrimaryHits[historyPixel];
+#else
+    const PackedHitInfo owner = h.ownerPrimaryHit;
+#endif
+    if (!(h.M > 0.f) || !HitInfo(owner).isValid()) return false;
+    source.ownerPrimaryHit = owner;
     source.sourceX1 = h.sourceX1;
     source.reconnectHit = h.reconnectHit;
     source.areaPdf = h.sourceAreaPdf;
@@ -75,8 +83,6 @@ bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecor
     source.suffixLight = h.suffixLight;
 #if RTPT_GRIS_DUAL_FIRST_HIT
     source.dualExplicitRng = h.dualExplicitRng;
-    source.dualExplicitBounce = h.dualExplicitBounce;
-    source.dualExplicitPathID = h.dualExplicitPathID;
 #endif
     source.lightPdfOrIndex = h.lightPdfOrIndex;
 #if RTPT_GRIS_SUFFIX_REPLAY
@@ -88,9 +94,13 @@ bool rtptGrisLoadHistory(uint historyPixel, float currentM, out GrisSpatialRecor
     source.sharcKey = h.sharcKey;
     source.sharcGain = h.sharcGain;
 #endif
+#if RTPT_GRIS_DUAL_FIRST_HIT
+    source.candidate.packedFlags = h.terminalAndFlags;
+#else
     source.lightIsAnalytic = (h.terminalAndFlags & kGrisHistoryAnalytic) != 0u;
     source.candidate.terminalKind = h.terminalAndFlags & ~kGrisHistoryAnalytic;
     source.candidate.rootLobe = h.rootLobe;
+#endif
     source.candidate.F = h.F;
     source.candidate.W = h.W;
     // The Talbot history limit is relative to the current Fresh count.
@@ -110,7 +120,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     const uint2 pixel = threadID.xy;
     if (any(pixel >= gPrimarySettings.frameDim)) return;
     const uint index = pixel.y * gPrimarySettings.frameDim.x + pixel.x;
-    GrisSpatialRecord canonical = gGRISSpatialInput[index];
+    GrisSpatialRecord canonical = rtptGrisLoadCurrentRecord(gGRISSpatialInput[index], index);
     GrisSpatialRecord result = canonical;
 #if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
     SampleGenerator rng = SampleGenerator(pixel, gPrimarySettings.sampleIndex ^ 0xc2b2ae35u);
@@ -129,7 +139,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
             (rtptGrisOwnerHasDeltaRoot(canonical.ownerPrimaryHit, gScene.camera.getPosition()) ||
              rtptGrisOwnerHasDeltaRoot(inputs[0].ownerPrimaryHit, gGRISTemporalSettings.previousCameraPosition)))
         {
-            gGRISSpatialOutput[index] = canonical;
+            gGRISSpatialOutput[index] = rtptGrisStoreRecord(canonical);
             return;
         }
 #endif
@@ -140,16 +150,20 @@ void main(uint3 threadID : SV_DispatchThreadID)
 #if RTPT_GRIS_DUAL_DYNAMIC_REPLAY
             , gGRISTemporalSettings.suffixReplayLightChange != 0u, gGRISTemporalSettings.suffixReplayGeometryChange != 0u,
             gGRISTemporalSettings.suffixReplayMovedBoundsCount
+#if RTPT_GRIS_SPATIAL_DEEP_INCIDENT
+            , (gGRISTemporalSettings.suffixReplayGeometryChange != 0u) ? gGRISSpatialDeepIncident[index] : float4(0.f)
+#endif
 #endif
 #if RTPT_GRIS_DUAL_SHARC
             , gGRISTemporalSettings.dualSharcPreviousCacheMode
 #endif
         );
         // Reload the output payload after replay so only selection data crosses the proposal loop.
-        const GrisSpatialRecord center = gGRISSpatialInput[index];
+        const GrisSpatialRecord center = rtptGrisLoadCurrentRecord(gGRISSpatialInput[index], index);
         GrisSpatialRecord winner = center;
         if (selection.inputIndex == 0u)
             rtptGrisLoadHistory(historyPixel, center.candidate.M, winner);
+        rtptGrisApplyDualWinnerTerminal(selection, winner);
         winner.candidate.F = selection.diffuse;
         winner.candidate.dualF = selection.specular;
         result = rtptGrisFinalizeDualTail(center, winner, selection.sum, selection.target, selection.count);
@@ -188,5 +202,5 @@ void main(uint3 threadID : SV_DispatchThreadID)
     );
 #endif
 #endif
-    gGRISSpatialOutput[index] = result;
+    gGRISSpatialOutput[index] = rtptGrisStoreRecord(result);
 }
